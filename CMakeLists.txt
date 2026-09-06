@@ -55,3 +55,7 @@ target_link_libraries(smoke_check PRIVATE amdhip64)
 # Hardware inspection & topology discovery tool
 add_executable(aeon_info tools/aeon_info.cpp)
 target_link_libraries(aeon_info PRIVATE amdhip64)
+
+# Phase 0 Spike 2.1: Single-tile Wave32 WMMA smoke test
+add_executable(test_wmma_tile tests/test_wmma_tile.cpp)
+target_link_libraries(test_wmma_tile PRIVATE amdhip64)
