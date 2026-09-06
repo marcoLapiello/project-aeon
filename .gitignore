@@ -1,0 +1,28 @@
+# Build directories
+build/
+bin/
+lib/
+
+# Cache & temporary files
+*.o
+*.a
+*.so
+*.out
+.cache/
+
+# IDE & editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+
+# System / logs
+*.log
