@@ -71,3 +71,7 @@ target_link_libraries(test_direct_io PRIVATE amdhip64)
 # Phase 0 Spike 3.2: Concurrent compute + SDMA transfer overlap test
 add_executable(bench_async_overlap tests/bench_async_overlap.cpp)
 target_link_libraries(bench_async_overlap PRIVATE amdhip64)
+
+# Phase 0 Spike 4.2: Single-layer toy MoE pipeline with dynamic expert caching
+add_executable(test_toy_moe_layer tests/test_toy_moe_layer.cpp)
+target_link_libraries(test_toy_moe_layer PRIVATE amdhip64)

@@ -28,21 +28,21 @@ Always consult these authoritative documents for deep technical specifics:
 - [x] Completed architectural research, blocker analysis, and model specialization strategy.
 - [x] Verified host hardware: AMD Ryzen Threadripper PRO 3975WX (32C/64T), 64 GB DDR, 4x AMD Radeon RX 7900 XTX (96 GB VRAM total, `gfx1100`), ROCm 7.2.2 toolchain with `hipcc`, Linux kernel 7.0.
 - [x] Established non-re-inventing philosophy: No PyTorch in production runtime; ingest standard model formats (GGUF/Safetensors); Python for offline toolchain/tests only.
-- [x] Micro-Step 1.1: Root `CMakeLists.txt` configured for `hipcc`, C++20, and `gfx1100` Wave32 mode.
-- [x] Micro-Step 1.2: Hardware inspection utility (`tools/aeon_info.cpp`) enumerating 4x RX 7900 XTX devices, CUs, VRAM, and full P2P peer access matrix.
-- [x] Micro-Step 2.1: Single-tile WMMA HIP kernel test with CPU reference validation (`tests/test_wmma_tile.cpp`).
-- [x] Micro-Step 2.2: Tiled block GEMM benchmark achieving ~25.6 TFLOP/s and 870 us per 2048-dim expert on silicon (`tests/bench_wmma_gemm.cpp`).
-- [x] Micro-Step 3.1: 4096-byte sector-aligned memory allocator and `io_uring` direct reader (`src/io/`).
-- [x] Micro-Step 3.2: Concurrent compute + SDMA transfer jitter test (`tests/bench_async_overlap.cpp`).
-- [x] Micro-Step 4.1: Offline format packer (`scripts/prepare_rdna.py`).
+- [x] **[Phase 0 Execution Plan](plans-and-docs/PHASE_0_EXECUTION_PLAN.md) — Foundations & Hardware Validation**:
+  - Spike 1: CMake & Ninja build system with `hipcc` targeting RDNA3 Wave32 mode; hardware topology inspection tool (`tools/aeon_info.cpp`) verifying 4x RX 7900 XTX devices with 100% full bidirectional P2P access.
+  - Spike 2: Native Wave32 WMMA micro-kernel with CPU reference validation (`tests/test_wmma_tile.cpp`); tiled block GEMM benchmark achieving ~25.6 TFLOP/s and 870 us per 2048-dim matrix on silicon (`tests/bench_wmma_gemm.cpp`).
+  - Spike 3: 4KB sector-aligned memory allocator and Linux `io_uring` Direct I/O reader achieving 6.33 GB/s from NVMe (`src/io/`, `tests/test_direct_io.cpp`); concurrent compute + SDMA transfer test proving non-blocking PCIe DMA transfers at 24.9 GB/s with 0% compute jitter (`tests/bench_async_overlap.cpp`).
+  - Spike 4: Offline 4KB sector-aligned `.aeon` format packer (`scripts/prepare_rdna.py`); single-layer toy MoE pipeline validating dynamic Tier 1 VRAM LRU caching and asynchronous Tier 2 Host DDR SDMA swaps (`tests/test_toy_moe_layer.cpp`).
 
 ### Present (In Progress)
-- [ ] **Phase 0 Spike 4 — Sector-Aligned Storage & Single-Layer Toy MoE Pipeline**:
-  - [ ] Micro-Step 4.2: Single-layer cached execution test (`tests/test_toy_moe_layer.cpp`).
+- [ ] **Phase 1 Planning & Scaffolding — Single-GPU Core Runtime**:
+  - Define Phase 1 micro-execution plan for DeepSeek-V4 architecture (SwiGLU, Wave32 FlashMLA fused attention, real model weight ingestion).
 
 ### Future (Upcoming Next)
-- [ ] **Phase 1 — Single-GPU Core Runtime & DeepSeek-V4 End-to-End Pipeline**:
-  - Fused Wave32 FlashMLA kernel, standard model ingestion, and complete multi-layer pipeline.
+- [ ] **Phase 1 Execution — Core DeepSeek-V4 Runtime**:
+  - Fused Wave32 FlashMLA kernel, standard format ingestion, and multi-layer single-card inference.
+- [ ] **Phase 2 — Multi-GPU Pipeline Parallelism**:
+  - 4-card stage partitioning across P2P PCIe links and 1F1B micro-batching.
 
 ---
 
