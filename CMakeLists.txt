@@ -51,3 +51,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # Smoke test executable to verify compiler and toolchain sanity
 add_executable(smoke_check src/smoke.cpp)
 target_link_libraries(smoke_check PRIVATE amdhip64)
+
+# Hardware inspection & topology discovery tool
+add_executable(aeon_info tools/aeon_info.cpp)
+target_link_libraries(aeon_info PRIVATE amdhip64)
