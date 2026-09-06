@@ -63,3 +63,7 @@ target_link_libraries(test_wmma_tile PRIVATE amdhip64)
 # Phase 0 Spike 2.2: Tiled block GEMM benchmark
 add_executable(bench_wmma_gemm tests/bench_wmma_gemm.cpp)
 target_link_libraries(bench_wmma_gemm PRIVATE amdhip64)
+
+# Phase 0 Spike 3.1: 4KB sector-aligned direct I/O test
+add_executable(test_direct_io tests/test_direct_io.cpp)
+target_link_libraries(test_direct_io PRIVATE amdhip64)
