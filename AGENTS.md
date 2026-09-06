@@ -28,10 +28,10 @@ Always consult these authoritative documents for deep technical specifics:
 - [x] Completed architectural research, blocker analysis, and model specialization strategy.
 - [x] Verified host hardware: AMD Ryzen Threadripper PRO 3975WX (32C/64T), 64 GB DDR, 4x AMD Radeon RX 7900 XTX (96 GB VRAM total, `gfx1100`), ROCm 7.2.2 toolchain with `hipcc`, Linux kernel 7.0.
 - [x] Established non-re-inventing philosophy: No PyTorch in production runtime; ingest standard model formats (GGUF/Safetensors); Python for offline toolchain/tests only.
+- [x] Micro-Step 1.1: Root `CMakeLists.txt` configured for `hipcc`, C++20, and `gfx1100` Wave32 mode.
 
 ### Present (In Progress)
 - [ ] **Phase 0 Spike 1 — Toolchain, Build System & Hardware Discovery**:
-  - [ ] Micro-Step 1.1: Root `CMakeLists.txt` configured for `hipcc`, C++20, and `gfx1100`.
   - [ ] Micro-Step 1.2: Hardware inspection utility (`tools/aeon_info.cpp`) enumerating 4x RX 7900 XTX devices, CUs, Infinity Cache properties, and Wave32 support.
 
 ### Future (Upcoming Next)
