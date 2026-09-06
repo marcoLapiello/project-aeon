@@ -24,7 +24,7 @@ Activation entropy varies significantly across different MoE designs:
    * Small expert count ($N = 8$), low active count ($K = 2$).
    * Expert weights are large (~3–7 GB each).
    * Low routing entropy per layer, but swapping incur massive PCIe/storage transfer penalties.
-2. **Fine-Grained MoEs with Shared Experts (e.g., DeepSeek-V2 / V3 / V4):**
+2. **Fine-Grained MoEs with Shared Experts (e.g., DeepSeek-V4):**
    * High expert count ($N = 64, 160, 256$), small active count ($K = 6, 8$).
    * Individual expert size is small (~80–150 MB at 4-bit).
    * Features **permanently active Shared Experts** that absorb baseline representational continuity.
@@ -75,8 +75,8 @@ Prior art demonstrates that engines attempting to support all architectures from
 
 Hyper-optimized engines (such as *Flash-MoE* on Apple Silicon or *hipfire* on RDNA3) achieve state-of-the-art throughput by tailoring their dispatch loops and memory layouts to specific hardware and tensor shapes.
 
-### 3.2 Target Selection for Phase 1: DeepSeek Fine-Grained MoE
-Project Aeon will focus Phase 1 exclusively on the **DeepSeek MoE architecture** (V2/V3/V4) based on four structural advantages:
+### 3.2 Target Selection for Phase 1: DeepSeek Fine-Grained MoE (V4)
+Project Aeon will focus Phase 1 exclusively on the **DeepSeek-V4 MoE architecture** based on four structural advantages:
 1. **Granular Expert Sizing:** Individual 4-bit experts (~100–150 MB) can be staged across PCIe Gen4 in ~2–3 ms, perfectly fitting speculative asynchronous transfer windows.
 2. **Permanent Shared Experts:** Baseline attention and dense representations remain anchored in VRAM at all times, ensuring stability even during routed expert cache misses.
 3. **Multi-Head Latent Attention (MLA):** Compressed KV cache dimensions reduce memory footprint by 4×–6×, freeing up to ~80 GB of physical VRAM across the 4x RX 7900 XTX array solely for the resident expert cache pool.
