@@ -33,14 +33,16 @@ Always consult these authoritative documents for deep technical specifics:
 - [x] Micro-Step 2.1: Single-tile WMMA HIP kernel test with CPU reference validation (`tests/test_wmma_tile.cpp`).
 - [x] Micro-Step 2.2: Tiled block GEMM benchmark achieving ~25.6 TFLOP/s and 870 us per 2048-dim expert on silicon (`tests/bench_wmma_gemm.cpp`).
 - [x] Micro-Step 3.1: 4096-byte sector-aligned memory allocator and `io_uring` direct reader (`src/io/`).
+- [x] Micro-Step 3.2: Concurrent compute + SDMA transfer jitter test (`tests/bench_async_overlap.cpp`).
 
 ### Present (In Progress)
-- [ ] **Phase 0 Spike 3 — Asynchronous I/O & SDMA Transfer Overlap**:
-  - [ ] Micro-Step 3.2: Concurrent compute + SDMA transfer jitter test.
+- [ ] **Phase 0 Spike 4 — Sector-Aligned Storage & Single-Layer Toy MoE Pipeline**:
+  - [ ] Micro-Step 4.1: Offline format packer (`prepare_rdna.py`).
+  - [ ] Micro-Step 4.2: Single-layer cached execution test (`tests/test_toy_moe_layer.cpp`).
 
 ### Future (Upcoming Next)
-- [ ] **Phase 0 Spike 4 — Sector-Aligned Storage & Single-Layer Toy MoE Pipeline**:
-  - Offline format packer (`prepare_rdna.py`) and single-layer cached execution test.
+- [ ] **Phase 1 — Single-GPU Core Runtime & DeepSeek-V4 End-to-End Pipeline**:
+  - Fused Wave32 FlashMLA kernel, standard model ingestion, and complete multi-layer pipeline.
 
 ---
 

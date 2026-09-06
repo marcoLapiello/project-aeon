@@ -67,3 +67,7 @@ target_link_libraries(bench_wmma_gemm PRIVATE amdhip64)
 # Phase 0 Spike 3.1: 4KB sector-aligned direct I/O test
 add_executable(test_direct_io tests/test_direct_io.cpp)
 target_link_libraries(test_direct_io PRIVATE amdhip64)
+
+# Phase 0 Spike 3.2: Concurrent compute + SDMA transfer overlap test
+add_executable(bench_async_overlap tests/bench_async_overlap.cpp)
+target_link_libraries(bench_async_overlap PRIVATE amdhip64)
