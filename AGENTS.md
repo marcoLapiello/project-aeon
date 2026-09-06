@@ -31,14 +31,14 @@ Always consult these authoritative documents for deep technical specifics:
 - [x] Micro-Step 1.1: Root `CMakeLists.txt` configured for `hipcc`, C++20, and `gfx1100` Wave32 mode.
 - [x] Micro-Step 1.2: Hardware inspection utility (`tools/aeon_info.cpp`) enumerating 4x RX 7900 XTX devices, CUs, VRAM, and full P2P peer access matrix.
 - [x] Micro-Step 2.1: Single-tile WMMA HIP kernel test with CPU reference validation (`tests/test_wmma_tile.cpp`).
+- [x] Micro-Step 2.2: Tiled block GEMM benchmark achieving ~25.6 TFLOP/s and 870 us per 2048-dim expert on silicon (`tests/bench_wmma_gemm.cpp`).
 
 ### Present (In Progress)
-- [ ] **Phase 0 Spike 2 — Bare-Metal Wave32 WMMA Compute Kernel**:
-  - [ ] Micro-Step 2.2: Tiled GEMM micro-benchmark measuring sustained TFLOPs against theoretical peak.
+- [ ] **Phase 0 Spike 3 — Asynchronous I/O & SDMA Transfer Overlap**:
+  - [ ] Micro-Step 3.1: 4096-byte sector-aligned memory allocator and `io_uring` direct reader.
 
 ### Future (Upcoming Next)
 - [ ] **Phase 0 Spike 3 — Asynchronous I/O & SDMA Transfer Overlap**:
-  - Micro-Step 3.1: 4096-byte sector-aligned memory allocator and `io_uring` direct reader.
   - Micro-Step 3.2: Concurrent compute + SDMA transfer jitter test.
 - [ ] **Phase 0 Spike 4 — Sector-Aligned Storage & Single-Layer Toy MoE Pipeline**:
   - Offline format packer (`prepare_rdna.py`) and single-layer cached execution test.

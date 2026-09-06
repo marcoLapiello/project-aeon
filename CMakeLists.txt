@@ -59,3 +59,7 @@ target_link_libraries(aeon_info PRIVATE amdhip64)
 # Phase 0 Spike 2.1: Single-tile Wave32 WMMA smoke test
 add_executable(test_wmma_tile tests/test_wmma_tile.cpp)
 target_link_libraries(test_wmma_tile PRIVATE amdhip64)
+
+# Phase 0 Spike 2.2: Tiled block GEMM benchmark
+add_executable(bench_wmma_gemm tests/bench_wmma_gemm.cpp)
+target_link_libraries(bench_wmma_gemm PRIVATE amdhip64)
