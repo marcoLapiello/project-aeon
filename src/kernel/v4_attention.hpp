@@ -324,6 +324,201 @@ __global__ void v4_gemv_fp16_kernel(
     }
 }
 
+// 7. Single-position Forward RoPE for autoregressive generation
+__global__ void __launch_bounds__(32) v4_forward_rope_at_pos_wave32_kernel(
+    __half* __restrict__ vec,           // [num_heads, head_dim]
+    const float* __restrict__ cos_cache,// [max_seq, 32]
+    const float* __restrict__ sin_cache,// [max_seq, 32]
+    int pos,
+    int num_heads,
+    int head_dim,                       // 512
+    int nope_dim,                       // 448
+    int half_rope                       // 32
+) {
+    int head_idx = blockIdx.x;
+    int k        = threadIdx.x; // 0..31
+
+    if (k < half_rope) {
+        int base_idx = head_idx * head_dim + nope_dim + 2 * k;
+
+        float c = cos_cache[pos * half_rope + k];
+        float s = sin_cache[pos * half_rope + k];
+
+        float x0 = __half2float(vec[base_idx + 0]);
+        float x1 = __half2float(vec[base_idx + 1]);
+
+        float rot0 = x0 * c - x1 * s;
+        float rot1 = x0 * s + x1 * c;
+
+        vec[base_idx + 0] = __float2half(rot0);
+        vec[base_idx + 1] = __float2half(rot1);
+    }
+}
+
+// 8. Single-position Inverse RoPE for autoregressive generation
+__global__ void __launch_bounds__(32) v4_inverse_rope_at_pos_wave32_kernel(
+    __half* __restrict__ vec,           // [num_heads, head_dim]
+    const float* __restrict__ cos_cache,// [max_seq, 32]
+    const float* __restrict__ sin_cache,// [max_seq, 32]
+    int pos,
+    int num_heads,
+    int head_dim,                       // 512
+    int nope_dim,                       // 448
+    int half_rope                       // 32
+) {
+    int head_idx = blockIdx.x;
+    int k        = threadIdx.x; // 0..31
+
+    if (k < half_rope) {
+        int base_idx = head_idx * head_dim + nope_dim + 2 * k;
+
+        float c = cos_cache[pos * half_rope + k];
+        float s = sin_cache[pos * half_rope + k];
+
+        float x0 = __half2float(vec[base_idx + 0]);
+        float x1 = __half2float(vec[base_idx + 1]);
+
+        float inv0 = x0 * c + x1 * s;
+        float inv1 = x1 * c - x0 * s;
+
+        vec[base_idx + 0] = __float2half(inv0);
+        vec[base_idx + 1] = __float2half(inv1);
+    }
+}
+
+// 9. Autoregressive Sliding-Window Attention with persistent KV Cache
+__global__ void __launch_bounds__(32) v4_cached_sliding_window_attn_wave32_kernel(
+    const __half* __restrict__ q,         // [64, 512]
+    const __half* __restrict__ kv_cache,  // [max_seq_len, 512]
+    const float*  __restrict__ attn_sink, // [64]
+    __half*       __restrict__ out,       // [64, 512]
+    int current_pos,                      // sequence index (0, 1, 2, ...)
+    int window_size,                      // 128
+    float scale                           // 1.0f / sqrt(512)
+) {
+    int head = blockIdx.x;                // 0..63
+    int lane = threadIdx.x;               // 0..31
+
+    __shared__ float lds_scores[DSV4_SLIDING_WINDOW];
+
+    int j_start = max(0, current_pos - window_size + 1);
+    int num_keys = current_pos - j_start + 1;
+
+    const __half* q_ptr = q + head * DSV4_HEAD_DIM;
+
+    // Phase 1: Dot products with cached keys
+    for (int step = 0; step < num_keys; ++step) {
+        int j = j_start + step;
+        const __half* k_ptr = kv_cache + j * DSV4_HEAD_DIM;
+
+        float dot = 0.0f;
+        #pragma unroll 4
+        for (int d = lane * 16; d < (lane + 1) * 16; ++d) {
+            dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d]);
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            dot += __shfl_xor(dot, offset, 32);
+        }
+
+        if (lane == 0) {
+            lds_scores[step] = dot * scale;
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: Softmax with attention sink
+    float max_score = attn_sink[head];
+    for (int step = 0; step < num_keys; ++step) {
+        max_score = fmaxf(max_score, lds_scores[step]);
+    }
+
+    float sink_weight = expf(attn_sink[head] - max_score);
+    float sum_exp = sink_weight;
+
+    for (int step = 0; step < num_keys; ++step) {
+        float p = expf(lds_scores[step] - max_score);
+        lds_scores[step] = p;
+        sum_exp += p;
+    }
+
+    float inv_sum = 1.0f / fmaxf(sum_exp, 1e-30f);
+    __syncthreads();
+
+    // Phase 3: Weighted sum of Value vectors (V = K)
+    __half* out_ptr = out + head * DSV4_HEAD_DIM;
+
+    #pragma unroll 4
+    for (int d = lane * 16; d < (lane + 1) * 16; ++d) {
+        float acc = 0.0f;
+        for (int step = 0; step < num_keys; ++step) {
+            int j = j_start + step;
+            float weight = lds_scores[step] * inv_sum;
+            acc += weight * __half2float(kv_cache[j * DSV4_HEAD_DIM + d]);
+        }
+        out_ptr[d] = __float2half(acc);
+    }
+}
+
+// 10. Hyper-Connections Head Reduction Kernel
+__global__ void __launch_bounds__(32) hc_head_wave32_kernel(
+    const float* __restrict__ residual_in, // [4, 4096] = 16384 floats
+    const float* __restrict__ hc_head_fn,  // [4, 16384] floats
+    const float* __restrict__ hc_head_base,// [4] floats
+    const float* __restrict__ hc_head_scale,// [1] float
+    __half*      __restrict__ out,         // [4096] half
+    int hidden_dim,                        // 4096
+    int hc_mult,                           // 4
+    float rms_eps,                         // 1e-6f
+    float hc_eps                           // 1e-6f
+) {
+    int total_hc_dim = hc_mult * hidden_dim; // 16384
+    int lane = threadIdx.x; // 0..31
+
+    // Step 1: Mean square over total_hc_dim
+    float sum_sq = 0.0f;
+    for (int i = lane; i < total_hc_dim; i += 32) {
+        float v = residual_in[i];
+        sum_sq += v * v;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_xor(sum_sq, offset, 32);
+    }
+    float rsqrt = rsqrtf((sum_sq / (float)total_hc_dim) + rms_eps);
+
+    // Step 2: Linear projection for each of the 4 streams
+    __shared__ float s_pre[4];
+    for (int s = 0; s < hc_mult; ++s) {
+        float dot = 0.0f;
+        const float* fn_row = hc_head_fn + s * total_hc_dim;
+        for (int i = lane; i < total_hc_dim; i += 32) {
+            dot += residual_in[i] * fn_row[i];
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            dot += __shfl_xor(dot, offset, 32);
+        }
+        if (lane == 0) {
+            float mix = dot * rsqrt;
+            float val = mix * hc_head_scale[0] + hc_head_base[s];
+            float pre = (1.0f / (1.0f + expf(-val))) + hc_eps;
+            s_pre[s] = pre;
+        }
+    }
+    __syncthreads();
+
+    // Step 3: Combine streams into output [4096]
+    for (int h = lane; h < hidden_dim; h += 32) {
+        float acc = 0.0f;
+        for (int s = 0; s < hc_mult; ++s) {
+            acc += s_pre[s] * residual_in[s * hidden_dim + h];
+        }
+        out[h] = __float2half(acc);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CPU Reference Implementations for Precision Verification
 // ---------------------------------------------------------------------------

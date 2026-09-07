@@ -43,7 +43,10 @@ Always consult these authoritative documents for deep technical specifics:
   - [x] Spike 3: Fused INT4 $\to$ FP16 Wave32 Dequantization-GEMM kernel targeting `gfx1100` WMMA (`src/kernel/w4a16_gemm.hpp`, `tests/test_w4a16_wmma.cpp`).
   - [x] Spike 4: Dual-mode MoE routing (hash layers 0–2 + `sqrtsoftplus` layers 3–42) with Tier 1/2 dynamic expert streaming (`src/kernel/moe_router.hpp`, `tests/test_moe_router.cpp`, `tests/test_v4_moe_layer.cpp`).
   - [x] Spike 5: Sliding-window attention ($W=128$) and end-to-end `DeepSeekV4Block` single-layer silicon validation (`src/kernel/v4_attention.hpp`, `src/core/v4_block.hpp`, `tests/test_v4_attention.cpp`, `tests/test_v4_block.cpp`).
-  - [ ] Spike 6: Multi-layer pipeline execution & autoregressive generation benchmark.
+  - [x] Spike 6: Multi-layer pipeline execution & autoregressive generation benchmark (`src/core/safetensors_loader.hpp`, `src/core/v4_pipeline.hpp`, `tests/test_v4_pipeline.cpp`, `tests/bench_v4_generation.cpp`).
+
+### Present (In Progress)
+- [ ] **Phase 1 Complete**: Single-GPU core runtime for DeepSeek-V4 verified end-to-end on real INT4-W4A16 Safetensors shards.
 
 ### Future (Upcoming Next)
 - [ ] **Phase 2 — Multi-GPU Pipeline Parallelism**:

@@ -112,6 +112,14 @@ target_link_libraries(test_v4_attention PRIVATE amdhip64)
 add_executable(test_v4_block tests/test_v4_block.cpp)
 target_link_libraries(test_v4_block PRIVATE amdhip64)
 
+# Phase 1 Spike 6.1: Multi-Layer Pipeline & KV Cache test
+add_executable(test_v4_pipeline tests/test_v4_pipeline.cpp)
+target_link_libraries(test_v4_pipeline PRIVATE amdhip64)
+
+# Phase 1 Spike 6.2: End-to-End Autoregressive Generation Benchmark
+add_executable(bench_v4_generation tests/bench_v4_generation.cpp)
+target_link_libraries(bench_v4_generation PRIVATE amdhip64)
+
 
 
 

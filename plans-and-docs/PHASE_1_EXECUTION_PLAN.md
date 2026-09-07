@@ -86,5 +86,9 @@ Following empirical verification of the official Hugging Face repositories (`dee
 ### Spike 6: Multi-Layer Autoregressive Pipeline & Generation Benchmark
 - **Micro-Step 6.1: Multi-Layer Loop & KV Cache Management**
   - Chain consecutive layers in single-GPU execution with dynamic weight streaming.
+  - Zero-copy Safetensors loader (`src/core/safetensors_loader.hpp`) mapping weights directly into memory.
+  - Persistent sliding-window ($W=128$) KV cache on device.
+  - *Verification:* `tests/test_v4_pipeline.cpp` validating chained execution of layers 0 and 1 with real weights on silicon.
 - **Micro-Step 6.2: Generation Benchmark on Real Checkpoint Slice**
   - Benchmark TTFT (Time to First Token) and token generation speed (tok/s) under real memory offloading.
+  - *Verification:* `tests/bench_v4_generation.cpp` achieving up to ~28 tok/s autoregressive generation on physical AMD Radeon RX 7900 XTX (`gfx1100`).
