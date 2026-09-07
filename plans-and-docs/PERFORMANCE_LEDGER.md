@@ -1,0 +1,72 @@
+# Project Aeon — Milestone Performance & Accuracy Ledger
+
+This ledger records physical hardware verification benchmarks, test conditions, latencies, throughputs, and cache behaviors across major development milestones. Every significant advancement must add an entry here for empirical before-and-after tracking.
+
+---
+
+## Hardware Target & Testbed Baseline
+* **Host CPU**: AMD Ryzen Threadripper PRO 3975WX (32 Cores / 64 Threads @ 3.5–4.2 GHz)
+* **Host Memory**: 64 GB DDR4 (128 PCIe 4.0 root complex lanes)
+* **Storage**: NVMe PCIe 4.0 SSD (`/dev/nvme0n1p2`, ~6.33 GB/s `io_uring` O_DIRECT read bandwidth)
+* **Accelerators**: 4x AMD Radeon RX 7900 XTX (Navi 31 / `gfx1100`, 24 GB GDDR6 VRAM each, 96 GB aggregate, PCIe 4.0 x16 per slot, bidirectional P2P enabled)
+* **Software Toolchain**: ROCm 7.2.2, native `hipcc`, Linux Kernel 7.0, Wave32 execution mode (`-mno-wavefrontsize64`)
+
+---
+
+## Milestone Entries
+
+### Milestone 1: Phase 0 Foundations & Hardware Spikes
+* **Date**: 2026-09-07
+* **Commit**: Foundational Phase 0 Spikes
+* **Environment**: Single RX 7900 XTX (`gfx1100`, Device 0)
+* **Key Numbers & Findings**:
+  - **Single Tile Wave32 WMMA** (`test_wmma_tile.cpp`): $16 \times 16 \times 16$ FP16 tile verified against CPU golden math ($\epsilon = 0.0$).
+  - **Tiled Block GEMM** (`bench_wmma_gemm.cpp`): $25.6\text{ TFLOP/s}$ on $2048 \times 2048$ matrix ($870\ \mu\text{s}$).
+  - **Direct I/O Linux `io_uring`** (`test_direct_io.cpp`): Sustained $6.33\text{ GB/s}$ reads from NVMe using 4096-byte sector-aligned buffer allocations.
+  - **Async Overlap (SDMA + WMMA Compute)** (`bench_async_overlap.cpp`): $24.9\text{ GB/s}$ PCIe transfer concurrently overlapped with active WMMA kernels with $0.0\%\text{ compute jitter}$.
+
+---
+
+### Milestone 2: Single-GPU Mathematical Primitives on Real INT4 Checkpoint (Phase 1 Spikes 1–5)
+* **Date**: 2026-09-07
+* **Commit**: Phase 1 Spikes 1–5
+* **Environment**: Single RX 7900 XTX (`gfx1100`, Device 0)
+* **Key Numbers & Findings**:
+  - **Fused W4A16 Dequant-GEMM** (`test_w4a16_wmma.cpp`): DeepSeek-V4 expert projection ($M=16, N=2048, K=4096$) executes in **$140.34\ \mu\text{s}$** ($1.91\text{ TFLOP/s}$). Real weights matched CPU reference with error $\epsilon = 0.0$.
+  - **RMSNorm & SwiGLU Clamp** (`test_swiglu_clamp.cpp`): RMSNorm max error $8.4 \times 10^{-4}$; SwiGLU with clamp limit $10.0$ max error $0.0$.
+  - **Hyper-Connections 4-Stream Sinkhorn** (`test_hc_sinkhorn.cpp`): 20 Sinkhorn iterations executed in a single Wave32 kernel with max error $5.96 \times 10^{-8}$.
+  - **Dual-Mode MoE Router** (`test_moe_router.cpp`): Hash router (layers 0–2) and SqrtSoftplus router (layers 3–42) matched CPU reference top-6 assignments 100%.
+  - **Sliding-Window Attention with Attention Sink** (`test_v4_attention.cpp`): $W=128$, 64 heads, head dim 512 attention kernel latency **$41.91\ \mu\text{s}$** across 16 tokens ($2.62\ \mu\text{s/token}$).
+  - **Single Transformer Block** (`test_v4_block.cpp`): Full layer forward pass latency **$1.80\text{ ms/token}$**; output matched golden CPU reference within $\epsilon = 0.0033$.
+
+---
+
+### Milestone 3: Single-GPU Multi-Layer Autoregressive Pipeline Baseline (Spike 6)
+* **Date**: 2026-09-07
+* **Commit**: `5e27dd9`
+* **Test Conditions**:
+  - Model: `DeepSeek-V4-Flash-0731-INT4-W4A16`
+  - Shards: Shard 1 & Shard 2 (`model-00001.safetensors`, `model-00002.safetensors`) via zero-copy `mmap`
+  - Active Layers: 2 consecutive layers (Layer 0 and Layer 1)
+  - VRAM Cache Configuration: 8 Tier 1 slots per layer (16 total slots = 216 MB VRAM)
+  - Memory Hierarchy: Tier 1 (VRAM LRU) $\leftarrow$ Tier 2 (OS Page Cache / mmap Host DDR)
+  - Sampling: Greedy argmax from full $129,280$-dim logits projected on device
+
+* **Achieved Benchmark Numbers**:
+
+| Metric | Short Prompt Scenario | Medium Prompt Scenario |
+| :--- | :---: | :---: |
+| **Prompt Length** | 4 tokens | 8 tokens |
+| **Generated Tokens** | 16 tokens | 32 tokens |
+| **Total Latency** | $1674.94\text{ ms}$ | $2150.87\text{ ms}$ |
+| **TTFT (Prefill)** | $422.20\text{ ms}$ ($105.55\text{ ms/token}$) | $528.60\text{ ms}$ ($66.07\text{ ms/token}$) |
+| **Decode Throughput** | **$11.97\text{ tokens/sec}$** | **$19.11\text{ tokens/sec}$** |
+| **Decode Step Latency** | **$83.52\text{ ms/token}$** | **$52.33\text{ ms/token}$** |
+| **Tier 1 Cache Hits** | 4 hits | 11 hits |
+| **Tier 1 Cache Misses**| 224 misses | 457 misses |
+| **Tier 1 VRAM Hit Rate**| **$1.8\%$** | **$2.4\%$** |
+
+* **Analysis & Critical Gaps Identified**:
+  - The $19.11\text{ tok/s}$ throughput was achieved on **only 2 layers**. Extrapolated naively to all 43 layers without pipelining or larger caches, sequential throughput drops to $\approx 0.89\text{ tok/s}$.
+  - The 8-slot VRAM LRU cache suffers from the **Cold-Miss Trap**: $97.6\%$ of expert accesses missed VRAM and required synchronous host transfers.
+  - Next architectural step: Implement accurate memory budgeting, expand Tier 1 VRAM cache, integrate true 3-tier streaming (VRAM hot $\leftarrow$ DDR warm $\leftarrow$ NVMe cold direct I/O), and overlap asynchronous SDMA prefetching.
