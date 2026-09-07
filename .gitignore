@@ -24,5 +24,10 @@ __pycache__/
 .venv/
 env/
 
+# Model weights & binaries
+models/
+*.aeon
+*.safetensors
+
 # System / logs
 *.log

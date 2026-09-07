@@ -35,12 +35,15 @@ Always consult these authoritative documents for deep technical specifics:
   - Spike 4: Offline 4KB sector-aligned `.aeon` format packer (`scripts/prepare_rdna.py`); single-layer toy MoE pipeline validating dynamic Tier 1 VRAM LRU caching and asynchronous Tier 2 Host DDR SDMA swaps (`tests/test_toy_moe_layer.cpp`).
 
 ### Present (In Progress)
-- [ ] **Phase 1 Planning & Scaffolding — Single-GPU Core Runtime**:
-  - Define Phase 1 micro-execution plan for DeepSeek-V4 architecture (SwiGLU, Wave32 FlashMLA fused attention, real model weight ingestion).
+- [ ] **[Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md) — Single-GPU Core Runtime for DeepSeek-V4-Flash**:
+  - Spike 1: Real INT4-W4A16 Safetensors parser & 4KB-aligned `.aeon` packer (`scripts/prepare_rdna.py`).
+  - Spike 2: Wave32 RMSNorm, SwiGLU with clamping (`swiglu_limit = 10.0`), and Hyper-Connections (HC Sinkhorn) kernels.
+  - Spike 3: Fused INT4 $\to$ FP16 Wave32 Dequantization-GEMM kernel targeting `gfx1100` WMMA.
+  - Spike 4: Dual-mode MoE routing (hash layers 0–2 + `sqrtsoftplus` layers 3–42) with Tier 1/2 dynamic expert streaming.
+  - Spike 5: Sliding-window attention ($W=128$) and end-to-end `DeepSeekV4Block` single-layer silicon validation.
+  - Spike 6: Multi-layer pipeline execution & autoregressive generation benchmark.
 
 ### Future (Upcoming Next)
-- [ ] **Phase 1 Execution — Core DeepSeek-V4 Runtime**:
-  - Fused Wave32 FlashMLA kernel, standard format ingestion, and multi-layer single-card inference.
 - [ ] **Phase 2 — Multi-GPU Pipeline Parallelism**:
   - 4-card stage partitioning across P2P PCIe links and 1F1B micro-batching.
 
