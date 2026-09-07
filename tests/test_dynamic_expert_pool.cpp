@@ -3,6 +3,7 @@
 #include "core/device.hpp"
 #include "core/expert_registry.hpp"
 #include "core/memory_budget.hpp"
+#include "core/v4_pipeline.hpp"
 #include "core/vram_expert_pool.hpp"
 
 #include <cassert>
@@ -105,8 +106,46 @@ int main() {
     }
     std::cout << "  > [PASSED] GlobalVRAMExpertPool DMA stream & silicon bit-parity verified!\n";
 
+    // -------------------------------------------------------------------------
+    // Test 5: End-to-End V4Pipeline with Global Unified Pool on Physical Silicon
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Test 5] Initializing end-to-end V4Pipeline with Global Unified Pool (2 layers)..." << std::endl;
+    aeon::core::V4Pipeline pipeline;
+    aeon::core::AeonRuntimeConfig pipeline_cfg;
+    pipeline_cfg.context_size = 4096;
+    pipeline_cfg.host_ram_bytes = 0; // auto 80%
+
+    pipeline.init_dynamic_global(aeon_model_dir, pipeline_cfg, 2);
+
+    // Run forward step (token 1, pos 0)
+    std::cout << "\n  > Executing forward step on Global Unified Pool..." << std::endl;
+    uint32_t next_tok = pipeline.step(1, 0);
+    std::cout << "  > Output next token: " << next_tok << std::endl;
+    assert(next_tok < 129280);
+
+    // Multi-token generation
+    std::cout << "  > Running multi-token autoregressive generation (4 new tokens)..." << std::endl;
+    std::vector<uint32_t> prompt = {1, 100, 256};
+    double ttft_ms = 0.0;
+    double tok_sec = 0.0;
+    auto gen = pipeline.generate(prompt, 4, &ttft_ms, &tok_sec);
+
+    std::cout << "  > Generated tokens: [";
+    for (size_t i = 0; i < gen.size(); ++i) {
+        std::cout << gen[i] << (i + 1 < gen.size() ? ", " : "");
+    }
+    std::cout << "]" << std::endl;
+    assert(gen.size() == 4);
+    for (auto t : gen) assert(t < 129280);
+
+    // Check registry hit statistics
+    std::cout << "  > Global Pool Registry Stats: Hot Hits=" << pipeline.expert_registry_->hits_hot
+              << ", Warm Hits=" << pipeline.expert_registry_->hits_warm
+              << ", Cold Misses=" << pipeline.expert_registry_->misses_cold << std::endl;
+    assert(pipeline.expert_registry_->hits_hot > 0);
+
     std::cout << "\n================================================================================" << std::endl;
-    std::cout << "  [SUCCESS] Spike 1 Foundations PASSED on physical AMD silicon!" << std::endl;
+    std::cout << "  [SUCCESS] Spike 1 (Micro-Steps 1.1-1.4) PASSED on physical AMD silicon!" << std::endl;
     std::cout << "================================================================================" << std::endl;
 
     return 0;

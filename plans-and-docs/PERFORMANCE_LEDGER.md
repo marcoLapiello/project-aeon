@@ -70,3 +70,37 @@ This ledger records physical hardware verification benchmarks, test conditions, 
   - The $19.11\text{ tok/s}$ throughput was achieved on **only 2 layers**. Extrapolated naively to all 43 layers without pipelining or larger caches, sequential throughput drops to $\approx 0.89\text{ tok/s}$.
   - The 8-slot VRAM LRU cache suffers from the **Cold-Miss Trap**: $97.6\%$ of expert accesses missed VRAM and required synchronous host transfers.
   - Next architectural step: Implement accurate memory budgeting, expand Tier 1 VRAM cache, integrate true 3-tier streaming (VRAM hot $\leftarrow$ DDR warm $\leftarrow$ NVMe cold direct I/O), and overlap asynchronous SDMA prefetching.
+
+---
+
+### Milestone 4: Phase 2 Spike 1 — Dynamic Memory Budgeting & Global Unified VRAM Expert Pool
+* **Date**: 2026-09-07
+* **Commit**: `34a4cb0`
+* **Test Conditions**:
+  - Model: `DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon` (Native `.aeon` format)
+  - Hardware: AMD Radeon RX 7900 XTX (24 GB VRAM, `gfx1100`, PCIe 4.0 x16), Threadripper PRO 3975WX (64 GB DDR)
+  - Memory Budget Engine:
+    - Target Context Size: $4,096$ tokens ($176\text{ MB}$ KV Cache for all 43 layers)
+    - Headroom: Fixed $300\text{ MB}$ OS safety buffer
+    - Host RAM Cap: Fixed $80\%$ ($50.10\text{ GB}$)
+  - Hierarchy Partitioning:
+    - **Tier 1 (Hot VRAM)**: **664 dynamic slots** ($8.75\text{ GB}$) dynamically shared across all layers (up from 16 slots / 216 MB in Milestone 3)
+    - **Tier 2 (Warm Host DDR)**: **3,800 slots** ($50.10\text{ GB}$)
+    - **Tier 3 (Cold NVMe SSD)**: **6,544 slots**
+  - Active Layers: 2 consecutive layers in end-to-end forward test
+
+* **Achieved Benchmark Numbers & Empirical Validation**:
+
+| Metric | Spike 0 Baseline (Per-Layer Slots) | Spike 1 (Global Unified Pool) |
+| :--- | :---: | :---: |
+| **VRAM Expert Slots** | 16 slots (8 per layer) | **664 slots (Global dynamic pool)** |
+| **VRAM Dedicated to Experts**| $0.21\text{ GB}$ | **$8.75\text{ GB}$** |
+| **Host DDR Warm Buffer** | Unmanaged page cache | **$50.10\text{ GB}$ (3,800 experts staged)** |
+| **Feasibility Gating** | None (unsafe) | **Strict rejection & boundary enforcement** |
+| **Tier 1 VRAM Hit Rate** | $2.4\%$ | **$100\%$ on resident test sequence** (84/84 hits) |
+| **Silicon Bit-Parity** | Verified ($\epsilon = 0.0$) | **Verified ($\epsilon = 0.0$)** |
+
+* **Key Architectural Breakthroughs**:
+  1. **Zero VRAM Waste**: Available VRAM utilization expanded from $0.21\text{ GB}$ to $8.75\text{ GB}$, allowing over 664 experts to remain permanently hot in VRAM without per-layer fragmentation.
+  2. **Predictable Safety Floor**: Over-budget context sizes (e.g., $262{,}144$ tokens requiring $25.96\text{ GB}$) are immediately intercepted before allocation, protecting the host system from GTT thrashing.
+  3. **Seamless Transition to Spike 2**: Global pool index abstraction directly unlocks the upcoming dual-stream asynchronous SDMA prefetching engine.

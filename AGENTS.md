@@ -49,15 +49,42 @@ Always consult these authoritative documents for deep technical specifics:
   - 11,008 routed experts (43 layers $\times$ 256) serialized into `model_experts.aeon` (145.12 GB) with 100% 4096-byte sector alignment (`O_DIRECT` compliant) and binary lookup index `model_experts.index` (172 KB).
   - Bit-exact numerical verification passed ($\epsilon = 0.0$ parity against Safetensors source).
 
+### Past (Completed)
+- [x] Initialized Git repository on `main` branch and linked remote `https://github.com/marcoLapiello/project-aeon.git`.
+- [x] Completed architectural research, blocker analysis, and model specialization strategy.
+- [x] Verified host hardware: AMD Ryzen Threadripper PRO 3975WX (32C/64T), 64 GB DDR, 4x AMD Radeon RX 7900 XTX (96 GB VRAM total, `gfx1100`), ROCm 7.2.2 toolchain with `hipcc`, Linux kernel 7.0.
+- [x] Established non-re-inventing philosophy: No PyTorch in production runtime; ingest standard model formats (GGUF/Safetensors); Python for offline toolchain/tests only.
+- [x] **[Phase 0 Execution Plan](plans-and-docs/PHASE_0_EXECUTION_PLAN.md) — Foundations & Hardware Validation**:
+  - Spike 1: CMake & Ninja build system with `hipcc` targeting RDNA3 Wave32 mode; hardware topology inspection tool (`tools/aeon_info.cpp`) verifying 4x RX 7900 XTX devices with 100% full bidirectional P2P access.
+  - Spike 2: Native Wave32 WMMA micro-kernel with CPU reference validation (`tests/test_wmma_tile.cpp`); tiled block GEMM benchmark achieving ~25.6 TFLOP/s and 870 us per 2048-dim matrix on silicon (`tests/bench_wmma_gemm.cpp`).
+  - Spike 3: 4KB sector-aligned memory allocator and Linux `io_uring` Direct I/O reader achieving 6.33 GB/s from NVMe (`src/io/`, `tests/test_direct_io.cpp`); concurrent compute + SDMA transfer test proving non-blocking PCIe DMA transfers at 24.9 GB/s with 0% compute jitter (`tests/bench_async_overlap.cpp`).
+  - Spike 4: Offline 4KB sector-aligned `.aeon` format packer (`scripts/prepare_rdna.py`); single-layer toy MoE pipeline validating dynamic Tier 1 VRAM LRU caching and asynchronous Tier 2 Host DDR SDMA swaps (`tests/test_toy_moe_layer.cpp`).
+- [x] **[Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md) — Single-GPU Core Runtime for DeepSeek-V4-Flash**:
+  - Spike 1: Model config parser (`src/core/config.hpp`) and zero-dependency Safetensors header parser (`src/core/safetensors.hpp`).
+  - Spike 2: Wave32 RMSNorm and fused SwiGLU with clamp (`tests/test_swiglu_clamp.cpp`); 4-stream Hyper-Connections Sinkhorn kernels on silicon (`tests/test_hc_sinkhorn.cpp`).
+  - Spike 3: Fused INT4 $\to$ FP16 Wave32 Dequantization-GEMM kernel targeting `gfx1100` WMMA (`src/kernel/w4a16_gemm.hpp`, `tests/test_w4a16_wmma.cpp`).
+  - Spike 4: Dual-mode MoE router (hash routing + `sqrtsoftplus` routing) with expert dispatch on silicon (`src/kernel/moe_router.hpp`, `tests/test_moe_router.cpp`, `tests/test_v4_moe_layer.cpp`).
+  - Spike 5: Sliding-window attention ($W=128$) with attention sink and complete single-block validation (`src/kernel/v4_attention.hpp`, `src/core/v4_block.hpp`, `tests/test_v4_attention.cpp`, `tests/test_v4_block.cpp`).
+  - Spike 6: Multi-layer pipeline execution & autoregressive generation benchmark on real Safetensors weights (`src/core/safetensors_loader.hpp`, `src/core/v4_pipeline.hpp`, `tests/test_v4_pipeline.cpp`, `tests/bench_v4_generation.cpp`).
+- [x] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Spike 0: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification**:
+  - Offline converter (`scripts/convert_safetensors_to_aeon.py`) unbundled 34 Safetensors shards into self-contained `models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon/`.
+  - Dense weights isolated into `model_dense.aeon` (14.66 GB, 1,271 tensors).
+  - 11,008 routed experts (43 layers $\times$ 256) serialized into `model_experts.aeon` (145.12 GB) with 100% 4096-byte sector alignment (`O_DIRECT` compliant) and binary lookup index `model_experts.index` (172 KB).
+  - Bit-exact numerical verification passed ($\epsilon = 0.0$ parity against Safetensors source).
+- [x] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Spike 1: Dynamic Memory Budgeting & Global Unified VRAM Expert Pool**:
+  - Micro-Step 1.1: Runtime configuration, hard startup feasibility gate (`src/core/memory_budget.hpp`).
+  - Micro-Step 1.2: Global unified flat VRAM expert pool (`src/core/vram_expert_pool.hpp`).
+  - Micro-Step 1.3: Host-side dynamic expert registry with EMA entropy tracking (`src/core/expert_registry.hpp`).
+  - Micro-Step 1.4: Pipeline integration & verification on physical silicon (`tests/test_dynamic_expert_pool.cpp`).
+
 ### Present (In Progress)
 - [ ] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Single-GPU 3-Tier Storage & Memory Hierarchy Optimization**:
   - [x] Spike 0: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification.
-  - [ ] Spike 1: Dynamic memory budgeting & Global Unified VRAM Expert Pool:
-    - [x] Micro-Step 1.1: Runtime configuration, hard startup feasibility gate (`src/core/memory_budget.hpp`).
-    - [x] Micro-Step 1.2: Global unified flat VRAM expert pool (`src/core/vram_expert_pool.hpp`).
-    - [x] Micro-Step 1.3: Host-side dynamic expert registry with EMA entropy tracking (`src/core/expert_registry.hpp`).
-    - [ ] Micro-Step 1.4: Pipeline integration & verification on physical silicon (`tests/test_dynamic_expert_pool.cpp`).
-  - [ ] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding.
+  - [x] Spike 1: Dynamic memory budgeting & Global Unified VRAM Expert Pool.
+  - [ ] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding:
+    - [ ] Micro-Step 2.1: Lookahead Routing & Prefetch Horizon Pipeline.
+    - [ ] Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream.
+    - [ ] Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon.
   - [ ] Spike 3: Linux `io_uring` Direct I/O NVMe Cold Tier integration.
 
 ### Future (Upcoming Next)

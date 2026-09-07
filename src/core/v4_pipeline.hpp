@@ -3,7 +3,10 @@
 #include "core/config.hpp"
 #include "core/device.hpp"
 #include "core/aeon_loader.hpp"
+#include "core/expert_registry.hpp"
+#include "core/memory_budget.hpp"
 #include "core/safetensors_loader.hpp"
+#include "core/vram_expert_pool.hpp"
 #include "kernel/hc_sinkhorn.hpp"
 #include "kernel/moe_router.hpp"
 #include "kernel/v4_attention.hpp"
@@ -257,7 +260,64 @@ public:
         init_with_loader(id, loader, max_seq, vram_slots);
     }
 
-    // Access or Stream an Expert into Tier 1 VRAM Slot
+    // Initialize layer in Global Pool mode (does not allocate private VRAM slots)
+    template<typename LoaderT>
+    void init_global(int id, const LoaderT& loader, uint32_t max_seq = 4096) {
+        layer_id = id;
+        is_hash_layer = (id < 3);
+        max_seq_len_ = max_seq;
+        vram_capacity_ = 0; // Managed by GlobalVRAMExpertPool
+
+        std::string pfx = "layers." + std::to_string(layer_id) + ".";
+
+        // 1. Attention Weights
+        upload_tensor(loader, pfx + "attn_norm.weight", &d_attn_norm);
+        upload_tensor(loader, pfx + "attn.wq_a.weight", &d_wq_a);
+        upload_tensor(loader, pfx + "attn.q_norm.weight", &d_q_norm);
+        upload_tensor(loader, pfx + "attn.wq_b.weight", &d_wq_b);
+        upload_tensor(loader, pfx + "attn.wkv.weight", &d_wkv);
+        upload_tensor(loader, pfx + "attn.kv_norm.weight", &d_kv_norm);
+        upload_tensor(loader, pfx + "attn.attn_sink", &d_attn_sink);
+        upload_tensor(loader, pfx + "attn.wo_a.weight", &d_wo_a);
+        upload_tensor(loader, pfx + "attn.wo_b.weight", &d_wo_b);
+
+        upload_tensor(loader, pfx + "hc_attn_fn", &d_hc_attn_fn);
+        if (loader.has_tensor(pfx + "hc_attn_fn")) {
+            h_hc_attn_fn = loader.template get_data_ptr<float>(pfx + "hc_attn_fn");
+        }
+        upload_tensor(loader, pfx + "hc_attn_base", &d_hc_attn_base);
+        upload_tensor(loader, pfx + "hc_attn_scale", &d_hc_attn_scale);
+
+        // 2. FFN Weights
+        upload_tensor(loader, pfx + "ffn_norm.weight", &d_ffn_norm);
+        upload_tensor(loader, pfx + "hc_ffn_fn", &d_hc_ffn_fn);
+        if (loader.has_tensor(pfx + "hc_ffn_fn")) {
+            h_hc_ffn_fn = loader.template get_data_ptr<float>(pfx + "hc_ffn_fn");
+        }
+        upload_tensor(loader, pfx + "hc_ffn_base", &d_hc_ffn_base);
+        upload_tensor(loader, pfx + "hc_ffn_scale", &d_hc_ffn_scale);
+
+        // 3. Shared Expert
+        upload_tensor(loader, pfx + "ffn.shared_experts.w1.weight", &d_shared_w1);
+        upload_tensor(loader, pfx + "ffn.shared_experts.w2.weight", &d_shared_w2);
+        upload_tensor(loader, pfx + "ffn.shared_experts.w3.weight", &d_shared_w3);
+
+        // 4. Router
+        if (is_hash_layer) {
+            upload_tensor(loader, pfx + "ffn.gate.tid2eid", &d_tid2eid);
+        }
+        upload_tensor(loader, pfx + "ffn.gate.weight", &d_gate_weight);
+
+        // 5. Allocate Persistent KV Cache on Device
+        CHECK_HIP(hipMalloc(&d_kv_cache, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
+        CHECK_HIP(hipMemset(d_kv_cache, 0, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
+
+        // 6. Index Host / Mmap Sources for 256 Routed Experts
+        host_experts_.resize(256);
+        bind_host_experts(loader, pfx);
+    }
+
+    // Access or Stream an Expert into Tier 1 VRAM Slot (Local mode fallback)
     uint32_t acquire_expert_slot(uint32_t expert_id, hipStream_t stream = 0) {
         auto it = lru_map_.find(expert_id);
         if (it != lru_map_.end()) {
@@ -576,6 +636,12 @@ public:
     uint32_t num_layers_{0};
     uint32_t current_seq_len_{0};
 
+    // Spike 1: Global VRAM Expert Pool & Expert Registry
+    bool use_global_pool_{false};
+    std::unique_ptr<GlobalVRAMExpertPool> global_pool_;
+    std::unique_ptr<ExpertRegistry> expert_registry_;
+    MemoryBudgetReport budget_report_;
+
     V4Pipeline() = default;
 
     ~V4Pipeline() {
@@ -731,6 +797,117 @@ public:
         }
 
         std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers with native .aeon format." << std::endl;
+    }
+
+    // Initialize with Dynamic Memory Budgeting & Global Unified VRAM Expert Pool (Spike 1)
+    void init_dynamic_global(
+        const std::string& aeon_model_dir,
+        const AeonRuntimeConfig& runtime_cfg,
+        uint32_t num_layers = 2
+    ) {
+        std::cout << "================================================================================" << std::endl;
+        std::cout << "      Project Aeon — Dynamic VRAM Budget & Global Expert Pool Pipeline          " << std::endl;
+        std::cout << "================================================================================" << std::endl;
+
+        use_global_pool_ = true;
+        num_layers_ = num_layers;
+        current_seq_len_ = 0;
+
+        // 1. Initialize streams
+        CHECK_HIP(hipStreamCreate(&compute_stream));
+        CHECK_HIP(hipStreamCreate(&sdma_stream));
+
+        // 2. Open Model Containers
+        std::cout << "[Pipeline] Opening native .aeon model from " << aeon_model_dir << "..." << std::endl;
+        aeon_loader.open_model(aeon_model_dir);
+        std::cout << "  > Dense tensors indexed: " << aeon_loader.total_dense_tensors() << std::endl;
+
+        // Load config
+        auto model_cfg = DeepSeekV4Config::load_from_json(aeon_model_dir + "/config.json");
+
+        // 3. Evaluate Memory Budget & Feasibility Gate
+        size_t dense_bytes = 15745100992ULL; // model_dense.aeon size
+        budget_report_ = MemoryBudgetEngine::evaluate(runtime_cfg, model_cfg, dense_bytes);
+        std::cout << budget_report_.to_string() << std::endl;
+
+        if (!budget_report_.is_feasible) {
+            throw std::runtime_error("V4Pipeline: Feasibility gate REJECTED startup: " + budget_report_.rejection_reason);
+        }
+
+        // 4. Initialize RoPE Tables
+        std::cout << "[Pipeline] Initializing RoPE tables (max_seq=" << runtime_cfg.context_size << ")..." << std::endl;
+        rope_table.init(runtime_cfg.context_size, kernel::DSV4_ROPE_THETA, 1.0f);
+
+        size_t rope_bytes = rope_table.max_seq_len * rope_table.half_rope * sizeof(float);
+        CHECK_HIP(hipMalloc(&d_cos_cache_, rope_bytes));
+        CHECK_HIP(hipMalloc(&d_sin_cache_, rope_bytes));
+        CHECK_HIP(hipMemcpy(d_cos_cache_, rope_table.cos_cache.data(), rope_bytes, hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_sin_cache_, rope_table.sin_cache.data(), rope_bytes, hipMemcpyHostToDevice));
+
+        // 5. Model-level Weights
+        std::cout << "[Pipeline] Binding model-level embeddings and LM head..." << std::endl;
+        host_embed_table = aeon_loader.get_data_ptr<half>("embed.weight");
+
+        const auto& head_t = aeon_loader.get_tensor("head.weight");
+        std::cout << "  > Uploading LM Head [129280, 4096] (" << (head_t.byte_size / (1024*1024)) << " MB) to VRAM..." << std::endl;
+        CHECK_HIP(hipMalloc(&d_lm_head, head_t.byte_size));
+        CHECK_HIP(hipMemcpy(d_lm_head, head_t.data, head_t.byte_size, hipMemcpyHostToDevice));
+
+        // HC Head
+        const auto& fn_t = aeon_loader.get_tensor("hc_head_fn");
+        const auto& base_t = aeon_loader.get_tensor("hc_head_base");
+        const auto& sc_t = aeon_loader.get_tensor("hc_head_scale");
+        CHECK_HIP(hipMalloc(&d_hc_head_fn, fn_t.byte_size));
+        CHECK_HIP(hipMalloc(&d_hc_head_base, base_t.byte_size));
+        CHECK_HIP(hipMalloc(&d_hc_head_scale, sc_t.byte_size));
+        CHECK_HIP(hipMemcpy(d_hc_head_fn, fn_t.data, fn_t.byte_size, hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_hc_head_base, base_t.data, base_t.byte_size, hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_hc_head_scale, sc_t.data, sc_t.byte_size, hipMemcpyHostToDevice));
+
+        // Final norm
+        const auto& norm_t = aeon_loader.get_tensor("norm.weight");
+        CHECK_HIP(hipMalloc(&d_final_norm, norm_t.byte_size));
+        CHECK_HIP(hipMemcpy(d_final_norm, norm_t.data, norm_t.byte_size, hipMemcpyHostToDevice));
+
+        // 6. Allocate Reusable Pipeline Scratch Buffers
+        std::cout << "[Pipeline] Allocating intermediate GPU scratch buffers..." << std::endl;
+        scratch.allocate();
+
+        // 7. Initialize Global VRAM Expert Pool & Expert Registry
+        std::cout << "[Pipeline] Allocating Global VRAM Expert Pool (" << budget_report_.hot_vram_slots << " slots, "
+                  << (budget_report_.hot_vram_bytes / (1024*1024*1024.0)) << " GB)..." << std::endl;
+        global_pool_ = std::make_unique<GlobalVRAMExpertPool>(budget_report_.hot_vram_slots);
+
+        std::cout << "[Pipeline] Initializing Expert Registry (VRAM=" << budget_report_.hot_vram_slots
+                  << ", Host=" << budget_report_.warm_host_slots << ")..." << std::endl;
+        expert_registry_ = std::make_unique<ExpertRegistry>(
+            num_layers_, model_cfg.n_routed_experts,
+            budget_report_.hot_vram_slots, budget_report_.warm_host_slots
+        );
+
+        // Preload Hot VRAM slots from AeonModelLoader into Global Pool
+        std::cout << "[Pipeline] Pre-populating Hot VRAM slots into Global Pool..." << std::endl;
+        for (uint32_t slot = 0; slot < budget_report_.hot_vram_slots; ++slot) {
+            int32_t gid = expert_registry_->vram_slots[slot];
+            if (gid >= 0) {
+                uint32_t lay = expert_registry_->catalog[gid].layer_id;
+                uint32_t exp = expert_registry_->catalog[gid].expert_id;
+                const uint8_t* p = aeon_loader.get_expert_data(lay, exp);
+                global_pool_->upload_from_host_expert(slot, p, compute_stream);
+            }
+        }
+        CHECK_HIP(hipStreamSynchronize(compute_stream));
+
+        // 8. Initialize Consecutive Transformer Layers in Global Mode
+        layers.resize(num_layers_);
+        for (uint32_t l = 0; l < num_layers_; ++l) {
+            std::cout << "[Pipeline] Initializing DeepSeek-V4 Layer " << l << " (Global Pool Mode)..." << std::endl;
+            layers[l] = std::make_unique<V4Layer>();
+            layers[l]->init_global(l, aeon_loader, runtime_cfg.context_size);
+        }
+
+        std::cout << "[Pipeline] Global Pool Engine ready! Configured for " << num_layers_
+                  << " layers with " << budget_report_.hot_vram_slots << " dynamic hot slots." << std::endl;
     }
 
     // Run Single Autoregressive Step for token_id at sequence position `pos`
@@ -1060,16 +1237,49 @@ public:
                 uint32_t expert_id = h_topk_indices[k];
                 float expert_weight = h_topk_weights[k];
 
-                uint32_t slot = layer.acquire_expert_slot(expert_id, compute_stream);
-                const auto& eslot = layer.vram_slots_[slot];
+                const uint32_t* d_w1_p = nullptr;
+                const half*     d_w1_s = nullptr;
+                const uint32_t* d_w2_p = nullptr;
+                const half*     d_w2_s = nullptr;
+                const uint32_t* d_w3_p = nullptr;
+                const half*     d_w3_s = nullptr;
+
+                if (use_global_pool_) {
+                    // Global VRAM Expert Pool mode
+                    int32_t slot = expert_registry_->touch_hot_expert(l, expert_id, pos);
+                    if (slot < 0) {
+                        // Cache miss: allocate slot and upload from host memory
+                        uint32_t gid = expert_registry_->get_global_id(l, expert_id);
+                        auto [allocated_slot, evicted_gid] = expert_registry_->allocate_vram_slot(gid);
+                        const uint8_t* p = aeon_loader.get_expert_data(l, expert_id);
+                        global_pool_->upload_from_host_expert(allocated_slot, p, compute_stream);
+                        slot = static_cast<int32_t>(allocated_slot);
+                    }
+                    d_w1_p = global_pool_->get_w1_packed(slot);
+                    d_w1_s = global_pool_->get_w1_scale(slot);
+                    d_w2_p = global_pool_->get_w2_packed(slot);
+                    d_w2_s = global_pool_->get_w2_scale(slot);
+                    d_w3_p = global_pool_->get_w3_packed(slot);
+                    d_w3_s = global_pool_->get_w3_scale(slot);
+                } else {
+                    // Per-layer local pool fallback
+                    uint32_t slot = layer.acquire_expert_slot(expert_id, compute_stream);
+                    const auto& eslot = layer.vram_slots_[slot];
+                    d_w1_p = eslot.d_w1_packed;
+                    d_w1_s = eslot.d_w1_scale;
+                    d_w2_p = eslot.d_w2_packed;
+                    d_w2_s = eslot.d_w2_scale;
+                    d_w3_p = eslot.d_w3_packed;
+                    d_w3_s = eslot.d_w3_scale;
+                }
 
                 // w1 & w3 via fused W4A16 WMMA
                 kernel::dispatch_w4a16_gemm(
-                    scratch.d_ffn_norm_act, eslot.d_w1_packed, eslot.d_w1_scale,
+                    scratch.d_ffn_norm_act, d_w1_p, d_w1_s,
                     scratch.d_expert_gate, M_PAD, INTER_DIM, H, compute_stream
                 );
                 kernel::dispatch_w4a16_gemm(
-                    scratch.d_ffn_norm_act, eslot.d_w3_packed, eslot.d_w3_scale,
+                    scratch.d_ffn_norm_act, d_w3_p, d_w3_s,
                     scratch.d_expert_up, M_PAD, INTER_DIM, H, compute_stream
                 );
 
@@ -1083,7 +1293,7 @@ public:
 
                 // w2
                 kernel::dispatch_w4a16_gemm(
-                    scratch.d_expert_swiglu, eslot.d_w2_packed, eslot.d_w2_scale,
+                    scratch.d_expert_swiglu, d_w2_p, d_w2_s,
                     scratch.d_expert_down, M_PAD, H, INTER_DIM, compute_stream
                 );
 
@@ -1215,7 +1425,10 @@ public:
             if (l) l->free();
         }
         layers.clear();
+        global_pool_.reset();
+        expert_registry_.reset();
         loader.close_all();
+        aeon_loader.close_all();
     }
 
 private:
