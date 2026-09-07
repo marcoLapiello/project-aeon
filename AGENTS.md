@@ -52,7 +52,11 @@ Always consult these authoritative documents for deep technical specifics:
 ### Present (In Progress)
 - [ ] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Single-GPU 3-Tier Storage & Memory Hierarchy Optimization**:
   - [x] Spike 0: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification.
-  - [ ] Spike 1: Dynamic memory budgeting & Global Unified VRAM Expert Pool (up to ~880 slots, ~11.9 GB VRAM).
+  - [ ] Spike 1: Dynamic memory budgeting & Global Unified VRAM Expert Pool:
+    - [x] Micro-Step 1.1: Runtime configuration, hard startup feasibility gate (`src/core/memory_budget.hpp`).
+    - [x] Micro-Step 1.2: Global unified flat VRAM expert pool (`src/core/vram_expert_pool.hpp`).
+    - [x] Micro-Step 1.3: Host-side dynamic expert registry with EMA entropy tracking (`src/core/expert_registry.hpp`).
+    - [ ] Micro-Step 1.4: Pipeline integration & verification on physical silicon (`tests/test_dynamic_expert_pool.cpp`).
   - [ ] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding.
   - [ ] Spike 3: Linux `io_uring` Direct I/O NVMe Cold Tier integration.
 
