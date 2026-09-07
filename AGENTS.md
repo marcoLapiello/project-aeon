@@ -43,12 +43,18 @@ Always consult these authoritative documents for deep technical specifics:
   - Spike 4: Dual-mode MoE router (hash routing + `sqrtsoftplus` routing) with expert dispatch on silicon (`src/kernel/moe_router.hpp`, `tests/test_moe_router.cpp`, `tests/test_v4_moe_layer.cpp`).
   - Spike 5: Sliding-window attention ($W=128$) with attention sink and complete single-block validation (`src/kernel/v4_attention.hpp`, `src/core/v4_block.hpp`, `tests/test_v4_attention.cpp`, `tests/test_v4_block.cpp`).
   - Spike 6: Multi-layer pipeline execution & autoregressive generation benchmark on real Safetensors weights (`src/core/safetensors_loader.hpp`, `src/core/v4_pipeline.hpp`, `tests/test_v4_pipeline.cpp`, `tests/bench_v4_generation.cpp`).
+- [x] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Spike 0: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification**:
+  - Offline converter (`scripts/convert_safetensors_to_aeon.py`) unbundled 34 Safetensors shards into self-contained `models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon/`.
+  - Dense weights isolated into `model_dense.aeon` (14.66 GB, 1,271 tensors).
+  - 11,008 routed experts (43 layers $\times$ 256) serialized into `model_experts.aeon` (145.12 GB) with 100% 4096-byte sector alignment (`O_DIRECT` compliant) and binary lookup index `model_experts.index` (172 KB).
+  - Bit-exact numerical verification passed ($\epsilon = 0.0$ parity against Safetensors source).
 
 ### Present (In Progress)
 - [ ] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Single-GPU 3-Tier Storage & Memory Hierarchy Optimization**:
+  - [x] Spike 0: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification.
   - [ ] Spike 1: Dynamic memory budgeting & Global Unified VRAM Expert Pool (up to ~880 slots, ~11.9 GB VRAM).
   - [ ] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding.
-  - [ ] Spike 3: 4KB sector-aligned `.aeon` offline format & NVMe Linux `io_uring` Direct I/O cold tier.
+  - [ ] Spike 3: Linux `io_uring` Direct I/O NVMe Cold Tier integration.
 
 ### Future (Upcoming Next)
 - [ ] **Phase 3 — Multi-GPU Pipeline Parallelism**:

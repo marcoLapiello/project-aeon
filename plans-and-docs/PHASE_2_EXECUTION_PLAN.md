@@ -15,14 +15,30 @@ As revealed in our empirical performance analysis ([plans-and-docs/PERFORMANCE_L
 Rather than prematurely distributing an unoptimized single-GPU engine across multiple cards, Phase 2 implements and rigorously benchmarks the full **3-Tier Storage & Memory Hierarchy** on a single card:
 $$\text{Tier 1: Hot VRAM Pool (LRU)} \longleftrightarrow \text{Tier 2: Warm Pinned Host DDR} \longleftrightarrow \text{Tier 3: Cold NVMe SSD (io\_uring Direct I/O)}$$
 
-Phase 2 is partitioned into three distinct, decoupled Spikes:
+Phase 2 is partitioned into four distinct, decoupled Spikes:
+0. **Spike 0**: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification.
 1. **Spike 1**: Dynamic VRAM Budgeting & Global Unified Expert Pool.
 2. **Spike 2**: Dual-Stream Asynchronous SDMA Prefetching & Latency Hiding.
-3. **Spike 3**: 4KB Sector-Aligned `.aeon` Offline Formatter & NVMe Direct I/O Cold Tier.
+3. **Spike 3**: Linux `io_uring` Direct I/O NVMe Cold Tier Integration.
 
 ---
 
 ## 2. Micro-Spike Breakdown & Verification Gates
+
+### Spike 0: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification
+*Objective: Unbundle and isolate the dense backbone from the 11,008 routed experts into strictly 4096-byte sector-aligned binary containers, ensuring production-ready layouts and 100% bit-exact numerical parity before cache engine optimization.*
+
+- **Micro-Step 0.1: Surgical Model Splitting & Sector-Aligned Serializer (`scripts/prepare_rdna.py`)**
+  - Ingest the 34 sharded Safetensors files of `DeepSeek-V4-Flash-0731-INT4-W4A16`.
+  - Isolate all dense weights into `model_dense.aeon` (~9.24 GB): Attention projections ($W_q, W_{kv}, W_o$), RMSNorms, Hyper-Connections Sinkhorn tables, Shared Experts, and Router gate weights.
+  - Isolate the 11,008 routed experts (43 layers $\times$ 256 experts) into `model_experts.aeon` (~135 GB): Each expert FFN ($W_1, W_2, W_3$ packed INT4 + FP16 scales) is written as an isolated contiguous block starting at a strictly 4096-byte aligned file offset (`O_DIRECT` compliant).
+  - Generate a compact binary index table `model_experts.index` mapping `(layer_id, expert_id)` to `(uint64_t file_offset, uint64_t byte_length)`.
+- **Micro-Step 0.2: Bit-Exact Numerical Verification Suite**
+  - Implement a verification test comparing the parsed `.aeon` weights against the original Safetensors weights on silicon.
+  - Validate that every INT4 nibble and FP16 scale is 100% bit-identical with zero precision loss ($\epsilon = 0.0$).
+  - *Verification:* Silicon test confirming bit-level identical tensor hashes across dense components and sample routed experts.
+
+---
 
 ### Spike 1: Dynamic Memory Budgeting & Global Unified VRAM Expert Pool
 *Objective: Eliminate rigid per-layer slot allocations; maximize cache hit rate under real Zipfian MoE activation entropy by dynamically sharing VRAM capacity across layers.*
@@ -51,18 +67,15 @@ Phase 2 is partitioned into three distinct, decoupled Spikes:
 
 ---
 
-### Spike 3: 4KB Sector-Aligned `.aeon` Format & NVMe Direct I/O Cold Tier
+### Spike 3: Linux `io_uring` Direct I/O NVMe Cold Tier Integration
 *Objective: Complete the 3-tier chain by connecting cold NVMe SSD storage directly to Host DDR staging via Linux `io_uring` with zero kernel page-cache contention.*
 
-- **Micro-Step 3.1: Full Model `.aeon` Offline Conversion Script**
-  - Upgrade `scripts/prepare_rdna.py` to ingest all Safetensors shards of `DeepSeek-V4-Flash-0731-INT4-W4A16`.
-  - Enforce strict 4096-byte sector alignment for every single expert tensor (`w1`, `w2`, `w3` packed and scales).
-  - Output binary `.aeon` shard files accompanied by a compact binary offset index table.
-- **Micro-Step 3.2: Linux `io_uring` Direct I/O Reader Integration (Tier 3 $\to$ Tier 2)**
-  - Integrate `src/io/direct_io_reader.hpp` into the runtime pipeline.
+- **Micro-Step 3.1: Linux `io_uring` Direct I/O Reader Integration (Tier 3 $\to$ Tier 2)**
+  - Integrate `src/io/direct_io_reader.hpp` into the runtime pipeline targeting `model_experts.aeon`.
   - Implement asynchronous direct streaming of cold experts from NVMe into pinned host DDR staging buffers with `O_DIRECT`.
   - Maintain a dynamic Tier 2 warm cache in host RAM ($\approx 48\text{ GB}$, $\approx 3,550$ warm experts) feeding Tier 1 VRAM.
-  - *Verification:* Silicon test measuring end-to-end 3-tier streaming throughput from NVMe $\to$ Host RAM $\to$ GPU VRAM, validating data integrity and measuring throughput in GB/s.
+- **Micro-Step 3.2: End-to-End 3-Tier Pipeline Validation**
+  - Silicon test measuring end-to-end 3-tier streaming throughput from NVMe $\to$ Host RAM $\to$ GPU VRAM, validating data integrity and measuring throughput in GB/s.
 
 ---
 
