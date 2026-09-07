@@ -18,6 +18,7 @@ Always consult these authoritative documents for deep technical specifics:
 - [Research & Inspiration Survey](plans-and-docs/AEON_RESEARCH_AND_INSPIRATION.md): Prior art review (hipfire, zinc, Flash-MoE, llama.cpp PR #25294).
 - [Phase 0 Execution Plan](plans-and-docs/PHASE_0_EXECUTION_PLAN.md): Step-by-step micro-plan for foundational spikes and hardware validation.
 - [Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md): Micro-execution plan for single-GPU Core Runtime on real INT4-W4A16 weights.
+- [Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md): Micro-execution plan for Single-GPU 3-Tier Storage & Memory Hierarchy Optimization.
 - [Performance & Accuracy Ledger](plans-and-docs/PERFORMANCE_LEDGER.md): Empirical benchmark ledger recording test conditions, throughput, latencies, and cache behaviors across major milestones.
 
 ---
@@ -35,23 +36,22 @@ Always consult these authoritative documents for deep technical specifics:
   - Spike 2: Native Wave32 WMMA micro-kernel with CPU reference validation (`tests/test_wmma_tile.cpp`); tiled block GEMM benchmark achieving ~25.6 TFLOP/s and 870 us per 2048-dim matrix on silicon (`tests/bench_wmma_gemm.cpp`).
   - Spike 3: 4KB sector-aligned memory allocator and Linux `io_uring` Direct I/O reader achieving 6.33 GB/s from NVMe (`src/io/`, `tests/test_direct_io.cpp`); concurrent compute + SDMA transfer test proving non-blocking PCIe DMA transfers at 24.9 GB/s with 0% compute jitter (`tests/bench_async_overlap.cpp`).
   - Spike 4: Offline 4KB sector-aligned `.aeon` format packer (`scripts/prepare_rdna.py`); single-layer toy MoE pipeline validating dynamic Tier 1 VRAM LRU caching and asynchronous Tier 2 Host DDR SDMA swaps (`tests/test_toy_moe_layer.cpp`).
+- [x] **[Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md) — Single-GPU Core Runtime for DeepSeek-V4-Flash**:
+  - Spike 1: Model config parser (`src/core/config.hpp`) and zero-dependency Safetensors header parser (`src/core/safetensors.hpp`).
+  - Spike 2: Wave32 RMSNorm and fused SwiGLU with clamp (`tests/test_swiglu_clamp.cpp`); 4-stream Hyper-Connections Sinkhorn kernels on silicon (`tests/test_hc_sinkhorn.cpp`).
+  - Spike 3: Fused INT4 $\to$ FP16 Wave32 Dequantization-GEMM kernel targeting `gfx1100` WMMA (`src/kernel/w4a16_gemm.hpp`, `tests/test_w4a16_wmma.cpp`).
+  - Spike 4: Dual-mode MoE router (hash routing + `sqrtsoftplus` routing) with expert dispatch on silicon (`src/kernel/moe_router.hpp`, `tests/test_moe_router.cpp`, `tests/test_v4_moe_layer.cpp`).
+  - Spike 5: Sliding-window attention ($W=128$) with attention sink and complete single-block validation (`src/kernel/v4_attention.hpp`, `src/core/v4_block.hpp`, `tests/test_v4_attention.cpp`, `tests/test_v4_block.cpp`).
+  - Spike 6: Multi-layer pipeline execution & autoregressive generation benchmark on real Safetensors weights (`src/core/safetensors_loader.hpp`, `src/core/v4_pipeline.hpp`, `tests/test_v4_pipeline.cpp`, `tests/bench_v4_generation.cpp`).
 
 ### Present (In Progress)
-- [ ] **[Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md) — Single-GPU Core Runtime for DeepSeek-V4-Flash**:
-  - [x] Spike 1.1: DeepSeek-V4 C++20 configuration & metadata parser (`src/core/config.hpp`, `tests/test_config_parser.cpp`).
-  - [x] Spike 1.2: Zero-dependency Safetensors header parser (`src/core/safetensors.hpp`, `tests/test_safetensors_parser.cpp`).
-  - [x] Spike 2.1: Wave32 RMSNorm and fused SwiGLU with `swiglu_limit = 10.0` clamping (`tests/test_swiglu_clamp.cpp`).
-  - [x] Spike 2.2: Hyper-Connections (HC) 4-stream Sinkhorn normalization and residual expansion kernels on silicon (`src/kernel/hc_sinkhorn.hpp`, `tests/test_hc_sinkhorn.cpp`).
-  - [x] Spike 3: Fused INT4 $\to$ FP16 Wave32 Dequantization-GEMM kernel targeting `gfx1100` WMMA (`src/kernel/w4a16_gemm.hpp`, `tests/test_w4a16_wmma.cpp`).
-  - [x] Spike 4: Dual-mode MoE routing (hash layers 0–2 + `sqrtsoftplus` layers 3–42) with Tier 1/2 dynamic expert streaming (`src/kernel/moe_router.hpp`, `tests/test_moe_router.cpp`, `tests/test_v4_moe_layer.cpp`).
-  - [x] Spike 5: Sliding-window attention ($W=128$) and end-to-end `DeepSeekV4Block` single-layer silicon validation (`src/kernel/v4_attention.hpp`, `src/core/v4_block.hpp`, `tests/test_v4_attention.cpp`, `tests/test_v4_block.cpp`).
-  - [x] Spike 6: Multi-layer pipeline execution & autoregressive generation benchmark (`src/core/safetensors_loader.hpp`, `src/core/v4_pipeline.hpp`, `tests/test_v4_pipeline.cpp`, `tests/bench_v4_generation.cpp`).
-
-### Present (In Progress)
-- [ ] **Phase 1 Complete**: Single-GPU core runtime for DeepSeek-V4 verified end-to-end on real INT4-W4A16 Safetensors shards.
+- [ ] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Single-GPU 3-Tier Storage & Memory Hierarchy Optimization**:
+  - [ ] Spike 1: Dynamic memory budgeting & Global Unified VRAM Expert Pool (up to ~880 slots, ~11.9 GB VRAM).
+  - [ ] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding.
+  - [ ] Spike 3: 4KB sector-aligned `.aeon` offline format & NVMe Linux `io_uring` Direct I/O cold tier.
 
 ### Future (Upcoming Next)
-- [ ] **Phase 2 — Multi-GPU Pipeline Parallelism**:
+- [ ] **Phase 3 — Multi-GPU Pipeline Parallelism**:
   - 4-card stage partitioning across P2P PCIe links and 1F1B micro-batching.
 
 ---
