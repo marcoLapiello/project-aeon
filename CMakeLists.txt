@@ -75,3 +75,23 @@ target_link_libraries(bench_async_overlap PRIVATE amdhip64)
 # Phase 0 Spike 4.2: Single-layer toy MoE pipeline with dynamic expert caching
 add_executable(test_toy_moe_layer tests/test_toy_moe_layer.cpp)
 target_link_libraries(test_toy_moe_layer PRIVATE amdhip64)
+
+# Phase 1 Spike 1.1: DeepSeek-V4 config parser test
+add_executable(test_config_parser tests/test_config_parser.cpp)
+target_link_libraries(test_config_parser PRIVATE amdhip64)
+
+# Phase 1 Spike 1.2: Safetensors header parser test
+add_executable(test_safetensors_parser tests/test_safetensors_parser.cpp)
+target_link_libraries(test_safetensors_parser PRIVATE amdhip64)
+
+# Phase 1 Spike 2.1: Wave32 RMSNorm and Clamped SwiGLU test
+add_executable(test_swiglu_clamp tests/test_swiglu_clamp.cpp)
+target_link_libraries(test_swiglu_clamp PRIVATE amdhip64)
+
+# Phase 1 Spike 2.2: Hyper-Connections Sinkhorn & Post expansion test
+add_executable(test_hc_sinkhorn tests/test_hc_sinkhorn.cpp)
+target_link_libraries(test_hc_sinkhorn PRIVATE amdhip64)
+
+
+
+

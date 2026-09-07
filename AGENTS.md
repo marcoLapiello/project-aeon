@@ -36,12 +36,14 @@ Always consult these authoritative documents for deep technical specifics:
 
 ### Present (In Progress)
 - [ ] **[Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md) — Single-GPU Core Runtime for DeepSeek-V4-Flash**:
-  - Spike 1: Real INT4-W4A16 Safetensors parser & 4KB-aligned `.aeon` packer (`scripts/prepare_rdna.py`).
-  - Spike 2: Wave32 RMSNorm, SwiGLU with clamping (`swiglu_limit = 10.0`), and Hyper-Connections (HC Sinkhorn) kernels.
-  - Spike 3: Fused INT4 $\to$ FP16 Wave32 Dequantization-GEMM kernel targeting `gfx1100` WMMA.
-  - Spike 4: Dual-mode MoE routing (hash layers 0–2 + `sqrtsoftplus` layers 3–42) with Tier 1/2 dynamic expert streaming.
-  - Spike 5: Sliding-window attention ($W=128$) and end-to-end `DeepSeekV4Block` single-layer silicon validation.
-  - Spike 6: Multi-layer pipeline execution & autoregressive generation benchmark.
+  - [x] Spike 1.1: DeepSeek-V4 C++20 configuration & metadata parser (`src/core/config.hpp`, `tests/test_config_parser.cpp`).
+  - [x] Spike 1.2: Zero-dependency Safetensors header parser (`src/core/safetensors.hpp`, `tests/test_safetensors_parser.cpp`).
+  - [x] Spike 2.1: Wave32 RMSNorm and fused SwiGLU with `swiglu_limit = 10.0` clamping (`tests/test_swiglu_clamp.cpp`).
+  - [x] Spike 2.2: Hyper-Connections (HC) 4-stream Sinkhorn normalization and residual expansion kernels on silicon (`src/kernel/hc_sinkhorn.hpp`, `tests/test_hc_sinkhorn.cpp`).
+  - [ ] Spike 3: Fused INT4 $\to$ FP16 Wave32 Dequantization-GEMM kernel targeting `gfx1100` WMMA.
+  - [ ] Spike 4: Dual-mode MoE routing (hash layers 0–2 + `sqrtsoftplus` layers 3–42) with Tier 1/2 dynamic expert streaming.
+  - [ ] Spike 5: Sliding-window attention ($W=128$) and end-to-end `DeepSeekV4Block` single-layer silicon validation.
+  - [ ] Spike 6: Multi-layer pipeline execution & autoregressive generation benchmark.
 
 ### Future (Upcoming Next)
 - [ ] **Phase 2 — Multi-GPU Pipeline Parallelism**:
