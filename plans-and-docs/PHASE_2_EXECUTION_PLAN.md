@@ -40,17 +40,44 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
 
 ---
 
-### Spike 1: Dynamic Memory Budgeting & Global Unified VRAM Expert Pool
-*Objective: Eliminate rigid per-layer slot allocations; maximize cache hit rate under real Zipfian MoE activation entropy by dynamically sharing VRAM capacity across layers.*
+### Spike 1: Dynamic Memory Budgeting, Feasibility Gating & Global Unified VRAM Expert Pool
+*Objective: Eliminate rigid per-layer slot allocations; enforce strict startup hardware feasibility gating; maximize cache hit rate under real Zipfian MoE activation entropy by dynamically sharing VRAM capacity across all 43 layers.*
 
-- **Micro-Step 1.1: Exact Memory Budgeting & Dynamic Slot Allocator**
-  - Allocate the 32k context KV Cache buffer upfront ($1.34\text{ GB}$).
-  - Permanently pin all dense weights (attention projections, RoPE, Sinkhorn, shared experts, LM head) in VRAM ($9.24\text{ GB}$).
-  - Dynamically calculate remaining VRAM and allocate a **Global Unified Expert Slot Pool** ($\approx 880$ INT4-W4A16 slots, $\approx 11.9\text{ GB}$).
-- **Micro-Step 1.2: Global Multi-Layer LRU Eviction & Mapping Policy**
-  - Implement a thread-safe global LRU cache index tracking `(layer_id, expert_id)` pairs to physical VRAM slot indices.
-  - Allow layers with high activation frequency or lower entropy to dynamically hold more slots than inactive layers.
-  - *Verification:* Silicon test comparing cache hit rate of global pool vs. static 8-slot per-layer baseline on real token sequences. Log hit rates and step latencies in [plans-and-docs/PERFORMANCE_LEDGER.md](plans-and-docs/PERFORMANCE_LEDGER.md).
+- **Micro-Step 1.1: Runtime Configuration & Hard Feasibility Gate (`src/core/memory_budget.hpp`)**
+  - Define `AeonRuntimeConfig` accepting user-specified `context_size` ($T \in [1, \text{max\_position\_embeddings}]$) and `host_ram_bytes`.
+  - Enforce internal safety constraints:
+    - Fixed VRAM headroom: $\mathbf{300\text{ MB}}$ to prevent OS desktop compositor/GTT memory migration.
+    - Fixed Host RAM safety cap: $\mathbf{80\%}$ of physical system RAM (`sysinfo` / `sysconf`).
+  - Calculate required VRAM components:
+    $$\text{VRAM}_{\text{kv}} = T \times L_{\text{layers}} \times d_{\text{kv}} \times 2\text{ bytes}$$
+    $$\text{VRAM}_{\text{min\_active}} = 2 \times K \times \text{AEON\_EXPERT\_BYTES} \quad (2 \times 6 \times 14{,}155{,}776\text{ B} \approx 162\text{ MB})$$
+  - Hard Startup Feasibility Gate:
+    $$\text{VRAM}_{\text{dense}} + \text{VRAM}_{\text{kv}}(T) + \text{VRAM}_{\text{scratch}} + \text{VRAM}_{\text{min\_active}} \le \text{VRAM}_{\text{total}} - 300\text{ MB}$$
+    If violated, cleanly reject initialization with detailed diagnostics (displaying current allocation breakdown, available VRAM, and maximum allowable context length $T_{\text{max}}$).
+  - Compute dynamic Hot VRAM capacity ($S_{\text{hot}}$ slots) and Warm Host DDR capacity ($S_{\text{warm}}$ slots).
+
+- **Micro-Step 1.2: Global Unified VRAM Expert Pool (`src/core/vram_expert_pool.hpp`)**
+  - Allocate a single, unified flat VRAM slab of $S_{\text{hot}}$ expert slots ($\approx 880$ slots on 24 GB card with $32\text{k}$ context).
+  - Flatten weight allocations into contiguous arrays `d_w1_packed`, `d_w1_scale`, `d_w2_packed`, `d_w2_scale`, `d_w3_packed`, `d_w3_scale` indexed by physical `slot_idx \in [0, S_{\text{hot}}-1]`.
+  - Provide asynchronous DMA transfer methods to load and evict experts to/from physical slot indices without per-layer fragmentation.
+
+- **Micro-Step 1.3: Host-Side Dynamic Expert Registry (`src/core/expert_registry.hpp`)**
+  - Maintain a lightweight Host CPU catalog ($\approx 528\text{ KB}$) tracking all 11,008 experts ($43 \times 256$).
+  - For each expert $(L, E)$, track:
+    - Current tier: `Tier::HOT_VRAM`, `Tier::WARM_HOST`, or `Tier::COLD_NVME`.
+    - Physical `slot_idx` in the corresponding tier pool.
+    - Online activation statistics: `activation_count`, `last_step_used`, and exponential moving average (EMA) activation frequency.
+  - Startup Initialization:
+    - Default policy: round-robin interleaving across layers into Hot VRAM and Warm DDR pools.
+    - Optional prior policy: ingest empirical calibration entropy table (`entropy_prior.bin`) if present.
+  - Multi-tier eviction policy: Priority score combining decayed activation frequency and recency to prevent cache pollution from transient tokens.
+
+- **Micro-Step 1.4: Pipeline Integration & Verification (`tests/test_dynamic_expert_pool.cpp`)**
+  - Wire `AeonMemoryBudgetEngine`, `GlobalVRAMExpertPool`, and `ExpertRegistry` into `V4Pipeline`.
+  - Benchmark on physical silicon:
+    - Test feasibility validation (boundary checks with small, valid, and over-budget context sizes).
+    - Measure cache hit rate, eviction overhead, and token latency across varying sequence lengths.
+    - Record findings in [plans-and-docs/PERFORMANCE_LEDGER.md](plans-and-docs/PERFORMANCE_LEDGER.md).
 
 ---
 
