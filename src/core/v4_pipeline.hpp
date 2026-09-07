@@ -2,6 +2,7 @@
 
 #include "core/config.hpp"
 #include "core/device.hpp"
+#include "core/aeon_loader.hpp"
 #include "core/safetensors_loader.hpp"
 #include "kernel/hc_sinkhorn.hpp"
 #include "kernel/moe_router.hpp"
@@ -130,12 +131,14 @@ public:
 
     // Hyper-Connections Attention
     float* d_hc_attn_fn{nullptr};    // [24, 16384]
+    const float* h_hc_attn_fn{nullptr};
     float* d_hc_attn_base{nullptr};  // [24]
     float* d_hc_attn_scale{nullptr}; // [3]
 
     // FFN Weights on Device
     half*  d_ffn_norm{nullptr};   // [4096]
     float* d_hc_ffn_fn{nullptr};    // [24, 16384]
+    const float* h_hc_ffn_fn{nullptr};
     float* d_hc_ffn_base{nullptr};  // [24]
     float* d_hc_ffn_scale{nullptr}; // [3]
 
@@ -166,7 +169,8 @@ public:
     uint64_t cache_hits{0};
     uint64_t cache_misses{0};
 
-    void init(int id, const SafetensorsLoader& loader, uint32_t max_seq = 4096, uint32_t vram_slots = 8) {
+    template<typename LoaderT>
+    void init_with_loader(int id, const LoaderT& loader, uint32_t max_seq = 4096, uint32_t vram_slots = 8) {
         layer_id = id;
         is_hash_layer = (id < 3);
         max_seq_len_ = max_seq;
@@ -186,12 +190,18 @@ public:
         upload_tensor(loader, pfx + "attn.wo_b.weight", &d_wo_b);
 
         upload_tensor(loader, pfx + "hc_attn_fn", &d_hc_attn_fn);
+        if (loader.has_tensor(pfx + "hc_attn_fn")) {
+            h_hc_attn_fn = loader.template get_data_ptr<float>(pfx + "hc_attn_fn");
+        }
         upload_tensor(loader, pfx + "hc_attn_base", &d_hc_attn_base);
         upload_tensor(loader, pfx + "hc_attn_scale", &d_hc_attn_scale);
 
         // 2. FFN Weights
         upload_tensor(loader, pfx + "ffn_norm.weight", &d_ffn_norm);
         upload_tensor(loader, pfx + "hc_ffn_fn", &d_hc_ffn_fn);
+        if (loader.has_tensor(pfx + "hc_ffn_fn")) {
+            h_hc_ffn_fn = loader.template get_data_ptr<float>(pfx + "hc_ffn_fn");
+        }
         upload_tensor(loader, pfx + "hc_ffn_base", &d_hc_ffn_base);
         upload_tensor(loader, pfx + "hc_ffn_scale", &d_hc_ffn_scale);
 
@@ -212,15 +222,7 @@ public:
 
         // 6. Index Host / Mmap Sources for 256 Routed Experts
         host_experts_.resize(256);
-        for (int e = 0; e < 256; ++e) {
-            std::string exp_pfx = pfx + "ffn.experts." + std::to_string(e) + ".";
-            host_experts_[e].w1_packed = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
-            host_experts_[e].w1_scale  = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
-            host_experts_[e].w2_packed = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
-            host_experts_[e].w2_scale  = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
-            host_experts_[e].w3_packed = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
-            host_experts_[e].w3_scale  = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
-        }
+        bind_host_experts(loader, pfx);
 
         // 7. Allocate Tier 1 VRAM LRU Cache Slots
         vram_slots_.resize(vram_capacity_);
@@ -245,6 +247,14 @@ public:
             vram_slots_[s].resident_expert_id = -1;
             free_slots_.push_back(s);
         }
+    }
+
+    void init(int id, const SafetensorsLoader& loader, uint32_t max_seq = 4096, uint32_t vram_slots = 8) {
+        init_with_loader(id, loader, max_seq, vram_slots);
+    }
+
+    void init(int id, const AeonModelLoader& loader, uint32_t max_seq = 4096, uint32_t vram_slots = 8) {
+        init_with_loader(id, loader, max_seq, vram_slots);
     }
 
     // Access or Stream an Expert into Tier 1 VRAM Slot
@@ -334,8 +344,32 @@ public:
     }
 
 private:
-    template<typename T>
-    void upload_tensor(const SafetensorsLoader& loader, const std::string& name, T** d_ptr) {
+    void bind_host_experts(const SafetensorsLoader& loader, const std::string& pfx) {
+        for (int e = 0; e < 256; ++e) {
+            std::string exp_pfx = pfx + "ffn.experts." + std::to_string(e) + ".";
+            host_experts_[e].w1_packed = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
+            host_experts_[e].w1_scale  = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
+            host_experts_[e].w2_packed = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
+            host_experts_[e].w2_scale  = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
+            host_experts_[e].w3_packed = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
+            host_experts_[e].w3_scale  = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
+        }
+    }
+
+    void bind_host_experts(const AeonModelLoader& loader, const std::string& /*pfx*/) {
+        for (int e = 0; e < 256; ++e) {
+            const uint8_t* raw = loader.get_expert_data(layer_id, e);
+            host_experts_[e].w1_packed = reinterpret_cast<const uint32_t*>(raw + AEON_W1_PACKED_OFFSET);
+            host_experts_[e].w1_scale  = reinterpret_cast<const half*>(raw + AEON_W1_SCALE_OFFSET);
+            host_experts_[e].w2_packed = reinterpret_cast<const uint32_t*>(raw + AEON_W2_PACKED_OFFSET);
+            host_experts_[e].w2_scale  = reinterpret_cast<const half*>(raw + AEON_W2_SCALE_OFFSET);
+            host_experts_[e].w3_packed = reinterpret_cast<const uint32_t*>(raw + AEON_W3_PACKED_OFFSET);
+            host_experts_[e].w3_scale  = reinterpret_cast<const half*>(raw + AEON_W3_SCALE_OFFSET);
+        }
+    }
+
+    template<typename LoaderT, typename T>
+    void upload_tensor(const LoaderT& loader, const std::string& name, T** d_ptr) {
         if (!loader.has_tensor(name)) {
             *d_ptr = nullptr;
             return;
@@ -523,6 +557,7 @@ struct PipelineScratchBuffers {
 class V4Pipeline {
 public:
     SafetensorsLoader loader;
+    AeonModelLoader aeon_loader;
     std::vector<std::unique_ptr<V4Layer>> layers;
     PipelineScratchBuffers scratch;
     kernel::RopeTable rope_table;
@@ -568,6 +603,7 @@ public:
         std::cout << "[Pipeline] Opening Safetensors shards from " << snapshot_dir << "..." << std::endl;
         loader.open_shard(snapshot_dir + "/model-00001.safetensors");
         loader.open_shard(snapshot_dir + "/model-00002.safetensors");
+        loader.open_shard(snapshot_dir + "/model-00034.safetensors");
         std::cout << "  > Total tensors indexed: " << loader.total_tensors() << std::endl;
 
         // 3. Initialize RoPE Tables
@@ -627,6 +663,76 @@ public:
         std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers." << std::endl;
     }
 
+    // Initialize pipeline directly from native .aeon format folder
+    void init_aeon(
+        const std::string& aeon_model_dir,
+        uint32_t num_layers = 2,
+        uint32_t vram_slots_per_layer = 8,
+        uint32_t max_seq_len = 4096
+    ) {
+        num_layers_ = num_layers;
+        current_seq_len_ = 0;
+
+        // 1. Initialize streams
+        CHECK_HIP(hipStreamCreate(&compute_stream));
+        CHECK_HIP(hipStreamCreate(&sdma_stream));
+
+        // 2. Open Aeon Model via Zero-Copy Mmap
+        std::cout << "[Pipeline] Opening native Aeon model from " << aeon_model_dir << "..." << std::endl;
+        aeon_loader.open_model(aeon_model_dir);
+        std::cout << "  > Total dense tensors indexed: " << aeon_loader.total_dense_tensors() << std::endl;
+
+        // 3. Initialize RoPE Tables
+        std::cout << "[Pipeline] Initializing RoPE tables (max_seq=" << max_seq_len << ")..." << std::endl;
+        rope_table.init(max_seq_len, kernel::DSV4_ROPE_THETA, 1.0f);
+
+        // Upload RoPE caches to GPU
+        size_t rope_bytes = rope_table.max_seq_len * rope_table.half_rope * sizeof(float);
+        CHECK_HIP(hipMalloc(&d_cos_cache_, rope_bytes));
+        CHECK_HIP(hipMalloc(&d_sin_cache_, rope_bytes));
+        CHECK_HIP(hipMemcpy(d_cos_cache_, rope_table.cos_cache.data(), rope_bytes, hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_sin_cache_, rope_table.sin_cache.data(), rope_bytes, hipMemcpyHostToDevice));
+
+        // 4. Model-level Weights
+        std::cout << "[Pipeline] Binding model-level embeddings and LM head..." << std::endl;
+        host_embed_table = aeon_loader.get_data_ptr<half>("embed.weight");
+
+        const auto& head_t = aeon_loader.get_tensor("head.weight");
+        std::cout << "  > Uploading LM Head [129280, 4096] (" << (head_t.byte_size / (1024*1024)) << " MB) to VRAM..." << std::endl;
+        CHECK_HIP(hipMalloc(&d_lm_head, head_t.byte_size));
+        CHECK_HIP(hipMemcpy(d_lm_head, head_t.data, head_t.byte_size, hipMemcpyHostToDevice));
+
+        // HC Head
+        const auto& fn_t = aeon_loader.get_tensor("hc_head_fn");
+        const auto& base_t = aeon_loader.get_tensor("hc_head_base");
+        const auto& sc_t = aeon_loader.get_tensor("hc_head_scale");
+        CHECK_HIP(hipMalloc(&d_hc_head_fn, fn_t.byte_size));
+        CHECK_HIP(hipMalloc(&d_hc_head_base, base_t.byte_size));
+        CHECK_HIP(hipMalloc(&d_hc_head_scale, sc_t.byte_size));
+        CHECK_HIP(hipMemcpy(d_hc_head_fn, fn_t.data, fn_t.byte_size, hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_hc_head_base, base_t.data, base_t.byte_size, hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_hc_head_scale, sc_t.data, sc_t.byte_size, hipMemcpyHostToDevice));
+
+        // Final norm
+        const auto& norm_t = aeon_loader.get_tensor("norm.weight");
+        CHECK_HIP(hipMalloc(&d_final_norm, norm_t.byte_size));
+        CHECK_HIP(hipMemcpy(d_final_norm, norm_t.data, norm_t.byte_size, hipMemcpyHostToDevice));
+
+        // 5. Allocate Reusable Pipeline Scratch Buffers
+        std::cout << "[Pipeline] Allocating intermediate GPU scratch buffers..." << std::endl;
+        scratch.allocate();
+
+        // 6. Initialize Consecutive Transformer Layers
+        layers.resize(num_layers_);
+        for (uint32_t l = 0; l < num_layers_; ++l) {
+            std::cout << "[Pipeline] Initializing DeepSeek-V4 Layer " << l << " (Tier 1 slots=" << vram_slots_per_layer << ")..." << std::endl;
+            layers[l] = std::make_unique<V4Layer>();
+            layers[l]->init(l, aeon_loader, max_seq_len, vram_slots_per_layer);
+        }
+
+        std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers with native .aeon format." << std::endl;
+    }
+
     // Run Single Autoregressive Step for token_id at sequence position `pos`
     // Returns next token ID via greedy argmax
     uint32_t step(uint32_t token_id, uint32_t pos) {
@@ -680,9 +786,8 @@ public:
             for (int i = 0; i < HC_DIM; ++i) sqrsum += h_res[i] * h_res[i];
             float rms = 1.0f / std::sqrt((sqrsum / (float)HC_DIM) + 1e-6f);
 
-            // Fetch fn from loader for layer l
-            std::string pfx = "layers." + std::to_string(l) + ".";
-            const float* hc_fn_ptr = loader.get_data_ptr<float>(pfx + "hc_attn_fn");
+            // Fetch fn from layer weights
+            const float* hc_fn_ptr = layer.h_hc_attn_fn;
             std::vector<float> h_mixes_a(24);
             for (int j = 0; j < 24; ++j) {
                 float dot = 0.0f;
@@ -843,7 +948,8 @@ public:
             for (int i = 0; i < HC_DIM; ++i) sqrsum_f += h_res_mid[i] * h_res_mid[i];
             float rms_f = 1.0f / std::sqrt((sqrsum_f / (float)HC_DIM) + 1e-6f);
 
-            const float* hc_ffn_fn_ptr = loader.get_data_ptr<float>(pfx + "hc_ffn_fn");
+            // Fetch fn from layer weights
+            const float* hc_ffn_fn_ptr = layer.h_hc_ffn_fn;
             std::vector<float> h_mixes_f(24);
             for (int j = 0; j < 24; ++j) {
                 float dot = 0.0f;

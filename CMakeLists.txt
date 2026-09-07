@@ -120,6 +120,14 @@ target_link_libraries(test_v4_pipeline PRIVATE amdhip64)
 add_executable(bench_v4_generation tests/bench_v4_generation.cpp)
 target_link_libraries(bench_v4_generation PRIVATE amdhip64)
 
+# Phase 2 Spike 0.2: Native Aeon Model Loader Smoke Test
+add_executable(test_aeon_loader tests/test_aeon_loader.cpp)
+target_link_libraries(test_aeon_loader PRIVATE amdhip64)
+
+# Phase 2 Spike 0.3: End-to-End Pipeline Execution on Native .aeon Model
+add_executable(test_aeon_pipeline tests/test_aeon_pipeline.cpp)
+target_link_libraries(test_aeon_pipeline PRIVATE amdhip64)
+
 
 
 
