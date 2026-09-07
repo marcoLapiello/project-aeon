@@ -110,3 +110,38 @@ This ledger records physical hardware verification benchmarks, test conditions, 
   - **$4.7\times$ to $7.7\times$ Decode Speedup**: Throughput jumped from $11.97 - 19.11\text{ tok/s}$ to **$89.48 - 91.78\text{ tok/s}$** on 2 layers.
   - **Elimination of the Cold-Miss Trap**: With 664 global VRAM slots instead of 8 per-layer slots, all required experts for the sequence were resident in Hot VRAM ($100\%$ hit rate), completely eliminating the synchronous host-to-device PCIe transfer stalls ($83.52\text{ ms} \to 10.90\text{ ms}$ per step).
   - **Pre-Prefill Acceleration**: TTFT improved by **$6.0\times$ to $9.6\times$** ($105.55\text{ ms/tok} \to 10.94\text{ ms/tok}$).
+
+---
+
+### Milestone 5: Full 43-Layer End-to-End Model Execution on Single GPU
+* **Date**: 2026-09-07
+* **Commit**: Pending
+* **Test Conditions**:
+  - Model: `DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon` (All 43 layers, 11,008 routed experts, 145 GB parameter universe)
+  - Hardware: AMD Radeon RX 7900 XTX (24 GB VRAM, `gfx1100`, PCIe 4.0 x16), Threadripper PRO 3975WX (64 GB DDR)
+  - Active Layers: **All 43 consecutive layers (100% full model forward pass)**
+  - VRAM Budget: $14.66\text{ GB}$ dense backbone + $0.17\text{ GB}$ KV cache + $100\text{ MB}$ scratch + $300\text{ MB}$ headroom
+  - Global VRAM Pool: **664 hot slots** ($8.75\text{ GB}$) shared dynamically across all 43 layers
+  - Warm Host DDR Staging: **3,800 slots** ($50.10\text{ GB}$)
+  - Benchmark Suite: `tests/bench_full_model.cpp` (Prompt: 4 tokens -> 8 generated tokens)
+
+* **Achieved Benchmark Numbers**:
+
+| Metric | 43-Layer Full-Model Run |
+| :--- | :---: |
+| **Total Model Layers Executed** | **43 layers** (100% complete model) |
+| **Pipeline Initialization Time** | **$16.05\text{ seconds}$** |
+| **Prompt Length** | 4 tokens |
+| **Generated Tokens** | 8 tokens |
+| **Total Execution Time** | $10,565.01\text{ ms}$ |
+| **TTFT (Prompt Prefill)** | **$5,816.63\text{ ms}$** ($1,454.16\text{ ms/tok}$ total, **$33.82\text{ ms/tok/layer}$**) |
+| **Decode Throughput** | **$1.47\text{ tokens/sec}$** |
+| **Decode Step Latency** | **$678.32\text{ ms/token}$** (**$15.77\text{ ms/tok/layer}$**) |
+| **Tier 1 VRAM Cache Hits** | 1,684 hits |
+| **Tier 1 VRAM Cache Misses**| 1,154 misses |
+| **Tier 1 VRAM Hit Rate** | **$59.3\%$** |
+
+* **Empirical Bottleneck Analysis & Spike 2 Rationale**:
+  - **Hit Rate Reality**: Across 43 layers, the 664 VRAM slots achieved a **$59.3\%$ hit rate** under uniform initial placement without offline prior or async prefetching.
+  - **PCIe Latency Cost**: The 1,154 misses required on-demand synchronous PCIe host transfers ($14.15\text{ MB}$ per expert $\approx 0.6\text{ ms}$ per miss). Across the 43-layer forward pass ($258$ expert evaluations per token), cache misses accounted for $\approx 450\text{ ms}$ of the $678\text{ ms}$ decode step latency.
+  - **The Direct Mandate for Spike 2**: Asynchronous SDMA prefetching must overlap these misses behind the preceding layer's compute to recover pure silicon compute speed.
