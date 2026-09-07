@@ -79,6 +79,14 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
     - Measure cache hit rate, eviction overhead, and token latency across varying sequence lengths.
     - Record findings in [plans-and-docs/PERFORMANCE_LEDGER.md](plans-and-docs/PERFORMANCE_LEDGER.md).
 
+#### Open Issues & Known Blockers for Next Session (Recorded 2026-09-07)
+1. **Tier 2 Warm Host DDR Preload Bottleneck & Memory Pressure**:
+   - **Page-Cache & Swap Contention**: Populating 3,325 warm experts (~43.8 GB) synchronously via `mmap` / `memcpy` caused severe memory pressure, pushing active process pages into the Linux swap partition and risking OOM termination (`Getötet` / exit code 137).
+   - **Extremely Slow Pre-population**: Single-threaded `mmap` page-faulting across a 145 GB disk file is completely unviable for large allocations. Warm expert pre-loading must be converted to sector-aligned Direct I/O (`O_DIRECT` / `pread` / `io_uring`) instead of sequential `memcpy` over `mmap`.
+   - **Host RAM Budget Configuration**: User configuration for `host_ram_bytes` must be explicitly capped to safe bounds (e.g., target ~35 GB instead of maximum hardware limits) so that user-space buffers never compete with the Linux OS, window compositor, or kernel buffers.
+2. **`hipHostMalloc` Fallback**:
+   - `hipHostMalloc` failed with OOM when requesting ~43.8 GB in a single contiguous pinned slab, falling back to `posix_memalign`. The staging pool needs segmented slab allocation or explicit capacity limits tailored to available unpinned/pinned memory limits (`ulimit -l`).
+
 ---
 
 ### Spike 2: Dual-Stream Asynchronous SDMA Prefetching & Latency Hiding
