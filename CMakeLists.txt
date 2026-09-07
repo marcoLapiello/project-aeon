@@ -132,6 +132,10 @@ target_link_libraries(test_aeon_pipeline PRIVATE amdhip64)
 add_executable(test_dynamic_expert_pool tests/test_dynamic_expert_pool.cpp)
 target_link_libraries(test_dynamic_expert_pool PRIVATE amdhip64)
 
+# Phase 2 Spike 1.2: End-to-End Generation Benchmark with Global VRAM Expert Pool
+add_executable(bench_dynamic_pool tests/bench_dynamic_pool.cpp)
+target_link_libraries(bench_dynamic_pool PRIVATE amdhip64)
+
 
 
 

@@ -75,7 +75,7 @@ This ledger records physical hardware verification benchmarks, test conditions, 
 
 ### Milestone 4: Phase 2 Spike 1 — Dynamic Memory Budgeting & Global Unified VRAM Expert Pool
 * **Date**: 2026-09-07
-* **Commit**: `34a4cb0`
+* **Commit**: `cc252c9`
 * **Test Conditions**:
   - Model: `DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon` (Native `.aeon` format)
   - Hardware: AMD Radeon RX 7900 XTX (24 GB VRAM, `gfx1100`, PCIe 4.0 x16), Threadripper PRO 3975WX (64 GB DDR)
@@ -87,20 +87,26 @@ This ledger records physical hardware verification benchmarks, test conditions, 
     - **Tier 1 (Hot VRAM)**: **664 dynamic slots** ($8.75\text{ GB}$) dynamically shared across all layers (up from 16 slots / 216 MB in Milestone 3)
     - **Tier 2 (Warm Host DDR)**: **3,800 slots** ($50.10\text{ GB}$)
     - **Tier 3 (Cold NVMe SSD)**: **6,544 slots**
-  - Active Layers: 2 consecutive layers in end-to-end forward test
+  - Active Layers: 2 consecutive layers (Layer 0 and Layer 1)
+  - Benchmark Executable: `tests/bench_dynamic_pool.cpp`
+  - Sampling: Greedy argmax from full $129,280$-dim logits projected on device
 
-* **Achieved Benchmark Numbers & Empirical Validation**:
+* **Achieved Benchmark Numbers**:
 
-| Metric | Spike 0 Baseline (Per-Layer Slots) | Spike 1 (Global Unified Pool) |
+| Metric | Short Prompt Scenario (Spike 1) | Medium Prompt Scenario (Spike 1) |
 | :--- | :---: | :---: |
-| **VRAM Expert Slots** | 16 slots (8 per layer) | **664 slots (Global dynamic pool)** |
-| **VRAM Dedicated to Experts**| $0.21\text{ GB}$ | **$8.75\text{ GB}$** |
-| **Host DDR Warm Buffer** | Unmanaged page cache | **$50.10\text{ GB}$ (3,800 experts staged)** |
-| **Feasibility Gating** | None (unsafe) | **Strict rejection & boundary enforcement** |
-| **Tier 1 VRAM Hit Rate** | $2.4\%$ | **$100\%$ on resident test sequence** (84/84 hits) |
-| **Silicon Bit-Parity** | Verified ($\epsilon = 0.0$) | **Verified ($\epsilon = 0.0$)** |
+| **Prompt Length** | 4 tokens | 8 tokens |
+| **Generated Tokens** | 16 tokens | 32 tokens |
+| **Total Latency** | **$207.20\text{ ms}$** *(was $1674.94\text{ ms}$)* | **$434.63\text{ ms}$** *(was $2150.87\text{ ms}$)* |
+| **TTFT (Prefill)** | **$43.76\text{ ms}$** ($10.94\text{ ms/token}$) | **$88.19\text{ ms}$** ($11.02\text{ ms/token}$) |
+| **Decode Throughput** | **$91.78\text{ tokens/sec}$** *(was $11.97\text{ tok/s}$)* | **$89.48\text{ tokens/sec}$** *(was $19.11\text{ tok/s}$)* |
+| **Decode Step Latency** | **$10.90\text{ ms/token}$** *(was $83.52\text{ ms/tok}$)* | **$11.18\text{ ms/token}$** *(was $52.33\text{ ms/tok}$)* |
+| **Overall Avg Latency** | **$10.36\text{ ms/token}$** | **$10.87\text{ ms/token}$** |
+| **Tier 1 VRAM Cache Hits** | 228 hits | 468 hits |
+| **Tier 1 VRAM Cache Misses**| 0 misses *(was 224 misses)* | 0 misses *(was 457 misses)* |
+| **Tier 1 VRAM Hit Rate**| **$100.0\%$** *(was $1.8\%$)* | **$100.0\%$** *(was $2.4\%$)* |
 
-* **Key Architectural Breakthroughs**:
-  1. **Zero VRAM Waste**: Available VRAM utilization expanded from $0.21\text{ GB}$ to $8.75\text{ GB}$, allowing over 664 experts to remain permanently hot in VRAM without per-layer fragmentation.
-  2. **Predictable Safety Floor**: Over-budget context sizes (e.g., $262{,}144$ tokens requiring $25.96\text{ GB}$) are immediately intercepted before allocation, protecting the host system from GTT thrashing.
-  3. **Seamless Transition to Spike 2**: Global pool index abstraction directly unlocks the upcoming dual-stream asynchronous SDMA prefetching engine.
+* **Analysis & Comparison against Milestone 3 Baseline**:
+  - **$4.7\times$ to $7.7\times$ Decode Speedup**: Throughput jumped from $11.97 - 19.11\text{ tok/s}$ to **$89.48 - 91.78\text{ tok/s}$** on 2 layers.
+  - **Elimination of the Cold-Miss Trap**: With 664 global VRAM slots instead of 8 per-layer slots, all required experts for the sequence were resident in Hot VRAM ($100\%$ hit rate), completely eliminating the synchronous host-to-device PCIe transfer stalls ($83.52\text{ ms} \to 10.90\text{ ms}$ per step).
+  - **Pre-Prefill Acceleration**: TTFT improved by **$6.0\times$ to $9.6\times$** ($105.55\text{ ms/tok} \to 10.94\text{ ms/tok}$).
