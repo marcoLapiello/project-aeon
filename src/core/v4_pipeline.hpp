@@ -4,6 +4,7 @@
 #include "core/device.hpp"
 #include "core/aeon_loader.hpp"
 #include "core/expert_registry.hpp"
+#include "core/host_expert_pool.hpp"
 #include "core/memory_budget.hpp"
 #include "core/safetensors_loader.hpp"
 #include "core/vram_expert_pool.hpp"
@@ -636,9 +637,10 @@ public:
     uint32_t num_layers_{0};
     uint32_t current_seq_len_{0};
 
-    // Spike 1: Global VRAM Expert Pool & Expert Registry
+    // Spike 1: Global VRAM Expert Pool, Warm Host Pool & Expert Registry
     bool use_global_pool_{false};
     std::unique_ptr<GlobalVRAMExpertPool> global_pool_;
+    std::unique_ptr<HostExpertPool> host_pool_;
     std::unique_ptr<ExpertRegistry> expert_registry_;
     MemoryBudgetReport budget_report_;
 
@@ -844,7 +846,7 @@ public:
         CHECK_HIP(hipMemcpy(d_cos_cache_, rope_table.cos_cache.data(), rope_bytes, hipMemcpyHostToDevice));
         CHECK_HIP(hipMemcpy(d_sin_cache_, rope_table.sin_cache.data(), rope_bytes, hipMemcpyHostToDevice));
 
-        // 5. Model-level Weights
+        // 5. Model-level Weights (LM Head & Norms)
         std::cout << "[Pipeline] Binding model-level embeddings and LM head..." << std::endl;
         host_embed_table = aeon_loader.get_data_ptr<half>("embed.weight");
 
@@ -869,15 +871,25 @@ public:
         CHECK_HIP(hipMalloc(&d_final_norm, norm_t.byte_size));
         CHECK_HIP(hipMemcpy(d_final_norm, norm_t.data, norm_t.byte_size, hipMemcpyHostToDevice));
 
-        // 6. Allocate Reusable Pipeline Scratch Buffers
+        // 6. Allocate Intermediate GPU Scratch Buffers
         std::cout << "[Pipeline] Allocating intermediate GPU scratch buffers..." << std::endl;
         scratch.allocate();
 
-        // 7. Initialize Global VRAM Expert Pool & Expert Registry
+        // 7. Initialize Consecutive Transformer Layers in Global Mode (Dense weights + KV Cache)
+        std::cout << "[Pipeline] Initializing " << num_layers_ << " Transformer Layers (Dense weights + KV Cache in VRAM)..." << std::endl;
+        layers.resize(num_layers_);
+        for (uint32_t l = 0; l < num_layers_; ++l) {
+            layers[l] = std::make_unique<V4Layer>();
+            layers[l]->init_global(l, aeon_loader, runtime_cfg.context_size);
+        }
+        std::cout << "  > Dense weights and KV cache for all " << num_layers_ << " layers uploaded to VRAM." << std::endl;
+
+        // 8. Allocate Global VRAM Expert Pool (Hot Pool)
         std::cout << "[Pipeline] Allocating Global VRAM Expert Pool (" << budget_report_.hot_vram_slots << " slots, "
                   << (budget_report_.hot_vram_bytes / (1024*1024*1024.0)) << " GB)..." << std::endl;
         global_pool_ = std::make_unique<GlobalVRAMExpertPool>(budget_report_.hot_vram_slots);
 
+        // 9. Initialize Expert Registry Catalog
         std::cout << "[Pipeline] Initializing Expert Registry (VRAM=" << budget_report_.hot_vram_slots
                   << ", Host=" << budget_report_.warm_host_slots << ")..." << std::endl;
         expert_registry_ = std::make_unique<ExpertRegistry>(
@@ -885,7 +897,7 @@ public:
             budget_report_.hot_vram_slots, budget_report_.warm_host_slots
         );
 
-        // Preload Hot VRAM slots from AeonModelLoader into Global Pool
+        // 10. Preload Hot VRAM slots into Global Pool
         std::cout << "[Pipeline] Pre-populating Hot VRAM slots into Global Pool..." << std::endl;
         for (uint32_t slot = 0; slot < budget_report_.hot_vram_slots; ++slot) {
             int32_t gid = expert_registry_->vram_slots[slot];
@@ -897,17 +909,31 @@ public:
             }
         }
         CHECK_HIP(hipStreamSynchronize(compute_stream));
+        std::cout << "  > GPU complete: Dense backbone, KV cache, and Hot Expert Pool resident in VRAM!" << std::endl;
 
-        // 8. Initialize Consecutive Transformer Layers in Global Mode
-        layers.resize(num_layers_);
-        for (uint32_t l = 0; l < num_layers_; ++l) {
-            std::cout << "[Pipeline] Initializing DeepSeek-V4 Layer " << l << " (Global Pool Mode)..." << std::endl;
-            layers[l] = std::make_unique<V4Layer>();
-            layers[l]->init_global(l, aeon_loader, runtime_cfg.context_size);
+        // 11. Allocate and Preload Tier 2 Warm Host DDR Pool
+        if (budget_report_.warm_host_slots > 0) {
+            std::cout << "[Pipeline] Allocating Tier 2 Warm Host DDR Pool (" << budget_report_.warm_host_slots << " slots, "
+                      << (budget_report_.warm_host_bytes / (1024*1024*1024.0)) << " GB)..." << std::endl;
+            host_pool_ = std::make_unique<HostExpertPool>(budget_report_.warm_host_slots);
+
+            std::cout << "[Pipeline] Pre-populating Warm Host DDR Pool ("
+                      << budget_report_.warm_host_slots << " experts)..." << std::endl;
+            for (uint32_t hslot = 0; hslot < budget_report_.warm_host_slots; ++hslot) {
+                int32_t gid = expert_registry_->host_slots[hslot];
+                if (gid >= 0) {
+                    uint32_t lay = expert_registry_->catalog[gid].layer_id;
+                    uint32_t exp = expert_registry_->catalog[gid].expert_id;
+                    const uint8_t* p = aeon_loader.get_expert_data(lay, exp);
+                    host_pool_->copy_from(hslot, p);
+                }
+            }
+            std::cout << "  > Tier 2 Warm Host DDR Pool populated with " << budget_report_.warm_host_slots << " experts." << std::endl;
         }
 
-        std::cout << "[Pipeline] Global Pool Engine ready! Configured for " << num_layers_
-                  << " layers with " << budget_report_.hot_vram_slots << " dynamic hot slots." << std::endl;
+        std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_
+                  << " layers with " << budget_report_.hot_vram_slots << " hot VRAM slots and "
+                  << budget_report_.warm_host_slots << " warm host slots." << std::endl;
     }
 
     // Run Single Autoregressive Step for token_id at sequence position `pos`
@@ -1248,10 +1274,36 @@ public:
                     // Global VRAM Expert Pool mode
                     int32_t slot = expert_registry_->touch_hot_expert(l, expert_id, pos);
                     if (slot < 0) {
-                        // Cache miss: allocate slot and upload from host memory
+                        // Cache miss in Hot VRAM: check if resident in Tier 2 Warm Host DDR
                         uint32_t gid = expert_registry_->get_global_id(l, expert_id);
+                        const auto& entry = expert_registry_->catalog[gid];
+
+                        const uint8_t* p = nullptr;
+                        if (entry.tier == ExpertTier::WARM_HOST && host_pool_ && entry.slot_idx >= 0) {
+                            // Hit in Tier 2 Warm Host DDR! DMA directly from physical host memory
+                            p = host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(entry.slot_idx));
+                        } else {
+                            // Cold NVMe: stream from disk via AeonModelLoader
+                            p = aeon_loader.get_expert_data(l, expert_id);
+                        }
+
                         auto [allocated_slot, evicted_gid] = expert_registry_->allocate_vram_slot(gid);
-                        const uint8_t* p = aeon_loader.get_expert_data(l, expert_id);
+
+                        // If an expert was evicted from VRAM to Host DDR, copy its weights to host pool if space exists
+                        if (evicted_gid >= 0 && host_pool_) {
+                            const auto& ev_entry = expert_registry_->catalog[evicted_gid];
+                            if (ev_entry.tier == ExpertTier::WARM_HOST && ev_entry.slot_idx >= 0) {
+                                uint32_t ev_hslot = static_cast<uint32_t>(ev_entry.slot_idx);
+                                // The evicted expert is in allocated_slot in VRAM before overwrite
+                                // Copy its payload back to host staging buffer
+                                const uint8_t* ev_raw = aeon_loader.get_expert_data(
+                                    expert_registry_->catalog[evicted_gid].layer_id,
+                                    expert_registry_->catalog[evicted_gid].expert_id
+                                );
+                                host_pool_->copy_from(ev_hslot, ev_raw);
+                            }
+                        }
+
                         global_pool_->upload_from_host_expert(allocated_slot, p, compute_stream);
                         slot = static_cast<int32_t>(allocated_slot);
                     }
@@ -1426,6 +1478,7 @@ public:
         }
         layers.clear();
         global_pool_.reset();
+        host_pool_.reset();
         expert_registry_.reset();
         loader.close_all();
         aeon_loader.close_all();

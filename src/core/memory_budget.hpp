@@ -19,7 +19,7 @@ namespace aeon::core {
 
 // Constant safety margins & architectural parameters
 constexpr size_t VRAM_HEADROOM_SAFETY_BYTES = 300ULL * 1024ULL * 1024ULL; // 300 MB
-constexpr double HOST_RAM_MAX_RATIO         = 0.80;                       // 80% cap on physical system RAM
+constexpr double HOST_RAM_MAX_RATIO         = 0.70;                       // 70% cap (~43-45 GB) to leave comfortable room for OS
 constexpr size_t PIPELINE_SCRATCH_BYTES      = 100ULL * 1024ULL * 1024ULL; // ~100 MB activation scratch
 
 struct AeonRuntimeConfig {
