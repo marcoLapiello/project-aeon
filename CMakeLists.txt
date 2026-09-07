@@ -128,6 +128,10 @@ target_link_libraries(test_aeon_loader PRIVATE amdhip64)
 add_executable(test_aeon_pipeline tests/test_aeon_pipeline.cpp)
 target_link_libraries(test_aeon_pipeline PRIVATE amdhip64)
 
+# Phase 2 Spike 1.1: Dynamic Memory Budget, Feasibility & Global Pool Test
+add_executable(test_dynamic_expert_pool tests/test_dynamic_expert_pool.cpp)
+target_link_libraries(test_dynamic_expert_pool PRIVATE amdhip64)
+
 
 
 
