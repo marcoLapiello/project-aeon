@@ -92,6 +92,21 @@ target_link_libraries(test_swiglu_clamp PRIVATE amdhip64)
 add_executable(test_hc_sinkhorn tests/test_hc_sinkhorn.cpp)
 target_link_libraries(test_hc_sinkhorn PRIVATE amdhip64)
 
+# Phase 1 Spike 3: Fused INT4 -> FP16 Wave32 WMMA test
+add_executable(test_w4a16_wmma tests/test_w4a16_wmma.cpp)
+target_link_libraries(test_w4a16_wmma PRIVATE amdhip64)
+
+# Phase 1 Spike 4: Dual-Mode MoE Router test
+add_executable(test_moe_router tests/test_moe_router.cpp)
+target_link_libraries(test_moe_router PRIVATE amdhip64)
+
+# Phase 1 Spike 4.3: End-to-End DeepSeek-V4 MoE Layer Forward Pass test
+add_executable(test_v4_moe_layer tests/test_v4_moe_layer.cpp)
+target_link_libraries(test_v4_moe_layer PRIVATE amdhip64)
+
+
+
+
 
 
 
