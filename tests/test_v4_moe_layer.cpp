@@ -1,4 +1,5 @@
 #include "core/config.hpp"
+#include "core/device.hpp"
 #include "kernel/w4a16_gemm.hpp"
 #include "kernel/moe_router.hpp"
 
@@ -97,6 +98,7 @@ __global__ void accumulate_expert_output_kernel(
 
 int main() {
     std::cout << "[Test] Spike 4.3: End-to-End DeepSeek-V4 MoE Layer Forward Pass on Silicon..." << std::endl;
+    aeon::core::select_compute_device(true);
 
     const uint32_t M_padded = 16; // Single-token autoregressive decoding step (padded to 16 for WMMA)
     const uint32_t vram_cache_capacity = 8; // 8 active expert slots in VRAM

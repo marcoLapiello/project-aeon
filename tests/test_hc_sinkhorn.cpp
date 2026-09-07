@@ -1,3 +1,4 @@
+#include "core/device.hpp"
 #include "kernel/hc_sinkhorn.hpp"
 #include <iostream>
 #include <vector>
@@ -14,6 +15,7 @@
 
 int main() {
     std::cout << "[Test] Hyper-Connections Sinkhorn & Post-Expansion on Silicon..." << std::endl;
+    aeon::core::select_compute_device(true);
 
     const int num_tokens = 4;
     const int hidden_size = 4096;

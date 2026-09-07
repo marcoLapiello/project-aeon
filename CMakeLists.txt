@@ -104,6 +104,14 @@ target_link_libraries(test_moe_router PRIVATE amdhip64)
 add_executable(test_v4_moe_layer tests/test_v4_moe_layer.cpp)
 target_link_libraries(test_v4_moe_layer PRIVATE amdhip64)
 
+# Phase 1 Spike 5.1: Sliding-Window Attention & Rotary Embeddings test
+add_executable(test_v4_attention tests/test_v4_attention.cpp)
+target_link_libraries(test_v4_attention PRIVATE amdhip64)
+
+# Phase 1 Spike 5.2: Complete DeepSeek-V4 Transformer Block Forward Pass test
+add_executable(test_v4_block tests/test_v4_block.cpp)
+target_link_libraries(test_v4_block PRIVATE amdhip64)
+
 
 
 

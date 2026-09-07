@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cassert>
 
+#include "core/device.hpp"
 #include "kernel/w4a16_gemm.hpp"
 
 #define CHECK_HIP(cmd) do { \
@@ -102,6 +103,7 @@ void cpu_w4a16_gemm(
 
 int main() {
     std::cout << "[Test] Spike 3: Fused INT4 -> FP16 Wave32 WMMA Kernel on Silicon..." << std::endl;
+    aeon::core::select_compute_device(true);
 
     // 1. Single-Tile Verification (16x16x16)
     {
