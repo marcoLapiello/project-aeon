@@ -349,6 +349,109 @@ int main() {
         }
     }
 
+    // 4. Decode GEMV Path (M=1): full-N CPU validation + both expert shapes benchmark
+    {
+        std::cout << "\n--- Sub-Test 4: Decode GEMV Path (M=1, warp-per-row) ---" << std::endl;
+        const uint32_t M = 1;
+        const uint32_t N = 2048;
+        const uint32_t K = 4096;
+
+        std::vector<half> h_a(M * K);
+        std::vector<uint32_t> h_w_packed(N * (K / 8));
+        std::vector<half> h_w_scale(N * (K / 32));
+        std::vector<half> h_d_gpu(M * N);
+
+        for (uint32_t i = 0; i < h_a.size(); ++i) {
+            h_a[i] = __float2half(((i % 11) - 5) * 0.1f);
+        }
+        for (uint32_t i = 0; i < h_w_packed.size(); ++i) {
+            uint32_t p = 0;
+            for (int b = 0; b < 8; ++b) {
+                uint32_t nib = ((i * 8 + b) % 15);
+                p |= (nib << (b * 4));
+            }
+            h_w_packed[i] = p;
+        }
+        for (uint32_t i = 0; i < h_w_scale.size(); ++i) {
+            h_w_scale[i] = __float2half(0.0075f);
+        }
+
+        half* d_a;
+        uint32_t* d_w_packed;
+        half* d_w_scale;
+        half* d_out;
+
+        CHECK_HIP(hipMalloc(&d_a, h_a.size() * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_w_packed, h_w_packed.size() * sizeof(uint32_t)));
+        CHECK_HIP(hipMalloc(&d_w_scale, h_w_scale.size() * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_out, h_d_gpu.size() * sizeof(half)));
+
+        CHECK_HIP(hipMemcpy(d_a, h_a.data(), h_a.size() * sizeof(half), hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_w_packed, h_w_packed.data(), h_w_packed.size() * sizeof(uint32_t), hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_w_scale, h_w_scale.data(), h_w_scale.size() * sizeof(half), hipMemcpyHostToDevice));
+
+        // Full-N CPU reference for the single decode row
+        std::vector<float> h_d_ref(N);
+        cpu_w4a16_gemm(h_a.data(), h_w_packed.data(), h_w_scale.data(), h_d_ref.data(), M, N, K);
+
+        aeon::kernel::dispatch_w4a16_gemm(d_a, d_w_packed, d_w_scale, d_out, M, N, K);
+        CHECK_HIP(hipDeviceSynchronize());
+        CHECK_HIP(hipMemcpy(h_d_gpu.data(), d_out, h_d_gpu.size() * sizeof(half), hipMemcpyDeviceToHost));
+
+        float max_diff = 0.0f;
+        for (uint32_t n = 0; n < N; ++n) {
+            float diff = std::abs(__half2float(h_d_gpu[n]) - h_d_ref[n]);
+            if (diff > max_diff) max_diff = diff;
+        }
+        std::cout << "GEMV Full-N Max Difference vs CPU: " << max_diff << std::endl;
+        assert(max_diff < 0.05f); // FP32 accumulation-order difference over 4096 products
+
+        // Benchmark both routed-expert shapes through the M=1 decode path
+        auto bench_shape = [&](uint32_t n_dim, uint32_t k_dim, const char* name) {
+            half* d_a2;
+            uint32_t* d_wp2;
+            half* d_ws2;
+            half* d_o2;
+            CHECK_HIP(hipMalloc(&d_a2, k_dim * sizeof(half)));
+            CHECK_HIP(hipMalloc(&d_wp2, (size_t)n_dim * (k_dim / 8) * sizeof(uint32_t)));
+            CHECK_HIP(hipMalloc(&d_ws2, (size_t)n_dim * (k_dim / 32) * sizeof(half)));
+            CHECK_HIP(hipMalloc(&d_o2, n_dim * sizeof(half)));
+            CHECK_HIP(hipMemset(d_wp2, 0x11, (size_t)n_dim * (k_dim / 8) * sizeof(uint32_t)));
+            CHECK_HIP(hipMemset(d_ws2, 0x3C, (size_t)n_dim * (k_dim / 32) * sizeof(half)));
+
+            aeon::kernel::dispatch_w4a16_gemm(d_a2, d_wp2, d_ws2, d_o2, 1, n_dim, k_dim);
+            CHECK_HIP(hipDeviceSynchronize());
+
+            const int iterations = 200;
+            auto start = std::chrono::high_resolution_clock::now();
+            for (int it = 0; it < iterations; ++it) {
+                aeon::kernel::dispatch_w4a16_gemm(d_a2, d_wp2, d_ws2, d_o2, 1, n_dim, k_dim);
+            }
+            CHECK_HIP(hipDeviceSynchronize());
+            auto end = std::chrono::high_resolution_clock::now();
+
+            double us = std::chrono::duration<double, std::micro>(end - start).count() / iterations;
+            double weight_bytes = (double)n_dim * (k_dim / 8) * 4.0 + (double)n_dim * (k_dim / 32) * 2.0;
+            double gbps = weight_bytes / (us * 1e-6) / 1e9;
+            std::cout << "  GEMV " << name << " (M=1, N=" << n_dim << ", K=" << k_dim << "): "
+                      << us << " us  (" << gbps << " GB/s effective weight stream)" << std::endl;
+
+            CHECK_HIP(hipFree(d_a2));
+            CHECK_HIP(hipFree(d_wp2));
+            CHECK_HIP(hipFree(d_ws2));
+            CHECK_HIP(hipFree(d_o2));
+        };
+        bench_shape(2048, 4096, "w1/w3");
+        bench_shape(4096, 2048, "w2   ");
+
+        CHECK_HIP(hipFree(d_a));
+        CHECK_HIP(hipFree(d_w_packed));
+        CHECK_HIP(hipFree(d_w_scale));
+        CHECK_HIP(hipFree(d_out));
+
+        std::cout << "[PASS] Decode GEMV path verified (M=1) and benchmarked!" << std::endl;
+    }
+
     std::cout << "\n[ALL TESTS PASSED] Fused INT4-W4A16 Wave32 Dequant-GEMM verified on silicon!" << std::endl;
     return 0;
 }

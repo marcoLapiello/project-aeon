@@ -1007,14 +1007,14 @@ public:
                 layer.cache_hits = expert_registry_->hits_hot;
                 layer.cache_misses = expert_registry_->hits_warm + expert_registry_->misses_cold;
 
-                // w1 & w3 via fused W4A16 WMMA
+                // w1 & w3 via fused W4A16 (M=1 decode GEMV path; writes row 0)
                 kernel::dispatch_w4a16_gemm(
                     scratch.d_ffn_norm_act, d_w1_p, d_w1_s,
-                    scratch.d_expert_gate, M_PAD, INTER_DIM, H, compute_stream
+                    scratch.d_expert_gate, 1, INTER_DIM, H, compute_stream
                 );
                 kernel::dispatch_w4a16_gemm(
                     scratch.d_ffn_norm_act, d_w3_p, d_w3_s,
-                    scratch.d_expert_up, M_PAD, INTER_DIM, H, compute_stream
+                    scratch.d_expert_up, 1, INTER_DIM, H, compute_stream
                 );
 
                 // SwiGLU clamp
@@ -1028,7 +1028,7 @@ public:
                 // w2
                 kernel::dispatch_w4a16_gemm(
                     scratch.d_expert_swiglu, d_w2_p, d_w2_s,
-                    scratch.d_expert_down, M_PAD, H, INTER_DIM, compute_stream
+                    scratch.d_expert_down, 1, H, INTER_DIM, compute_stream
                 );
 
                 // Accumulate row 0
