@@ -95,20 +95,24 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
 - **Micro-Step 2.1: Lookahead Routing & Prefetch Horizon Pipeline**
   - While Layer $L$ is executing its attention and resident shared expert pass, trigger routing calculation for Layer $L+1$.
   - Identify missing experts for Layer $L+1$ ahead of execution time.
-- **Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream**
-  - Dispatch non-blocking PCIe DMA transfers on a dedicated HIP SDMA stream concurrently with Layer $L$'s compute stream.
-  - Synchronize via HIP events (`hipEventRecord`, `hipStreamWaitEvent`) immediately before Layer $L+1$'s routed MoE execution.
-  - *Verification:* Measure PCIe transfer overlap efficiency using `hipEventElapsedTime`; verify that $>80\%$ of PCIe transfer latency is hidden behind compute without compute kernel jitter.
+- **Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream (`src/core/prefetch_staging.hpp`)**
+  - Implemented 12-slot ($170\text{ MB}$) pinned host arena via `hipHostMalloc` (`hipHostMallocPortable`), bypassing OS page-faults and unpinned memory thrashing.
+  - Dispatch non-blocking PCIe DMA transfers on dedicated HIP SDMA stream concurrently with compute stream.
+  - Synchronize via non-blocking HIP event barriers (`hipEventRecord`, `hipStreamWaitEvent`) immediately before routed MoE execution.
+- **Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon (`tests/test_async_prefetch.cpp`)**
+  - Silicon verification under severe cold-miss conditions (12 VRAM slots, 94% miss rate).
+  - TTFT improved by $+36.2\%$ ($111.4\text{ ms} \to 71.1\text{ ms}$) and decode throughput accelerated by $+71.5\%$ ($19.1\text{ tok/s} \to 32.8\text{ tok/s}$).
+  - *Key Finding*: Inter-layer lookahead plateaued at $33.1\text{ tok/s}$ because single-threaded CPU `memcpy` from unpinned `mmap` backing pages into pinned staging buffers ($85\text{ MB/step}$) creates a synchronous host memory bus bottleneck, directly affirming the need for Spike 3 Direct I/O.
 
 ---
 
 ### Spike 3: Linux `io_uring` Direct I/O NVMe Cold Tier Integration
-*Objective: Complete the 3-tier chain by connecting cold NVMe SSD storage directly to Host DDR staging via Linux `io_uring` with zero kernel page-cache contention.*
+*Objective: Complete the 3-tier chain by connecting cold NVMe SSD storage directly to Host DDR staging via Linux `io_uring` with zero kernel page-cache contention, eliminating synchronous CPU `memcpy` stalls from the streaming pipeline.*
 
 - **Micro-Step 3.1: Linux `io_uring` Direct I/O Reader Integration (Tier 3 $\to$ Tier 2)**
   - Integrate `src/io/direct_io_reader.hpp` into the runtime pipeline targeting `model_experts.aeon`.
-  - Implement asynchronous direct streaming of cold experts from NVMe into pinned host DDR staging buffers with `O_DIRECT`.
-  - Maintain a dynamic Tier 2 warm cache in host RAM ($\approx 48\text{ GB}$, $\approx 3,550$ warm experts) feeding Tier 1 VRAM.
+  - Replace `mmap` + CPU `memcpy` expert retrieval with asynchronous direct streaming of cold experts from NVMe into pinned host DDR staging buffers (`PrefetchStagingArena`) using `O_DIRECT`.
+  - Maintain a dynamic Tier 2 warm cache in host RAM ($\approx 35\text{ GB}$) feeding Tier 1 VRAM without triggering OS page-cache bloat or swap thrashing.
 - **Micro-Step 3.2: End-to-End 3-Tier Pipeline Validation**
   - Silicon test measuring end-to-end 3-tier streaming throughput from NVMe $\to$ Host RAM $\to$ GPU VRAM, validating data integrity and measuring throughput in GB/s.
 

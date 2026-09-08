@@ -49,6 +49,7 @@ Always consult these authoritative documents for deep technical specifics:
     - [x] Micro-Step 2.1: Lookahead Routing & Prefetch Horizon Pipeline.
     - [x] Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream (`PrefetchStagingArena`).
     - [x] Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon (`test_async_prefetch` passing with +71.5% decode speedup under cold misses).
+      - Note: Inter-layer lookahead confirmed that single-threaded CPU `memcpy` from unpinned `mmap` backing pages ($85\text{ MB/step}$) bottlenecks prefetching, making Spike 3 Direct I/O the critical unlock.
   - [ ] Spike 3: Linux `io_uring` Direct I/O NVMe Cold Tier integration.
 
 ### Future (Upcoming Next)
