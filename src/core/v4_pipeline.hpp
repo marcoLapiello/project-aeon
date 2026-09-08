@@ -64,7 +64,8 @@ public:
     half*  d_final_norm{nullptr};          // [4096] on device
 
     hipStream_t compute_stream{0};
-    hipStream_t sdma_stream{0};
+    hipStream_t sdma_stream{0};       // warm-host / safetensors H2D uploads
+    hipStream_t sdma_cold_stream{0};  // io_uring staging -> VRAM cold uploads
 
     uint32_t num_layers_{0};
     uint32_t current_seq_len_{0};
@@ -101,6 +102,7 @@ public:
         // 1. Initialize streams
         CHECK_HIP(hipStreamCreate(&compute_stream));
         CHECK_HIP(hipStreamCreate(&sdma_stream));
+        CHECK_HIP(hipStreamCreate(&sdma_cold_stream));
 
         // 2. Open Safetensors Shards via Zero-Copy Mmap
         std::cout << "[Pipeline] Opening Safetensors shards from " << snapshot_dir << "..." << std::endl;
@@ -186,6 +188,7 @@ public:
         // 1. Initialize streams
         CHECK_HIP(hipStreamCreate(&compute_stream));
         CHECK_HIP(hipStreamCreate(&sdma_stream));
+        CHECK_HIP(hipStreamCreate(&sdma_cold_stream));
 
         // 2. Open Aeon Model via Zero-Copy Mmap
         std::cout << "[Pipeline] Opening native Aeon model from " << aeon_model_dir << "..." << std::endl;
@@ -280,6 +283,7 @@ public:
         // 1. Initialize streams
         CHECK_HIP(hipStreamCreate(&compute_stream));
         CHECK_HIP(hipStreamCreate(&sdma_stream));
+        CHECK_HIP(hipStreamCreate(&sdma_cold_stream));
 
         // 2. Open Model Containers
         std::cout << "[Pipeline] Opening native .aeon model from " << aeon_model_dir << "..." << std::endl;
@@ -664,12 +668,15 @@ public:
                 const uint32_t staging_idx = state.staging_indices[k];
                 prefetch_staging_->complete_io(staging_idx);
                 prefetch_staging_->begin_gpu_transfer(staging_idx);
+                // Cold NVMe payloads upload on the dedicated cold-DMA stream so a
+                // burst of io_uring completions never head-of-line blocks warm-hit
+                // or safetensors H2D transfers on sdma_stream.
                 unified_vram_pool_->upload_from_host_expert(
                     static_cast<uint32_t>(state.vram_slots[k]),
                     prefetch_staging_->get_slot_ptr(staging_idx),
-                    sdma_stream
+                    sdma_cold_stream
                 );
-                CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
+                CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_cold_stream));
 
                 state.is_prefetched[k] = true;
                 state.io_pending[k] = false;
@@ -1155,8 +1162,10 @@ public:
     void free_all() {
         if (compute_stream) { (void)hipStreamSynchronize(compute_stream); }
         if (sdma_stream) { (void)hipStreamSynchronize(sdma_stream); }
+        if (sdma_cold_stream) { (void)hipStreamSynchronize(sdma_cold_stream); }
         if (compute_stream) { (void)hipStreamDestroy(compute_stream); compute_stream = 0; }
         if (sdma_stream) { (void)hipStreamDestroy(sdma_stream); sdma_stream = 0; }
+        if (sdma_cold_stream) { (void)hipStreamDestroy(sdma_cold_stream); sdma_cold_stream = 0; }
         if (d_cos_cache_) { (void)hipFree(d_cos_cache_); d_cos_cache_ = nullptr; }
         if (d_sin_cache_) { (void)hipFree(d_sin_cache_); d_sin_cache_ = nullptr; }
         if (d_lm_head) { (void)hipFree(d_lm_head); d_lm_head = nullptr; }
