@@ -152,6 +152,9 @@ public:
 
         if (entry.tier == ExpertTier::WARM_HOST) {
             hits_warm++;
+            warm_host_lru.erase(entry.lru_it);
+            warm_host_lru.push_front(gid);
+            entry.lru_it = warm_host_lru.begin();
         } else {
             misses_cold++;
         }
@@ -164,6 +167,15 @@ public:
     std::pair<uint32_t, int32_t> allocate_vram_slot(uint32_t gid) {
         uint32_t slot = 0;
         int32_t evicted_gid = -1;
+
+        auto& incoming = catalog[gid];
+        if (incoming.tier == ExpertTier::WARM_HOST && incoming.slot_idx >= 0) {
+            const uint32_t host_slot = static_cast<uint32_t>(incoming.slot_idx);
+            warm_host_lru.erase(incoming.lru_it);
+            host_slots[host_slot] = -1;
+            free_host_slots.push_back(host_slot);
+            incoming.slot_idx = -1;
+        }
 
         if (!free_vram_slots.empty()) {
             slot = free_vram_slots.back();

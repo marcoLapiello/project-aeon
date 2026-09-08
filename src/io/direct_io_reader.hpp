@@ -198,6 +198,10 @@ public:
         return submitted;
     }
 
+    uint32_t submission_capacity() const noexcept {
+        return params_.sq_entries;
+    }
+
     DirectIOCompletion wait_for_completion() {
         for (;;) {
             uint32_t head = __atomic_load_n(cring_head_, __ATOMIC_ACQUIRE);

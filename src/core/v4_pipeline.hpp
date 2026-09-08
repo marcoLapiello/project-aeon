@@ -30,6 +30,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifndef CHECK_HIP
@@ -352,8 +353,13 @@ public:
         prefetch_staging_ = std::make_unique<PrefetchStagingArena>();
 
         // 9. Initialize Expert Registry Catalog
+        const uint32_t active_total_experts = num_layers_ * model_cfg.n_routed_experts;
+        const uint32_t active_remaining_after_vram =
+            active_total_experts > budget_report_.hot_vram_slots
+                ? active_total_experts - budget_report_.hot_vram_slots
+                : 0;
         uint32_t active_warm_host_slots = runtime_cfg.preload_warm_host
-            ? budget_report_.warm_host_slots
+            ? std::min(budget_report_.warm_host_slots, active_remaining_after_vram)
             : 0;
         std::cout << "[Pipeline] Initializing Expert Registry (VRAM=" << budget_report_.hot_vram_slots
               << ", Host=" << active_warm_host_slots << ")..." << std::endl;
@@ -364,36 +370,72 @@ public:
 
         // 10. Preload Hot VRAM slots into Unified Pool
         std::cout << "[Pipeline] Pre-populating Hot VRAM slots into Unified Pool..." << std::endl;
-        for (uint32_t slot = 0; slot < budget_report_.hot_vram_slots; ++slot) {
-            int32_t gid = expert_registry_->vram_slots[slot];
-            if (gid >= 0) {
-                uint32_t lay = expert_registry_->catalog[gid].layer_id;
-                uint32_t exp = expert_registry_->catalog[gid].expert_id;
-                const uint8_t* p = aeon_loader.get_expert_data(lay, exp);
-                unified_vram_pool_->upload_from_host_expert(slot, p, compute_stream);
+        const size_t direct_batch_slots = std::max<size_t>(
+            1, direct_io_reader_->submission_capacity() /
+               ((AEON_EXPERT_BYTES + aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES - 1) /
+                aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES));
+        for (uint32_t batch_start = 0; batch_start < budget_report_.hot_vram_slots; batch_start += direct_batch_slots) {
+            const uint32_t batch_end = std::min<uint32_t>(
+                budget_report_.hot_vram_slots,
+                batch_start + static_cast<uint32_t>(direct_batch_slots));
+            std::vector<std::pair<uint32_t, uint32_t>> expert_ids;
+            std::vector<aeon::io::AlignedBuffer> buffers;
+            expert_ids.reserve(batch_end - batch_start);
+            buffers.reserve(batch_end - batch_start);
+
+            for (uint32_t slot = batch_start; slot < batch_end; ++slot) {
+                int32_t gid = expert_registry_->vram_slots[slot];
+                if (gid < 0) continue;
+                const auto& entry = expert_registry_->catalog[gid];
+                expert_ids.emplace_back(entry.layer_id, entry.expert_id);
+                buffers.emplace_back(AEON_EXPERT_BYTES);
             }
+
+            std::vector<uint8_t*> destinations;
+            destinations.reserve(buffers.size());
+            for (auto& buffer : buffers) {
+                destinations.push_back(static_cast<uint8_t*>(buffer.data()));
+            }
+            read_experts_direct_blocking(expert_ids, destinations);
+
+            size_t buffer_idx = 0;
+            for (uint32_t slot = batch_start; slot < batch_end; ++slot) {
+                if (expert_registry_->vram_slots[slot] < 0) continue;
+                unified_vram_pool_->upload_from_host_expert(
+                    slot, destinations[buffer_idx++], compute_stream);
+            }
+            CHECK_HIP(hipStreamSynchronize(compute_stream));
         }
-        CHECK_HIP(hipStreamSynchronize(compute_stream));
         std::cout << "  > GPU complete: Dense backbone, KV cache, and Hot Expert Pool resident in VRAM!" << std::endl;
 
         // 11. Allocate and Preload Tier 2 Warm Host DDR Pool
-        if (runtime_cfg.preload_warm_host && budget_report_.warm_host_slots > 0) {
-            std::cout << "[Pipeline] Allocating Tier 2 Warm Host DDR Pool (" << budget_report_.warm_host_slots << " slots, "
-                      << (budget_report_.warm_host_bytes / (1024*1024*1024.0)) << " GB)..." << std::endl;
-            host_pool_ = std::make_unique<HostExpertPool>(budget_report_.warm_host_slots);
+        if (runtime_cfg.preload_warm_host && active_warm_host_slots > 0) {
+            const size_t active_warm_host_bytes = static_cast<size_t>(active_warm_host_slots) * AEON_EXPERT_BYTES;
+            std::cout << "[Pipeline] Allocating Tier 2 Warm Host DDR Pool (" << active_warm_host_slots << " slots, "
+                      << (active_warm_host_bytes / (1024*1024*1024.0)) << " GB)..." << std::endl;
+            host_pool_ = std::make_unique<HostExpertPool>(active_warm_host_slots);
 
             std::cout << "[Pipeline] Pre-populating Warm Host DDR Pool ("
-                      << budget_report_.warm_host_slots << " experts)..." << std::endl;
-            for (uint32_t hslot = 0; hslot < budget_report_.warm_host_slots; ++hslot) {
-                int32_t gid = expert_registry_->host_slots[hslot];
-                if (gid >= 0) {
-                    uint32_t lay = expert_registry_->catalog[gid].layer_id;
-                    uint32_t exp = expert_registry_->catalog[gid].expert_id;
-                    const uint8_t* p = aeon_loader.get_expert_data(lay, exp);
-                    host_pool_->copy_from(hslot, p);
+                      << active_warm_host_slots << " experts)..." << std::endl;
+            for (uint32_t batch_start = 0; batch_start < active_warm_host_slots; batch_start += direct_batch_slots) {
+                const uint32_t batch_end = std::min<uint32_t>(
+                    active_warm_host_slots,
+                    batch_start + static_cast<uint32_t>(direct_batch_slots));
+                std::vector<std::pair<uint32_t, uint32_t>> expert_ids;
+                std::vector<uint8_t*> destinations;
+                expert_ids.reserve(batch_end - batch_start);
+                destinations.reserve(batch_end - batch_start);
+
+                for (uint32_t hslot = batch_start; hslot < batch_end; ++hslot) {
+                    int32_t gid = expert_registry_->host_slots[hslot];
+                    if (gid < 0) continue;
+                    const auto& entry = expert_registry_->catalog[gid];
+                    expert_ids.emplace_back(entry.layer_id, entry.expert_id);
+                    destinations.push_back(host_pool_->get_expert_slot_ptr(hslot));
                 }
+                read_experts_direct_blocking(expert_ids, destinations);
             }
-            std::cout << "  > Tier 2 Warm Host DDR Pool populated with " << budget_report_.warm_host_slots << " experts." << std::endl;
+            std::cout << "  > Tier 2 Warm Host DDR Pool populated with " << active_warm_host_slots << " experts." << std::endl;
         } else if (!runtime_cfg.preload_warm_host) {
             std::cout << "[Pipeline] Warm Host DDR preload disabled; non-hot experts will stream from the cold .aeon tier on demand." << std::endl;
         }
@@ -447,7 +489,7 @@ public:
             std::array<uint32_t, 6> io_request_counts{0, 0, 0, 0, 0, 0};
         };
         LayerPrefetchState lookahead_prefetch;
-        std::vector<uint32_t> direct_staging_slots;
+        std::vector<uint32_t> releasable_staging_slots;
 
         auto dispatch_layer_prefetch = [&](uint32_t target_l, const std::vector<int32_t>& topk_experts) -> LayerPrefetchState {
             LayerPrefetchState state;
@@ -467,6 +509,19 @@ public:
                     const auto& entry = expert_registry_->catalog[gid];
                     const ExpertTier source_tier = entry.tier;
                     const int32_t source_slot = entry.slot_idx;
+                    const bool source_is_warm = source_tier == ExpertTier::WARM_HOST &&
+                                                host_pool_ && source_slot >= 0;
+                    const uint32_t source_staging_idx = buf_offset + k;
+                    if (source_is_warm) {
+                        if (!prefetch_staging_) {
+                            throw std::runtime_error("V4Pipeline: warm expert has no staging arena");
+                        }
+                        wait_for_pending_warm_slot(static_cast<uint32_t>(source_slot));
+                        prefetch_staging_->stage_payload(
+                            source_staging_idx,
+                            host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(source_slot))
+                        );
+                    }
 
                     auto [allocated_slot, evicted_gid] = expert_registry_->allocate_vram_slot(gid);
 
@@ -474,13 +529,13 @@ public:
                         const auto& ev_entry = expert_registry_->catalog[evicted_gid];
                         if (ev_entry.tier == ExpertTier::WARM_HOST && ev_entry.slot_idx >= 0) {
                             uint32_t ev_hslot = static_cast<uint32_t>(ev_entry.slot_idx);
-                            if (aeon_loader.total_dense_tensors() > 0) {
-                                const uint8_t* ev_raw = aeon_loader.get_expert_data(
-                                    expert_registry_->catalog[evicted_gid].layer_id,
-                                    expert_registry_->catalog[evicted_gid].expert_id
-                                );
-                                host_pool_->copy_from(ev_hslot, ev_raw);
-                            }
+                            wait_for_pending_warm_slot(ev_hslot);
+                            unified_vram_pool_->download_to_host_expert(
+                                allocated_slot,
+                                host_pool_->get_expert_slot_ptr(ev_hslot),
+                                sdma_stream
+                            );
+                            record_pending_warm_slot(ev_hslot);
                         }
                     }
 
@@ -510,48 +565,55 @@ public:
                         state.io_request_counts[k] = static_cast<uint32_t>(request_count);
                         submitted_direct_io = true;
                     } else {
-                        const uint8_t* src_ptr = nullptr;
-                        if (source_tier == ExpertTier::WARM_HOST && host_pool_ && source_slot >= 0) {
-                            src_ptr = host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(source_slot));
-                        } else if (aeon_loader.total_dense_tensors() > 0) {
-                            src_ptr = aeon_loader.get_expert_data(target_l, expert_id);
-                        }
-
-                        if (src_ptr && prefetch_staging_) {
-                            uint32_t staging_idx = buf_offset + k;
-                            prefetch_staging_->stage_payload(staging_idx, src_ptr);
-                            const uint8_t* pinned_payload = prefetch_staging_->get_slot_ptr(staging_idx);
-
-                            prefetch_staging_->begin_gpu_transfer(staging_idx);
+                        if (source_is_warm) {
+                            const uint8_t* pinned_payload = prefetch_staging_->get_slot_ptr(source_staging_idx);
+                            prefetch_staging_->begin_gpu_transfer(source_staging_idx);
                             unified_vram_pool_->upload_from_host_expert(allocated_slot, pinned_payload, sdma_stream);
-                            CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
+                            CHECK_HIP(hipEventRecord(prefetch_staging_->events[source_staging_idx], sdma_stream));
 
                             state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
                             state.is_prefetched[k] = true;
-                            state.staging_indices[k] = staging_idx;
-                            direct_staging_slots.push_back(staging_idx);
-                        } else if (src_ptr) {
-                            unified_vram_pool_->upload_from_host_expert(allocated_slot, src_ptr, sdma_stream);
-                            state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
-                            state.is_prefetched[k] = false;
+                            state.staging_indices[k] = source_staging_idx;
                         } else {
-                            std::string exp_pfx = "layers." + std::to_string(target_l) + ".ffn.experts." + std::to_string(expert_id) + ".";
-                            const auto* w1_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
-                            const auto* w1_s = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
-                            const auto* w2_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
-                            const auto* w2_s = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
-                            const auto* w3_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
-                            const auto* w3_s = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
+                            const uint8_t* src_ptr = nullptr;
+                            if (aeon_loader.total_dense_tensors() > 0) {
+                                src_ptr = aeon_loader.get_expert_data(target_l, expert_id);
+                            }
 
-                            unified_vram_pool_->upload_from_pointers(
-                                allocated_slot,
-                                w1_p, w1_s,
-                                w2_p, w2_s,
-                                w3_p, w3_s,
-                                compute_stream
-                            );
-                            state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
-                            state.is_prefetched[k] = false;
+                            if (src_ptr && prefetch_staging_) {
+                                const uint32_t staging_idx = buf_offset + k;
+                                prefetch_staging_->stage_payload(staging_idx, src_ptr);
+                                const uint8_t* pinned_payload = prefetch_staging_->get_slot_ptr(staging_idx);
+                                prefetch_staging_->begin_gpu_transfer(staging_idx);
+                                unified_vram_pool_->upload_from_host_expert(allocated_slot, pinned_payload, sdma_stream);
+                                CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
+
+                                state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
+                                state.is_prefetched[k] = true;
+                                state.staging_indices[k] = staging_idx;
+                            } else if (src_ptr) {
+                                unified_vram_pool_->upload_from_host_expert(allocated_slot, src_ptr, sdma_stream);
+                                state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
+                                state.is_prefetched[k] = false;
+                            } else {
+                                std::string exp_pfx = "layers." + std::to_string(target_l) + ".ffn.experts." + std::to_string(expert_id) + ".";
+                                const auto* w1_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
+                                const auto* w1_s = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
+                                const auto* w2_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
+                                const auto* w2_s = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
+                                const auto* w3_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
+                                const auto* w3_s = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
+
+                                unified_vram_pool_->upload_from_pointers(
+                                    allocated_slot,
+                                    w1_p, w1_s,
+                                    w2_p, w2_s,
+                                    w3_p, w3_s,
+                                    compute_stream
+                                );
+                                state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
+                                state.is_prefetched[k] = false;
+                            }
                         }
                     }
                 }
@@ -609,7 +671,6 @@ public:
 
                 state.is_prefetched[k] = true;
                 state.io_pending[k] = false;
-                direct_staging_slots.push_back(staging_idx);
             }
         };
 
@@ -838,6 +899,11 @@ public:
             CHECK_HIP(hipMemcpyAsync(h_topk_indices.data(), scratch.d_topk_indices, 6 * sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream));
             CHECK_HIP(hipStreamSynchronize(compute_stream));
 
+            for (uint32_t staging_idx : releasable_staging_slots) {
+                prefetch_staging_->release_after_gpu_transfer(staging_idx);
+            }
+            releasable_staging_slots.clear();
+
             // -----------------------------------------------------------------
             // Dual-Stream Asynchronous SDMA Prefetching Pipeline
             // If this layer was prefetched in advance by lookahead routing, reuse its slots and events!
@@ -856,13 +922,6 @@ public:
                 lookahead_prefetch.is_active = false;
             } else {
                 active_prefetch = dispatch_layer_prefetch(l, h_topk_indices);
-            }
-            materialize_layer_prefetch(active_prefetch);
-
-            for (int k = 0; k < 6; ++k) {
-                pending_transfers[k].vram_slot = active_prefetch.vram_slots[k];
-                pending_transfers[k].is_prefetched = active_prefetch.is_prefetched[k];
-                pending_transfers[k].staging_idx = active_prefetch.staging_indices[k];
             }
 
             // Lookahead prefetch trigger for Layer L+1:
@@ -908,6 +967,16 @@ public:
                 dim3(H, 1), dim3(32), 0, compute_stream,
                 scratch.d_shared_swiglu, layer.d_shared_w2, scratch.d_moe_accum, INTER_DIM
             );
+
+            // Let cold NVMe reads overlap the shared expert pass; materialization
+            // still completes before the first routed expert consumes each slot.
+            materialize_layer_prefetch(active_prefetch);
+
+            for (int k = 0; k < 6; ++k) {
+                pending_transfers[k].vram_slot = active_prefetch.vram_slots[k];
+                pending_transfers[k].is_prefetched = active_prefetch.is_prefetched[k];
+                pending_transfers[k].staging_idx = active_prefetch.staging_indices[k];
+            }
 
             // 3. 6 Routed Experts (INT4-W4A16 WMMA GEMM)
             for (int k = 0; k < 6; ++k) {
@@ -963,6 +1032,12 @@ public:
                 );
             }
 
+            for (int k = 0; k < 6; ++k) {
+                if (pending_transfers[k].is_prefetched) {
+                    releasable_staging_slots.push_back(pending_transfers[k].staging_idx);
+                }
+            }
+
             // -----------------------------------------------------------------
             // I. HC FFN Post Expansion: res_out = comb_f * res_mid + post_f * moe_accum
             // -----------------------------------------------------------------
@@ -1006,7 +1081,7 @@ public:
         std::vector<half> h_logits(129280);
         CHECK_HIP(hipMemcpyAsync(h_logits.data(), scratch.d_logits, 129280 * sizeof(half), hipMemcpyDeviceToHost, compute_stream));
         CHECK_HIP(hipStreamSynchronize(compute_stream));
-        for (uint32_t staging_idx : direct_staging_slots) {
+        for (uint32_t staging_idx : releasable_staging_slots) {
             prefetch_staging_->release_after_gpu_transfer(staging_idx);
         }
 
@@ -1073,6 +1148,7 @@ public:
     void free_all() {
         if (compute_stream) { (void)hipStreamSynchronize(compute_stream); }
         if (sdma_stream) { (void)hipStreamSynchronize(sdma_stream); }
+        clear_pending_warm_slots();
         if (compute_stream) { (void)hipStreamDestroy(compute_stream); compute_stream = 0; }
         if (sdma_stream) { (void)hipStreamDestroy(sdma_stream); sdma_stream = 0; }
         if (d_cos_cache_) { (void)hipFree(d_cos_cache_); d_cos_cache_ = nullptr; }
@@ -1099,8 +1175,116 @@ public:
     }
 
 private:
+    void wait_for_pending_warm_slot(uint32_t host_slot) {
+        auto event_it = pending_warm_events_.find(host_slot);
+        if (event_it == pending_warm_events_.end()) return;
+        CHECK_HIP(hipEventSynchronize(event_it->second));
+        (void)hipEventDestroy(event_it->second);
+        pending_warm_events_.erase(event_it);
+    }
+
+    void record_pending_warm_slot(uint32_t host_slot) {
+        wait_for_pending_warm_slot(host_slot);
+        hipEvent_t event = nullptr;
+        CHECK_HIP(hipEventCreateWithFlags(&event, hipEventDisableTiming));
+        CHECK_HIP(hipEventRecord(event, sdma_stream));
+        pending_warm_events_.emplace(host_slot, event);
+    }
+
+    void clear_pending_warm_slots() {
+        for (auto& [host_slot, event] : pending_warm_events_) {
+            (void)host_slot;
+            if (event) (void)hipEventDestroy(event);
+        }
+        pending_warm_events_.clear();
+    }
+
+    void read_experts_direct_blocking(
+        const std::vector<std::pair<uint32_t, uint32_t>>& expert_ids,
+        const std::vector<uint8_t*>& destinations
+    ) {
+        if (expert_ids.size() != destinations.size()) {
+            throw std::invalid_argument("V4Pipeline: direct expert read batch has mismatched inputs");
+        }
+        if (expert_ids.empty()) return;
+        if (!direct_io_reader_) {
+            throw std::runtime_error("V4Pipeline: direct expert reader is not initialized");
+        }
+
+        const size_t requests_per_expert =
+            (AEON_EXPERT_BYTES + aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES - 1) /
+            aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
+        const size_t max_batch_experts = std::max<size_t>(
+            1, direct_io_reader_->submission_capacity() / requests_per_expert);
+
+        struct ReadJob {
+            uint64_t first_user_data{0};
+            size_t request_count{0};
+        };
+
+        for (size_t batch_start = 0; batch_start < expert_ids.size(); batch_start += max_batch_experts) {
+            const size_t batch_end = std::min(expert_ids.size(), batch_start + max_batch_experts);
+            std::vector<ReadJob> jobs;
+            jobs.reserve(batch_end - batch_start);
+            size_t total_requests = 0;
+
+            for (size_t i = batch_start; i < batch_end; ++i) {
+                const auto location = aeon_loader.get_expert_location(
+                    expert_ids[i].first, expert_ids[i].second);
+                const uint64_t first_user_data = next_direct_io_id_;
+                const size_t request_count = direct_io_reader_->submit_read_chunks(
+                    aeon_loader.expert_direct_fd(),
+                    destinations[i],
+                    location.byte_length,
+                    location.file_offset,
+                    first_user_data
+                );
+                next_direct_io_id_ += request_count;
+                total_requests += request_count;
+                jobs.push_back(ReadJob{first_user_data, request_count});
+            }
+
+            const size_t submitted = direct_io_reader_->submit_pending_reads();
+            if (submitted != total_requests) {
+                throw std::runtime_error("V4Pipeline: direct expert batch submitted an unexpected request count");
+            }
+
+            std::unordered_map<uint64_t, aeon::io::DirectIOCompletion> completions;
+            completions.reserve(total_requests);
+            for (size_t i = 0; i < total_requests; ++i) {
+                const auto completion = direct_io_reader_->wait_for_completion();
+                completions.emplace(completion.user_data, completion);
+            }
+
+            for (const auto& job : jobs) {
+                for (size_t chunk = 0; chunk < job.request_count; ++chunk) {
+                    const uint64_t request_id = job.first_user_data + chunk;
+                    const auto completion_it = completions.find(request_id);
+                    if (completion_it == completions.end()) {
+                        throw std::runtime_error("V4Pipeline: missing direct expert completion");
+                    }
+
+                    const auto completion = completion_it->second;
+                    if (completion.result < 0) {
+                        throw std::runtime_error("V4Pipeline: direct expert read failed: " +
+                                                 std::string(strerror(-completion.result)));
+                    }
+                    const size_t chunk_offset = chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
+                    const size_t expected_bytes = std::min(
+                        aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
+                        static_cast<size_t>(AEON_EXPERT_BYTES) - chunk_offset
+                    );
+                    if (completion.result != static_cast<int32_t>(expected_bytes)) {
+                        throw std::runtime_error("V4Pipeline: direct expert read returned a short payload");
+                    }
+                }
+            }
+        }
+    }
+
     float* d_cos_cache_{nullptr};
     float* d_sin_cache_{nullptr};
+    std::unordered_map<uint32_t, hipEvent_t> pending_warm_events_;
 };
 
 } // namespace aeon::core

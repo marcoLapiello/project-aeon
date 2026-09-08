@@ -31,9 +31,10 @@ Always consult these authoritative documents for deep technical specifics:
 - [x] Completed the architectural research, model specialization decisions, and Phase 0 foundations. The project now has a working HIP/CMake base, hardware discovery, Wave32 WMMA validation, direct-I/O primitives, SDMA overlap checks, and the original toy MoE cache path. See [Phase 0 Execution Plan](plans-and-docs/PHASE_0_EXECUTION_PLAN.md).
 - [x] Completed Phase 1: a single-GPU DeepSeek-V4 INT4-W4A16 runtime with configuration and Safetensors loading, fused kernels, MoE routing, sliding-window attention, transformer blocks, and multi-layer autoregressive generation. See [Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md).
 - [x] Completed Phase 2 Spike 0: lossless Safetensors-to-`.aeon` repacking with separate dense and routed-expert containers, 4096-byte alignment, expert indexing, and bit-exact verification. See [Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) and [Performance & Accuracy Ledger](plans-and-docs/PERFORMANCE_LEDGER.md).
-- [x] Completed the implementation portion of Phase 2 Spike 1: dynamic memory budgeting, startup feasibility checks, a unified VRAM expert pool, Host RAM expert staging, expert residency tracking, and full-model silicon benchmarks. The full three-tier preload remains blocked by host-memory pressure and is documented in the Phase 2 plan.
+- [x] Completed the implementation portion of Phase 2 Spike 1: dynamic memory budgeting, startup feasibility checks, a unified VRAM expert pool, Host RAM expert staging, expert residency tracking, and full-model silicon benchmarks. The original contiguous three-tier preload was blocked by host-memory pressure; the later bounded segmented Warm-tier integration is recorded below.
 - [x] Completed Phase 2 Pipeline Modularization Step 1: carved out HIP utility kernels to `src/kernel/v4_pipeline_ops.hpp`, scratch activation arena to `src/core/v4_pipeline_scratch.hpp`, and layer structure to `src/core/v4_layer.hpp`, cutting the monolithic `v4_pipeline.hpp` from ~1,500 down to 920 lines with full silicon test verification.
 - [x] Completed Phase 2 Pipeline Modularization Step 2: eliminated the dual-cache split, retired per-layer local LRU caches, standardized all pipelines on `UnifiedVRAMExpertPool` + `ExpertRegistry`, and removed hardcoded slot counts in favor of dynamic runtime configuration. Passed bit-exact tests on silicon (`test_dynamic_expert_pool`, `test_aeon_pipeline`, `test_v4_pipeline`).
+- [x] Connected a bounded Hot/Warm/Cold runtime path: segmented Warm Host storage, direct `io_uring` population for initial Hot and Warm residents, VRAM-to-host demotion, safe Warm-to-Hot promotion, and multi-layer staging reuse. The 43-layer silicon smoke test passes with 676 Hot slots, 8 Warm slots, and direct Cold misses; full-capacity performance measurement remains open.
 
 ### Present (In Progress)
 - [ ] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Single-GPU 3-Tier Storage & Memory Hierarchy Optimization**:
@@ -54,7 +55,11 @@ Always consult these authoritative documents for deep technical specifics:
     - [x] Implemented batched `io_uring` requests, validated expert offsets, dedicated `O_DIRECT` model descriptor, and staging-slot ownership cleanup.
     - [x] Corrected synchronous regular-file submissions by enabling `IOSQE_ASYNC` and splitting expert payloads into 4 MiB aligned subreads.
     - [x] Integrated direct cold reads into the native pipeline and passed model parity plus silicon generation regressions.
-    - [ ] Reach the `>= 6.0 GB/s` model-backed throughput target and complete the Tier 2 warm-cache end-to-end measurement; remaining work is dominated by physical expert placement and storage-layout optimization.
+    - [x] Replaced contiguous Warm Host allocation with segmented slabs and populated bounded Hot/Warm residents through direct I/O; added Hot-to-Warm DMA demotion and safe multi-layer staging reuse.
+    - [x] Ran the full 43-layer benchmark with 606 direct-populated Warm slots (`7.99 GiB`): 555 Warm hits and 601 Cold misses, with valid output at `3.98 tok/s`.
+    - [x] Ran the target 35 GiB Warm profile with 2,654 direct-populated slots: 684 Warm hits and 472 Cold misses, with valid output at `3.95 tok/s`; the run completed but increased observed swap usage by approximately `0.7 GiB`.
+    - [x] Removed the synchronous Hot-to-Warm demotion wait and validated the controlled A/B: `4.37 tok/s` with Warm disabled versus `5.15 tok/s` with the 35 GiB Warm profile; output remained identical.
+    - [ ] Reduce host-memory pressure, remove the remaining Warm Host staging `memcpy`, reach the `>= 6.0 GB/s` model-backed throughput target, and complete controlled Tier 2 end-to-end measurements; remaining work is dominated by physical expert placement and storage-layout optimization.
 
 ### Future (Upcoming Next)
 - [ ] **Phase 3 — Multi-GPU Pipeline Parallelism**:

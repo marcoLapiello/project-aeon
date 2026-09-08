@@ -7,8 +7,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace aeon::core {
@@ -17,7 +19,10 @@ namespace aeon::core {
 // Allocates page-locked (pinned) system memory via hipHostMalloc for ultra-fast PCIe SDMA (25 GB/s)
 class HostExpertPool {
 public:
+    static constexpr uint32_t SEGMENT_SLOTS = 64;
+
     uint32_t num_slots{0};
+    // Compatibility view for callers that only need the first segment.
     uint8_t* h_pinned_buffer{nullptr};
 
     HostExpertPool() = default;
@@ -46,56 +51,85 @@ public:
     }
 
     void allocate(uint32_t slots) {
+        free();
         if (slots == 0) return;
         num_slots = slots;
 
-        size_t total_bytes = static_cast<size_t>(num_slots) * AEON_EXPERT_BYTES;
-        uses_hip_host_malloc_ = false;
+        const uint32_t segment_count = (num_slots + SEGMENT_SLOTS - 1) / SEGMENT_SLOTS;
+        segments_.reserve(segment_count);
+        bool reported_pinned_fallback = false;
 
-        // Use hipHostMalloc with hipHostMallocPortable for high-throughput PCIe DMA transfers
-        hipError_t err = hipHostMalloc(reinterpret_cast<void**>(&h_pinned_buffer), total_bytes, hipHostMallocPortable);
-        if (err != hipSuccess) {
-            // Fallback to posix_memalign if hipHostMalloc fails due to OS ulimit
-            std::cerr << "[HostExpertPool] Warning: hipHostMalloc failed (" << hipGetErrorString(err)
-                      << "), attempting 4KB-aligned posix_memalign..." << std::endl;
-            void* ptr = nullptr;
-            int ret = posix_memalign(&ptr, AEON_SECTOR_SIZE, total_bytes);
-            if (ret != 0 || ptr == nullptr) {
-                throw std::runtime_error("HostExpertPool: Failed to allocate " +
-                                         std::to_string(total_bytes / (1024 * 1024)) + " MB of host memory!");
+        try {
+            for (uint32_t segment_idx = 0; segment_idx < segment_count; ++segment_idx) {
+                Segment segment;
+                segment.slot_count = std::min(SEGMENT_SLOTS,
+                                              num_slots - segment_idx * SEGMENT_SLOTS);
+                const size_t segment_bytes = static_cast<size_t>(segment.slot_count) * AEON_EXPERT_BYTES;
+
+                hipError_t err = hipHostMalloc(reinterpret_cast<void**>(&segment.base),
+                                                segment_bytes, hipHostMallocPortable);
+                if (err != hipSuccess) {
+                    if (!reported_pinned_fallback) {
+                        std::cerr << "[HostExpertPool] hipHostMalloc failed (" << hipGetErrorString(err)
+                                  << "); using sector-aligned host segments where pinning is unavailable."
+                                  << std::endl;
+                        reported_pinned_fallback = true;
+                    }
+                    void* ptr = nullptr;
+                    const int ret = posix_memalign(&ptr, AEON_SECTOR_SIZE, segment_bytes);
+                    if (ret != 0 || ptr == nullptr) {
+                        throw std::runtime_error("HostExpertPool: Failed to allocate " +
+                                                 std::to_string(segment_bytes / (1024 * 1024)) +
+                                                 " MB host segment");
+                    }
+                    segment.base = static_cast<uint8_t*>(ptr);
+                    segment.uses_hip_host_malloc = false;
+                } else {
+                    segment.uses_hip_host_malloc = true;
+                }
+                segments_.push_back(segment);
             }
-            h_pinned_buffer = static_cast<uint8_t*>(ptr);
-        } else {
-            uses_hip_host_malloc_ = true;
+        } catch (...) {
+            free();
+            throw;
         }
+
+        h_pinned_buffer = segments_.front().base;
     }
 
     void free() {
-        if (h_pinned_buffer) {
-            if (uses_hip_host_malloc_) {
-                (void)hipHostFree(h_pinned_buffer);
+        for (auto& segment : segments_) {
+            if (!segment.base) continue;
+            if (segment.uses_hip_host_malloc) {
+                (void)hipHostFree(segment.base);
             } else {
-                std::free(h_pinned_buffer);
+                std::free(segment.base);
             }
-            h_pinned_buffer = nullptr;
         }
-        uses_hip_host_malloc_ = false;
+        segments_.clear();
+        h_pinned_buffer = nullptr;
         num_slots = 0;
     }
 
     // Direct pointer to contiguous 14.15 MB expert payload at slot index
     uint8_t* get_expert_slot_ptr(uint32_t slot_idx) {
-        if (slot_idx >= num_slots) {
+        const uint32_t segment_idx = slot_idx / SEGMENT_SLOTS;
+        const uint32_t segment_slot = slot_idx % SEGMENT_SLOTS;
+        if (slot_idx >= num_slots || segment_idx >= segments_.size() ||
+            segment_slot >= segments_[segment_idx].slot_count) {
             throw std::runtime_error("HostExpertPool: Invalid slot index " + std::to_string(slot_idx));
         }
-        return h_pinned_buffer + static_cast<size_t>(slot_idx) * AEON_EXPERT_BYTES;
+        return segments_[segment_idx].base + static_cast<size_t>(segment_slot) * AEON_EXPERT_BYTES;
     }
 
     const uint8_t* get_expert_slot_ptr(uint32_t slot_idx) const {
-        if (slot_idx >= num_slots) {
+        const uint32_t segment_idx = slot_idx / SEGMENT_SLOTS;
+        const uint32_t segment_slot = slot_idx % SEGMENT_SLOTS;
+        if (slot_idx >= num_slots || segment_idx >= segments_.size() ||
+            segment_slot >= segments_[segment_idx].slot_count) {
             throw std::runtime_error("HostExpertPool: Invalid slot index " + std::to_string(slot_idx));
         }
-        return h_pinned_buffer + static_cast<size_t>(slot_idx) * AEON_EXPERT_BYTES;
+        return segments_[segment_idx].base + static_cast<size_t>(segment_slot) * AEON_EXPERT_BYTES;
     }
 
     // Sub-tensor pointers within a host slot
@@ -125,16 +159,22 @@ public:
     }
 
 private:
-    bool uses_hip_host_malloc_{false};
+    struct Segment {
+        uint8_t* base{nullptr};
+        uint32_t slot_count{0};
+        bool uses_hip_host_malloc{false};
+    };
+
+    std::vector<Segment> segments_;
 
     void move_from(HostExpertPool&& other) {
         num_slots = other.num_slots;
         h_pinned_buffer = other.h_pinned_buffer;
-        uses_hip_host_malloc_ = other.uses_hip_host_malloc_;
+        segments_ = std::move(other.segments_);
 
         other.num_slots = 0;
         other.h_pinned_buffer = nullptr;
-        other.uses_hip_host_malloc_ = false;
+        other.segments_.clear();
     }
 };
 

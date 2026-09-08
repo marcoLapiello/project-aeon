@@ -140,6 +140,24 @@ public:
         CHECK_HIP(hipMemcpyAsync(get_w3_scale(slot_idx),  p + AEON_W3_SCALE_OFFSET,  W3_SCALE_BYTES,  hipMemcpyHostToDevice, stream));
     }
 
+    void download_to_host_expert(
+        uint32_t slot_idx,
+        uint8_t* host_expert_payload,
+        hipStream_t stream = 0
+    ) const {
+        if (slot_idx >= num_slots || host_expert_payload == nullptr) {
+            throw std::runtime_error("UnifiedVRAMExpertPool: Invalid download destination");
+        }
+
+        uint8_t* p = host_expert_payload;
+        CHECK_HIP(hipMemcpyAsync(p + AEON_W1_PACKED_OFFSET, get_w1_packed(slot_idx), W1_PACKED_BYTES, hipMemcpyDeviceToHost, stream));
+        CHECK_HIP(hipMemcpyAsync(p + AEON_W1_SCALE_OFFSET,  get_w1_scale(slot_idx),  W1_SCALE_BYTES,  hipMemcpyDeviceToHost, stream));
+        CHECK_HIP(hipMemcpyAsync(p + AEON_W2_PACKED_OFFSET, get_w2_packed(slot_idx), W2_PACKED_BYTES, hipMemcpyDeviceToHost, stream));
+        CHECK_HIP(hipMemcpyAsync(p + AEON_W2_SCALE_OFFSET,  get_w2_scale(slot_idx),  W2_SCALE_BYTES,  hipMemcpyDeviceToHost, stream));
+        CHECK_HIP(hipMemcpyAsync(p + AEON_W3_PACKED_OFFSET, get_w3_packed(slot_idx), W3_PACKED_BYTES, hipMemcpyDeviceToHost, stream));
+        CHECK_HIP(hipMemcpyAsync(p + AEON_W3_SCALE_OFFSET,  get_w3_scale(slot_idx),  W3_SCALE_BYTES,  hipMemcpyDeviceToHost, stream));
+    }
+
     // Stream an expert from individual host pointers (Safetensors host source) into this slot asynchronously
     void upload_from_pointers(
         uint32_t slot_idx,

@@ -155,6 +155,12 @@ target_link_libraries(test_dynamic_expert_pool PRIVATE amdhip64)
 add_test(NAME test_dynamic_expert_pool COMMAND test_dynamic_expert_pool)
 set_tests_properties(test_dynamic_expert_pool PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Phase 2 end-to-end smoke test: direct hot/warm initialization and cold streaming
+add_executable(test_hot_warm_cold_pipeline tests/test_hot_warm_cold_pipeline.cpp)
+target_link_libraries(test_hot_warm_cold_pipeline PRIVATE amdhip64)
+add_test(NAME test_hot_warm_cold_pipeline COMMAND test_hot_warm_cold_pipeline)
+set_tests_properties(test_hot_warm_cold_pipeline PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Phase 2 Spike 2 validation: dual-stream asynchronous SDMA prefetching
 add_executable(test_async_prefetch tests/test_async_prefetch.cpp)
 target_link_libraries(test_async_prefetch PRIVATE amdhip64)

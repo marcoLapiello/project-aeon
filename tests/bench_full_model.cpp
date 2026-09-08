@@ -2,11 +2,13 @@
 #include "core/v4_pipeline.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
-int main() {
+int main(int argc, char** argv) {
     std::cout << "================================================================================" << std::endl;
     std::cout << "  Project Aeon: 43-Layer Full-Model Autoregressive Inference Benchmark          " << std::endl;
     std::cout << "  Model: DeepSeek-V4-Flash-0731 (INT4-W4A16, 43 Layers, 11,008 Routed Experts)  " << std::endl;
@@ -20,9 +22,12 @@ int main() {
     // 1. Configure runtime for full 43-layer model
     aeon::core::V4Pipeline pipeline;
     aeon::core::AeonRuntimeConfig pipeline_cfg;
+    const uint64_t warm_host_gib = argc > 1 ? std::stoull(argv[1]) : 35;
     pipeline_cfg.context_size = 4096; // 4096 tokens context
-    pipeline_cfg.host_ram_bytes = 35ULL * 1024ULL * 1024ULL * 1024ULL; // 35 GiB warm staging ceiling
-    pipeline_cfg.preload_warm_host = false;
+    pipeline_cfg.host_ram_bytes = warm_host_gib * 1024ULL * 1024ULL * 1024ULL;
+    pipeline_cfg.preload_warm_host = warm_host_gib > 0;
+    std::cout << "[Profile] Warm Host budget: " << warm_host_gib << " GiB"
+              << (pipeline_cfg.preload_warm_host ? " (enabled)" : " (disabled)") << std::endl;
 
     std::cout << "\n[Step 1] Initializing complete 43-layer pipeline..." << std::endl;
     auto t_init_start = std::chrono::high_resolution_clock::now();
@@ -81,6 +86,8 @@ int main() {
     std::cout << "  > Tier 1 VRAM Cache Hits  : " << hits << std::endl;
     std::cout << "  > Tier 1 VRAM Cache Misses: " << misses << std::endl;
     std::cout << "  > Tier 1 VRAM Hit Rate    : " << std::fixed << std::setprecision(1) << hit_rate << " %" << std::endl;
+    std::cout << "  > Tier 2 Warm Host Hits   : " << pipeline.expert_registry_->hits_warm << std::endl;
+    std::cout << "  > Tier 3 Cold NVMe Misses : " << pipeline.expert_registry_->misses_cold << std::endl;
     std::cout << "================================================================================" << std::endl;
 
     return 0;

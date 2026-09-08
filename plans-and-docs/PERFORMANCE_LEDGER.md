@@ -140,3 +140,44 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
   - Unit clarification: each expert is `14,155,776` bytes, exactly `3,456` sectors, which is `13.5 MiB` or `14.155776 MB` decimal. The apparent `13.5 MB` versus `14.15 MB` discrepancy is binary versus decimal notation, not a format change.
   - End-to-end A/B (`bench_async_prefetch_io_modes`, identical 12-slot native pipeline): direct I/O measured `32.31` and `32.57 tok/s`; mmap source measured `33.57` and `33.22 tok/s`, with identical generated tokens. The mmap case warms its page-cache pages during the warmup step, while O_DIRECT bypasses that cache, so this is a steady-state behavior comparison rather than a cold-cache equivalence test.
   - Tier 2 warm-cache population remains disabled for this checkpoint because the prior contiguous preload caused host-memory pressure and swap contention.
+
+### M12: Direct Warm-Tier Population & Bounded 3-Tier Integration (Phase 2 Spike 3)
+* **Date**: 2026-09-08 | **Status**: Bounded integration passed; capacity/performance measurement open | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers)
+* **Configuration**: Context 256; 676 Hot VRAM slots (`8.91 GiB`); 8 segmented Warm Host slots (`105.47 MiB`); 10,324 Cold NVMe slots.
+* **Implementation**:
+  - Initial Hot and Warm residents are populated through bounded 4 MiB `O_DIRECT`/`io_uring` batches; the dynamic-global preload no longer reads routed experts through the expert mmap.
+  - Hot-to-Warm demotion uses VRAM-to-host DMA, and Warm-to-Hot promotion snapshots the warm payload before registry slot reuse.
+  - Multi-layer staging ownership was corrected so the fixed 12-slot arena can be reused across all 43 layers.
+* **Silicon validation**:
+  - `test_hot_warm_cold_pipeline` passed on RX 7900 XTX with valid token `295`, 12 Hot hits, 0 Warm hits, and 24 Cold misses in one 43-layer step.
+  - Focused Phase 2 group passed `5/5`: model direct-I/O parity, native pipeline, dynamic pool, asynchronous prefetch, and bounded hot/warm/cold integration.
+* **Interpretation**: Direct I/O has now unlocked a real bounded Hot -> Warm -> Cold runtime path. The one-step workload did not select one of the eight preloaded Warm experts, so Warm-hit latency is not yet measured. Full-capacity Warm preload, controlled cold-cache comparison, storage-layout optimization, and the `>= 6.0 GB/s` model-backed target remain open.
+
+### M13: Full-Model Direct Warm-Tier Benchmark (Phase 2 Spike 3)
+* **Date**: 2026-09-08 | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers, 11,008 routed experts)
+* **Configuration**: Context 4096; 664 Hot VRAM slots (`8.75 GiB`); 606 Warm Host slots (`7.99 GiB`); 9,738 Cold NVMe slots. Warm pool was populated through bounded 4 MiB `O_DIRECT`/`io_uring` reads.
+* **Initialization**: `8.59 s`.
+* **Measured generation**: 4 prompt tokens -> 8 generated tokens; output `[237, 223, 223, 223, 223, 223, 223, 223]`.
+* **Performance**: TTFT `2,455.05 ms`; total measured execution `4,215.70 ms`; decode `3.98 tok/s` (`251.51 ms/tok`).
+* **Tier service counts**: 1,682 Hot hits; 555 Warm Host hits; 601 Cold NVMe misses. Warm served `48.0%` of the lower-tier requests in this run.
+* **Interpretation**: The significant Warm pool is now serving the full 43-layer inference path. This is a functional integration milestone, not the final performance target: the run still exposes 601 Cold requests, and the full approximately 35 GiB Warm configuration, controlled cold-cache A/B, storage-layout optimization, and the `>= 6.0 GB/s` model-backed target remain open.
+
+### M14: Full-Capacity Warm-Tier Benchmark (Phase 2 Spike 3)
+* **Date**: 2026-09-08 | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers, 11,008 routed experts)
+* **Configuration**: Context 4096; 664 Hot VRAM slots (`8.75 GiB`); 2,654 Warm Host slots (`34.99 GiB`); 7,690 Cold NVMe slots. Warm pool was populated through bounded 4 MiB `O_DIRECT`/`io_uring` reads.
+* **Initialization**: `24.05 s`; all 2,654 Warm slots allocated and populated successfully.
+* **Measured generation**: 4 prompt tokens -> 8 generated tokens; output `[237, 223, 223, 223, 223, 223, 223, 223]`.
+* **Performance**: TTFT `2,408.78 ms`; total measured execution `4,179.34 ms`; decode `3.95 tok/s` (`252.92 ms/tok`).
+* **Tier service counts**: 1,682 Hot hits; 684 Warm Host hits; 472 Cold NVMe misses. Warm served `59.2%` of the lower-tier requests in this run.
+* **Host-memory observation**: The process exited cleanly and returned host memory, but observed swap usage increased by approximately `0.7 GiB` during the run. The target capacity is therefore operational but still requires memory-pressure tuning before being treated as the default profile.
+* **Interpretation**: Full-capacity Warm integration is complete. This pre-scheduling-fix run exposed the cost of synchronously demoting every evicted Hot expert into Warm. Remaining work is controlled cold-cache A/B measurement, reducing host pressure, physical expert-layout optimization, and reaching the `>= 6.0 GB/s` model-backed target.
+
+### M15: Asynchronous Hot-to-Warm Demotion Validation (Phase 2 Spike 3)
+* **Date**: 2026-09-08 | **Status**: Correctness and controlled Warm benefit validated | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers)
+* **Root cause fixed**: The first 35 GiB Warm implementation synchronously waited for a 14.15 MiB VRAM-to-host demotion on every non-Hot request. That made the Warm profile slower despite serving 684 Warm requests.
+* **Fix**: Hot-to-Warm device-to-host transfers are now enqueued on `sdma_stream` with per-host-slot HIP events. The CPU waits only when a pending Warm payload is consumed or its host slot is about to be overwritten.
+* **Controlled A/B**: Identical 43-layer workload, context 4096, 664 Hot slots, 4 prompt tokens -> 8 generated tokens.
+  - Warm disabled (`0 GiB`): `4.37 tok/s`, 1,682 Hot hits, 1,156 Cold misses.
+  - Warm enabled (`35 GiB`): `5.15 tok/s`, 1,682 Hot hits, 684 Warm hits, 472 Cold misses.
+  - Generated token sequences were identical: `[237, 223, 223, 223, 223, 223, 223, 223]`.
+* **Interpretation**: Warm is now demonstrably active and beneficial: `+17.8%` decode throughput versus the direct-cold control. The stable `59.3%` Hot hit rate is expected because Hot capacity and the routed access sequence are unchanged; Warm capacity changes lower-tier service cost, not Hot residency capacity.
