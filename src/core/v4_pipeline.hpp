@@ -65,9 +65,8 @@ public:
     uint32_t num_layers_{0};
     uint32_t current_seq_len_{0};
 
-    // Global VRAM expert pool, warm host pool, and expert registry.
-    bool use_global_pool_{false};
-    std::unique_ptr<GlobalVRAMExpertPool> global_pool_;
+    // Unified VRAM expert pool, warm host pool, and expert registry.
+    std::unique_ptr<UnifiedVRAMExpertPool> unified_vram_pool_;
     std::unique_ptr<HostExpertPool> host_pool_;
     std::unique_ptr<ExpertRegistry> expert_registry_;
     MemoryBudgetReport budget_report_;
@@ -81,7 +80,7 @@ public:
     void init(
         const std::string& snapshot_dir,
         uint32_t num_layers = 2,
-        uint32_t vram_slots_per_layer = 8,
+        uint32_t unified_vram_slots = 0,
         uint32_t max_seq_len = 4096
     ) {
         std::cout << "================================================================================" << std::endl;
@@ -151,19 +150,24 @@ public:
         // 6. Initialize Consecutive Transformer Layers
         layers.resize(num_layers_);
         for (uint32_t l = 0; l < num_layers_; ++l) {
-            std::cout << "[Pipeline] Initializing DeepSeek-V4 Layer " << l << " (Tier 1 slots=" << vram_slots_per_layer << ")..." << std::endl;
             layers[l] = std::make_unique<V4Layer>();
-            layers[l]->init(l, loader, max_seq_len, vram_slots_per_layer);
+            layers[l]->init(l, loader, max_seq_len);
         }
 
-        std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers." << std::endl;
+        // 7. Setup Unified VRAM Pool and Expert Registry
+        uint32_t active_vram_slots = unified_vram_slots > 0 ? unified_vram_slots : std::max(num_layers_ * 8u, 16u);
+        unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(active_vram_slots);
+        expert_registry_ = std::make_unique<ExpertRegistry>(num_layers_, 256, active_vram_slots, 0);
+
+        std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers with "
+                  << active_vram_slots << " unified VRAM expert slots." << std::endl;
     }
 
     // Initialize pipeline directly from native .aeon format folder
     void init_aeon(
         const std::string& aeon_model_dir,
         uint32_t num_layers = 2,
-        uint32_t vram_slots_per_layer = 8,
+        uint32_t unified_vram_slots = 0,
         uint32_t max_seq_len = 4096
     ) {
         num_layers_ = num_layers;
@@ -221,12 +225,29 @@ public:
         // 6. Initialize Consecutive Transformer Layers
         layers.resize(num_layers_);
         for (uint32_t l = 0; l < num_layers_; ++l) {
-            std::cout << "[Pipeline] Initializing DeepSeek-V4 Layer " << l << " (Tier 1 slots=" << vram_slots_per_layer << ")..." << std::endl;
             layers[l] = std::make_unique<V4Layer>();
-            layers[l]->init(l, aeon_loader, max_seq_len, vram_slots_per_layer);
+            layers[l]->init(l, aeon_loader, max_seq_len);
         }
 
-        std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers with native .aeon format." << std::endl;
+        // 7. Setup Unified VRAM Pool and Expert Registry
+        uint32_t active_vram_slots = unified_vram_slots > 0 ? unified_vram_slots : std::max(num_layers_ * 8u, 16u);
+        unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(active_vram_slots);
+        expert_registry_ = std::make_unique<ExpertRegistry>(num_layers_, 256, active_vram_slots, 0);
+
+        // Preload initial hot experts
+        for (uint32_t slot = 0; slot < active_vram_slots; ++slot) {
+            int32_t gid = expert_registry_->vram_slots[slot];
+            if (gid >= 0) {
+                uint32_t lay = expert_registry_->catalog[gid].layer_id;
+                uint32_t exp = expert_registry_->catalog[gid].expert_id;
+                const uint8_t* p = aeon_loader.get_expert_data(lay, exp);
+                unified_vram_pool_->upload_from_host_expert(slot, p, compute_stream);
+            }
+        }
+        CHECK_HIP(hipStreamSynchronize(compute_stream));
+
+        std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers with "
+                  << active_vram_slots << " unified VRAM expert slots in native .aeon format." << std::endl;
     }
 
     // Initialize dynamic memory budgeting and the unified VRAM expert pool.
@@ -239,7 +260,6 @@ public:
         std::cout << "      Project Aeon — Dynamic VRAM Budget & Global Expert Pool Pipeline          " << std::endl;
         std::cout << "================================================================================" << std::endl;
 
-        use_global_pool_ = true;
         num_layers_ = num_layers;
         current_seq_len_ = 0;
 
@@ -312,10 +332,10 @@ public:
         }
         std::cout << "  > Dense weights and KV cache for all " << num_layers_ << " layers uploaded to VRAM." << std::endl;
 
-        // 8. Allocate Global VRAM Expert Pool (Hot Pool)
-        std::cout << "[Pipeline] Allocating Global VRAM Expert Pool (" << budget_report_.hot_vram_slots << " slots, "
+        // 8. Allocate Unified VRAM Expert Pool (Hot Pool)
+        std::cout << "[Pipeline] Allocating Unified VRAM Expert Pool (" << budget_report_.hot_vram_slots << " slots, "
                   << (budget_report_.hot_vram_bytes / (1024*1024*1024.0)) << " GB)..." << std::endl;
-        global_pool_ = std::make_unique<GlobalVRAMExpertPool>(budget_report_.hot_vram_slots);
+        unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(budget_report_.hot_vram_slots);
 
         // 9. Initialize Expert Registry Catalog
         std::cout << "[Pipeline] Initializing Expert Registry (VRAM=" << budget_report_.hot_vram_slots
@@ -325,15 +345,15 @@ public:
             budget_report_.hot_vram_slots, budget_report_.warm_host_slots
         );
 
-        // 10. Preload Hot VRAM slots into Global Pool
-        std::cout << "[Pipeline] Pre-populating Hot VRAM slots into Global Pool..." << std::endl;
+        // 10. Preload Hot VRAM slots into Unified Pool
+        std::cout << "[Pipeline] Pre-populating Hot VRAM slots into Unified Pool..." << std::endl;
         for (uint32_t slot = 0; slot < budget_report_.hot_vram_slots; ++slot) {
             int32_t gid = expert_registry_->vram_slots[slot];
             if (gid >= 0) {
                 uint32_t lay = expert_registry_->catalog[gid].layer_id;
                 uint32_t exp = expert_registry_->catalog[gid].expert_id;
                 const uint8_t* p = aeon_loader.get_expert_data(lay, exp);
-                global_pool_->upload_from_host_expert(slot, p, compute_stream);
+                unified_vram_pool_->upload_from_host_expert(slot, p, compute_stream);
             }
         }
         CHECK_HIP(hipStreamSynchronize(compute_stream));
@@ -698,32 +718,21 @@ public:
                 const uint32_t* d_w3_p = nullptr;
                 const half*     d_w3_s = nullptr;
 
-                if (use_global_pool_) {
-                    // Global VRAM Expert Pool mode
-                    int32_t slot = expert_registry_->touch_hot_expert(l, expert_id, pos);
-                    if (slot < 0) {
-                        // Cache miss in Hot VRAM: check if resident in Tier 2 Warm Host DDR
-                        uint32_t gid = expert_registry_->get_global_id(l, expert_id);
-                        const auto& entry = expert_registry_->catalog[gid];
+                // Unified Cross-Layer VRAM Expert Pool lookup
+                int32_t slot = expert_registry_->touch_hot_expert(l, expert_id, pos);
+                if (slot < 0) {
+                    // Cache miss in Hot VRAM: check if resident in Tier 2 Warm Host DDR
+                    uint32_t gid = expert_registry_->get_global_id(l, expert_id);
+                    const auto& entry = expert_registry_->catalog[gid];
 
-                        const uint8_t* p = nullptr;
-                        if (entry.tier == ExpertTier::WARM_HOST && host_pool_ && entry.slot_idx >= 0) {
-                            // Hit in Tier 2 Warm Host DDR! DMA directly from physical host memory
-                            p = host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(entry.slot_idx));
-                        } else {
-                            // Cold NVMe: stream from disk via AeonModelLoader
-                            p = aeon_loader.get_expert_data(l, expert_id);
-                        }
+                    auto [allocated_slot, evicted_gid] = expert_registry_->allocate_vram_slot(gid);
 
-                        auto [allocated_slot, evicted_gid] = expert_registry_->allocate_vram_slot(gid);
-
-                        // If an expert was evicted from VRAM to Host DDR, copy its weights to host pool if space exists
-                        if (evicted_gid >= 0 && host_pool_) {
-                            const auto& ev_entry = expert_registry_->catalog[evicted_gid];
-                            if (ev_entry.tier == ExpertTier::WARM_HOST && ev_entry.slot_idx >= 0) {
-                                uint32_t ev_hslot = static_cast<uint32_t>(ev_entry.slot_idx);
-                                // The evicted expert is in allocated_slot in VRAM before overwrite
-                                // Copy its payload back to host staging buffer
+                    // If an expert was evicted from VRAM to Host DDR, copy its weights to host pool if space exists
+                    if (evicted_gid >= 0 && host_pool_) {
+                        const auto& ev_entry = expert_registry_->catalog[evicted_gid];
+                        if (ev_entry.tier == ExpertTier::WARM_HOST && ev_entry.slot_idx >= 0) {
+                            uint32_t ev_hslot = static_cast<uint32_t>(ev_entry.slot_idx);
+                            if (aeon_loader.total_dense_tensors() > 0) {
                                 const uint8_t* ev_raw = aeon_loader.get_expert_data(
                                     expert_registry_->catalog[evicted_gid].layer_id,
                                     expert_registry_->catalog[evicted_gid].expert_id
@@ -731,27 +740,48 @@ public:
                                 host_pool_->copy_from(ev_hslot, ev_raw);
                             }
                         }
-
-                        global_pool_->upload_from_host_expert(allocated_slot, p, compute_stream);
-                        slot = static_cast<int32_t>(allocated_slot);
                     }
-                    d_w1_p = global_pool_->get_w1_packed(slot);
-                    d_w1_s = global_pool_->get_w1_scale(slot);
-                    d_w2_p = global_pool_->get_w2_packed(slot);
-                    d_w2_s = global_pool_->get_w2_scale(slot);
-                    d_w3_p = global_pool_->get_w3_packed(slot);
-                    d_w3_s = global_pool_->get_w3_scale(slot);
-                } else {
-                    // Per-layer local pool fallback
-                    uint32_t slot = layer.acquire_expert_slot(expert_id, compute_stream);
-                    const auto& eslot = layer.vram_slots_[slot];
-                    d_w1_p = eslot.d_w1_packed;
-                    d_w1_s = eslot.d_w1_scale;
-                    d_w2_p = eslot.d_w2_packed;
-                    d_w2_s = eslot.d_w2_scale;
-                    d_w3_p = eslot.d_w3_packed;
-                    d_w3_s = eslot.d_w3_scale;
+
+                    if (entry.tier == ExpertTier::WARM_HOST && host_pool_ && entry.slot_idx >= 0) {
+                        // Hit in Tier 2 Warm Host DDR! DMA directly from physical host memory
+                        const uint8_t* p = host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(entry.slot_idx));
+                        unified_vram_pool_->upload_from_host_expert(allocated_slot, p, compute_stream);
+                    } else if (aeon_loader.total_dense_tensors() > 0) {
+                        // Cold NVMe: stream from .aeon disk container via AeonModelLoader
+                        const uint8_t* p = aeon_loader.get_expert_data(l, expert_id);
+                        unified_vram_pool_->upload_from_host_expert(allocated_slot, p, compute_stream);
+                    } else {
+                        // Stream from Safetensors host source
+                        std::string exp_pfx = "layers." + std::to_string(l) + ".ffn.experts." + std::to_string(expert_id) + ".";
+                        const auto* w1_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
+                        const auto* w1_s = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
+                        const auto* w2_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
+                        const auto* w2_s = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
+                        const auto* w3_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
+                        const auto* w3_s = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
+
+                        unified_vram_pool_->upload_from_pointers(
+                            allocated_slot,
+                            w1_p, w1_s,
+                            w2_p, w2_s,
+                            w3_p, w3_s,
+                            compute_stream
+                        );
+                    }
+
+                    slot = static_cast<int32_t>(allocated_slot);
                 }
+
+                d_w1_p = unified_vram_pool_->get_w1_packed(slot);
+                d_w1_s = unified_vram_pool_->get_w1_scale(slot);
+                d_w2_p = unified_vram_pool_->get_w2_packed(slot);
+                d_w2_s = unified_vram_pool_->get_w2_scale(slot);
+                d_w3_p = unified_vram_pool_->get_w3_packed(slot);
+                d_w3_s = unified_vram_pool_->get_w3_scale(slot);
+
+                // Update layer statistics from central expert registry
+                layer.cache_hits = expert_registry_->hits_hot;
+                layer.cache_misses = expert_registry_->hits_warm + expert_registry_->misses_cold;
 
                 // w1 & w3 via fused W4A16 WMMA
                 kernel::dispatch_w4a16_gemm(
@@ -905,7 +935,7 @@ public:
             if (l) l->free();
         }
         layers.clear();
-        global_pool_.reset();
+        unified_vram_pool_.reset();
         host_pool_.reset();
         expert_registry_.reset();
         loader.close_all();

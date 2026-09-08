@@ -19,9 +19,9 @@
 
 namespace aeon::core {
 
-// Global unified VRAM pool for S_hot routed INT4-W4A16 experts
+// Unified VRAM pool for S_hot routed INT4-W4A16 experts
 // Shared dynamically across all transformer layers
-class GlobalVRAMExpertPool {
+class UnifiedVRAMExpertPool {
 public:
     uint32_t num_slots{0};
 
@@ -47,24 +47,24 @@ public:
                                                  W2_PACKED_BYTES + W2_SCALE_BYTES +
                                                  W3_PACKED_BYTES + W3_SCALE_BYTES;
 
-    GlobalVRAMExpertPool() = default;
+    UnifiedVRAMExpertPool() = default;
 
-    explicit GlobalVRAMExpertPool(uint32_t slots) {
+    explicit UnifiedVRAMExpertPool(uint32_t slots) {
         allocate(slots);
     }
 
-    ~GlobalVRAMExpertPool() {
+    ~UnifiedVRAMExpertPool() {
         free();
     }
 
-    GlobalVRAMExpertPool(const GlobalVRAMExpertPool&) = delete;
-    GlobalVRAMExpertPool& operator=(const GlobalVRAMExpertPool&) = delete;
+    UnifiedVRAMExpertPool(const UnifiedVRAMExpertPool&) = delete;
+    UnifiedVRAMExpertPool& operator=(const UnifiedVRAMExpertPool&) = delete;
 
-    GlobalVRAMExpertPool(GlobalVRAMExpertPool&& other) noexcept {
+    UnifiedVRAMExpertPool(UnifiedVRAMExpertPool&& other) noexcept {
         move_from(std::move(other));
     }
 
-    GlobalVRAMExpertPool& operator=(GlobalVRAMExpertPool&& other) noexcept {
+    UnifiedVRAMExpertPool& operator=(UnifiedVRAMExpertPool&& other) noexcept {
         if (this != &other) {
             free();
             move_from(std::move(other));
@@ -128,7 +128,7 @@ public:
         hipStream_t stream = 0
     ) {
         if (slot_idx >= num_slots) {
-            throw std::runtime_error("GlobalVRAMExpertPool: Invalid slot index " + std::to_string(slot_idx));
+            throw std::runtime_error("UnifiedVRAMExpertPool: Invalid slot index " + std::to_string(slot_idx));
         }
 
         const uint8_t* p = host_expert_payload;
@@ -140,8 +140,28 @@ public:
         CHECK_HIP(hipMemcpyAsync(get_w3_scale(slot_idx),  p + AEON_W3_SCALE_OFFSET,  W3_SCALE_BYTES,  hipMemcpyHostToDevice, stream));
     }
 
+    // Stream an expert from individual host pointers (Safetensors host source) into this slot asynchronously
+    void upload_from_pointers(
+        uint32_t slot_idx,
+        const uint32_t* w1_packed, const half* w1_scale,
+        const uint32_t* w2_packed, const half* w2_scale,
+        const uint32_t* w3_packed, const half* w3_scale,
+        hipStream_t stream = 0
+    ) {
+        if (slot_idx >= num_slots) {
+            throw std::runtime_error("UnifiedVRAMExpertPool: Invalid slot index " + std::to_string(slot_idx));
+        }
+
+        CHECK_HIP(hipMemcpyAsync(get_w1_packed(slot_idx), w1_packed, W1_PACKED_BYTES, hipMemcpyHostToDevice, stream));
+        CHECK_HIP(hipMemcpyAsync(get_w1_scale(slot_idx),  w1_scale,  W1_SCALE_BYTES,  hipMemcpyHostToDevice, stream));
+        CHECK_HIP(hipMemcpyAsync(get_w2_packed(slot_idx), w2_packed, W2_PACKED_BYTES, hipMemcpyHostToDevice, stream));
+        CHECK_HIP(hipMemcpyAsync(get_w2_scale(slot_idx),  w2_scale,  W2_SCALE_BYTES,  hipMemcpyHostToDevice, stream));
+        CHECK_HIP(hipMemcpyAsync(get_w3_packed(slot_idx), w3_packed, W3_PACKED_BYTES, hipMemcpyHostToDevice, stream));
+        CHECK_HIP(hipMemcpyAsync(get_w3_scale(slot_idx),  w3_scale,  W3_SCALE_BYTES,  hipMemcpyHostToDevice, stream));
+    }
+
 private:
-    void move_from(GlobalVRAMExpertPool&& other) {
+    void move_from(UnifiedVRAMExpertPool&& other) {
         num_slots   = other.num_slots;
         d_w1_packed = other.d_w1_packed;
         d_w1_scale  = other.d_w1_scale;
@@ -159,5 +179,8 @@ private:
         other.d_w3_scale  = nullptr;
     }
 };
+
+// Backwards-compatibility alias during refactoring
+using GlobalVRAMExpertPool = UnifiedVRAMExpertPool;
 
 } // namespace aeon::core
