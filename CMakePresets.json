@@ -1,0 +1,16 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "rocm-hipcc",
+            "displayName": "ROCm hipcc (gfx1100)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_CXX_COMPILER": "/usr/bin/hipcc",
+                "ROCM_PATH": "/opt/rocm",
+                "AEON_GPU_TARGET": "gfx1100"
+            }
+        }
+    ]
+}

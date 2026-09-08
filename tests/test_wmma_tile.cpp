@@ -64,7 +64,7 @@ void cpu_reference_gemm(const std::vector<float>& h_a,
 
 int main() {
     std::cout << "====================================================================" << std::endl;
-    std::cout << "  Project Aeon — Spike 2.1: Single-Tile Wave32 WMMA Smoke Test" << std::endl;
+    std::cout << "  Project Aeon — Single-Tile Wave32 WMMA Hardware Validation" << std::endl;
     std::cout << "====================================================================" << std::endl;
 
     // Set GPU 0

@@ -8,7 +8,7 @@
 
 int main() {
     std::cout << "================================================================================" << std::endl;
-    std::cout << "  Spike 6.2: DeepSeek-V4 End-to-End Autoregressive Generation Benchmark         " << std::endl;
+    std::cout << "  DeepSeek-V4 Safetensors Autoregressive Generation Baseline Benchmark         " << std::endl;
     std::cout << "  Target: AMD Radeon RX 7900 XTX (Navi 31 / gfx1100) — Bare-Metal Wave32 Engine " << std::endl;
     std::cout << "================================================================================" << std::endl;
 
@@ -84,7 +84,7 @@ int main() {
     }
 
     std::cout << "\n================================================================================" << std::endl;
-    std::cout << "  [SUCCESS] Spike 6 Complete: Generation Benchmark Verified on Physical GPU!    " << std::endl;
+    std::cout << "  [SUCCESS] Generation baseline benchmark completed on physical GPU!            " << std::endl;
     std::cout << "================================================================================" << std::endl;
     return 0;
 }

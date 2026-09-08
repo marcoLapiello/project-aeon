@@ -7,7 +7,7 @@
 
 int main() {
     std::cout << "================================================================================" << std::endl;
-    std::cout << "       Phase 2 Spike 0.2: Native .aeon Multi-Layer Pipeline Execution Test      " << std::endl;
+    std::cout << "       Native .aeon Multi-Layer Pipeline Execution Validation                  " << std::endl;
     std::cout << "================================================================================" << std::endl;
 
     // 1. Device selection

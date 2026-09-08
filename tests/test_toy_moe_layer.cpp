@@ -227,7 +227,7 @@ private:
 
 int main() {
     std::cout << "====================================================================" << std::endl;
-    std::cout << "  Project Aeon — Spike 4.2: Single-Layer Toy MoE Cached Pipeline" << std::endl;
+    std::cout << "  Project Aeon — Legacy Single-Layer MoE Cache Diagnostic" << std::endl;
     std::cout << "====================================================================" << std::endl;
 
     CHECK_HIP(hipSetDevice(0));

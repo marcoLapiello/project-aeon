@@ -11,7 +11,7 @@
 
 int main() {
     std::cout << "====================================================================" << std::endl;
-    std::cout << "  Project Aeon — Spike 3.1: 4KB Sector-Aligned Direct I/O Reader" << std::endl;
+    std::cout << "  Project Aeon — 4KB Sector-Aligned Direct I/O Reader Validation" << std::endl;
     std::cout << "====================================================================" << std::endl;
 
     // 1. Verify Aligned Allocator

@@ -637,7 +637,7 @@ public:
     uint32_t num_layers_{0};
     uint32_t current_seq_len_{0};
 
-    // Spike 1: Global VRAM Expert Pool, Warm Host Pool & Expert Registry
+    // Global VRAM expert pool, warm host pool, and expert registry.
     bool use_global_pool_{false};
     std::unique_ptr<GlobalVRAMExpertPool> global_pool_;
     std::unique_ptr<HostExpertPool> host_pool_;
@@ -801,7 +801,7 @@ public:
         std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers with native .aeon format." << std::endl;
     }
 
-    // Initialize with Dynamic Memory Budgeting & Global Unified VRAM Expert Pool (Spike 1)
+    // Initialize dynamic memory budgeting and the unified VRAM expert pool.
     void init_dynamic_global(
         const std::string& aeon_model_dir,
         const AeonRuntimeConfig& runtime_cfg,

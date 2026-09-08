@@ -21,7 +21,7 @@
 
 int main() {
     std::cout << "================================================================================" << std::endl;
-    std::cout << "       Spike 5.1: DeepSeek-V4 Sliding-Window Attention & RoPE on Silicon        " << std::endl;
+    std::cout << "       DeepSeek-V4 Sliding-Window Attention & RoPE Validation on Silicon        " << std::endl;
     std::cout << "================================================================================" << std::endl;
 
     // 1. Hardware device selection (strictly bypass display GPU)
@@ -268,7 +268,7 @@ int main() {
     CHECK_HIP(hipFree(d_z));
 
     std::cout << "================================================================================" << std::endl;
-    std::cout << "  [SUCCESS] All Spike 5.1 Verification Gates Passed on Silicon!                " << std::endl;
+    std::cout << "  [SUCCESS] Sliding-window attention verification passed on silicon!             " << std::endl;
     std::cout << "================================================================================" << std::endl;
     return 0;
 }

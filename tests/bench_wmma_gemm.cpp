@@ -155,7 +155,7 @@ bool verify_output_subset(const std::vector<float>& h_a_f32,
 
 int main(int argc, char** argv) {
     std::cout << "====================================================================" << std::endl;
-    std::cout << "  Project Aeon — Spike 2.2: Tiled Block GEMM Benchmark" << std::endl;
+    std::cout << "  Project Aeon — Tiled Wave32 WMMA GEMM Benchmark" << std::endl;
     std::cout << "====================================================================" << std::endl;
 
     CHECK_HIP(hipSetDevice(0));

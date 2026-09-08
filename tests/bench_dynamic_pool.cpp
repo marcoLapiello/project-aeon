@@ -8,7 +8,7 @@
 
 int main() {
     std::cout << "================================================================================" << std::endl;
-    std::cout << " Phase 2 Spike 1: End-to-End Generation Benchmark (Global VRAM Expert Pool)    " << std::endl;
+    std::cout << " Global VRAM Expert Pool End-to-End Generation Benchmark                      " << std::endl;
     std::cout << " Target: AMD Radeon RX 7900 XTX (Navi 31 / gfx1100) — Bare-Metal Wave32 Engine " << std::endl;
     std::cout << "================================================================================" << std::endl;
 
@@ -83,7 +83,7 @@ int main() {
     }
 
     std::cout << "\n================================================================================" << std::endl;
-    std::cout << "  [SUCCESS] Spike 1 Benchmark Complete on Physical Silicon!                     " << std::endl;
+    std::cout << "  [SUCCESS] Global VRAM pool benchmark completed on physical silicon!          " << std::endl;
     std::cout << "================================================================================" << std::endl;
     return 0;
 }

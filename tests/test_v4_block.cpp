@@ -21,7 +21,7 @@
 
 int main() {
     std::cout << "================================================================================" << std::endl;
-    std::cout << "        Spike 5.2: DeepSeek-V4 Complete Transformer Block on Silicon            " << std::endl;
+    std::cout << "        DeepSeek-V4 Complete Transformer Block Validation on Silicon            " << std::endl;
     std::cout << "================================================================================" << std::endl;
 
     // 1. Hardware device selection (strictly bypass display GPU)
@@ -387,7 +387,7 @@ int main() {
     CHECK_HIP(hipFree(d_comb_f));
 
     std::cout << "================================================================================" << std::endl;
-    std::cout << "  [SUCCESS] Spike 5 Complete: Full DeepSeekV4Block Verified on Silicon!         " << std::endl;
+    std::cout << "  [SUCCESS] Complete DeepSeek-V4 block validation passed on silicon!            " << std::endl;
     std::cout << "================================================================================" << std::endl;
     return 0;
 }

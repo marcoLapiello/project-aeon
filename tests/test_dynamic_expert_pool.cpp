@@ -12,7 +12,7 @@
 
 int main() {
     std::cout << "================================================================================" << std::endl;
-    std::cout << "    Phase 2 Spike 1 Test: Dynamic Memory Budget, Feasibility & Global Pool      " << std::endl;
+    std::cout << "    Dynamic Memory Budget, Feasibility & Global Pool Validation                 " << std::endl;
     std::cout << "================================================================================" << std::endl;
 
     // 1. Device selection
@@ -145,7 +145,7 @@ int main() {
     assert(pipeline.expert_registry_->hits_hot > 0);
 
     std::cout << "\n================================================================================" << std::endl;
-    std::cout << "  [SUCCESS] Spike 1 (Micro-Steps 1.1-1.4) PASSED on physical AMD silicon!" << std::endl;
+    std::cout << "  [SUCCESS] Dynamic memory budget and global pool validation passed on silicon!" << std::endl;
     std::cout << "================================================================================" << std::endl;
 
     return 0;

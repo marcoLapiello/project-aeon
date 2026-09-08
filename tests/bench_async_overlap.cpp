@@ -31,7 +31,7 @@ constexpr uint32_t WARPS_M = BLOCK_M / WMMA_M;
 constexpr uint32_t WARPS_N = BLOCK_N / WMMA_N;
 constexpr uint32_t THREADS_PER_BLOCK = WARPS_M * WARPS_N * 32;
 
-// Tiled GEMM kernel (from Spike 2.2)
+// Reused tiled GEMM kernel for the transfer-overlap benchmark.
 __global__ void wmma_gemm_block_tiled_kernel(const half* __restrict__ a,
                                              const half* __restrict__ b,
                                              float* __restrict__ d,
@@ -105,7 +105,7 @@ __global__ void wmma_gemm_block_tiled_kernel(const half* __restrict__ a,
 
 int main() {
     std::cout << "====================================================================" << std::endl;
-    std::cout << "  Project Aeon — Spike 3.2: Concurrent Compute + SDMA Overlap Test" << std::endl;
+    std::cout << "  Project Aeon — Concurrent Compute + SDMA Overlap Benchmark" << std::endl;
     std::cout << "====================================================================" << std::endl;
 
     CHECK_HIP(hipSetDevice(0));

@@ -14,7 +14,7 @@
 } while(0)
 
 int main() {
-    std::cout << "[Test] Spike 4: Dual-Mode MoE Router Validation on Silicon..." << std::endl;
+    std::cout << "[Test] Dual-Mode MoE Router Validation on Silicon..." << std::endl;
 
     const int num_tokens = 4;
     const int n_routed_experts = 256;
@@ -157,6 +157,6 @@ int main() {
         std::cout << "[PASS] Hash router successfully matched CPU reference!" << std::endl;
     }
 
-    std::cout << "\n[ALL TESTS PASSED] Spike 4: Dual-Mode MoE Router validated on silicon!" << std::endl;
+    std::cout << "\n[ALL TESTS PASSED] Dual-Mode MoE Router validated on silicon!" << std::endl;
     return 0;
 }

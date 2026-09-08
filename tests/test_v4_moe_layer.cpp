@@ -97,7 +97,7 @@ __global__ void accumulate_expert_output_kernel(
 }
 
 int main() {
-    std::cout << "[Test] Spike 4.3: End-to-End DeepSeek-V4 MoE Layer Forward Pass on Silicon..." << std::endl;
+    std::cout << "[Test] End-to-End DeepSeek-V4 MoE Layer Forward Pass on Silicon..." << std::endl;
     aeon::core::select_compute_device(true);
 
     const uint32_t M_padded = 16; // Single-token autoregressive decoding step (padded to 16 for WMMA)

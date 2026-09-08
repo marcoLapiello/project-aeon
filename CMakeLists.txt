@@ -56,87 +56,87 @@ target_link_libraries(smoke_check PRIVATE amdhip64)
 add_executable(aeon_info tools/aeon_info.cpp)
 target_link_libraries(aeon_info PRIVATE amdhip64)
 
-# Phase 0 Spike 2.1: Single-tile Wave32 WMMA smoke test
+# Hardware validation: single-tile Wave32 WMMA smoke test
 add_executable(test_wmma_tile tests/test_wmma_tile.cpp)
 target_link_libraries(test_wmma_tile PRIVATE amdhip64)
 
-# Phase 0 Spike 2.2: Tiled block GEMM benchmark
+# Hardware benchmark: tiled Wave32 WMMA GEMM
 add_executable(bench_wmma_gemm tests/bench_wmma_gemm.cpp)
 target_link_libraries(bench_wmma_gemm PRIVATE amdhip64)
 
-# Phase 0 Spike 3.1: 4KB sector-aligned direct I/O test
+# I/O validation: 4KB sector-aligned direct reader
 add_executable(test_direct_io tests/test_direct_io.cpp)
 target_link_libraries(test_direct_io PRIVATE amdhip64)
 
-# Phase 0 Spike 3.2: Concurrent compute + SDMA transfer overlap test
+# Transfer benchmark: concurrent compute and SDMA overlap
 add_executable(bench_async_overlap tests/bench_async_overlap.cpp)
 target_link_libraries(bench_async_overlap PRIVATE amdhip64)
 
-# Phase 0 Spike 4.2: Single-layer toy MoE pipeline with dynamic expert caching
+# Legacy diagnostic: single-layer toy MoE cache pipeline
 add_executable(test_toy_moe_layer tests/test_toy_moe_layer.cpp)
 target_link_libraries(test_toy_moe_layer PRIVATE amdhip64)
 
-# Phase 1 Spike 1.1: DeepSeek-V4 config parser test
+# Regression test: DeepSeek-V4 configuration parser
 add_executable(test_config_parser tests/test_config_parser.cpp)
 target_link_libraries(test_config_parser PRIVATE amdhip64)
 
-# Phase 1 Spike 1.2: Safetensors header parser test
+# Regression test: Safetensors header parser
 add_executable(test_safetensors_parser tests/test_safetensors_parser.cpp)
 target_link_libraries(test_safetensors_parser PRIVATE amdhip64)
 
-# Phase 1 Spike 2.1: Wave32 RMSNorm and Clamped SwiGLU test
+# Regression test: Wave32 RMSNorm and clamped SwiGLU
 add_executable(test_swiglu_clamp tests/test_swiglu_clamp.cpp)
 target_link_libraries(test_swiglu_clamp PRIVATE amdhip64)
 
-# Phase 1 Spike 2.2: Hyper-Connections Sinkhorn & Post expansion test
+# Regression test: Hyper-Connections Sinkhorn and expansion
 add_executable(test_hc_sinkhorn tests/test_hc_sinkhorn.cpp)
 target_link_libraries(test_hc_sinkhorn PRIVATE amdhip64)
 
-# Phase 1 Spike 3: Fused INT4 -> FP16 Wave32 WMMA test
+# Regression test: fused INT4-to-FP16 Wave32 WMMA
 add_executable(test_w4a16_wmma tests/test_w4a16_wmma.cpp)
 target_link_libraries(test_w4a16_wmma PRIVATE amdhip64)
 
-# Phase 1 Spike 4: Dual-Mode MoE Router test
+# Regression test: dual-mode MoE router
 add_executable(test_moe_router tests/test_moe_router.cpp)
 target_link_libraries(test_moe_router PRIVATE amdhip64)
 
-# Phase 1 Spike 4.3: End-to-End DeepSeek-V4 MoE Layer Forward Pass test
+# Regression test: DeepSeek-V4 MoE layer forward pass
 add_executable(test_v4_moe_layer tests/test_v4_moe_layer.cpp)
 target_link_libraries(test_v4_moe_layer PRIVATE amdhip64)
 
-# Phase 1 Spike 5.1: Sliding-Window Attention & Rotary Embeddings test
+# Regression test: sliding-window attention and rotary embeddings
 add_executable(test_v4_attention tests/test_v4_attention.cpp)
 target_link_libraries(test_v4_attention PRIVATE amdhip64)
 
-# Phase 1 Spike 5.2: Complete DeepSeek-V4 Transformer Block Forward Pass test
+# Regression test: complete DeepSeek-V4 transformer block
 add_executable(test_v4_block tests/test_v4_block.cpp)
 target_link_libraries(test_v4_block PRIVATE amdhip64)
 
-# Phase 1 Spike 6.1: Multi-Layer Pipeline & KV Cache test
+# Regression test: multi-layer pipeline and KV cache
 add_executable(test_v4_pipeline tests/test_v4_pipeline.cpp)
 target_link_libraries(test_v4_pipeline PRIVATE amdhip64)
 
-# Phase 1 Spike 6.2: End-to-End Autoregressive Generation Benchmark
+# Baseline benchmark: Safetensors autoregressive generation
 add_executable(bench_v4_generation tests/bench_v4_generation.cpp)
 target_link_libraries(bench_v4_generation PRIVATE amdhip64)
 
-# Phase 2 Spike 0.2: Native Aeon Model Loader Smoke Test
+# Current format validation: native Aeon model loader
 add_executable(test_aeon_loader tests/test_aeon_loader.cpp)
 target_link_libraries(test_aeon_loader PRIVATE amdhip64)
 
-# Phase 2 Spike 0.3: End-to-End Pipeline Execution on Native .aeon Model
+# Current format validation: end-to-end native .aeon pipeline
 add_executable(test_aeon_pipeline tests/test_aeon_pipeline.cpp)
 target_link_libraries(test_aeon_pipeline PRIVATE amdhip64)
 
-# Phase 2 Spike 1.1: Dynamic Memory Budget, Feasibility & Global Pool Test
+# Current architecture validation: dynamic memory budget and global pool
 add_executable(test_dynamic_expert_pool tests/test_dynamic_expert_pool.cpp)
 target_link_libraries(test_dynamic_expert_pool PRIVATE amdhip64)
 
-# Phase 2 Spike 1.2: End-to-End Generation Benchmark with Global VRAM Expert Pool
+# Current architecture benchmark: global VRAM expert pool generation
 add_executable(bench_dynamic_pool tests/bench_dynamic_pool.cpp)
 target_link_libraries(bench_dynamic_pool PRIVATE amdhip64)
 
-# Phase 2 Spike 1.3: Full 43-Layer Model Autoregressive Generation Benchmark
+# Current architecture benchmark: full 43-layer autoregressive generation
 add_executable(bench_full_model tests/bench_full_model.cpp)
 target_link_libraries(bench_full_model PRIVATE amdhip64)
 

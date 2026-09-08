@@ -7,7 +7,7 @@
 
 int main() {
     std::cout << "================================================================================" << std::endl;
-    std::cout << "        Spike 6.1: Multi-Layer Autoregressive Pipeline & KV Cache Test          " << std::endl;
+    std::cout << "        Multi-Layer Autoregressive Pipeline & KV Cache Regression Test          " << std::endl;
     std::cout << "================================================================================" << std::endl;
 
     // 1. Device selection
@@ -66,7 +66,7 @@ int main() {
     }
 
     std::cout << "\n================================================================================" << std::endl;
-    std::cout << "  [SUCCESS] Spike 6.1 Complete: Multi-Layer Pipeline & KV Cache Validated!      " << std::endl;
+    std::cout << "  [SUCCESS] Multi-layer pipeline and KV cache validation passed!                " << std::endl;
     std::cout << "================================================================================" << std::endl;
     return 0;
 }
