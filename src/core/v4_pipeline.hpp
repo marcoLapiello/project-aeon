@@ -426,6 +426,105 @@ public:
         int32_t h_token = static_cast<int32_t>(token_id);
         CHECK_HIP(hipMemcpyAsync(scratch.d_token_id, &h_token, sizeof(int32_t), hipMemcpyHostToDevice, compute_stream));
 
+        // State tracking for inter-layer prefetching across pipeline stages
+        struct LayerPrefetchState {
+            bool is_active{false};
+            uint32_t layer_idx{0};
+            std::array<int32_t, 6> vram_slots{-1, -1, -1, -1, -1, -1};
+            std::array<bool, 6> is_prefetched{false, false, false, false, false, false};
+            std::array<uint32_t, 6> staging_indices{0, 0, 0, 0, 0, 0};
+        };
+        LayerPrefetchState lookahead_prefetch;
+
+        // Lambda helper to dispatch asynchronous SDMA prefetch for layer `target_layer`
+        auto dispatch_layer_prefetch = [&](uint32_t target_l, const std::vector<int32_t>& topk_experts) -> LayerPrefetchState {
+            LayerPrefetchState state;
+            state.is_active = true;
+            state.layer_idx = target_l;
+            uint32_t buf_offset = (target_l % 2) * 6;
+
+            for (int k = 0; k < 6; ++k) {
+                uint32_t expert_id = static_cast<uint32_t>(topk_experts[k]);
+                int32_t slot = expert_registry_->touch_hot_expert(target_l, expert_id, pos);
+                if (slot >= 0) {
+                    state.vram_slots[k] = slot;
+                    state.is_prefetched[k] = false;
+                } else {
+                    uint32_t gid = expert_registry_->get_global_id(target_l, expert_id);
+                    const auto& entry = expert_registry_->catalog[gid];
+
+                    auto [allocated_slot, evicted_gid] = expert_registry_->allocate_vram_slot(gid);
+
+                    if (evicted_gid >= 0 && host_pool_) {
+                        const auto& ev_entry = expert_registry_->catalog[evicted_gid];
+                        if (ev_entry.tier == ExpertTier::WARM_HOST && ev_entry.slot_idx >= 0) {
+                            uint32_t ev_hslot = static_cast<uint32_t>(ev_entry.slot_idx);
+                            if (aeon_loader.total_dense_tensors() > 0) {
+                                const uint8_t* ev_raw = aeon_loader.get_expert_data(
+                                    expert_registry_->catalog[evicted_gid].layer_id,
+                                    expert_registry_->catalog[evicted_gid].expert_id
+                                );
+                                host_pool_->copy_from(ev_hslot, ev_raw);
+                            }
+                        }
+                    }
+
+                    const uint8_t* src_ptr = nullptr;
+                    if (entry.tier == ExpertTier::WARM_HOST && host_pool_ && entry.slot_idx >= 0) {
+                        src_ptr = host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(entry.slot_idx));
+                    } else if (aeon_loader.total_dense_tensors() > 0) {
+                        src_ptr = aeon_loader.get_expert_data(target_l, expert_id);
+                    }
+
+                    if (src_ptr && prefetch_staging_) {
+                        uint32_t staging_idx = buf_offset + k;
+                        prefetch_staging_->stage_payload(staging_idx, src_ptr);
+                        const uint8_t* pinned_payload = prefetch_staging_->get_slot_ptr(staging_idx);
+
+                        unified_vram_pool_->upload_from_host_expert(allocated_slot, pinned_payload, sdma_stream);
+                        CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
+
+                        state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
+                        state.is_prefetched[k] = true;
+                        state.staging_indices[k] = staging_idx;
+                    } else if (src_ptr) {
+                        unified_vram_pool_->upload_from_host_expert(allocated_slot, src_ptr, sdma_stream);
+                        state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
+                        state.is_prefetched[k] = false;
+                    } else {
+                        // Fallback for Safetensors loader
+                        std::string exp_pfx = "layers." + std::to_string(target_l) + ".ffn.experts." + std::to_string(expert_id) + ".";
+                        const auto* w1_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
+                        const auto* w1_s = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
+                        const auto* w2_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
+                        const auto* w2_s = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
+                        const auto* w3_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
+                        const auto* w3_s = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
+
+                        unified_vram_pool_->upload_from_pointers(
+                            allocated_slot,
+                            w1_p, w1_s,
+                            w2_p, w2_s,
+                            w3_p, w3_s,
+                            compute_stream
+                        );
+                        state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
+                        state.is_prefetched[k] = false;
+                    }
+                }
+            }
+            return state;
+        };
+
+        // Bootstrap: If Layer 0 is a Hash Layer, look ahead and dispatch its SDMA prefetch before Layer 0 Attention!
+        if (num_layers_ > 0 && layers[0]->is_hash_layer && layers[0]->host_tid2eid) {
+            std::vector<int32_t> l0_topk(6);
+            for (int k = 0; k < 6; ++k) {
+                l0_topk[k] = static_cast<int32_t>(layers[0]->host_tid2eid[h_token * 6 + k]);
+            }
+            lookahead_prefetch = dispatch_layer_prefetch(0, l0_topk);
+        }
+
         // 2. Execute Consecutive Transformer Layers
         for (uint32_t l = 0; l < num_layers_; ++l) {
             auto& layer = *layers[l];
@@ -644,8 +743,8 @@ public:
 
             // -----------------------------------------------------------------
             // Dual-Stream Asynchronous SDMA Prefetching Pipeline
-            // Lookahead: Identify missing experts and dispatch non-blocking DMA transfers
-            // concurrently on sdma_stream while compute_stream executes Shared Expert.
+            // If this layer was prefetched in advance by lookahead routing, reuse its slots and events!
+            // Otherwise, perform intra-layer prefetch concurrently with Shared Expert execution.
             // -----------------------------------------------------------------
             struct PendingPrefetch {
                 int32_t vram_slot{-1};
@@ -655,81 +754,103 @@ public:
             std::array<PendingPrefetch, 6> pending_transfers;
             uint32_t buffer_offset = (l % 2) * 6; // Double-buffering: alternating 6-slot windows
 
-            for (int k = 0; k < 6; ++k) {
-                uint32_t expert_id = h_topk_indices[k];
-                int32_t slot = expert_registry_->touch_hot_expert(l, expert_id, pos);
-                if (slot >= 0) {
-                    // Hot hit: already in VRAM
-                    pending_transfers[k].vram_slot = slot;
-                    pending_transfers[k].is_prefetched = false;
-                } else {
-                    // Cache miss: allocate slot and dispatch asynchronous DMA on sdma_stream
-                    uint32_t gid = expert_registry_->get_global_id(l, expert_id);
-                    const auto& entry = expert_registry_->catalog[gid];
+            bool layer_already_prefetched = (lookahead_prefetch.is_active && lookahead_prefetch.layer_idx == l);
 
-                    auto [allocated_slot, evicted_gid] = expert_registry_->allocate_vram_slot(gid);
-
-                    // If an expert was evicted from VRAM to Host DDR, copy its weights to host pool if space exists
-                    if (evicted_gid >= 0 && host_pool_) {
-                        const auto& ev_entry = expert_registry_->catalog[evicted_gid];
-                        if (ev_entry.tier == ExpertTier::WARM_HOST && ev_entry.slot_idx >= 0) {
-                            uint32_t ev_hslot = static_cast<uint32_t>(ev_entry.slot_idx);
-                            if (aeon_loader.total_dense_tensors() > 0) {
-                                const uint8_t* ev_raw = aeon_loader.get_expert_data(
-                                    expert_registry_->catalog[evicted_gid].layer_id,
-                                    expert_registry_->catalog[evicted_gid].expert_id
-                                );
-                                host_pool_->copy_from(ev_hslot, ev_raw);
-                            }
-                        }
-                    }
-
-                    const uint8_t* src_ptr = nullptr;
-                    if (entry.tier == ExpertTier::WARM_HOST && host_pool_ && entry.slot_idx >= 0) {
-                        src_ptr = host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(entry.slot_idx));
-                    } else if (aeon_loader.total_dense_tensors() > 0) {
-                        src_ptr = aeon_loader.get_expert_data(l, expert_id);
-                    }
-
-                    if (src_ptr && prefetch_staging_) {
-                        uint32_t staging_idx = buffer_offset + k;
-                        // Fast copy into pinned staging buffer to ensure maximum PCIe bandwidth
-                        prefetch_staging_->stage_payload(staging_idx, src_ptr);
-                        const uint8_t* pinned_payload = prefetch_staging_->get_slot_ptr(staging_idx);
-
-                        // Asynchronous DMA transfer to VRAM slot on dedicated SDMA stream
-                        unified_vram_pool_->upload_from_host_expert(allocated_slot, pinned_payload, sdma_stream);
-                        // Record completion event on sdma_stream
-                        CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
-
-                        pending_transfers[k].vram_slot = static_cast<int32_t>(allocated_slot);
-                        pending_transfers[k].is_prefetched = true;
-                        pending_transfers[k].staging_idx = staging_idx;
-                    } else if (src_ptr) {
-                        unified_vram_pool_->upload_from_host_expert(allocated_slot, src_ptr, sdma_stream);
-                        pending_transfers[k].vram_slot = static_cast<int32_t>(allocated_slot);
+            if (layer_already_prefetched) {
+                for (int k = 0; k < 6; ++k) {
+                    pending_transfers[k].vram_slot = lookahead_prefetch.vram_slots[k];
+                    pending_transfers[k].is_prefetched = lookahead_prefetch.is_prefetched[k];
+                    pending_transfers[k].staging_idx = lookahead_prefetch.staging_indices[k];
+                }
+                lookahead_prefetch.is_active = false;
+            } else {
+                for (int k = 0; k < 6; ++k) {
+                    uint32_t expert_id = h_topk_indices[k];
+                    int32_t slot = expert_registry_->touch_hot_expert(l, expert_id, pos);
+                    if (slot >= 0) {
+                        // Hot hit: already in VRAM
+                        pending_transfers[k].vram_slot = slot;
                         pending_transfers[k].is_prefetched = false;
                     } else {
-                        // Fallback for Safetensors loader
-                        std::string exp_pfx = "layers." + std::to_string(l) + ".ffn.experts." + std::to_string(expert_id) + ".";
-                        const auto* w1_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
-                        const auto* w1_s = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
-                        const auto* w2_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
-                        const auto* w2_s = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
-                        const auto* w3_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
-                        const auto* w3_s = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
+                        // Cache miss: allocate slot and dispatch asynchronous DMA on sdma_stream
+                        uint32_t gid = expert_registry_->get_global_id(l, expert_id);
+                        const auto& entry = expert_registry_->catalog[gid];
 
-                        unified_vram_pool_->upload_from_pointers(
-                            allocated_slot,
-                            w1_p, w1_s,
-                            w2_p, w2_s,
-                            w3_p, w3_s,
-                            compute_stream
-                        );
-                        pending_transfers[k].vram_slot = static_cast<int32_t>(allocated_slot);
-                        pending_transfers[k].is_prefetched = false;
+                        auto [allocated_slot, evicted_gid] = expert_registry_->allocate_vram_slot(gid);
+
+                        // If an expert was evicted from VRAM to Host DDR, copy its weights to host pool if space exists
+                        if (evicted_gid >= 0 && host_pool_) {
+                            const auto& ev_entry = expert_registry_->catalog[evicted_gid];
+                            if (ev_entry.tier == ExpertTier::WARM_HOST && ev_entry.slot_idx >= 0) {
+                                uint32_t ev_hslot = static_cast<uint32_t>(ev_entry.slot_idx);
+                                if (aeon_loader.total_dense_tensors() > 0) {
+                                    const uint8_t* ev_raw = aeon_loader.get_expert_data(
+                                        expert_registry_->catalog[evicted_gid].layer_id,
+                                        expert_registry_->catalog[evicted_gid].expert_id
+                                    );
+                                    host_pool_->copy_from(ev_hslot, ev_raw);
+                                }
+                            }
+                        }
+
+                        const uint8_t* src_ptr = nullptr;
+                        if (entry.tier == ExpertTier::WARM_HOST && host_pool_ && entry.slot_idx >= 0) {
+                            src_ptr = host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(entry.slot_idx));
+                        } else if (aeon_loader.total_dense_tensors() > 0) {
+                            src_ptr = aeon_loader.get_expert_data(l, expert_id);
+                        }
+
+                        if (src_ptr && prefetch_staging_) {
+                            uint32_t staging_idx = buffer_offset + k;
+                            // Fast copy into pinned staging buffer to ensure maximum PCIe bandwidth
+                            prefetch_staging_->stage_payload(staging_idx, src_ptr);
+                            const uint8_t* pinned_payload = prefetch_staging_->get_slot_ptr(staging_idx);
+
+                            // Asynchronous DMA transfer to VRAM slot on dedicated SDMA stream
+                            unified_vram_pool_->upload_from_host_expert(allocated_slot, pinned_payload, sdma_stream);
+                            // Record completion event on sdma_stream
+                            CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
+
+                            pending_transfers[k].vram_slot = static_cast<int32_t>(allocated_slot);
+                            pending_transfers[k].is_prefetched = true;
+                            pending_transfers[k].staging_idx = staging_idx;
+                        } else if (src_ptr) {
+                            unified_vram_pool_->upload_from_host_expert(allocated_slot, src_ptr, sdma_stream);
+                            pending_transfers[k].vram_slot = static_cast<int32_t>(allocated_slot);
+                            pending_transfers[k].is_prefetched = false;
+                        } else {
+                            // Fallback for Safetensors loader
+                            std::string exp_pfx = "layers." + std::to_string(l) + ".ffn.experts." + std::to_string(expert_id) + ".";
+                            const auto* w1_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
+                            const auto* w1_s = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
+                            const auto* w2_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
+                            const auto* w2_s = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
+                            const auto* w3_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
+                            const auto* w3_s = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
+
+                            unified_vram_pool_->upload_from_pointers(
+                                allocated_slot,
+                                w1_p, w1_s,
+                                w2_p, w2_s,
+                                w3_p, w3_s,
+                                compute_stream
+                            );
+                            pending_transfers[k].vram_slot = static_cast<int32_t>(allocated_slot);
+                            pending_transfers[k].is_prefetched = false;
+                        }
                     }
                 }
+            }
+
+            // Lookahead prefetch trigger for Layer L+1:
+            // If the next layer is a Hash Layer, we already know its top-6 experts from token_id!
+            // Dispatch Layer L+1 transfers immediately on sdma_stream while Layer L executes Shared & Routed experts.
+            if (l + 1 < num_layers_ && layers[l + 1]->is_hash_layer && layers[l + 1]->host_tid2eid) {
+                std::vector<int32_t> next_topk(6);
+                for (int k = 0; k < 6; ++k) {
+                    next_topk[k] = static_cast<int32_t>(layers[l + 1]->host_tid2eid[h_token * 6 + k]);
+                }
+                lookahead_prefetch = dispatch_layer_prefetch(l + 1, next_topk);
             }
 
             // Clear MoE accumulation buffer

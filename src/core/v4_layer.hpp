@@ -61,6 +61,7 @@ public:
 
     // MoE Router Weights
     int64_t* d_tid2eid{nullptr};     // [129280, 6] (for hash layers)
+    const int64_t* host_tid2eid{nullptr}; // Host pointer for lookahead routing
     half*    d_gate_weight{nullptr}; // [256, 4096]
 
     // Persistent Sliding-Window KV Cache on Device: [max_seq_len, 512]
@@ -130,6 +131,9 @@ public:
         // 4. Router
         if (is_hash_layer) {
             upload_tensor(loader, pfx + "ffn.gate.tid2eid", &d_tid2eid);
+            if (loader.has_tensor(pfx + "ffn.gate.tid2eid")) {
+                host_tid2eid = reinterpret_cast<const int64_t*>(loader.get_tensor(pfx + "ffn.gate.tid2eid").data);
+            }
         }
         upload_tensor(loader, pfx + "ffn.gate.weight", &d_gate_weight);
 
@@ -209,6 +213,7 @@ private:
         d_shared_w3 = o.d_shared_w3; o.d_shared_w3 = nullptr;
 
         d_tid2eid = o.d_tid2eid; o.d_tid2eid = nullptr;
+        host_tid2eid = o.host_tid2eid; o.host_tid2eid = nullptr;
         d_gate_weight = o.d_gate_weight; o.d_gate_weight = nullptr;
 
         d_kv_cache = o.d_kv_cache; o.d_kv_cache = nullptr;
