@@ -32,11 +32,16 @@ Always consult these authoritative documents for deep technical specifics:
 - [x] Completed Phase 1: a single-GPU DeepSeek-V4 INT4-W4A16 runtime with configuration and Safetensors loading, fused kernels, MoE routing, sliding-window attention, transformer blocks, and multi-layer autoregressive generation. See [Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md).
 - [x] Completed Phase 2 Spike 0: lossless Safetensors-to-`.aeon` repacking with separate dense and routed-expert containers, 4096-byte alignment, expert indexing, and bit-exact verification. See [Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) and [Performance & Accuracy Ledger](plans-and-docs/PERFORMANCE_LEDGER.md).
 - [x] Completed the implementation portion of Phase 2 Spike 1: dynamic memory budgeting, startup feasibility checks, a unified VRAM expert pool, Host RAM expert staging, expert residency tracking, and full-model silicon benchmarks. The full three-tier preload remains blocked by host-memory pressure and is documented in the Phase 2 plan.
+- [x] Completed Phase 2 Pipeline Modularization Step 1: carved out HIP utility kernels to `src/kernel/v4_pipeline_ops.hpp`, scratch activation arena to `src/core/v4_pipeline_scratch.hpp`, and layer structure to `src/core/v4_layer.hpp`, cutting the monolithic `v4_pipeline.hpp` from ~1,500 down to 920 lines with full silicon test verification.
 
 ### Present (In Progress)
 - [ ] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Single-GPU 3-Tier Storage & Memory Hierarchy Optimization**:
   - [x] Spike 0: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification.
   - [x] Spike 1: Dynamic memory budgeting & Global Unified VRAM Expert Pool.
+  - [ ] Pipeline Architecture Cleanup & Refactoring:
+    - [x] Step 1: Mechanical modularization (extract ops, scratch buffers, layer context).
+    - [ ] Step 2: Eliminate dual-cache split (retire per-layer local LRU cache, standardize on Unified VRAM Pool + ExpertRegistry, scrub hardcoded slot numbers).
+    - [ ] Step 3: Purge host-side HC synchronization roundtrips in token step loop.
   - [ ] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding:
     - [ ] Micro-Step 2.1: Lookahead Routing & Prefetch Horizon Pipeline.
     - [ ] Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream.

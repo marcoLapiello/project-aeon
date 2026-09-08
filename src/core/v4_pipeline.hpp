@@ -7,10 +7,13 @@
 #include "core/host_expert_pool.hpp"
 #include "core/memory_budget.hpp"
 #include "core/safetensors_loader.hpp"
+#include "core/v4_layer.hpp"
+#include "core/v4_pipeline_scratch.hpp"
 #include "core/vram_expert_pool.hpp"
 #include "kernel/hc_sinkhorn.hpp"
 #include "kernel/moe_router.hpp"
 #include "kernel/v4_attention.hpp"
+#include "kernel/v4_pipeline_ops.hpp"
 #include "kernel/w4a16_gemm.hpp"
 
 #include <hip/hip_fp16.h>
@@ -27,6 +30,7 @@
 #include <unordered_map>
 #include <vector>
 
+#ifndef CHECK_HIP
 #define CHECK_HIP(cmd) do { \
     hipError_t err = cmd; \
     if (err != hipSuccess) { \
@@ -34,585 +38,9 @@
         exit(1); \
     } \
 } while(0)
+#endif
 
 namespace aeon::core {
-
-// Clamped SwiGLU Kernel
-__global__ void v4_pipeline_swiglu_clamp_kernel(
-    const half* __restrict__ gate,
-    const half* __restrict__ up,
-    half* __restrict__ out,
-    int total_elements,
-    float limit
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total_elements) {
-        float g = __half2float(gate[idx]);
-        float u = __half2float(up[idx]);
-        g = fminf(g, limit);
-        u = fminf(fmaxf(u, -limit), limit);
-        float silu_g = g / (1.0f + expf(-g));
-        out[idx] = __float2half(silu_g * u);
-    }
-}
-
-// Accumulate weighted expert output into token hidden state
-__global__ void v4_pipeline_accumulate_expert_kernel(
-    half* __restrict__ accum_out,
-    const half* __restrict__ expert_out,
-    float weight,
-    int hidden_dim
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < hidden_dim) {
-        float acc = __half2float(accum_out[idx]);
-        float exp = __half2float(expert_out[idx]);
-        accum_out[idx] = __float2half(acc + weight * exp);
-    }
-}
-
-// Convert FP16 array to float array
-__global__ void v4_half_to_float_kernel(
-    const half* __restrict__ src,
-    float* __restrict__ dst,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] = __half2float(src[idx]);
-    }
-}
-
-// Convert float array to FP16 array
-__global__ void v4_float_to_half_kernel(
-    const float* __restrict__ src,
-    half* __restrict__ dst,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] = __float2half(src[idx]);
-    }
-}
-
-// Tier 1 VRAM Slot for an INT4-W4A16 Routed Expert
-struct VRAMExpertSlot {
-    uint32_t* d_w1_packed{nullptr};
-    half*     d_w1_scale{nullptr};
-    uint32_t* d_w2_packed{nullptr};
-    half*     d_w2_scale{nullptr};
-    uint32_t* d_w3_packed{nullptr};
-    half*     d_w3_scale{nullptr};
-    int32_t   resident_expert_id{-1};
-};
-
-// Pointers to Host / Mmap memory for one routed expert
-struct HostExpertSource {
-    const uint32_t* w1_packed{nullptr};
-    const half*     w1_scale{nullptr};
-    const uint32_t* w2_packed{nullptr};
-    const half*     w2_scale{nullptr};
-    const uint32_t* w3_packed{nullptr};
-    const half*     w3_scale{nullptr};
-};
-
-// Device Context and Weights for One Complete Transformer Block
-class V4Layer {
-public:
-    int layer_id{0};
-    bool is_hash_layer{true};
-
-    // Attention Weights on Device
-    half*  d_attn_norm{nullptr};  // [4096]
-    half*  d_wq_a{nullptr};       // [1024, 4096]
-    half*  d_q_norm{nullptr};     // [1024]
-    half*  d_wq_b{nullptr};       // [32768, 1024]
-    half*  d_wkv{nullptr};        // [512, 4096]
-    half*  d_kv_norm{nullptr};    // [512]
-    float* d_attn_sink{nullptr};  // [64]
-    half*  d_wo_a{nullptr};       // [8192, 4096]
-    half*  d_wo_b{nullptr};       // [4096, 8192]
-
-    // Hyper-Connections Attention
-    float* d_hc_attn_fn{nullptr};    // [24, 16384]
-    const float* h_hc_attn_fn{nullptr};
-    float* d_hc_attn_base{nullptr};  // [24]
-    float* d_hc_attn_scale{nullptr}; // [3]
-
-    // FFN Weights on Device
-    half*  d_ffn_norm{nullptr};   // [4096]
-    float* d_hc_ffn_fn{nullptr};    // [24, 16384]
-    const float* h_hc_ffn_fn{nullptr};
-    float* d_hc_ffn_base{nullptr};  // [24]
-    float* d_hc_ffn_scale{nullptr}; // [3]
-
-    // Shared Expert (FP16 unquantized)
-    half*  d_shared_w1{nullptr};  // [2048, 4096]
-    half*  d_shared_w2{nullptr};  // [4096, 2048]
-    half*  d_shared_w3{nullptr};  // [2048, 4096]
-
-    // MoE Router Weights
-    int64_t* d_tid2eid{nullptr};     // [129280, 6] (for hash layers)
-    half*    d_gate_weight{nullptr}; // [256, 4096]
-
-    // Persistent Sliding-Window KV Cache on Device: [max_seq_len, 512]
-    half*  d_kv_cache{nullptr};
-    uint32_t max_seq_len_{4096};
-
-    // Tier 1 VRAM LRU Cache for Routed Experts
-    uint32_t vram_capacity_{8};
-    std::vector<VRAMExpertSlot> vram_slots_;
-    std::vector<uint32_t> free_slots_;
-    std::list<uint32_t> lru_list_;
-    std::unordered_map<uint32_t, std::pair<uint32_t, std::list<uint32_t>::iterator>> lru_map_;
-
-    // Tier 2 Host / Mmap Sources for 256 Routed Experts
-    std::vector<HostExpertSource> host_experts_;
-
-    // Cache Stats
-    uint64_t cache_hits{0};
-    uint64_t cache_misses{0};
-
-    template<typename LoaderT>
-    void init_with_loader(int id, const LoaderT& loader, uint32_t max_seq = 4096, uint32_t vram_slots = 8) {
-        layer_id = id;
-        is_hash_layer = (id < 3);
-        max_seq_len_ = max_seq;
-        vram_capacity_ = vram_slots;
-
-        std::string pfx = "layers." + std::to_string(layer_id) + ".";
-
-        // 1. Attention Weights
-        upload_tensor(loader, pfx + "attn_norm.weight", &d_attn_norm);
-        upload_tensor(loader, pfx + "attn.wq_a.weight", &d_wq_a);
-        upload_tensor(loader, pfx + "attn.q_norm.weight", &d_q_norm);
-        upload_tensor(loader, pfx + "attn.wq_b.weight", &d_wq_b);
-        upload_tensor(loader, pfx + "attn.wkv.weight", &d_wkv);
-        upload_tensor(loader, pfx + "attn.kv_norm.weight", &d_kv_norm);
-        upload_tensor(loader, pfx + "attn.attn_sink", &d_attn_sink);
-        upload_tensor(loader, pfx + "attn.wo_a.weight", &d_wo_a);
-        upload_tensor(loader, pfx + "attn.wo_b.weight", &d_wo_b);
-
-        upload_tensor(loader, pfx + "hc_attn_fn", &d_hc_attn_fn);
-        if (loader.has_tensor(pfx + "hc_attn_fn")) {
-            h_hc_attn_fn = loader.template get_data_ptr<float>(pfx + "hc_attn_fn");
-        }
-        upload_tensor(loader, pfx + "hc_attn_base", &d_hc_attn_base);
-        upload_tensor(loader, pfx + "hc_attn_scale", &d_hc_attn_scale);
-
-        // 2. FFN Weights
-        upload_tensor(loader, pfx + "ffn_norm.weight", &d_ffn_norm);
-        upload_tensor(loader, pfx + "hc_ffn_fn", &d_hc_ffn_fn);
-        if (loader.has_tensor(pfx + "hc_ffn_fn")) {
-            h_hc_ffn_fn = loader.template get_data_ptr<float>(pfx + "hc_ffn_fn");
-        }
-        upload_tensor(loader, pfx + "hc_ffn_base", &d_hc_ffn_base);
-        upload_tensor(loader, pfx + "hc_ffn_scale", &d_hc_ffn_scale);
-
-        // 3. Shared Expert
-        upload_tensor(loader, pfx + "ffn.shared_experts.w1.weight", &d_shared_w1);
-        upload_tensor(loader, pfx + "ffn.shared_experts.w2.weight", &d_shared_w2);
-        upload_tensor(loader, pfx + "ffn.shared_experts.w3.weight", &d_shared_w3);
-
-        // 4. Router
-        if (is_hash_layer) {
-            upload_tensor(loader, pfx + "ffn.gate.tid2eid", &d_tid2eid);
-        }
-        upload_tensor(loader, pfx + "ffn.gate.weight", &d_gate_weight);
-
-        // 5. Allocate Persistent KV Cache on Device
-        CHECK_HIP(hipMalloc(&d_kv_cache, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
-        CHECK_HIP(hipMemset(d_kv_cache, 0, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
-
-        // 6. Index Host / Mmap Sources for 256 Routed Experts
-        host_experts_.resize(256);
-        bind_host_experts(loader, pfx);
-
-        // 7. Allocate Tier 1 VRAM LRU Cache Slots
-        vram_slots_.resize(vram_capacity_);
-        free_slots_.clear();
-        lru_list_.clear();
-        lru_map_.clear();
-
-        constexpr size_t W1_BYTES = 2048 * 512 * sizeof(uint32_t); // 4MB
-        constexpr size_t W1_SC_BYTES = 2048 * 128 * sizeof(half);  // 512KB
-        constexpr size_t W2_BYTES = 4096 * 256 * sizeof(uint32_t); // 4MB
-        constexpr size_t W2_SC_BYTES = 4096 * 64 * sizeof(half);   // 512KB
-        constexpr size_t W3_BYTES = 2048 * 512 * sizeof(uint32_t); // 4MB
-        constexpr size_t W3_SC_BYTES = 2048 * 128 * sizeof(half);  // 512KB
-
-        for (uint32_t s = 0; s < vram_capacity_; ++s) {
-            CHECK_HIP(hipMalloc(&vram_slots_[s].d_w1_packed, W1_BYTES));
-            CHECK_HIP(hipMalloc(&vram_slots_[s].d_w1_scale, W1_SC_BYTES));
-            CHECK_HIP(hipMalloc(&vram_slots_[s].d_w2_packed, W2_BYTES));
-            CHECK_HIP(hipMalloc(&vram_slots_[s].d_w2_scale, W2_SC_BYTES));
-            CHECK_HIP(hipMalloc(&vram_slots_[s].d_w3_packed, W3_BYTES));
-            CHECK_HIP(hipMalloc(&vram_slots_[s].d_w3_scale, W3_SC_BYTES));
-            vram_slots_[s].resident_expert_id = -1;
-            free_slots_.push_back(s);
-        }
-    }
-
-    void init(int id, const SafetensorsLoader& loader, uint32_t max_seq = 4096, uint32_t vram_slots = 8) {
-        init_with_loader(id, loader, max_seq, vram_slots);
-    }
-
-    void init(int id, const AeonModelLoader& loader, uint32_t max_seq = 4096, uint32_t vram_slots = 8) {
-        init_with_loader(id, loader, max_seq, vram_slots);
-    }
-
-    // Initialize layer in Global Pool mode (does not allocate private VRAM slots)
-    template<typename LoaderT>
-    void init_global(int id, const LoaderT& loader, uint32_t max_seq = 4096) {
-        layer_id = id;
-        is_hash_layer = (id < 3);
-        max_seq_len_ = max_seq;
-        vram_capacity_ = 0; // Managed by GlobalVRAMExpertPool
-
-        std::string pfx = "layers." + std::to_string(layer_id) + ".";
-
-        // 1. Attention Weights
-        upload_tensor(loader, pfx + "attn_norm.weight", &d_attn_norm);
-        upload_tensor(loader, pfx + "attn.wq_a.weight", &d_wq_a);
-        upload_tensor(loader, pfx + "attn.q_norm.weight", &d_q_norm);
-        upload_tensor(loader, pfx + "attn.wq_b.weight", &d_wq_b);
-        upload_tensor(loader, pfx + "attn.wkv.weight", &d_wkv);
-        upload_tensor(loader, pfx + "attn.kv_norm.weight", &d_kv_norm);
-        upload_tensor(loader, pfx + "attn.attn_sink", &d_attn_sink);
-        upload_tensor(loader, pfx + "attn.wo_a.weight", &d_wo_a);
-        upload_tensor(loader, pfx + "attn.wo_b.weight", &d_wo_b);
-
-        upload_tensor(loader, pfx + "hc_attn_fn", &d_hc_attn_fn);
-        if (loader.has_tensor(pfx + "hc_attn_fn")) {
-            h_hc_attn_fn = loader.template get_data_ptr<float>(pfx + "hc_attn_fn");
-        }
-        upload_tensor(loader, pfx + "hc_attn_base", &d_hc_attn_base);
-        upload_tensor(loader, pfx + "hc_attn_scale", &d_hc_attn_scale);
-
-        // 2. FFN Weights
-        upload_tensor(loader, pfx + "ffn_norm.weight", &d_ffn_norm);
-        upload_tensor(loader, pfx + "hc_ffn_fn", &d_hc_ffn_fn);
-        if (loader.has_tensor(pfx + "hc_ffn_fn")) {
-            h_hc_ffn_fn = loader.template get_data_ptr<float>(pfx + "hc_ffn_fn");
-        }
-        upload_tensor(loader, pfx + "hc_ffn_base", &d_hc_ffn_base);
-        upload_tensor(loader, pfx + "hc_ffn_scale", &d_hc_ffn_scale);
-
-        // 3. Shared Expert
-        upload_tensor(loader, pfx + "ffn.shared_experts.w1.weight", &d_shared_w1);
-        upload_tensor(loader, pfx + "ffn.shared_experts.w2.weight", &d_shared_w2);
-        upload_tensor(loader, pfx + "ffn.shared_experts.w3.weight", &d_shared_w3);
-
-        // 4. Router
-        if (is_hash_layer) {
-            upload_tensor(loader, pfx + "ffn.gate.tid2eid", &d_tid2eid);
-        }
-        upload_tensor(loader, pfx + "ffn.gate.weight", &d_gate_weight);
-
-        // 5. Allocate Persistent KV Cache on Device
-        CHECK_HIP(hipMalloc(&d_kv_cache, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
-        CHECK_HIP(hipMemset(d_kv_cache, 0, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
-
-        // 6. Index Host / Mmap Sources for 256 Routed Experts
-        host_experts_.resize(256);
-        bind_host_experts(loader, pfx);
-    }
-
-    // Access or Stream an Expert into Tier 1 VRAM Slot (Local mode fallback)
-    uint32_t acquire_expert_slot(uint32_t expert_id, hipStream_t stream = 0) {
-        auto it = lru_map_.find(expert_id);
-        if (it != lru_map_.end()) {
-            cache_hits++;
-            uint32_t slot_idx = it->second.first;
-            lru_list_.erase(it->second.second);
-            lru_list_.push_front(expert_id);
-            it->second.second = lru_list_.begin();
-            return slot_idx;
-        }
-
-        cache_misses++;
-        uint32_t slot_idx = 0;
-        if (!free_slots_.empty()) {
-            slot_idx = free_slots_.back();
-            free_slots_.pop_back();
-        } else {
-            // Evict least recently used expert
-            uint32_t evict_eid = lru_list_.back();
-            lru_list_.pop_back();
-            slot_idx = lru_map_[evict_eid].first;
-            lru_map_.erase(evict_eid);
-        }
-
-        // Stream expert from Tier 2 Host / Mmap into VRAM slot
-        const auto& src = host_experts_[expert_id];
-        constexpr size_t W1_BYTES = 2048 * 512 * sizeof(uint32_t);
-        constexpr size_t W1_SC_BYTES = 2048 * 128 * sizeof(half);
-        constexpr size_t W2_BYTES = 4096 * 256 * sizeof(uint32_t);
-        constexpr size_t W2_SC_BYTES = 4096 * 64 * sizeof(half);
-        constexpr size_t W3_BYTES = 2048 * 512 * sizeof(uint32_t);
-        constexpr size_t W3_SC_BYTES = 2048 * 128 * sizeof(half);
-
-        CHECK_HIP(hipMemcpyAsync(vram_slots_[slot_idx].d_w1_packed, src.w1_packed, W1_BYTES, hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(vram_slots_[slot_idx].d_w1_scale, src.w1_scale, W1_SC_BYTES, hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(vram_slots_[slot_idx].d_w2_packed, src.w2_packed, W2_BYTES, hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(vram_slots_[slot_idx].d_w2_scale, src.w2_scale, W2_SC_BYTES, hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(vram_slots_[slot_idx].d_w3_packed, src.w3_packed, W3_BYTES, hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(vram_slots_[slot_idx].d_w3_scale, src.w3_scale, W3_SC_BYTES, hipMemcpyHostToDevice, stream));
-
-        vram_slots_[slot_idx].resident_expert_id = expert_id;
-        lru_list_.push_front(expert_id);
-        lru_map_[expert_id] = {slot_idx, lru_list_.begin()};
-
-        return slot_idx;
-    }
-
-    void free() {
-        if (d_attn_norm) (void)hipFree(d_attn_norm);
-        if (d_wq_a) (void)hipFree(d_wq_a);
-        if (d_q_norm) (void)hipFree(d_q_norm);
-        if (d_wq_b) (void)hipFree(d_wq_b);
-        if (d_wkv) (void)hipFree(d_wkv);
-        if (d_kv_norm) (void)hipFree(d_kv_norm);
-        if (d_attn_sink) (void)hipFree(d_attn_sink);
-        if (d_wo_a) (void)hipFree(d_wo_a);
-        if (d_wo_b) (void)hipFree(d_wo_b);
-        if (d_hc_attn_fn) (void)hipFree(d_hc_attn_fn);
-        if (d_hc_attn_base) (void)hipFree(d_hc_attn_base);
-        if (d_hc_attn_scale) (void)hipFree(d_hc_attn_scale);
-
-        if (d_ffn_norm) (void)hipFree(d_ffn_norm);
-        if (d_hc_ffn_fn) (void)hipFree(d_hc_ffn_fn);
-        if (d_hc_ffn_base) (void)hipFree(d_hc_ffn_base);
-        if (d_hc_ffn_scale) (void)hipFree(d_hc_ffn_scale);
-
-        if (d_shared_w1) (void)hipFree(d_shared_w1);
-        if (d_shared_w2) (void)hipFree(d_shared_w2);
-        if (d_shared_w3) (void)hipFree(d_shared_w3);
-
-        if (d_tid2eid) (void)hipFree(d_tid2eid);
-        if (d_gate_weight) (void)hipFree(d_gate_weight);
-        if (d_kv_cache) (void)hipFree(d_kv_cache);
-
-        for (auto& slot : vram_slots_) {
-            if (slot.d_w1_packed) (void)hipFree(slot.d_w1_packed);
-            if (slot.d_w1_scale) (void)hipFree(slot.d_w1_scale);
-            if (slot.d_w2_packed) (void)hipFree(slot.d_w2_packed);
-            if (slot.d_w2_scale) (void)hipFree(slot.d_w2_scale);
-            if (slot.d_w3_packed) (void)hipFree(slot.d_w3_packed);
-            if (slot.d_w3_scale) (void)hipFree(slot.d_w3_scale);
-        }
-        vram_slots_.clear();
-    }
-
-private:
-    void bind_host_experts(const SafetensorsLoader& loader, const std::string& pfx) {
-        for (int e = 0; e < 256; ++e) {
-            std::string exp_pfx = pfx + "ffn.experts." + std::to_string(e) + ".";
-            host_experts_[e].w1_packed = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
-            host_experts_[e].w1_scale  = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
-            host_experts_[e].w2_packed = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
-            host_experts_[e].w2_scale  = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
-            host_experts_[e].w3_packed = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
-            host_experts_[e].w3_scale  = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
-        }
-    }
-
-    void bind_host_experts(const AeonModelLoader& loader, const std::string& /*pfx*/) {
-        for (int e = 0; e < 256; ++e) {
-            const uint8_t* raw = loader.get_expert_data(layer_id, e);
-            host_experts_[e].w1_packed = reinterpret_cast<const uint32_t*>(raw + AEON_W1_PACKED_OFFSET);
-            host_experts_[e].w1_scale  = reinterpret_cast<const half*>(raw + AEON_W1_SCALE_OFFSET);
-            host_experts_[e].w2_packed = reinterpret_cast<const uint32_t*>(raw + AEON_W2_PACKED_OFFSET);
-            host_experts_[e].w2_scale  = reinterpret_cast<const half*>(raw + AEON_W2_SCALE_OFFSET);
-            host_experts_[e].w3_packed = reinterpret_cast<const uint32_t*>(raw + AEON_W3_PACKED_OFFSET);
-            host_experts_[e].w3_scale  = reinterpret_cast<const half*>(raw + AEON_W3_SCALE_OFFSET);
-        }
-    }
-
-    template<typename LoaderT, typename T>
-    void upload_tensor(const LoaderT& loader, const std::string& name, T** d_ptr) {
-        if (!loader.has_tensor(name)) {
-            *d_ptr = nullptr;
-            return;
-        }
-        const auto& t = loader.get_tensor(name);
-        CHECK_HIP(hipMalloc(reinterpret_cast<void**>(d_ptr), t.byte_size));
-        CHECK_HIP(hipMemcpy(*d_ptr, t.data, t.byte_size, hipMemcpyHostToDevice));
-    }
-};
-
-// Scratch Device Buffers Reusable Across All Layers
-struct PipelineScratchBuffers {
-    // Residuals [4, 4096] in float and half
-    float* d_res_in{nullptr};
-    float* d_res_mid{nullptr};
-    float* d_res_out{nullptr};
-    half*  d_res_in_half{nullptr};
-    half*  d_res_mid_half{nullptr};
-    half*  d_res_out_half{nullptr};
-
-    // HC Attention Sinkhorn
-    float* d_mixes_a{nullptr};
-    float* d_pre_a{nullptr};
-    float* d_post_a{nullptr};
-    float* d_comb_a{nullptr};
-
-    // HC FFN Sinkhorn
-    float* d_mixes_f{nullptr};
-    float* d_pre_f{nullptr};
-    float* d_post_f{nullptr};
-    float* d_comb_f{nullptr};
-
-    // Attention Activations (padded to 16 rows for WMMA compatibility)
-    half*  d_x_pre{nullptr};       // [16, 4096]
-    half*  d_x_norm{nullptr};      // [16, 4096]
-    half*  d_qa{nullptr};          // [16, 1024]
-    half*  d_qa_norm{nullptr};     // [16, 1024]
-    half*  d_q{nullptr};           // [16, 64, 512]
-    half*  d_kv{nullptr};          // [16, 512]
-    half*  d_kv_norm_act{nullptr}; // [16, 512]
-    half*  d_attn_out{nullptr};    // [16, 64, 512]
-    half*  d_z_lora{nullptr};      // [16, 8192]
-    half*  d_attn_proj{nullptr};   // [16, 4096]
-
-    // MoE Activations
-    half*  d_ffn_pre{nullptr};      // [16, 4096]
-    half*  d_ffn_norm_act{nullptr}; // [16, 4096]
-    float* d_router_logits{nullptr};// [256]
-    float* d_topk_weights{nullptr}; // [6]
-    int32_t* d_topk_indices{nullptr};// [6]
-    int32_t* d_token_id{nullptr};   // [1]
-
-    half*  d_shared_gate{nullptr};  // [16, 2048]
-    half*  d_shared_up{nullptr};    // [16, 2048]
-    half*  d_shared_swiglu{nullptr};// [16, 2048]
-    half*  d_shared_down{nullptr};  // [16, 4096]
-
-    half*  d_moe_accum{nullptr};    // [16, 4096]
-    half*  d_expert_gate{nullptr};  // [16, 2048]
-    half*  d_expert_up{nullptr};    // [16, 2048]
-    half*  d_expert_swiglu{nullptr};// [16, 2048]
-    half*  d_expert_down{nullptr};  // [16, 4096]
-
-    // Head Activations
-    half*  d_hc_head_out{nullptr};  // [4096]
-    half*  d_head_norm{nullptr};    // [4096]
-    half*  d_logits{nullptr};       // [129280]
-
-    void allocate() {
-        constexpr int H = 4096;
-        constexpr int HC = 4;
-        constexpr int HC_DIM = HC * H;
-        constexpr int HC_MULT3 = 24;
-        constexpr int M = 16; // Padded row size for WMMA
-
-        CHECK_HIP(hipMalloc(&d_res_in, HC_DIM * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_res_mid, HC_DIM * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_res_out, HC_DIM * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_res_in_half, HC_DIM * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_res_mid_half, HC_DIM * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_res_out_half, HC_DIM * sizeof(half)));
-
-        CHECK_HIP(hipMalloc(&d_mixes_a, HC_MULT3 * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_pre_a, HC * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_post_a, HC * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_comb_a, HC * HC * sizeof(float)));
-
-        CHECK_HIP(hipMalloc(&d_mixes_f, HC_MULT3 * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_pre_f, HC * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_post_f, HC * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_comb_f, HC * HC * sizeof(float)));
-
-        CHECK_HIP(hipMalloc(&d_x_pre, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_x_norm, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_qa, M * 1024 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_qa_norm, M * 1024 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_q, M * 64 * 512 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_kv, M * 512 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_kv_norm_act, M * 512 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_attn_out, M * 64 * 512 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_z_lora, M * 8192 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_attn_proj, M * H * sizeof(half)));
-
-        CHECK_HIP(hipMalloc(&d_ffn_pre, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_ffn_norm_act, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_router_logits, 256 * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_topk_weights, 6 * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_topk_indices, 6 * sizeof(int32_t)));
-        CHECK_HIP(hipMalloc(&d_token_id, 1 * sizeof(int32_t)));
-
-        CHECK_HIP(hipMalloc(&d_shared_gate, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_shared_up, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_shared_swiglu, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_shared_down, M * H * sizeof(half)));
-
-        CHECK_HIP(hipMalloc(&d_moe_accum, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_expert_gate, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_expert_up, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_expert_swiglu, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_expert_down, M * H * sizeof(half)));
-
-        CHECK_HIP(hipMalloc(&d_hc_head_out, H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_head_norm, H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_logits, 129280 * sizeof(half)));
-
-        // Clear initial padded memory
-        CHECK_HIP(hipMemset(d_x_pre, 0, M * H * sizeof(half)));
-        CHECK_HIP(hipMemset(d_x_norm, 0, M * H * sizeof(half)));
-    }
-
-    void free() {
-        if (d_res_in) (void)hipFree(d_res_in);
-        if (d_res_mid) (void)hipFree(d_res_mid);
-        if (d_res_out) (void)hipFree(d_res_out);
-        if (d_res_in_half) (void)hipFree(d_res_in_half);
-        if (d_res_mid_half) (void)hipFree(d_res_mid_half);
-        if (d_res_out_half) (void)hipFree(d_res_out_half);
-
-        if (d_mixes_a) (void)hipFree(d_mixes_a);
-        if (d_pre_a) (void)hipFree(d_pre_a);
-        if (d_post_a) (void)hipFree(d_post_a);
-        if (d_comb_a) (void)hipFree(d_comb_a);
-
-        if (d_mixes_f) (void)hipFree(d_mixes_f);
-        if (d_pre_f) (void)hipFree(d_pre_f);
-        if (d_post_f) (void)hipFree(d_post_f);
-        if (d_comb_f) (void)hipFree(d_comb_f);
-
-        if (d_x_pre) (void)hipFree(d_x_pre);
-        if (d_x_norm) (void)hipFree(d_x_norm);
-        if (d_qa) (void)hipFree(d_qa);
-        if (d_qa_norm) (void)hipFree(d_qa_norm);
-        if (d_q) (void)hipFree(d_q);
-        if (d_kv) (void)hipFree(d_kv);
-        if (d_kv_norm_act) (void)hipFree(d_kv_norm_act);
-        if (d_attn_out) (void)hipFree(d_attn_out);
-        if (d_z_lora) (void)hipFree(d_z_lora);
-        if (d_attn_proj) (void)hipFree(d_attn_proj);
-
-        if (d_ffn_pre) (void)hipFree(d_ffn_pre);
-        if (d_ffn_norm_act) (void)hipFree(d_ffn_norm_act);
-        if (d_router_logits) (void)hipFree(d_router_logits);
-        if (d_topk_weights) (void)hipFree(d_topk_weights);
-        if (d_topk_indices) (void)hipFree(d_topk_indices);
-        if (d_token_id) (void)hipFree(d_token_id);
-
-        if (d_shared_gate) (void)hipFree(d_shared_gate);
-        if (d_shared_up) (void)hipFree(d_shared_up);
-        if (d_shared_swiglu) (void)hipFree(d_shared_swiglu);
-        if (d_shared_down) (void)hipFree(d_shared_down);
-
-        if (d_moe_accum) (void)hipFree(d_moe_accum);
-        if (d_expert_gate) (void)hipFree(d_expert_gate);
-        if (d_expert_up) (void)hipFree(d_expert_up);
-        if (d_expert_swiglu) (void)hipFree(d_expert_swiglu);
-        if (d_expert_down) (void)hipFree(d_expert_down);
-
-        if (d_hc_head_out) (void)hipFree(d_hc_head_out);
-        if (d_head_norm) (void)hipFree(d_head_norm);
-        if (d_logits) (void)hipFree(d_logits);
-    }
-};
 
 // Complete DeepSeek-V4 Autoregressive Multi-Layer Pipeline Engine
 class V4Pipeline {
@@ -961,7 +389,7 @@ public:
             CHECK_HIP(hipMemcpyAsync(scratch.d_res_in_half + s * H, token_emb, H * sizeof(half), hipMemcpyHostToDevice, compute_stream));
         }
         // Convert to float for HC pre-mix
-        v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_in_half, scratch.d_res_in, HC_DIM);
+        kernel::v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_in_half, scratch.d_res_in, HC_DIM);
 
         // Upload single token ID for hash routing
         int32_t h_token = static_cast<int32_t>(token_id);
@@ -1130,7 +558,7 @@ public:
             // -----------------------------------------------------------------
             // F. HC Attention Post Expansion: res_mid = comb_a * res_in + post_a * attn_proj
             // -----------------------------------------------------------------
-            v4_float_to_half_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_in, scratch.d_res_in_half, HC_DIM);
+            kernel::v4_float_to_half_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_in, scratch.d_res_in_half, HC_DIM);
 
             hipLaunchKernelGGL(
                 kernel::hc_post_kernel,
@@ -1138,7 +566,7 @@ public:
                 scratch.d_attn_proj, scratch.d_res_in_half, scratch.d_post_a, scratch.d_comb_a, scratch.d_res_mid_half, H
             );
 
-            v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_mid_half, scratch.d_res_mid, HC_DIM);
+            kernel::v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_mid_half, scratch.d_res_mid, HC_DIM);
 
             // -----------------------------------------------------------------
             // G. HC FFN Pre-Mix & Sinkhorn
@@ -1246,7 +674,7 @@ public:
             int swiglu_threads = 256;
             int swiglu_blocks = (INTER_DIM + swiglu_threads - 1) / swiglu_threads;
             hipLaunchKernelGGL(
-                v4_pipeline_swiglu_clamp_kernel,
+                kernel::v4_pipeline_swiglu_clamp_kernel,
                 dim3(swiglu_blocks), dim3(swiglu_threads), 0, compute_stream,
                 scratch.d_shared_gate, scratch.d_shared_up, scratch.d_shared_swiglu, INTER_DIM, 10.0f
             );
@@ -1338,7 +766,7 @@ public:
                 // SwiGLU clamp
                 int m_swiglu_blocks = (M_PAD * INTER_DIM + swiglu_threads - 1) / swiglu_threads;
                 hipLaunchKernelGGL(
-                    v4_pipeline_swiglu_clamp_kernel,
+                    kernel::v4_pipeline_swiglu_clamp_kernel,
                     dim3(m_swiglu_blocks), dim3(swiglu_threads), 0, compute_stream,
                     scratch.d_expert_gate, scratch.d_expert_up, scratch.d_expert_swiglu, M_PAD * INTER_DIM, 10.0f
                 );
@@ -1351,7 +779,7 @@ public:
 
                 // Accumulate row 0
                 hipLaunchKernelGGL(
-                    v4_pipeline_accumulate_expert_kernel,
+                    kernel::v4_pipeline_accumulate_expert_kernel,
                     dim3((H + 255) / 256), dim3(256), 0, compute_stream,
                     scratch.d_moe_accum, scratch.d_expert_down, expert_weight, H
                 );
@@ -1371,7 +799,7 @@ public:
                 scratch.d_res_in_half, scratch.d_res_out_half, HC_DIM * sizeof(half),
                 hipMemcpyDeviceToDevice, compute_stream
             ));
-            v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_in_half, scratch.d_res_in, HC_DIM);
+            kernel::v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_in_half, scratch.d_res_in, HC_DIM);
         }
 
         // 3. HC Head Reduction on Final Residual
