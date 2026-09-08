@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
     pipeline.expert_registry_->hits_hot = 0;
     pipeline.expert_registry_->hits_warm = 0;
     pipeline.expert_registry_->misses_cold = 0;
+    pipeline.reset_routing_locality_stats();
 
     double ttft_ms = 0.0;
     double tok_sec = 0.0;
@@ -89,6 +90,8 @@ int main(int argc, char** argv) {
     std::cout << "  > Tier 2 Warm Host Hits   : " << pipeline.expert_registry_->hits_warm << std::endl;
     std::cout << "  > Tier 3 Cold NVMe Misses : " << pipeline.expert_registry_->misses_cold << std::endl;
     std::cout << "================================================================================" << std::endl;
+
+    pipeline.print_routing_locality_report();
 
     return 0;
 }
