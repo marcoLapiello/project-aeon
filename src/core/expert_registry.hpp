@@ -181,43 +181,17 @@ public:
             slot = free_vram_slots.back();
             free_vram_slots.pop_back();
         } else {
-            // Evict LRU victim from hot VRAM
+            // Evict LRU victim from hot VRAM.
+            // Expert weights are immutable and permanently available on the Cold NVMe
+            // tier, so eviction never copies payloads back to host memory: the victim
+            // simply returns to Cold. (Warm re-fill, if desired, must come from disk
+            // at idle priority — never from VRAM on the request path.)
             evicted_gid = hot_vram_lru.back();
             hot_vram_lru.pop_back();
 
             slot = static_cast<uint32_t>(catalog[evicted_gid].slot_idx);
-
-            // Demote evicted expert to Warm Host DDR if space exists or evict LRU warm
-            if (host_capacity > 0) {
-                catalog[evicted_gid].tier = ExpertTier::WARM_HOST;
-                // If free host slots exist, assign one
-                if (!free_host_slots.empty()) {
-                    uint32_t hslot = free_host_slots.back();
-                    free_host_slots.pop_back();
-                    catalog[evicted_gid].slot_idx = static_cast<int32_t>(hslot);
-                    warm_host_lru.push_front(evicted_gid);
-                    catalog[evicted_gid].lru_it = warm_host_lru.begin();
-                    host_slots[hslot] = evicted_gid;
-                } else if (!warm_host_lru.empty()) {
-                    // Evict LRU from warm host pool to cold NVMe
-                    uint32_t cold_gid = warm_host_lru.back();
-                    warm_host_lru.pop_back();
-                    uint32_t hslot = static_cast<uint32_t>(catalog[cold_gid].slot_idx);
-                    catalog[cold_gid].tier = ExpertTier::COLD_NVME;
-                    catalog[cold_gid].slot_idx = -1;
-
-                    catalog[evicted_gid].slot_idx = static_cast<int32_t>(hslot);
-                    warm_host_lru.push_front(evicted_gid);
-                    catalog[evicted_gid].lru_it = warm_host_lru.begin();
-                    host_slots[hslot] = evicted_gid;
-                } else {
-                    catalog[evicted_gid].tier = ExpertTier::COLD_NVME;
-                    catalog[evicted_gid].slot_idx = -1;
-                }
-            } else {
-                catalog[evicted_gid].tier = ExpertTier::COLD_NVME;
-                catalog[evicted_gid].slot_idx = -1;
-            }
+            catalog[evicted_gid].tier = ExpertTier::COLD_NVME;
+            catalog[evicted_gid].slot_idx = -1;
         }
 
         // Install new expert in Hot VRAM

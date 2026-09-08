@@ -181,3 +181,15 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
   - Warm enabled (`35 GiB`): `5.15 tok/s`, 1,682 Hot hits, 684 Warm hits, 472 Cold misses.
   - Generated token sequences were identical: `[237, 223, 223, 223, 223, 223, 223, 223]`.
 * **Interpretation**: Warm is now demonstrably active and beneficial: `+17.8%` decode throughput versus the direct-cold control. The stable `59.3%` Hot hit rate is expected because Hot capacity and the routed access sequence are unchanged; Warm capacity changes lower-tier service cost, not Hot residency capacity.
+
+### M16: Demotion-Free Warm Path & Pre-Staging Shared-Expert Enqueue (Expert Review Step 1)
+* **Date**: 2026-09-08 | **Status**: Completed; hypothesis-defining result | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](EXPERT_PERFORMANCE_REVIEW.md)
+* **Changes**:
+  - Removed Hot→Warm D2H demotion from the request path: evicted Hot experts return directly to Cold NVMe (weights are immutable; payload always re-readable from disk). Eliminates 14.15 MB of VRAM→host DMA per eviction.
+  - Warm hits upload H2D **directly from pinned warm segments** via SDMA (new `PrefetchStagingArena::begin_direct_transfer` borrows the slot event; `HostExpertPool::is_slot_pinned` gates the fast path, with an unpinned-segment staging fallback). Warm-hit traffic drops from ~42 MB (memcpy + demotion + upload) to ~14 MB.
+  - Shared-expert kernels are enqueued **before** `dispatch_layer_prefetch`, so CPU-side staging and io_uring submission overlap GPU compute instead of running while the device idles.
+* **Regression validation (silicon)**: `test_model_direct_io`, `test_aeon_pipeline`, `test_v4_pipeline`, `test_dynamic_expert_pool`, `test_async_prefetch` (32.10 tok/s), `test_hot_warm_cold_pipeline` (golden token `295`) — all passed; generated tokens identical to M15.
+* **Controlled A/B** (identical to M15 workload: context 4096, 664 Hot slots, 4 prompt → 8 gen):
+  - Warm disabled: `4.36 tok/s` (`229.30 ms/tok`), 1,682 Hot / 1,156 Cold — unchanged vs M15, as expected (no demotion existed without a warm pool).
+  - Warm `35 GiB`: `5.11 tok/s` (`195.82 ms/tok`), 1,682 Hot / 157 Warm / 999 Cold. Tokens identical: `[237, 223, 223, 223, 223, 223, 223, 223]`.
+* **Interpretation — the decode loop is latency-bound, not bandwidth-bound**: despite a 3× traffic reduction per warm hit, throughput matches M15 (`5.11` vs `5.15 tok/s`). Warm coverage also drained (684 → 157 warm hits) because evictions no longer refill Warm — yet throughput was unchanged. Both facts prove the per-request byte volume is irrelevant today: the binding constraint is the **synchronous just-in-time dispatch** (2 `hipStreamSynchronize`/layer, cold io_uring read exposed on the critical path of every routed layer, ~3.5 ms × 43 layers ≈ 150 ms of the 196 ms step). This directly mandates Step 3 of the review roadmap: speculative cross-token prefetch to create a real prefetch horizon.

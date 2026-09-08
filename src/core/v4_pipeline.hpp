@@ -511,33 +511,12 @@ public:
                     const int32_t source_slot = entry.slot_idx;
                     const bool source_is_warm = source_tier == ExpertTier::WARM_HOST &&
                                                 host_pool_ && source_slot >= 0;
-                    const uint32_t source_staging_idx = buf_offset + k;
-                    if (source_is_warm) {
-                        if (!prefetch_staging_) {
-                            throw std::runtime_error("V4Pipeline: warm expert has no staging arena");
-                        }
-                        wait_for_pending_warm_slot(static_cast<uint32_t>(source_slot));
-                        prefetch_staging_->stage_payload(
-                            source_staging_idx,
-                            host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(source_slot))
-                        );
-                    }
 
+                    // Evicted Hot experts return directly to Cold NVMe: expert weights
+                    // are immutable and permanently available on disk, so eviction
+                    // never copies payloads back to host memory on the request path.
                     auto [allocated_slot, evicted_gid] = expert_registry_->allocate_vram_slot(gid);
-
-                    if (evicted_gid >= 0 && host_pool_) {
-                        const auto& ev_entry = expert_registry_->catalog[evicted_gid];
-                        if (ev_entry.tier == ExpertTier::WARM_HOST && ev_entry.slot_idx >= 0) {
-                            uint32_t ev_hslot = static_cast<uint32_t>(ev_entry.slot_idx);
-                            wait_for_pending_warm_slot(ev_hslot);
-                            unified_vram_pool_->download_to_host_expert(
-                                allocated_slot,
-                                host_pool_->get_expert_slot_ptr(ev_hslot),
-                                sdma_stream
-                            );
-                            record_pending_warm_slot(ev_hslot);
-                        }
-                    }
+                    (void)evicted_gid;
 
                     const bool can_direct_read = source_tier == ExpertTier::COLD_NVME &&
                                                  direct_io_reader_ &&
@@ -564,8 +543,30 @@ public:
                         state.io_user_data[k] = request_id;
                         state.io_request_counts[k] = static_cast<uint32_t>(request_count);
                         submitted_direct_io = true;
+                    } else if (source_is_warm &&
+                               host_pool_->is_slot_pinned(static_cast<uint32_t>(source_slot))) {
+                        // Fast path: page-locked warm slots upload straight to VRAM via
+                        // SDMA, skipping the redundant host-to-host staging memcpy.
+                        const uint32_t staging_idx = buf_offset + k;
+                        prefetch_staging_->begin_direct_transfer(staging_idx);
+                        unified_vram_pool_->upload_from_host_expert(
+                            allocated_slot,
+                            host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(source_slot)),
+                            sdma_stream
+                        );
+                        CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
+
+                        state.vram_slots[k] = static_cast<int32_t>(allocated_slot);
+                        state.is_prefetched[k] = true;
+                        state.staging_indices[k] = staging_idx;
                     } else {
                         if (source_is_warm) {
+                            // Unpinned warm-segment fallback: stage through the arena.
+                            const uint32_t source_staging_idx = buf_offset + k;
+                            prefetch_staging_->stage_payload(
+                                source_staging_idx,
+                                host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(source_slot))
+                            );
                             const uint8_t* pinned_payload = prefetch_staging_->get_slot_ptr(source_staging_idx);
                             prefetch_staging_->begin_gpu_transfer(source_staging_idx);
                             unified_vram_pool_->upload_from_host_expert(allocated_slot, pinned_payload, sdma_stream);
@@ -905,6 +906,44 @@ public:
             releasable_staging_slots.clear();
 
             // -----------------------------------------------------------------
+            // Shared Expert FIRST: enqueue all GPU work before any CPU-side staging
+            // or I/O dispatch so the device stays busy while the CPU submits
+            // io_uring reads and performs staging copies.
+            // -----------------------------------------------------------------
+            // Clear MoE accumulation buffer
+            CHECK_HIP(hipMemsetAsync(scratch.d_moe_accum, 0, M_PAD * H * sizeof(half), compute_stream));
+
+            // 2. Shared Expert (FP16 unquantized) executes on compute_stream while
+            // the CPU dispatches expert transfers and SDMA moves them across PCIe.
+            // w1 [2048, 4096] & w3 [2048, 4096]
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_kernel,
+                dim3(INTER_DIM, 1), dim3(32), 0, compute_stream,
+                scratch.d_ffn_norm_act, layer.d_shared_w1, scratch.d_shared_gate, H
+            );
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_kernel,
+                dim3(INTER_DIM, 1), dim3(32), 0, compute_stream,
+                scratch.d_ffn_norm_act, layer.d_shared_w3, scratch.d_shared_up, H
+            );
+
+            // Clamped SwiGLU
+            int swiglu_threads = 256;
+            int swiglu_blocks = (INTER_DIM + swiglu_threads - 1) / swiglu_threads;
+            hipLaunchKernelGGL(
+                kernel::v4_pipeline_swiglu_clamp_kernel,
+                dim3(swiglu_blocks), dim3(swiglu_threads), 0, compute_stream,
+                scratch.d_shared_gate, scratch.d_shared_up, scratch.d_shared_swiglu, INTER_DIM, 10.0f
+            );
+
+            // w2 [4096, 2048]
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_kernel,
+                dim3(H, 1), dim3(32), 0, compute_stream,
+                scratch.d_shared_swiglu, layer.d_shared_w2, scratch.d_moe_accum, INTER_DIM
+            );
+
+            // -----------------------------------------------------------------
             // Dual-Stream Asynchronous SDMA Prefetching Pipeline
             // If this layer was prefetched in advance by lookahead routing, reuse its slots and events!
             // Otherwise, perform intra-layer prefetch concurrently with Shared Expert execution.
@@ -934,39 +973,6 @@ public:
                 }
                 lookahead_prefetch = dispatch_layer_prefetch(l + 1, next_topk);
             }
-
-            // Clear MoE accumulation buffer
-            CHECK_HIP(hipMemsetAsync(scratch.d_moe_accum, 0, M_PAD * H * sizeof(half), compute_stream));
-
-            // 2. Shared Expert (FP16 unquantized) executes CONCURRENTLY on compute_stream
-            // while SDMA transfers are in flight across PCIe!
-            // w1 [2048, 4096] & w3 [2048, 4096]
-            hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
-                dim3(INTER_DIM, 1), dim3(32), 0, compute_stream,
-                scratch.d_ffn_norm_act, layer.d_shared_w1, scratch.d_shared_gate, H
-            );
-            hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
-                dim3(INTER_DIM, 1), dim3(32), 0, compute_stream,
-                scratch.d_ffn_norm_act, layer.d_shared_w3, scratch.d_shared_up, H
-            );
-
-            // Clamped SwiGLU
-            int swiglu_threads = 256;
-            int swiglu_blocks = (INTER_DIM + swiglu_threads - 1) / swiglu_threads;
-            hipLaunchKernelGGL(
-                kernel::v4_pipeline_swiglu_clamp_kernel,
-                dim3(swiglu_blocks), dim3(swiglu_threads), 0, compute_stream,
-                scratch.d_shared_gate, scratch.d_shared_up, scratch.d_shared_swiglu, INTER_DIM, 10.0f
-            );
-
-            // w2 [4096, 2048]
-            hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
-                dim3(H, 1), dim3(32), 0, compute_stream,
-                scratch.d_shared_swiglu, layer.d_shared_w2, scratch.d_moe_accum, INTER_DIM
-            );
 
             // Let cold NVMe reads overlap the shared expert pass; materialization
             // still completes before the first routed expert consumes each slot.
@@ -1148,7 +1154,6 @@ public:
     void free_all() {
         if (compute_stream) { (void)hipStreamSynchronize(compute_stream); }
         if (sdma_stream) { (void)hipStreamSynchronize(sdma_stream); }
-        clear_pending_warm_slots();
         if (compute_stream) { (void)hipStreamDestroy(compute_stream); compute_stream = 0; }
         if (sdma_stream) { (void)hipStreamDestroy(sdma_stream); sdma_stream = 0; }
         if (d_cos_cache_) { (void)hipFree(d_cos_cache_); d_cos_cache_ = nullptr; }
@@ -1175,30 +1180,6 @@ public:
     }
 
 private:
-    void wait_for_pending_warm_slot(uint32_t host_slot) {
-        auto event_it = pending_warm_events_.find(host_slot);
-        if (event_it == pending_warm_events_.end()) return;
-        CHECK_HIP(hipEventSynchronize(event_it->second));
-        (void)hipEventDestroy(event_it->second);
-        pending_warm_events_.erase(event_it);
-    }
-
-    void record_pending_warm_slot(uint32_t host_slot) {
-        wait_for_pending_warm_slot(host_slot);
-        hipEvent_t event = nullptr;
-        CHECK_HIP(hipEventCreateWithFlags(&event, hipEventDisableTiming));
-        CHECK_HIP(hipEventRecord(event, sdma_stream));
-        pending_warm_events_.emplace(host_slot, event);
-    }
-
-    void clear_pending_warm_slots() {
-        for (auto& [host_slot, event] : pending_warm_events_) {
-            (void)host_slot;
-            if (event) (void)hipEventDestroy(event);
-        }
-        pending_warm_events_.clear();
-    }
-
     void read_experts_direct_blocking(
         const std::vector<std::pair<uint32_t, uint32_t>>& expert_ids,
         const std::vector<uint8_t*>& destinations
@@ -1284,7 +1265,6 @@ private:
 
     float* d_cos_cache_{nullptr};
     float* d_sin_cache_{nullptr};
-    std::unordered_map<uint32_t, hipEvent_t> pending_warm_events_;
 };
 
 } // namespace aeon::core

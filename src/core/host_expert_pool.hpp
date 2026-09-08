@@ -132,6 +132,16 @@ public:
         return segments_[segment_idx].base + static_cast<size_t>(segment_slot) * AEON_EXPERT_BYTES;
     }
 
+    // True when the segment backing this slot is page-locked (hipHostMalloc),
+    // i.e. safe for direct SDMA upload without staging through a bounce buffer.
+    bool is_slot_pinned(uint32_t slot_idx) const {
+        const uint32_t segment_idx = slot_idx / SEGMENT_SLOTS;
+        if (slot_idx >= num_slots || segment_idx >= segments_.size()) {
+            return false;
+        }
+        return segments_[segment_idx].uses_hip_host_malloc;
+    }
+
     // Sub-tensor pointers within a host slot
     const uint32_t* get_w1_packed(uint32_t slot_idx) const {
         return reinterpret_cast<const uint32_t*>(get_expert_slot_ptr(slot_idx) + AEON_W1_PACKED_OFFSET);

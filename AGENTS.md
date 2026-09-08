@@ -59,7 +59,9 @@ Always consult these authoritative documents for deep technical specifics:
     - [x] Ran the full 43-layer benchmark with 606 direct-populated Warm slots (`7.99 GiB`): 555 Warm hits and 601 Cold misses, with valid output at `3.98 tok/s`.
     - [x] Ran the target 35 GiB Warm profile with 2,654 direct-populated slots: 684 Warm hits and 472 Cold misses, with valid output at `3.95 tok/s`; the run completed but increased observed swap usage by approximately `0.7 GiB`.
     - [x] Removed the synchronous Hot-to-Warm demotion wait and validated the controlled A/B: `4.37 tok/s` with Warm disabled versus `5.15 tok/s` with the 35 GiB Warm profile; output remained identical.
-    - [ ] Reduce host-memory pressure, remove the remaining Warm Host staging `memcpy`, reach the `>= 6.0 GB/s` model-backed throughput target, and complete controlled Tier 2 end-to-end measurements; remaining work is dominated by physical expert placement and storage-layout optimization.
+    - [x] Executed Expert Review Step 1 ([Expert Performance Review](plans-and-docs/EXPERT_PERFORMANCE_REVIEW.md)): deleted Hot-to-Warm D2H demotion from the request path, warm hits now upload directly from pinned segments (no staging memcpy), and shared-expert kernels enqueue before CPU staging dispatch. M16 A/B: `4.36` vs `5.11 tok/s` — throughput unchanged despite 3× less warm-hit traffic, proving the loop is latency-bound by just-in-time dispatch, not bandwidth-bound.
+    - [ ] Reduce host-memory pressure, reach the `>= 6.0 GB/s` model-backed throughput target, and complete controlled Tier 2 end-to-end measurements; remaining work is dominated by physical expert placement and storage-layout optimization.
+    - [ ] **Next (highest priority)**: Review Step 3 — measure token-to-token top-6 routing locality (Jaccard), then implement speculative cross-token expert prefetch with an enlarged staging arena to give routed layers L≥3 a real prefetch horizon.
 
 ### Future (Upcoming Next)
 - [ ] **Phase 3 — Multi-GPU Pipeline Parallelism**:

@@ -133,6 +133,12 @@ public:
         transition(slot_idx, SlotState::IO_PENDING, SlotState::IO_COMPLETE);
     }
 
+    // Claim a slot purely to borrow its completion event for a direct pinned
+    // host-to-device upload; no payload is staged into the arena.
+    void begin_direct_transfer(uint32_t slot_idx) {
+        transition(slot_idx, SlotState::AVAILABLE, SlotState::GPU_TRANSFER_PENDING);
+    }
+
     void begin_gpu_transfer(uint32_t slot_idx) {
         transition(slot_idx, SlotState::IO_COMPLETE, SlotState::GPU_TRANSFER_PENDING);
     }
