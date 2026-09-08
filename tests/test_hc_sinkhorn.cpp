@@ -141,7 +141,7 @@ int main() {
     CHECK_HIP(hipMemcpy(d_residual, h_residual.data(), h_residual.size() * sizeof(float), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(d_fn, h_fn.data(), h_fn.size() * sizeof(float), hipMemcpyHostToDevice));
 
-    aeon::kernel::hc_project_kernel<<<1, 32>>>(
+    aeon::kernel::hc_project_kernel<<<mix_hc, 256>>>(
         d_residual, d_fn, d_projected, hidden_size, hc_mult, 1e-6f
     );
     CHECK_HIP(hipDeviceSynchronize());
@@ -183,7 +183,7 @@ int main() {
     assert(max_err_post < 1e-5f);
     assert(max_err_comb < 1e-5f);
 
-    aeon::kernel::hc_pre_combine_kernel<<<(hidden_size + 255) / 256, 256>>>(
+    aeon::kernel::hc_pre_combine_kernel<<<(hidden_size / 4 + 255) / 256, 256>>>(
         d_residual, d_pre, d_layer_input, hidden_size, hc_mult
     );
     CHECK_HIP(hipDeviceSynchronize());

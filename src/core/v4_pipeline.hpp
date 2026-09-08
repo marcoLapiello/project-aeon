@@ -395,6 +395,7 @@ public:
         constexpr int H = kernel::DSV4_HIDDEN_SIZE; // 4096
         constexpr int HC = 4;
         constexpr int HC_DIM = HC * H;             // 16384
+        constexpr int HC_MULT3 = HC * (2 + HC);    // 24
         constexpr int M_PAD = 16;
         constexpr int Q_LORA = kernel::DSV4_Q_LORA_RANK;
         constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
@@ -429,7 +430,7 @@ public:
             // -----------------------------------------------------------------
             hipLaunchKernelGGL(
                 kernel::hc_project_kernel,
-                dim3(1), dim3(32), 0, compute_stream,
+                dim3(HC_MULT3), dim3(256), 0, compute_stream,
                 scratch.d_res_in, layer.d_hc_attn_fn, scratch.d_mixes_a,
                 H, HC, 1e-6f
             );
@@ -445,7 +446,7 @@ public:
 
             hipLaunchKernelGGL(
                 kernel::hc_pre_combine_kernel,
-                dim3((H + 255) / 256), dim3(256), 0, compute_stream,
+                dim3((H / 4 + 255) / 256), dim3(256), 0, compute_stream,
                 scratch.d_res_in, scratch.d_pre_a, scratch.d_x_pre, H, HC
             );
 
@@ -572,7 +573,7 @@ public:
             // -----------------------------------------------------------------
             hipLaunchKernelGGL(
                 kernel::hc_project_kernel,
-                dim3(1), dim3(32), 0, compute_stream,
+                dim3(HC_MULT3), dim3(256), 0, compute_stream,
                 scratch.d_res_mid, layer.d_hc_ffn_fn, scratch.d_mixes_f,
                 H, HC, 1e-6f
             );
@@ -587,7 +588,7 @@ public:
 
             hipLaunchKernelGGL(
                 kernel::hc_pre_combine_kernel,
-                dim3((H + 255) / 256), dim3(256), 0, compute_stream,
+                dim3((H / 4 + 255) / 256), dim3(256), 0, compute_stream,
                 scratch.d_res_mid, scratch.d_pre_f, scratch.d_ffn_pre, H, HC
             );
 
