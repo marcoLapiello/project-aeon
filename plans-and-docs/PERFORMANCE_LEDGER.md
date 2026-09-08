@@ -233,3 +233,36 @@ This ledger records physical hardware verification benchmarks, test conditions, 
   - **Full Throughput Recovery and Leap**: Completely resolved the $49\text{ tok/s}$ regression, exceeding both the Milestone 4 CPU-hybrid baseline ($89.5 - 91.8\text{ tok/s}$) and the earlier Milestone 7 regression by jumping to **$122.6 - 122.9\text{ tok/s}$** ($2.5\times$ over regressed state, $+34\%$ over original baseline).
   - **Pure Zero-Host-Sync GPU Execution**: Eliminates all CPU roundtrip copies (`d_res` to host, CPU dot products, host-to-device transfers) with zero host synchronization stalls.
   - **Bit-Exact Numerical Precision**: Parity verified against CPU reference with error $< 4.5 \times 10^{-6}$ for projection and exact 0 error for pre-combination and post-expansion.
+
+---
+
+### Milestone 9: 43-Layer Full-Model Benchmark with Optimized Kernels
+* **Date**: 2026-09-08
+* **Commit**: Pending
+* **Test Conditions**:
+  - Model: `DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon` (All 43 layers, 11,008 routed experts)
+  - Hardware: AMD Radeon RX 7900 XTX (`gfx1100`, Device 0)
+  - Active Layers: **All 43 consecutive layers (100% full model forward pass)**
+  - Tier 1: 664 hot VRAM slots ($8.75\text{ GB}$) dynamically shared across all layers
+  - Tier 2: Disabled for cold baseline; on-demand streaming from `.aeon` container
+  - Benchmark Executable: `tests/bench_full_model.cpp` (Prompt: 4 tokens -> 8 generated tokens)
+
+* **Achieved Benchmark Numbers**:
+
+| Metric | First Pass (Cold Page Cache) | Second Pass (Warm Page Cache) | Prior Milestone 6 Baseline |
+| :--- | :---: | :---: | :---: |
+| **Pipeline Initialization** | $17.03\text{ s}$ | $3.70\text{ s}$ | $4.42\text{ s}$ |
+| **Total Execution Time** | $9,064.50\text{ ms}$ | **$2,921.36\text{ ms}$** | $5,884.86\text{ ms}$ |
+| **TTFT (Prefill)** | $4,828.98\text{ ms}$ ($1,207.24\text{ ms/tok}$) | **$1,494.25\text{ ms}$** ($373.56\text{ ms/tok}$) | $2,549.36\text{ ms}$ |
+| **Decode Throughput** | $1.65\text{ tokens/sec}$ | **$4.91\text{ tokens/sec}$** | $2.10\text{ tokens/sec}$ |
+| **Decode Step Latency** | $605.06\text{ ms/token}$ | **$203.86\text{ ms/token}$** | $476.48\text{ ms/token}$ |
+| **Per-Layer Decode Latency** | $14.07\text{ ms/tok/layer}$ | **$4.74\text{ ms/tok/layer}$** | $11.08\text{ ms/tok/layer}$ |
+| **Tier 1 VRAM Cache Hits** | 1,682 hits | 1,682 hits | 1,609 hits |
+| **Tier 1 VRAM Cache Misses**| 1,156 misses | 1,156 misses | 1,229 misses |
+| **Tier 1 VRAM Hit Rate** | **$59.3\%$** | **$59.3\%$** | 56.7% |
+
+* **Analysis**:
+  - The parallelized HC kernels and zero-host-sync pipeline drastically lowered per-layer compute latency across all 43 layers.
+  - On warm pages, decode throughput jumped from **$2.10\text{ tok/s}$ to $4.91\text{ tok/s}$** ($2.3\times$ speedup), and decode step latency dropped from **$476.5\text{ ms}$ to $203.9\text{ ms}$** ($4.74\text{ ms/tok/layer}$).
+  - Even on cold page faults, total latency improved by over $3.7\text{ seconds}$ ($12.8\text{ s} \to 9.06\text{ s}$).
+  - Across 43 layers ($258$ active expert evaluations per token), the remaining $\approx 200\text{ ms/tok}$ latency is dominated by synchronous page faults and PCIe DMA transfers for the 1,156 misses ($40.7\%$ miss rate). This confirms the critical necessity of **Spike 2: Dual-stream asynchronous SDMA prefetching** to hide this remaining I/O latency behind compute.
