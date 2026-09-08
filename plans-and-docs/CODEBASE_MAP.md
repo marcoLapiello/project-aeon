@@ -22,6 +22,7 @@ The production-facing implementation is:
 - `src/core/vram_expert_pool.hpp` - Tier 1 hot expert pool.
 - `src/core/host_expert_pool.hpp` - Tier 2 warm expert pool.
 - `src/core/expert_registry.hpp` - expert residency and usage tracking.
+- `plans-and-docs/V4_PIPELINE_MODULARIZATION_ANALYSIS.md` - duplication findings and the proposed extraction order for `v4_pipeline.hpp`.
 - `src/kernel/*.hpp` - attention, W4A16 GEMM, routing, and Hyper-Connections kernels.
 
 The direct-I/O layer is not yet on this path. `src/io/aligned_allocator.hpp` and
