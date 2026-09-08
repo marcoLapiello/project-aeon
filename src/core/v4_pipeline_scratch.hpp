@@ -74,6 +74,9 @@ struct PipelineScratchBuffers {
     half*  d_hc_head_out{nullptr};  // [4096]
     half*  d_head_norm{nullptr};    // [4096]
     half*  d_logits{nullptr};       // [129280]
+    float*   d_argmax_partial_vals{nullptr}; // [505] GPU argmax block partials
+    int32_t* d_argmax_partial_idx{nullptr};  // [505]
+    int32_t* d_argmax_result{nullptr}; // [1] GPU argmax output token id
 
     PipelineScratchBuffers() = default;
 
@@ -153,6 +156,9 @@ struct PipelineScratchBuffers {
         CHECK_HIP(hipMalloc(&d_hc_head_out, H * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_head_norm, H * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_logits, 129280 * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_argmax_partial_vals, 505 * sizeof(float)));
+        CHECK_HIP(hipMalloc(&d_argmax_partial_idx, 505 * sizeof(int32_t)));
+        CHECK_HIP(hipMalloc(&d_argmax_result, sizeof(int32_t)));
 
         // Clear initial padded memory
         CHECK_HIP(hipMemset(d_x_pre, 0, M * H * sizeof(half)));
@@ -209,6 +215,9 @@ struct PipelineScratchBuffers {
         if (d_hc_head_out) { (void)hipFree(d_hc_head_out); d_hc_head_out = nullptr; }
         if (d_head_norm) { (void)hipFree(d_head_norm); d_head_norm = nullptr; }
         if (d_logits) { (void)hipFree(d_logits); d_logits = nullptr; }
+        if (d_argmax_partial_vals) { (void)hipFree(d_argmax_partial_vals); d_argmax_partial_vals = nullptr; }
+        if (d_argmax_partial_idx) { (void)hipFree(d_argmax_partial_idx); d_argmax_partial_idx = nullptr; }
+        if (d_argmax_result) { (void)hipFree(d_argmax_result); d_argmax_result = nullptr; }
     }
 
 private:
@@ -262,6 +271,9 @@ private:
         d_hc_head_out = o.d_hc_head_out; o.d_hc_head_out = nullptr;
         d_head_norm = o.d_head_norm; o.d_head_norm = nullptr;
         d_logits = o.d_logits; o.d_logits = nullptr;
+        d_argmax_partial_vals = o.d_argmax_partial_vals; o.d_argmax_partial_vals = nullptr;
+        d_argmax_partial_idx = o.d_argmax_partial_idx; o.d_argmax_partial_idx = nullptr;
+        d_argmax_result = o.d_argmax_result; o.d_argmax_result = nullptr;
     }
 };
 

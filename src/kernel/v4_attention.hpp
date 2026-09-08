@@ -324,7 +324,123 @@ __global__ void v4_gemv_fp16_kernel(
     }
 }
 
-// 7. Single-position Forward RoPE for autoregressive generation
+// Vectorized FP16 GEMV (Expert Review Step 5): each lane streams 8 halves per
+// iteration via uint4 (vs 1 half in v4_gemv_fp16_kernel) — 8x fewer global
+// transactions and FP32 FMA accumulation. Used for the shared-expert and LM
+// head projections; requires in_dim % 8 == 0 (satisfied by H=4096/2048).
+__global__ void __launch_bounds__(32) v4_gemv_fp16_vec8_kernel(
+    const __half* __restrict__ x,       // [T, in_dim]
+    const __half* __restrict__ w,       // [out_dim, in_dim]
+    __half*       __restrict__ y,       // [T, out_dim]
+    int in_dim
+) {
+    int out_col = blockIdx.x;
+    int token   = blockIdx.y;
+    int lane    = threadIdx.x;
+
+    const uint4* x_row = reinterpret_cast<const uint4*>(x + token * in_dim);
+    const uint4* w_row = reinterpret_cast<const uint4*>(w + out_col * in_dim);
+    const int vec_dim = in_dim >> 3; // 8 halves per uint4
+
+    float dot = 0.0f;
+    for (int i = lane; i < vec_dim; i += 32) {
+        const uint4 xv = __ldg(x_row + i);
+        const uint4 wv = __ldg(w_row + i);
+        const __half2* xh = reinterpret_cast<const __half2*>(&xv);
+        const __half2* wh = reinterpret_cast<const __half2*>(&wv);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 xf = __half22float2(xh[j]);
+            const float2 wf = __half22float2(wh[j]);
+            dot = fmaf(xf.x, wf.x, dot);
+            dot = fmaf(xf.y, wf.y, dot);
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        dot += __shfl_xor(dot, offset, 32);
+    }
+
+    if (lane == 0) {
+        y[token * gridDim.x + out_col] = __float2half(dot);
+    }
+}
+
+// Half -> float elementwise conversion (replaces the per-layer D2H/sync/CPU/
+// H2D router-logits round-trip with a single device kernel).
+__global__ void v4_half_to_float_n_kernel(
+    const __half* __restrict__ in,
+    float* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(in[i]);
+}
+
+// GPU argmax over the [129280] FP16 logit head (Expert Review Step 5).
+// Phase 1: each block reduces a strided span to a {max, idx} partial written
+// to partial_vals/partial_idx. Phase 2: block 0 reduces the gridDim.x partials
+// to the final winner. First-max-wins on ties (strictly-greater comparison,
+// ascending index) matches the previous CPU sequential argmax exactly.
+constexpr int V4_ARGMAX_BLOCKS = 505; // > #SMs; also the Phase-2 partial count
+
+__global__ void __launch_bounds__(256) v4_argmax_fp16_kernel(
+    const __half* __restrict__ logits,
+    int n,
+    float* __restrict__ partial_vals,   // [V4_ARGMAX_BLOCKS]
+    int32_t* __restrict__ partial_idx,  // [V4_ARGMAX_BLOCKS]
+    int32_t* __restrict__ out_idx       // [1]
+) {
+    __shared__ float s_val[256];
+    __shared__ int   s_idx[256];
+
+    const int tid = threadIdx.x;
+    const int gtid = blockIdx.x * blockDim.x + tid;
+    const int stride = gridDim.x * blockDim.x;
+
+    float best = -INFINITY;
+    int best_i = n; // sentinel: larger than any real index so real winners beat it
+    for (int i = gtid; i < n; i += stride) {
+        float v = __half2float(logits[i]);
+        if (v > best) { best = v; best_i = i; }
+    }
+
+    s_val[tid] = best;
+    s_idx[tid] = best_i;
+    __syncthreads();
+
+    // Block reduction: on ties keep the smaller index (first-max-wins)
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = s_val[tid + s];
+            int   oi = s_idx[tid + s];
+            if (ov > s_val[tid] || (ov == s_val[tid] && oi < s_idx[tid])) {
+                s_val[tid] = ov;
+                s_idx[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_vals[blockIdx.x] = s_val[0];
+        partial_idx[blockIdx.x]  = s_idx[0];
+    }
+
+    // Phase 2: block 0 reduces the gridDim.x block winners (np = 505, trivial)
+    if (blockIdx.x == 0 && tid == 0) {
+        const int np = gridDim.x;
+        float bv = -INFINITY;
+        int   bi = n;
+        for (int b = 0; b < np; ++b) {
+            float pv = partial_vals[b];
+            int   pi = partial_idx[b];
+            if (pv > bv || (pv == bv && pi < bi)) { bv = pv; bi = pi; }
+        }
+        out_idx[0] = bi;
+    }
+}
 __global__ void __launch_bounds__(32) v4_forward_rope_at_pos_wave32_kernel(
     __half* __restrict__ vec,           // [num_heads, head_dim]
     const float* __restrict__ cos_cache,// [max_seq, 32]

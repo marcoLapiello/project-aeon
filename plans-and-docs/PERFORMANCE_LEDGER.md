@@ -227,4 +227,17 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
 * **Controlled A/B** (context 4096, 4 prompt → 8 gen):
   - Warm 35 GiB: `5.79 → 5.88 tok/s` (`172.6 → 170.0 ms/tok`), TTFT `1835 → 1803 ms`.
   - Warm off: `5.25 → 5.39 tok/s` (`190.4 → 185.6 ms/tok`).
+
+### M20: Per-Layer CPU-Stall Removal & GPU Argmax (Expert Review Step 5)
+* **Date**: 2026-09-08 | **Status**: Completed | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](EXPERT_PERFORMANCE_REVIEW.md)
+* **Changes** ([v4_attention.hpp](../src/kernel/v4_attention.hpp), [v4_pipeline.hpp](../src/core/v4_pipeline.hpp), [v4_pipeline_scratch.hpp](../src/core/v4_pipeline_scratch.hpp)):
+  - **Router-logits round-trip eliminated**: the old path did D2H of 256 halves → `hipStreamSynchronize` → CPU half→float → H2D **every layer** just to satisfy the router kernel's float input. Replaced with a device-side `v4_half_to_float_n_kernel` — removes 43 full pipeline drains per token.
+  - **GPU argmax over the 129,280-logit head**: new two-phase `v4_argmax_fp16_kernel` (505 blocks × 256 threads, block partials + grid reduction, first-max-wins tie-break identical to the CPU sequential scan). Replaces the 258 KB D2H + sync + 129,280-element CPU loop with a 4-byte result readback.
+  - **Vectorized FP16 GEMV** (`v4_gemv_fp16_vec8_kernel`): lanes stream 8 halves/iteration via `uint4` + FP32 FMA (vs 1 half in `v4_gemv_fp16_kernel`). Applied to the router GEMV, shared-expert w1/w3/w2, and the LM head (the LM head alone moves 1.06 GB/token; ~8× fewer global transactions).
+* **Regression validation (silicon)**: `test_v4_pipeline`, `test_aeon_pipeline`, `test_v4_moe_layer`, `test_hot_warm_cold_pipeline` (golden token `295` — GPU argmax reproduces the CPU argmax exactly), `test_dynamic_expert_pool`, `test_async_prefetch` — all pass.
+* **Controlled A/B** (context 4096, 4 prompt → 8 gen):
+  - Warm 35 GiB: `5.88 → 7.10 tok/s` (`170.0 → 140.8 ms/tok`), +20.7%; TTFT `1803 → 1801 ms`.
+  - Warm off: `5.39 → 6.32 tok/s` (`185.6 → 158.2 ms/tok`), +17.3%.
+  - Generated tokens returned to the M15 sequence `[237, 223 ×7]` — the vectorized LM head's FP32 summation order resolves the near-tie argmax the same way as the pre-M18 path, further confirming the M18 flip was tie-break noise rather than a numerics error.
+* **Interpretation**: removing the 43 per-layer router round-trips and the per-token 258 KB readback + CPU scan cut ~29 ms/token. The step is now dominated by the exposed just-in-time cold-miss read path (io_uring latency + ~2.4 novel experts/layer). **Next**: Step 6 — contiguous `.aeon` repack (fallocate, frequency-ordered) to raise the cold tier from ~3.2 GB/s toward the ≥6 GB/s target, directly shrinking the exposed miss window.
 * **Interpretation**: +1.5–2.7% — modest but real, and structurally important: per-expert PCIe transfer is now a single sequential SDMA burst with far less submission overhead, and the io_uring cold path is decoupled from warm-hit latency. The step remains dominated by the just-in-time cold-miss read exposure (~2.4 novel experts/layer × ~3.5 ms) — next lever is Step 5 (single-sync router + GPU argmax to remove per-layer CPU stalls) and Step 6 (contiguous `.aeon` repack to raise cold-tier read bandwidth toward 6 GB/s).

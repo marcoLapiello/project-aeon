@@ -879,19 +879,18 @@ public:
             // H. MoE Routing & Expert Execution
             // -----------------------------------------------------------------
             // 1. Router Logits: gate_weight @ ffn_norm_act [256]
+            // The GEMV writes half logits into d_router_logits (used as a half
+            // scratch), then a device kernel widens them to float in-place for
+            // the router -- replacing the old D2H -> sync -> CPU convert -> H2D
+            // round-trip that drained the pipeline every layer.
             hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
+                kernel::v4_gemv_fp16_vec8_kernel,
                 dim3(256, 1), dim3(32), 0, compute_stream,
                 scratch.d_ffn_norm_act, layer.d_gate_weight, reinterpret_cast<half*>(scratch.d_router_logits), H
             );
-            // Convert logits from half to float in-place
-            // Or router_logits directly
-            std::vector<half> h_rlogits_half(256);
-            CHECK_HIP(hipMemcpyAsync(h_rlogits_half.data(), scratch.d_router_logits, 256 * sizeof(half), hipMemcpyDeviceToHost, compute_stream));
-            CHECK_HIP(hipStreamSynchronize(compute_stream));
-            std::vector<float> h_rlogits(256);
-            for (int i = 0; i < 256; ++i) h_rlogits[i] = __half2float(h_rlogits_half[i]);
-            CHECK_HIP(hipMemcpyAsync(scratch.d_router_logits, h_rlogits.data(), 256 * sizeof(float), hipMemcpyHostToDevice, compute_stream));
+            kernel::v4_half_to_float_n_kernel<<<(256 + 255) / 256, 256, 0, compute_stream>>>(
+                reinterpret_cast<const half*>(scratch.d_router_logits), scratch.d_router_logits, 256
+            );
 
             // Launch Router Kernel (Hash mode for layers 0..2)
             hipLaunchKernelGGL(
@@ -925,12 +924,12 @@ public:
             // the CPU dispatches expert transfers and SDMA moves them across PCIe.
             // w1 [2048, 4096] & w3 [2048, 4096]
             hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
+                kernel::v4_gemv_fp16_vec8_kernel,
                 dim3(INTER_DIM, 1), dim3(32), 0, compute_stream,
                 scratch.d_ffn_norm_act, layer.d_shared_w1, scratch.d_shared_gate, H
             );
             hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
+                kernel::v4_gemv_fp16_vec8_kernel,
                 dim3(INTER_DIM, 1), dim3(32), 0, compute_stream,
                 scratch.d_ffn_norm_act, layer.d_shared_w3, scratch.d_shared_up, H
             );
@@ -946,7 +945,7 @@ public:
 
             // w2 [4096, 2048]
             hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
+                kernel::v4_gemv_fp16_vec8_kernel,
                 dim3(H, 1), dim3(32), 0, compute_stream,
                 scratch.d_shared_swiglu, layer.d_shared_w2, scratch.d_moe_accum, INTER_DIM
             );
@@ -1086,28 +1085,27 @@ public:
 
         // 5. LM Head Projection: logits = head_norm @ lm_head.T [129280]
         hipLaunchKernelGGL(
-            kernel::v4_gemv_fp16_kernel,
+            kernel::v4_gemv_fp16_vec8_kernel,
             dim3(129280, 1), dim3(32), 0, compute_stream,
             scratch.d_head_norm, d_lm_head, scratch.d_logits, H
         );
 
-        // 6. Argmax Sampling
-        std::vector<half> h_logits(129280);
-        CHECK_HIP(hipMemcpyAsync(h_logits.data(), scratch.d_logits, 129280 * sizeof(half), hipMemcpyDeviceToHost, compute_stream));
-        CHECK_HIP(hipStreamSynchronize(compute_stream));
+        // 6. GPU Argmax Sampling over the [129280] logit head: replaces the
+        // 258 KB D2H + sync + 129,280-element CPU scan with one device kernel,
+        // leaving only a 4-byte result readback on the critical path.
+        kernel::v4_argmax_fp16_kernel<<<kernel::V4_ARGMAX_BLOCKS, 256, 0, compute_stream>>>(
+            scratch.d_logits, 129280,
+            scratch.d_argmax_partial_vals, scratch.d_argmax_partial_idx,
+            scratch.d_argmax_result
+        );
         for (uint32_t staging_idx : releasable_staging_slots) {
             prefetch_staging_->release_after_gpu_transfer(staging_idx);
         }
 
-        uint32_t best_tok = 0;
-        float best_val = -1e30f;
-        for (uint32_t v = 0; v < 129280; ++v) {
-            float val = __half2float(h_logits[v]);
-            if (val > best_val) {
-                best_val = val;
-                best_tok = v;
-            }
-        }
+        int32_t h_argmax = 0;
+        CHECK_HIP(hipMemcpyAsync(&h_argmax, scratch.d_argmax_result, sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream));
+        CHECK_HIP(hipStreamSynchronize(compute_stream));
+        uint32_t best_tok = static_cast<uint32_t>(h_argmax);
 
         current_seq_len_ = pos + 1;
         return best_tok;
