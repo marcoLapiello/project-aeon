@@ -141,6 +141,12 @@ target_link_libraries(test_dynamic_expert_pool PRIVATE amdhip64)
 add_test(NAME test_dynamic_expert_pool COMMAND test_dynamic_expert_pool)
 set_tests_properties(test_dynamic_expert_pool PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Phase 2 Spike 2 validation: dual-stream asynchronous SDMA prefetching
+add_executable(test_async_prefetch tests/test_async_prefetch.cpp)
+target_link_libraries(test_async_prefetch PRIVATE amdhip64)
+add_test(NAME test_async_prefetch COMMAND test_async_prefetch)
+set_tests_properties(test_async_prefetch PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Current architecture benchmark: global VRAM expert pool generation
 add_executable(bench_dynamic_pool tests/bench_dynamic_pool.cpp)
 target_link_libraries(bench_dynamic_pool PRIVATE amdhip64)

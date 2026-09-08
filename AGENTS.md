@@ -45,10 +45,10 @@ Always consult these authoritative documents for deep technical specifics:
     - [x] Step 3: Purge host-side HC synchronization roundtrips in token step loop.
       - Resolved blocking performance gap: redesigned `hc_project_kernel` with 24 parallel Wave32 blocks and `float4` vectorized loads ($1,188\ \mu\text{s} \to 9.2\ \mu\text{s}$, $129\times$ kernel speedup) and vectorized `hc_pre_combine_kernel`.
       - Exceeded baseline: decode throughput accelerated from 49 tok/s to **122.9 tok/s** on 2 layers with bit-exact CPU reference parity on physical silicon.
-  - [ ] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding:
-    - [ ] Micro-Step 2.1: Lookahead Routing & Prefetch Horizon Pipeline.
-    - [ ] Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream.
-    - [ ] Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon.
+  - [x] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding:
+    - [x] Micro-Step 2.1: Lookahead Routing & Prefetch Horizon Pipeline.
+    - [x] Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream (`PrefetchStagingArena`).
+    - [x] Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon (`test_async_prefetch` passing with +71.5% decode speedup under cold misses).
   - [ ] Spike 3: Linux `io_uring` Direct I/O NVMe Cold Tier integration.
 
 ### Future (Upcoming Next)

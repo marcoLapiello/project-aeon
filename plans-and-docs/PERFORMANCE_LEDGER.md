@@ -26,6 +26,7 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
 | **M7: Refactor Check (Gap)**| 2L | `.aeon` | 664 (global) | 100.0% | 20.39 ms | **49.0 tok/s** | 20.40 ms | Regressed: unparallelized device HC kernel (1 warp) |
 | **M8: Parallel HC Kernels** | 2L | `.aeon` | 664 (global) | 100.0% | 8.21 ms | **122.6 tok/s** | 8.16 ms | 24-block float4 HC ($129\times$ kernel speedup); $+37\%$ over M4 |
 | **M9: Full Model Optimized** | 43L | `.aeon` | 664 (global) | 59.3% | 8.69 ms/L | **4.91 tok/s** | 203.86 ms | $2.3\times$ speedup across all 43L ($4.74\text{ ms/tok/layer}$) |
+| **M10: Dual-Stream SDMA Prefetch** | 2L (Miss-stressed) | `.aeon` | 12 (pinned) | 6.2% | 71.10 ms | **32.8 tok/s** | 30.51 ms | Overlapped SDMA DMA with compute; $+71\%$ decode speed under severe cold-misses |
 
 ---
 
@@ -109,3 +110,15 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
   - Per-layer compute latency dropped to **$4.74\text{ ms}$**.
   - The remaining $203.86\text{ ms}$ decode step is dominated by synchronous DMA transfers for the 1,156 misses ($40.7\%$ miss rate).
   - Direct mandate for **Spike 2**: Asynchronous dual-stream SDMA prefetching to overlap expert transfers behind preceding layer compute.
+
+### M10: Dual-Stream Asynchronous SDMA Prefetching & Latency Hiding (Phase 2 Spike 2)
+* **Date**: 2026-09-08 | **Commit**: `HEAD` | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 2 layers, 12 slots)
+* **Optimization & Architecture**:
+  - Implemented `PrefetchStagingArena`: 12-slot ($170\text{ MB}$) double-buffered pinned host RAM arena (`hipHostMallocPortable`), bypassing OS page faults and swap thrashing.
+  - Decoupled `compute_stream` and `sdma_stream` with fine-grained HIP event synchronization (`hipEventRecord`, `hipStreamWaitEvent`).
+  - Asynchronous PCIe transfers of missing routed experts execute concurrently with Shared Expert forward pass ($W_1, W_3, \text{SwiGLU}, W_2$).
+* **Stress-Test Metrics (12 VRAM slots, 93.8% cold miss rate)**:
+  - TTFT (Prefill): **$71.10\text{ ms}$** (down from $111.43\text{ ms}$, **$36.2\%$ faster**).
+  - Decode Throughput: **$32.78\text{ tok/s}$** ($30.51\text{ ms/tok}$), compared to $19.11\text{ tok/s}$ synchronous baseline (**$+71.5\%$ speedup** under severe cold-miss pressure).
+  - Cache Stats: $14\text{ hits} / 208\text{ misses}$ ($6.2\%$ hit rate) while sustaining smooth execution without blocking CPU roundtrips.
+  - Bit-exact output verified on silicon: token `69146` at step 0 matching golden reference.
