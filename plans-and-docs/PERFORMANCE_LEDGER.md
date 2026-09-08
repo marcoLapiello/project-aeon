@@ -145,3 +145,61 @@ This ledger records physical hardware verification benchmarks, test conditions, 
   - **Hit Rate Reality**: Across 43 layers, the 664 VRAM slots achieved a **$59.3\%$ hit rate** under uniform initial placement without offline prior or async prefetching.
   - **PCIe Latency Cost**: The 1,154 misses required on-demand synchronous PCIe host transfers ($14.15\text{ MB}$ per expert $\approx 0.6\text{ ms}$ per miss). Across the 43-layer forward pass ($258$ expert evaluations per token), cache misses accounted for $\approx 450\text{ ms}$ of the $678\text{ ms}$ decode step latency.
   - **The Direct Mandate for Spike 2**: Asynchronous SDMA prefetching must overlap these misses behind the preceding layer's compute to recover pure silicon compute speed.
+
+---
+
+### Milestone 6: Full-Model Cold-Tier Baseline Without Eager Warm Preload
+* **Date**: 2026-09-08
+* **Commit**: Pending
+* **Test Conditions**:
+  - Model: `DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon` (43 layers, 11,008 routed experts)
+  - Hardware: AMD Radeon RX 7900 XTX (`gfx1100`, Device 0)
+  - Context size: 4,096 tokens
+  - Tier 1: 664 hot VRAM slots ($8.75\text{ GB}$)
+  - Tier 2: Disabled for this baseline; the configured 35 GiB ceiling was not allocated or preloaded
+  - Tier 3: 10,344 experts streamed on demand from the mapped `.aeon` source
+  - Benchmark: `tests/bench_full_model.cpp` (4-token prompt, 8 generated tokens)
+
+* **Achieved Benchmark Numbers**:
+
+| Metric | First Run (Cold File Pages) | Final Run (Warm File Pages) |
+| :--- | :---: | :---: |
+| **Pipeline Initialization** | $7.57\text{ s}$ | $4.42\text{ s}$ |
+| **Total Execution Time** | $12,822.61\text{ ms}$ | $5,884.86\text{ ms}$ |
+| **TTFT (Prefill)** | $6,277.68\text{ ms}$ | $2,549.36\text{ ms}$ |
+| **Decode Throughput** | $1.07\text{ tokens/sec}$ | **$2.10\text{ tokens/sec}$** |
+| **Decode Step Latency** | $934.98\text{ ms/token}$ | $476.48\text{ ms/token}$ |
+| **Tier 1 VRAM Cache Hits** | 1,609 | 1,609 |
+| **Tier 1 VRAM Cache Misses** | 1,229 | 1,229 |
+| **Tier 1 VRAM Hit Rate** | 56.7% | 56.7% |
+
+* **Analysis**:
+  - The benchmark now reaches inference without allocating or synchronously populating a 35 GiB warm buffer.
+  - The large difference between the first and final passes exposes the current mapped-file/page-cache dependency; it is the baseline Spike 2 must improve with explicit asynchronous staging and direct I/O.
+
+---
+
+### Milestone 7: Two-Layer Refactored Pipeline Performance Recheck
+* **Date**: 2026-09-08
+* **Commit**: Pending
+* **Test Conditions**:
+  - Model: `DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon`
+  - Hardware: AMD Radeon RX 7900 XTX (`gfx1100`, Device 0)
+  - Active layers: 2
+  - Tier 1: 664 hot VRAM slots; warm-host preload disabled to avoid the known eager 35 GiB startup path
+  - Three-step warmup before measurement; measured scenarios had no hot-pool misses
+  - Benchmark: `tests/bench_dynamic_pool.cpp`
+
+| Metric | Short Prompt (4 -> 16) | Medium Prompt (8 -> 32) |
+| :--- | :---: | :---: |
+| **Current Decode Throughput** | **$48.81\text{ tokens/sec}$** | **$49.01\text{ tokens/sec}$** |
+| **Current Decode Step Latency** | $20.49\text{ ms/token}$ | $20.40\text{ ms/token}$ |
+| **Tier 1 VRAM Cache Hits** | 228 | 468 |
+| **Tier 1 VRAM Cache Misses** | 0 | 0 |
+| **Tier 1 VRAM Hit Rate** | 100.0% | 100.0% |
+
+* **Regression Against Milestone 4**:
+  - Short-prompt throughput decreased from $91.78$ to $48.81\text{ tokens/sec}$ ($46.8\%$ lower).
+  - Medium-prompt throughput decreased from $89.48$ to $49.01\text{ tokens/sec}$ ($45.2\%$ lower).
+  - Because both current scenarios have zero expert misses, the regression is in the per-token execution path rather than PCIe expert transfers.
+  - Controlled A/B: restoring only the legacy CPU-side HC projection and pre-combine path under the same lazy-cache configuration recovered $90.80$ and $93.41\text{ tokens/sec}$. Restoring the device-HC path returned to $48.83$ and $48.79\text{ tokens/sec}$. This isolates the regression to the new device-side HC precompute implementation introduced by the refactoring.

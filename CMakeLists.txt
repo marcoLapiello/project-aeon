@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
 project(aeon VERSION 0.1.0 LANGUAGES CXX)
 
+enable_testing()
+
 # Enforce C++20 standard
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -91,6 +93,7 @@ target_link_libraries(test_swiglu_clamp PRIVATE amdhip64)
 # Regression test: Hyper-Connections Sinkhorn and expansion
 add_executable(test_hc_sinkhorn tests/test_hc_sinkhorn.cpp)
 target_link_libraries(test_hc_sinkhorn PRIVATE amdhip64)
+add_test(NAME test_hc_sinkhorn COMMAND test_hc_sinkhorn)
 
 # Regression test: fused INT4-to-FP16 Wave32 WMMA
 add_executable(test_w4a16_wmma tests/test_w4a16_wmma.cpp)
@@ -115,6 +118,8 @@ target_link_libraries(test_v4_block PRIVATE amdhip64)
 # Regression test: multi-layer pipeline and KV cache
 add_executable(test_v4_pipeline tests/test_v4_pipeline.cpp)
 target_link_libraries(test_v4_pipeline PRIVATE amdhip64)
+add_test(NAME test_v4_pipeline COMMAND test_v4_pipeline)
+set_tests_properties(test_v4_pipeline PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Baseline benchmark: Safetensors autoregressive generation
 add_executable(bench_v4_generation tests/bench_v4_generation.cpp)
@@ -127,10 +132,14 @@ target_link_libraries(test_aeon_loader PRIVATE amdhip64)
 # Current format validation: end-to-end native .aeon pipeline
 add_executable(test_aeon_pipeline tests/test_aeon_pipeline.cpp)
 target_link_libraries(test_aeon_pipeline PRIVATE amdhip64)
+add_test(NAME test_aeon_pipeline COMMAND test_aeon_pipeline)
+set_tests_properties(test_aeon_pipeline PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Current architecture validation: dynamic memory budget and global pool
 add_executable(test_dynamic_expert_pool tests/test_dynamic_expert_pool.cpp)
 target_link_libraries(test_dynamic_expert_pool PRIVATE amdhip64)
+add_test(NAME test_dynamic_expert_pool COMMAND test_dynamic_expert_pool)
+set_tests_properties(test_dynamic_expert_pool PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Current architecture benchmark: global VRAM expert pool generation
 add_executable(bench_dynamic_pool tests/bench_dynamic_pool.cpp)

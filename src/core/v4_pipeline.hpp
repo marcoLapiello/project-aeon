@@ -338,11 +338,14 @@ public:
         unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(budget_report_.hot_vram_slots);
 
         // 9. Initialize Expert Registry Catalog
+        uint32_t active_warm_host_slots = runtime_cfg.preload_warm_host
+            ? budget_report_.warm_host_slots
+            : 0;
         std::cout << "[Pipeline] Initializing Expert Registry (VRAM=" << budget_report_.hot_vram_slots
-                  << ", Host=" << budget_report_.warm_host_slots << ")..." << std::endl;
+              << ", Host=" << active_warm_host_slots << ")..." << std::endl;
         expert_registry_ = std::make_unique<ExpertRegistry>(
             num_layers_, model_cfg.n_routed_experts,
-            budget_report_.hot_vram_slots, budget_report_.warm_host_slots
+            budget_report_.hot_vram_slots, active_warm_host_slots
         );
 
         // 10. Preload Hot VRAM slots into Unified Pool
@@ -360,7 +363,7 @@ public:
         std::cout << "  > GPU complete: Dense backbone, KV cache, and Hot Expert Pool resident in VRAM!" << std::endl;
 
         // 11. Allocate and Preload Tier 2 Warm Host DDR Pool
-        if (budget_report_.warm_host_slots > 0) {
+        if (runtime_cfg.preload_warm_host && budget_report_.warm_host_slots > 0) {
             std::cout << "[Pipeline] Allocating Tier 2 Warm Host DDR Pool (" << budget_report_.warm_host_slots << " slots, "
                       << (budget_report_.warm_host_bytes / (1024*1024*1024.0)) << " GB)..." << std::endl;
             host_pool_ = std::make_unique<HostExpertPool>(budget_report_.warm_host_slots);
@@ -377,11 +380,13 @@ public:
                 }
             }
             std::cout << "  > Tier 2 Warm Host DDR Pool populated with " << budget_report_.warm_host_slots << " experts." << std::endl;
+        } else if (!runtime_cfg.preload_warm_host) {
+            std::cout << "[Pipeline] Warm Host DDR preload disabled; non-hot experts will stream from the cold .aeon tier on demand." << std::endl;
         }
 
         std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_
                   << " layers with " << budget_report_.hot_vram_slots << " hot VRAM slots and "
-                  << budget_report_.warm_host_slots << " warm host slots." << std::endl;
+                  << active_warm_host_slots << " active warm host slots." << std::endl;
     }
 
     // Run Single Autoregressive Step for token_id at sequence position `pos`
@@ -422,30 +427,12 @@ public:
             // -----------------------------------------------------------------
             // A. Hyper-Connections Attention Pre-Mix & Sinkhorn
             // -----------------------------------------------------------------
-            // Host mixes projection or device mixes projection
-            // mixes = (res @ fn.T) * rms
-            // Mixes projection (24 outputs from 16384 float inputs)
-            // We launch Wave32 GEMV for mixes [24, 16384]
-            // We use cpu/device helper or kernel
-            // Since HC_DIM = 16384, we do dot products on compute_stream:
-            // First compute mean square
-            std::vector<float> h_res(HC_DIM);
-            CHECK_HIP(hipMemcpyAsync(h_res.data(), scratch.d_res_in, HC_DIM * sizeof(float), hipMemcpyDeviceToHost, compute_stream));
-            CHECK_HIP(hipStreamSynchronize(compute_stream));
-
-            float sqrsum = 0.0f;
-            for (int i = 0; i < HC_DIM; ++i) sqrsum += h_res[i] * h_res[i];
-            float rms = 1.0f / std::sqrt((sqrsum / (float)HC_DIM) + 1e-6f);
-
-            // Fetch fn from layer weights
-            const float* hc_fn_ptr = layer.h_hc_attn_fn;
-            std::vector<float> h_mixes_a(24);
-            for (int j = 0; j < 24; ++j) {
-                float dot = 0.0f;
-                for (int k = 0; k < HC_DIM; ++k) dot += h_res[k] * hc_fn_ptr[j * HC_DIM + k];
-                h_mixes_a[j] = dot * rms;
-            }
-            CHECK_HIP(hipMemcpyAsync(scratch.d_mixes_a, h_mixes_a.data(), 24 * sizeof(float), hipMemcpyHostToDevice, compute_stream));
+            hipLaunchKernelGGL(
+                kernel::hc_project_kernel,
+                dim3(1), dim3(32), 0, compute_stream,
+                scratch.d_res_in, layer.d_hc_attn_fn, scratch.d_mixes_a,
+                H, HC, 1e-6f
+            );
 
             // Sinkhorn Normalize Kernel
             hipLaunchKernelGGL(
@@ -456,19 +443,11 @@ public:
                 1e-6f, 1e-6f, 2.0f, 20
             );
 
-            // Pre-combine streams: x_pre = sum_{s} pre_a[s] * res_in[s]
-            std::vector<float> h_pre_a(HC);
-            CHECK_HIP(hipMemcpyAsync(h_pre_a.data(), scratch.d_pre_a, HC * sizeof(float), hipMemcpyDeviceToHost, compute_stream));
-            CHECK_HIP(hipStreamSynchronize(compute_stream));
-
-            std::vector<half> h_x_pre(H);
-            for (int h = 0; h < H; ++h) {
-                float acc = 0.0f;
-                for (int s = 0; s < HC; ++s) acc += h_pre_a[s] * h_res[s * H + h];
-                h_x_pre[h] = __float2half(acc);
-            }
-            // Copy row 0 into d_x_pre (M_PAD rows)
-            CHECK_HIP(hipMemcpyAsync(scratch.d_x_pre, h_x_pre.data(), H * sizeof(half), hipMemcpyHostToDevice, compute_stream));
+            hipLaunchKernelGGL(
+                kernel::hc_pre_combine_kernel,
+                dim3((H + 255) / 256), dim3(256), 0, compute_stream,
+                scratch.d_res_in, scratch.d_pre_a, scratch.d_x_pre, H, HC
+            );
 
             // -----------------------------------------------------------------
             // B. Attention RMSNorm
@@ -591,23 +570,12 @@ public:
             // -----------------------------------------------------------------
             // G. HC FFN Pre-Mix & Sinkhorn
             // -----------------------------------------------------------------
-            std::vector<float> h_res_mid(HC_DIM);
-            CHECK_HIP(hipMemcpyAsync(h_res_mid.data(), scratch.d_res_mid, HC_DIM * sizeof(float), hipMemcpyDeviceToHost, compute_stream));
-            CHECK_HIP(hipStreamSynchronize(compute_stream));
-
-            float sqrsum_f = 0.0f;
-            for (int i = 0; i < HC_DIM; ++i) sqrsum_f += h_res_mid[i] * h_res_mid[i];
-            float rms_f = 1.0f / std::sqrt((sqrsum_f / (float)HC_DIM) + 1e-6f);
-
-            // Fetch fn from layer weights
-            const float* hc_ffn_fn_ptr = layer.h_hc_ffn_fn;
-            std::vector<float> h_mixes_f(24);
-            for (int j = 0; j < 24; ++j) {
-                float dot = 0.0f;
-                for (int k = 0; k < HC_DIM; ++k) dot += h_res_mid[k] * hc_ffn_fn_ptr[j * HC_DIM + k];
-                h_mixes_f[j] = dot * rms_f;
-            }
-            CHECK_HIP(hipMemcpyAsync(scratch.d_mixes_f, h_mixes_f.data(), 24 * sizeof(float), hipMemcpyHostToDevice, compute_stream));
+            hipLaunchKernelGGL(
+                kernel::hc_project_kernel,
+                dim3(1), dim3(32), 0, compute_stream,
+                scratch.d_res_mid, layer.d_hc_ffn_fn, scratch.d_mixes_f,
+                H, HC, 1e-6f
+            );
 
             hipLaunchKernelGGL(
                 kernel::hc_sinkhorn_normalize_kernel,
@@ -617,17 +585,11 @@ public:
                 1e-6f, 1e-6f, 2.0f, 20
             );
 
-            std::vector<float> h_pre_f(HC);
-            CHECK_HIP(hipMemcpyAsync(h_pre_f.data(), scratch.d_pre_f, HC * sizeof(float), hipMemcpyDeviceToHost, compute_stream));
-            CHECK_HIP(hipStreamSynchronize(compute_stream));
-
-            std::vector<half> h_ffn_pre(H);
-            for (int h = 0; h < H; ++h) {
-                float acc = 0.0f;
-                for (int s = 0; s < HC; ++s) acc += h_pre_f[s] * h_res_mid[s * H + h];
-                h_ffn_pre[h] = __float2half(acc);
-            }
-            CHECK_HIP(hipMemcpyAsync(scratch.d_ffn_pre, h_ffn_pre.data(), H * sizeof(half), hipMemcpyHostToDevice, compute_stream));
+            hipLaunchKernelGGL(
+                kernel::hc_pre_combine_kernel,
+                dim3((H + 255) / 256), dim3(256), 0, compute_stream,
+                scratch.d_res_mid, scratch.d_pre_f, scratch.d_ffn_pre, H, HC
+            );
 
             // FFN RMSNorm
             hipLaunchKernelGGL(

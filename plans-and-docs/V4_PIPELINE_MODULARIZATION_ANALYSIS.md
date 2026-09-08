@@ -130,25 +130,46 @@ Recommended direction: introduce a loader/resource initialization helper that
 accepts a model-source abstraction or narrowly shared loader operations. Keep
 the three public initialization entry points for compatibility.
 
-### Hyper-Connections pre-mix calculation
+### Hyper-Connections execution gap
 
-The production `step()` method manually performs host-side Hyper-Connections
-projection work before launching the shared Sinkhorn kernel:
+The original production `step()` path split HC execution across the CPU and
+GPU. It copied the residual to the host, computed the RMS and 24-value
+projection on the CPU, copied the mixes back, ran the existing GPU Sinkhorn
+kernel, copied the four pre-mix values back, combined the four residual
+streams on the CPU, and copied the resulting hidden vector to the GPU.
 
-1. Copy the residual from device to host.
-2. Compute RMS on the CPU.
-3. Compute the projection against the HC function matrix on the CPU.
-4. Copy the mixes back to the device.
-5. Launch `hc_sinkhorn_normalize_kernel`.
+This was not evidence that CPU execution was the intended architecture. It was
+an incremental implementation gap. The existing GPU HC kernels covered only:
 
-The CPU reference path in `v4_block.hpp` uses the shared helper
-`kernel::cpu_sinkhorn_and_mix` from `kernel/hc_sinkhorn.hpp` instead. This is
-not a byte-for-byte duplicate, but the algorithmic responsibility is split
-between two implementations.
+- `hc_sinkhorn_normalize_kernel` for the 4x4 Sinkhorn normalization and
+  pre/post/comb coefficient generation.
+- `hc_post_kernel` for the post-expansion residual update.
 
-This should be treated separately from the first mechanical extraction. The
-host round trips are also a likely performance bottleneck and should be removed
-only with a correctness check against the CPU reference.
+The initial 16,384-to-24 projection and the pre-combination reduction did not
+have production GPU kernels.
+
+A first device-side replacement was added experimentally with
+`hc_project_kernel` and `hc_pre_combine_kernel`. It passed numerical tests, but
+the projection kernel used one Wave32 block to process all 24 output
+projections sequentially. Under the two-layer benchmark this reduced decode
+throughput to approximately 49 tok/s, while restoring the old CPU HC path
+under the same zero-miss cache configuration recovered approximately 90 tok/s.
+
+Therefore Step 3 is still open. The current GPU path is functionally correct
+but not performance-accepted. Do not proceed to Spike 2 performance
+measurements until this gap is resolved, because the HC regression would
+contaminate SDMA and expert-prefetch results.
+
+Required resolution:
+
+1. Keep the CPU implementation as a reference and temporary performance
+   baseline.
+2. Benchmark the projection and pre-combination stages independently with
+   HIP events.
+3. Redesign the GPU projection to parallelize across output projections as
+   well as reduction lanes, and optimize or fuse the pre-combination stage.
+4. Validate numerical parity and recover the prior two-layer throughput before
+   making the device path the production default.
 
 ## Logic That Is Already Reused Correctly
 

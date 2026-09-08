@@ -1,5 +1,6 @@
 #include "core/device.hpp"
 #include "kernel/hc_sinkhorn.hpp"
+#include <algorithm>
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -36,6 +37,32 @@ int main() {
     }
     for (int i = 0; i < mix_hc; ++i) {
         h_base[i] = ((i % 7) - 3) * 0.25f;
+    }
+
+    const int hc_hidden_size = hc_mult * hidden_size;
+    std::vector<float> h_residual(hc_hidden_size);
+    std::vector<float> h_fn(mix_hc * hc_hidden_size);
+    std::vector<float> ref_projected(mix_hc);
+    std::vector<__half> ref_layer_input(hidden_size);
+
+    for (int i = 0; i < hc_hidden_size; ++i) {
+        h_residual[i] = ((i % 29) - 14) * 0.03125f;
+    }
+    for (int j = 0; j < mix_hc; ++j) {
+        for (int i = 0; i < hc_hidden_size; ++i) {
+            h_fn[j * hc_hidden_size + i] = (((j * 17 + i) % 23) - 11) * 0.002f;
+        }
+    }
+
+    float sqrsum = 0.0f;
+    for (float value : h_residual) sqrsum += value * value;
+    float rms = 1.0f / std::sqrt((sqrsum / static_cast<float>(hc_hidden_size)) + 1e-6f);
+    for (int j = 0; j < mix_hc; ++j) {
+        float dot = 0.0f;
+        for (int i = 0; i < hc_hidden_size; ++i) {
+            dot += h_residual[i] * h_fn[j * hc_hidden_size + i];
+        }
+        ref_projected[j] = dot * rms;
     }
 
     // CPU Reference calculations for Sinkhorn
@@ -95,16 +122,38 @@ int main() {
 
     // Allocate GPU buffers
     float *d_mixes, *d_scale, *d_base, *d_pre, *d_post, *d_comb;
+    float *d_residual, *d_fn, *d_projected;
+    __half* d_layer_input;
     CHECK_HIP(hipMalloc(&d_mixes, h_mixes.size() * sizeof(float)));
     CHECK_HIP(hipMalloc(&d_scale, h_scale.size() * sizeof(float)));
     CHECK_HIP(hipMalloc(&d_base, h_base.size() * sizeof(float)));
     CHECK_HIP(hipMalloc(&d_pre, ref_pre_mix.size() * sizeof(float)));
     CHECK_HIP(hipMalloc(&d_post, ref_post_mix.size() * sizeof(float)));
     CHECK_HIP(hipMalloc(&d_comb, ref_comb_mix.size() * sizeof(float)));
+    CHECK_HIP(hipMalloc(&d_residual, h_residual.size() * sizeof(float)));
+    CHECK_HIP(hipMalloc(&d_fn, h_fn.size() * sizeof(float)));
+    CHECK_HIP(hipMalloc(&d_projected, ref_projected.size() * sizeof(float)));
+    CHECK_HIP(hipMalloc(&d_layer_input, hidden_size * sizeof(__half)));
 
     CHECK_HIP(hipMemcpy(d_mixes, h_mixes.data(), h_mixes.size() * sizeof(float), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(d_scale, h_scale.data(), h_scale.size() * sizeof(float), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(d_base, h_base.data(), h_base.size() * sizeof(float), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d_residual, h_residual.data(), h_residual.size() * sizeof(float), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d_fn, h_fn.data(), h_fn.size() * sizeof(float), hipMemcpyHostToDevice));
+
+    aeon::kernel::hc_project_kernel<<<1, 32>>>(
+        d_residual, d_fn, d_projected, hidden_size, hc_mult, 1e-6f
+    );
+    CHECK_HIP(hipDeviceSynchronize());
+
+    std::vector<float> gpu_projected(ref_projected.size());
+    CHECK_HIP(hipMemcpy(gpu_projected.data(), d_projected, gpu_projected.size() * sizeof(float), hipMemcpyDeviceToHost));
+    float max_err_projected = 0.0f;
+    for (size_t i = 0; i < gpu_projected.size(); ++i) {
+        max_err_projected = std::max(max_err_projected, std::abs(gpu_projected[i] - ref_projected[i]));
+    }
+    std::cout << "HC Projection Max Error: " << max_err_projected << std::endl;
+    assert(max_err_projected < 1e-3f);
 
     // Launch Sinkhorn kernel (1 Wave32 warp per token)
     aeon::kernel::hc_sinkhorn_normalize_kernel<<<num_tokens, 32>>>(
@@ -133,6 +182,31 @@ int main() {
     assert(max_err_pre < 1e-5f);
     assert(max_err_post < 1e-5f);
     assert(max_err_comb < 1e-5f);
+
+    aeon::kernel::hc_pre_combine_kernel<<<(hidden_size + 255) / 256, 256>>>(
+        d_residual, d_pre, d_layer_input, hidden_size, hc_mult
+    );
+    CHECK_HIP(hipDeviceSynchronize());
+
+    for (int h = 0; h < hidden_size; ++h) {
+        float value = 0.0f;
+        for (int stream = 0; stream < hc_mult; ++stream) {
+            value += ref_pre_mix[stream] * h_residual[stream * hidden_size + h];
+        }
+        ref_layer_input[h] = __float2half(value);
+    }
+
+    std::vector<__half> gpu_layer_input(hidden_size);
+    CHECK_HIP(hipMemcpy(gpu_layer_input.data(), d_layer_input, gpu_layer_input.size() * sizeof(__half), hipMemcpyDeviceToHost));
+    float max_err_pre_combine = 0.0f;
+    for (size_t i = 0; i < gpu_layer_input.size(); ++i) {
+        max_err_pre_combine = std::max(
+            max_err_pre_combine,
+            std::abs(__half2float(gpu_layer_input[i]) - __half2float(ref_layer_input[i]))
+        );
+    }
+    std::cout << "HC Pre-Combine Max Error: " << max_err_pre_combine << std::endl;
+    assert(max_err_pre_combine < 1e-4f);
 
     // 2. Validate HC Post Kernel
     std::vector<__half> h_layer_out(num_tokens * hidden_size);
@@ -191,6 +265,10 @@ int main() {
     CHECK_HIP(hipFree(d_pre));
     CHECK_HIP(hipFree(d_post));
     CHECK_HIP(hipFree(d_comb));
+    CHECK_HIP(hipFree(d_residual));
+    CHECK_HIP(hipFree(d_fn));
+    CHECK_HIP(hipFree(d_projected));
+    CHECK_HIP(hipFree(d_layer_input));
     CHECK_HIP(hipFree(d_layer_out));
     CHECK_HIP(hipFree(d_res_in));
     CHECK_HIP(hipFree(d_res_out));

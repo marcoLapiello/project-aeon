@@ -43,7 +43,10 @@ Always consult these authoritative documents for deep technical specifics:
     - [x] Step 1: Mechanical modularization (extract ops, scratch buffers, layer context).
     - [x] Step 2: Eliminate dual-cache split (retire per-layer local LRU cache, standardize on Unified VRAM Pool + ExpertRegistry, scrub hardcoded slot numbers).
     - [ ] Step 3: Purge host-side HC synchronization roundtrips in token step loop.
+      - [ ] Open performance gap: the first device-side HC projection/pre-combine implementation is numerically correct but regresses the 2-layer benchmark to approximately 49 tok/s, versus approximately 90 tok/s with the validated CPU reference path under the same zero-miss cache conditions.
+      - [ ] Required before Spike 2: restore the validated baseline while redesigning `hc_project_kernel` and `hc_pre_combine_kernel` with sufficient parallelism; accept the GPU path only after it matches the HC reference and recovers the prior pipeline throughput.
   - [ ] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding:
+    - [ ] Blocked until Step 3 HC performance gap is resolved; otherwise SDMA measurements are contaminated by the HC regression.
     - [ ] Micro-Step 2.1: Lookahead Routing & Prefetch Horizon Pipeline.
     - [ ] Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream.
     - [ ] Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon.

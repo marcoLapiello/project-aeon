@@ -4,6 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace aeon::kernel {
 
@@ -150,6 +151,65 @@ inline void cpu_hc_post(
             residual_out[hco * hidden_size + h] = val;
         }
     }
+}
+
+__global__ void __launch_bounds__(32) hc_project_kernel(
+    const float* __restrict__ residual_in,
+    const float* __restrict__ fn,
+    float* __restrict__ mixes,
+    int hidden_size,
+    int hc_mult,
+    float rms_eps
+) {
+    int lane = threadIdx.x;
+    int hc_hidden_size = hc_mult * hidden_size;
+    int mix_count = hc_mult * (2 + hc_mult);
+
+    float sqrsum = 0.0f;
+    for (int i = lane; i < hc_hidden_size; i += 32) {
+        float value = residual_in[i];
+        sqrsum += value * value;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sqrsum += __shfl_xor(sqrsum, offset, 32);
+    }
+
+    float rms = rsqrtf((sqrsum / static_cast<float>(hc_hidden_size)) + rms_eps);
+    for (int mix_idx = 0; mix_idx < mix_count; ++mix_idx) {
+        float dot = 0.0f;
+        const float* fn_row = fn + mix_idx * hc_hidden_size;
+        for (int i = lane; i < hc_hidden_size; i += 32) {
+            dot += residual_in[i] * fn_row[i];
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            dot += __shfl_xor(dot, offset, 32);
+        }
+
+        if (lane == 0) {
+            mixes[mix_idx] = dot * rms;
+        }
+    }
+}
+
+__global__ void hc_pre_combine_kernel(
+    const float* __restrict__ residual_in,
+    const float* __restrict__ pre_mix,
+    __half* __restrict__ layer_input,
+    int hidden_size,
+    int hc_mult
+) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= hidden_size) return;
+
+    float value = 0.0f;
+    for (int stream = 0; stream < hc_mult; ++stream) {
+        value += pre_mix[stream] * residual_in[stream * hidden_size + h];
+    }
+    layer_input[h] = __float2half(value);
 }
 
 // GPU Wave32 Kernel for HC Sinkhorn and Pre/Post Mix calculation

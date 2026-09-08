@@ -27,11 +27,15 @@ struct AeonRuntimeConfig {
     uint32_t context_size{4096};
 
     // User-configurable: maximum Host RAM to utilize for Warm Tier 2 experts (in bytes).
-    // 0 means auto-allocate up to 80% of physical system RAM.
+    // 0 means auto-allocate up to 70% of physical system RAM.
     size_t host_ram_bytes{0};
 
     // Hardware target device index
     int device_id{0};
+
+    // When false, leave the warm-tier capacity unallocated and stream cold experts on demand.
+    bool preload_warm_host{true};
+
 };
 
 struct MemoryBudgetReport {
@@ -80,7 +84,7 @@ struct MemoryBudgetReport {
             << "    - Total VRAM           : " << (double)total_vram_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Free VRAM (at init)  : " << (double)free_vram_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Total Host RAM       : " << (double)total_host_ram_bytes / (1024 * 1024 * 1024) << " GB\n"
-            << "    - Max Allowed Host RAM : " << (double)max_allowed_host_ram_bytes / (1024 * 1024 * 1024) << " GB (80% safety cap)\n"
+            << "    - Max Allowed Host RAM : " << (double)max_allowed_host_ram_bytes / (1024 * 1024 * 1024) << " GB (70% safety cap)\n"
             << "--------------------------------------------------------------------------------\n"
             << "  VRAM Allocation Breakdown:\n"
             << "    - Dense Model Weights  : " << (double)vram_dense_bytes / (1024 * 1024 * 1024) << " GB\n"
@@ -205,9 +209,11 @@ public:
         report.hot_vram_bytes = static_cast<size_t>(report.hot_vram_slots) * AEON_EXPERT_BYTES;
 
         // 8. Calculate Warm Host DDR Expert Pool capacity
-        size_t host_budget = (runtime_cfg.host_ram_bytes > 0)
-            ? std::min(runtime_cfg.host_ram_bytes, report.max_allowed_host_ram_bytes)
-            : report.max_allowed_host_ram_bytes;
+        size_t host_budget = runtime_cfg.preload_warm_host
+            ? ((runtime_cfg.host_ram_bytes > 0)
+                ? std::min(runtime_cfg.host_ram_bytes, report.max_allowed_host_ram_bytes)
+                : report.max_allowed_host_ram_bytes)
+            : 0;
 
         uint32_t total_experts = static_cast<uint32_t>(model_cfg.num_hidden_layers * model_cfg.n_routed_experts);
         uint32_t remaining_after_vram = (total_experts > report.hot_vram_slots)

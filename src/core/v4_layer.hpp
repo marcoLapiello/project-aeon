@@ -45,14 +45,12 @@ public:
 
     // Hyper-Connections Attention
     float* d_hc_attn_fn{nullptr};    // [24, 16384]
-    const float* h_hc_attn_fn{nullptr};
     float* d_hc_attn_base{nullptr};  // [24]
     float* d_hc_attn_scale{nullptr}; // [3]
 
     // FFN Weights on Device
     half*  d_ffn_norm{nullptr};   // [4096]
     float* d_hc_ffn_fn{nullptr};    // [24, 16384]
-    const float* h_hc_ffn_fn{nullptr};
     float* d_hc_ffn_base{nullptr};  // [24]
     float* d_hc_ffn_scale{nullptr}; // [3]
 
@@ -115,18 +113,12 @@ public:
         upload_tensor(loader, pfx + "attn.wo_b.weight", &d_wo_b);
 
         upload_tensor(loader, pfx + "hc_attn_fn", &d_hc_attn_fn);
-        if (loader.has_tensor(pfx + "hc_attn_fn")) {
-            h_hc_attn_fn = loader.template get_data_ptr<float>(pfx + "hc_attn_fn");
-        }
         upload_tensor(loader, pfx + "hc_attn_base", &d_hc_attn_base);
         upload_tensor(loader, pfx + "hc_attn_scale", &d_hc_attn_scale);
 
         // 2. FFN Weights
         upload_tensor(loader, pfx + "ffn_norm.weight", &d_ffn_norm);
         upload_tensor(loader, pfx + "hc_ffn_fn", &d_hc_ffn_fn);
-        if (loader.has_tensor(pfx + "hc_ffn_fn")) {
-            h_hc_ffn_fn = loader.template get_data_ptr<float>(pfx + "hc_ffn_fn");
-        }
         upload_tensor(loader, pfx + "hc_ffn_base", &d_hc_ffn_base);
         upload_tensor(loader, pfx + "hc_ffn_scale", &d_hc_ffn_scale);
 
@@ -173,13 +165,11 @@ public:
         if (d_hc_attn_fn) { (void)hipFree(d_hc_attn_fn); d_hc_attn_fn = nullptr; }
         if (d_hc_attn_base) { (void)hipFree(d_hc_attn_base); d_hc_attn_base = nullptr; }
         if (d_hc_attn_scale) { (void)hipFree(d_hc_attn_scale); d_hc_attn_scale = nullptr; }
-        h_hc_attn_fn = nullptr;
 
         if (d_ffn_norm) { (void)hipFree(d_ffn_norm); d_ffn_norm = nullptr; }
         if (d_hc_ffn_fn) { (void)hipFree(d_hc_ffn_fn); d_hc_ffn_fn = nullptr; }
         if (d_hc_ffn_base) { (void)hipFree(d_hc_ffn_base); d_hc_ffn_base = nullptr; }
         if (d_hc_ffn_scale) { (void)hipFree(d_hc_ffn_scale); d_hc_ffn_scale = nullptr; }
-        h_hc_ffn_fn = nullptr;
 
         if (d_shared_w1) { (void)hipFree(d_shared_w1); d_shared_w1 = nullptr; }
         if (d_shared_w2) { (void)hipFree(d_shared_w2); d_shared_w2 = nullptr; }
@@ -206,13 +196,11 @@ private:
         d_wo_b = o.d_wo_b; o.d_wo_b = nullptr;
 
         d_hc_attn_fn = o.d_hc_attn_fn; o.d_hc_attn_fn = nullptr;
-        h_hc_attn_fn = o.h_hc_attn_fn; o.h_hc_attn_fn = nullptr;
         d_hc_attn_base = o.d_hc_attn_base; o.d_hc_attn_base = nullptr;
         d_hc_attn_scale = o.d_hc_attn_scale; o.d_hc_attn_scale = nullptr;
 
         d_ffn_norm = o.d_ffn_norm; o.d_ffn_norm = nullptr;
         d_hc_ffn_fn = o.d_hc_ffn_fn; o.d_hc_ffn_fn = nullptr;
-        h_hc_ffn_fn = o.h_hc_ffn_fn; o.h_hc_ffn_fn = nullptr;
         d_hc_ffn_base = o.d_hc_ffn_base; o.d_hc_ffn_base = nullptr;
         d_hc_ffn_scale = o.d_hc_ffn_scale; o.d_hc_ffn_scale = nullptr;
 

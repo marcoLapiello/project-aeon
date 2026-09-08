@@ -21,7 +21,8 @@ int main() {
     aeon::core::V4Pipeline pipeline;
     aeon::core::AeonRuntimeConfig pipeline_cfg;
     pipeline_cfg.context_size = 4096; // 4096 tokens context
-    pipeline_cfg.host_ram_bytes = 0; // auto 80% host RAM (~50 GB for warm staging)
+    pipeline_cfg.host_ram_bytes = 35ULL * 1024ULL * 1024ULL * 1024ULL; // 35 GiB warm staging ceiling
+    pipeline_cfg.preload_warm_host = false;
 
     std::cout << "\n[Step 1] Initializing complete 43-layer pipeline..." << std::endl;
     auto t_init_start = std::chrono::high_resolution_clock::now();
