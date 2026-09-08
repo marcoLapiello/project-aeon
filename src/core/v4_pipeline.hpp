@@ -26,9 +26,6 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <deque>
 #include <iostream>
 #include <list>
 #include <memory>
@@ -81,20 +78,6 @@ public:
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion> direct_io_completions_;
     uint64_t next_direct_io_id_{1};
     MemoryBudgetReport budget_report_;
-
-    // Routing-locality instrumentation (Expert Review Step 3): keeps a short
-    // per-layer history of top-6 expert sets and measures how well the union
-    // of the previous n tokens' sets covers the current token's set. This is
-    // the decisive ceiling for any n-token-union speculative prefetcher.
-    static constexpr uint32_t LOC_HISTORY = 4;
-    bool measure_route_locality_{false};
-    bool locality_flag_initialized_{false};
-    std::vector<std::deque<std::array<int32_t, 6>>> topk_history_;  // per layer
-    std::vector<uint64_t> loc_pair_count_;                          // observations per layer
-    // loc_cover_sum_[l][n-1] = sum over tokens of |top6(t) ∩ union(top6(t-1..t-n))|
-    std::vector<std::array<uint64_t, LOC_HISTORY>> loc_cover_sum_;
-    // loc_cover_hist_[l][n-1][c] = how many tokens had coverage exactly c (0..6)
-    std::vector<std::array<std::array<uint64_t, 7>, LOC_HISTORY>> loc_cover_hist_;
 
     V4Pipeline() = default;
 
@@ -482,16 +465,6 @@ public:
 
         // 1. Embed Token & Replicate to 4 HC streams
         const half* token_emb = host_embed_table + token_id * H;
-
-        // Lazily arm the routing-locality instrumentation (env-gated) and make
-        // sure the per-layer tracking arrays match the configured layer count.
-        if (!locality_flag_initialized_) {
-            measure_route_locality_ = std::getenv("AEON_MEASURE_LOCALITY") != nullptr;
-            locality_flag_initialized_ = true;
-        }
-        if (measure_route_locality_ && topk_history_.size() != num_layers_) {
-            reset_routing_locality_stats();
-        }
 
         // Replicate embedding across 4 streams into d_res_in_half on GPU
         // Shape [4, 4096]
@@ -928,35 +901,6 @@ public:
             CHECK_HIP(hipMemcpyAsync(h_topk_indices.data(), scratch.d_topk_indices, 6 * sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream));
             CHECK_HIP(hipStreamSynchronize(compute_stream));
 
-            // Routing-locality measurement: coverage of this token's top-6 by
-            // the union of the previous n tokens' top-6 sets (n = 1..4).
-            if (measure_route_locality_) {
-                auto& hist = topk_history_[l];
-                if (!hist.empty()) {
-                    loc_pair_count_[l] += 1;
-                    for (uint32_t n = 1; n <= LOC_HISTORY; ++n) {
-                        if (hist.size() < n) break;
-                        uint32_t cover = 0;
-                        for (int a = 0; a < 6; ++a) {
-                            bool found = false;
-                            for (uint32_t back = 0; back < n && !found; ++back) {
-                                const auto& past = hist[hist.size() - 1 - back];
-                                for (int b = 0; b < 6; ++b) {
-                                    if (h_topk_indices[a] == past[b]) { found = true; break; }
-                                }
-                            }
-                            if (found) ++cover;
-                        }
-                        loc_cover_sum_[l][n - 1] += cover;
-                        loc_cover_hist_[l][n - 1][cover] += 1;
-                    }
-                }
-                std::array<int32_t, 6> cur;
-                for (int k = 0; k < 6; ++k) cur[k] = h_topk_indices[k];
-                hist.push_back(cur);
-                if (hist.size() > LOC_HISTORY) hist.pop_front();
-            }
-
             for (uint32_t staging_idx : releasable_staging_slots) {
                 prefetch_staging_->release_after_gpu_transfer(staging_idx);
             }
@@ -1234,73 +1178,6 @@ public:
         direct_io_reader_.reset();
         loader.close_all();
         aeon_loader.close_all();
-    }
-
-    // Reset routing-locality statistics (call between warmup and measurement).
-    void reset_routing_locality_stats() {
-        if (topk_history_.size() != num_layers_) {
-            topk_history_.assign(num_layers_, {});
-            loc_pair_count_.assign(num_layers_, 0);
-            loc_cover_sum_.assign(num_layers_, {});
-            loc_cover_hist_.assign(num_layers_, {});
-        } else {
-            for (auto& h : topk_history_) h.clear();
-            std::fill(loc_pair_count_.begin(), loc_pair_count_.end(), 0);
-            for (auto& s : loc_cover_sum_) s.fill(0);
-            for (auto& h : loc_cover_hist_) {
-                for (auto& row : h) row.fill(0);
-            }
-        }
-    }
-
-    // Print the Step 3 routing-locality report: per-layer coverage of the
-    // current token's top-6 by the union of the previous n tokens' top-6 sets.
-    // The n-union coverage is the exact ceiling for a speculative prefetcher
-    // that predicts token t+1 from the last n tokens; compare against the
-    // measured VRAM hot-hit rate to see what LRU residency already harvests.
-    void print_routing_locality_report() const {
-        if (!measure_route_locality_ || loc_pair_count_.empty()) {
-            return;
-        }
-        std::cout << "\n================================================================================\n"
-                  << "   Routing Locality Report (coverage by union of previous n tokens' top-6)     \n"
-                  << "================================================================================\n"
-                  << "  Layer | pairs | mean coverage n=1   n=2   n=3   n=4  (experts of 6)\n";
-        uint64_t gated_pairs = 0;
-        std::array<uint64_t, LOC_HISTORY> gated_cover{};
-        std::array<std::array<uint64_t, 7>, LOC_HISTORY> gated_hist{};
-        for (uint32_t l = 0; l < num_layers_; ++l) {
-            if (loc_pair_count_[l] == 0) continue;
-            std::printf("  %5u | %5llu |", l, static_cast<unsigned long long>(loc_pair_count_[l]));
-            for (uint32_t n = 1; n <= LOC_HISTORY; ++n) {
-                const double mean = static_cast<double>(loc_cover_sum_[l][n - 1]) /
-                                    static_cast<double>(loc_pair_count_[l]);
-                std::printf("  %.2f", mean);
-            }
-            std::printf("\n");
-            if (l >= 3) {
-                gated_pairs += loc_pair_count_[l];
-                for (uint32_t n = 1; n <= LOC_HISTORY; ++n) {
-                    gated_cover[n - 1] += loc_cover_sum_[l][n - 1];
-                    for (int c = 0; c < 7; ++c) gated_hist[n - 1][c] += loc_cover_hist_[l][n - 1][c];
-                }
-            }
-        }
-        if (gated_pairs > 0) {
-            std::cout << "--------------------------------------------------------------------------------\n"
-                      << "  Gated layers 3-" << (num_layers_ - 1) << " aggregate (" << gated_pairs << " pairs):\n";
-            for (uint32_t n = 1; n <= LOC_HISTORY; ++n) {
-                const double mean = static_cast<double>(gated_cover[n - 1]) /
-                                    static_cast<double>(gated_pairs);
-                uint64_t full = gated_hist[n - 1][6];
-                uint64_t ge5 = gated_hist[n - 1][5] + full;
-                std::printf("    n=%u union : mean coverage %.2f/6 (%.0f%%)  P(full 6/6)=%.1f%%  P(>=5/6)=%.1f%%\n",
-                            n, mean, 100.0 * mean / 6.0,
-                            100.0 * static_cast<double>(full) / static_cast<double>(gated_pairs),
-                            100.0 * static_cast<double>(ge5) / static_cast<double>(gated_pairs));
-            }
-        }
-        std::cout << "================================================================================\n";
     }
 
 private:
