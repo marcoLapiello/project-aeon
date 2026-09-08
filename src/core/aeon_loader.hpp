@@ -31,6 +31,11 @@ constexpr size_t AEON_W3_SCALE_OFFSET  = 13631488;
 
 class AeonModelLoader {
 public:
+    struct ExpertLocation {
+        uint64_t file_offset{0};
+        size_t byte_length{0};
+    };
+
     AeonModelLoader() = default;
     ~AeonModelLoader() {
         close_all();
@@ -69,18 +74,32 @@ public:
         return dense_tensors_.size();
     }
 
-    // Expert access interface: provides zero-copy pointers to an expert's contiguous payload in Host DDR
-    const uint8_t* get_expert_data(uint32_t layer_id, uint32_t expert_id) const {
-        uint64_t slot_idx = static_cast<uint64_t>(layer_id) * experts_per_layer_ + expert_id;
-        if (slot_idx >= expert_offsets_.size()) {
+    ExpertLocation get_expert_location(uint32_t layer_id, uint32_t expert_id) const {
+        if (layer_id >= num_layers_ || expert_id >= experts_per_layer_) {
             throw std::runtime_error("AeonModelLoader: Invalid expert index: L" + std::to_string(layer_id) +
                                      " E" + std::to_string(expert_id));
         }
+
+        uint64_t slot_idx = static_cast<uint64_t>(layer_id) * experts_per_layer_ + expert_id;
         uint64_t offset = expert_offsets_[slot_idx];
-        if (offset + AEON_EXPERT_BYTES > experts_file_size_) {
-            throw std::runtime_error("AeonModelLoader: Expert offset out of bounds!");
+        if ((offset % AEON_SECTOR_SIZE) != 0 ||
+            offset > experts_file_size_ || AEON_EXPERT_BYTES > experts_file_size_ - offset) {
+            throw std::runtime_error("AeonModelLoader: Expert location is invalid or not sector aligned");
         }
-        return experts_mmap_base_ + offset;
+        return ExpertLocation{offset, AEON_EXPERT_BYTES};
+    }
+
+    // Expert access interface: provides zero-copy pointers to an expert's contiguous payload in Host DDR.
+    const uint8_t* get_expert_data(uint32_t layer_id, uint32_t expert_id) const {
+        ExpertLocation location = get_expert_location(layer_id, expert_id);
+        return experts_mmap_base_ + location.file_offset;
+    }
+
+    int expert_direct_fd() const {
+        if (experts_direct_fd_ < 0) {
+            throw std::runtime_error("AeonModelLoader: Direct expert file descriptor is not open");
+        }
+        return experts_direct_fd_;
     }
 
     uint32_t num_layers() const { return num_layers_; }
@@ -103,6 +122,10 @@ public:
         if (experts_fd_ >= 0) {
             ::close(experts_fd_);
             experts_fd_ = -1;
+        }
+        if (experts_direct_fd_ >= 0) {
+            ::close(experts_direct_fd_);
+            experts_direct_fd_ = -1;
         }
 
         dense_tensors_.clear();
@@ -221,9 +244,20 @@ private:
         void* mapped = ::mmap(nullptr, experts_file_size_, PROT_READ, MAP_SHARED, experts_fd_, 0);
         if (mapped == MAP_FAILED) {
             ::close(experts_fd_);
+            experts_fd_ = -1;
             throw std::runtime_error("AeonModelLoader: Failed to mmap experts file: " + experts_path);
         }
         experts_mmap_base_ = static_cast<const uint8_t*>(mapped);
+
+        experts_direct_fd_ = ::open(experts_path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (experts_direct_fd_ < 0) {
+            ::munmap(const_cast<uint8_t*>(experts_mmap_base_), experts_file_size_);
+            experts_mmap_base_ = nullptr;
+            ::close(experts_fd_);
+            experts_fd_ = -1;
+            throw std::runtime_error("AeonModelLoader: Failed to open expert file for O_DIRECT: " +
+                                     experts_path + " (" + strerror(errno) + ")");
+        }
 
         std::cout << "[AeonModelLoader] Loaded experts container: " << num_layers_
                   << " layers x " << experts_per_layer_ << " experts ("
@@ -285,6 +319,7 @@ private:
     std::unordered_map<std::string, LoadedTensor> dense_tensors_;
 
     int experts_fd_{-1};
+    int experts_direct_fd_{-1};
     size_t experts_file_size_{0};
     const uint8_t* experts_mmap_base_{nullptr};
     uint32_t num_layers_{0};

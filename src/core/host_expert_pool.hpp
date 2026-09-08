@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -49,6 +50,7 @@ public:
         num_slots = slots;
 
         size_t total_bytes = static_cast<size_t>(num_slots) * AEON_EXPERT_BYTES;
+        uses_hip_host_malloc_ = false;
 
         // Use hipHostMalloc with hipHostMallocPortable for high-throughput PCIe DMA transfers
         hipError_t err = hipHostMalloc(reinterpret_cast<void**>(&h_pinned_buffer), total_bytes, hipHostMallocPortable);
@@ -63,14 +65,21 @@ public:
                                          std::to_string(total_bytes / (1024 * 1024)) + " MB of host memory!");
             }
             h_pinned_buffer = static_cast<uint8_t*>(ptr);
+        } else {
+            uses_hip_host_malloc_ = true;
         }
     }
 
     void free() {
         if (h_pinned_buffer) {
-            (void)hipHostFree(h_pinned_buffer);
+            if (uses_hip_host_malloc_) {
+                (void)hipHostFree(h_pinned_buffer);
+            } else {
+                std::free(h_pinned_buffer);
+            }
             h_pinned_buffer = nullptr;
         }
+        uses_hip_host_malloc_ = false;
         num_slots = 0;
     }
 
@@ -116,12 +125,16 @@ public:
     }
 
 private:
+    bool uses_hip_host_malloc_{false};
+
     void move_from(HostExpertPool&& other) {
         num_slots = other.num_slots;
         h_pinned_buffer = other.h_pinned_buffer;
+        uses_hip_host_malloc_ = other.uses_hip_host_malloc_;
 
         other.num_slots = 0;
         other.h_pinned_buffer = nullptr;
+        other.uses_hip_host_malloc_ = false;
     }
 };
 

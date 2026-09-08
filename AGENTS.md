@@ -51,6 +51,10 @@ Always consult these authoritative documents for deep technical specifics:
     - [x] Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon (`test_async_prefetch` passing with +71.5% decode speedup under cold misses).
       - Note: Inter-layer lookahead confirmed that single-threaded CPU `memcpy` from unpinned `mmap` backing pages ($85\text{ MB/step}$) bottlenecks prefetching, making Spike 3 Direct I/O the critical unlock.
   - [ ] Spike 3: Linux `io_uring` Direct I/O NVMe Cold Tier integration.
+    - [x] Implemented batched `io_uring` requests, validated expert offsets, dedicated `O_DIRECT` model descriptor, and staging-slot ownership cleanup.
+    - [x] Corrected synchronous regular-file submissions by enabling `IOSQE_ASYNC` and splitting expert payloads into 4 MiB aligned subreads.
+    - [x] Integrated direct cold reads into the native pipeline and passed model parity plus silicon generation regressions.
+    - [ ] Reach the `>= 6.0 GB/s` model-backed throughput target and complete the Tier 2 warm-cache end-to-end measurement; remaining work is dominated by physical expert placement and storage-layout optimization.
 
 ### Future (Upcoming Next)
 - [ ] **Phase 3 — Multi-GPU Pipeline Parallelism**:

@@ -122,3 +122,21 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
   - Decode Throughput: **$32.78\text{ tok/s}$** ($30.51\text{ ms/tok}$), compared to $19.11\text{ tok/s}$ synchronous baseline (**$+71.5\%$ speedup** under severe cold-miss pressure).
   - Cache Stats: $14\text{ hits} / 208\text{ misses}$ ($6.2\%$ hit rate) while sustaining smooth execution without blocking CPU roundtrips.
   - Bit-exact output verified on silicon: token `69146` at step 0 matching golden reference.
+
+### M11: Direct I/O Cold Expert Integration Checkpoint (Phase 2 Spike 3)
+* **Date**: 2026-09-08 | **Status**: Implementation checkpoint, target not yet met | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 2 layers)
+* **Storage path**:
+  - Added batched `io_uring` submission and completion harvesting with strict 4KB buffer, offset, and length validation.
+  - Opened `model_experts.aeon` through a dedicated `O_DIRECT` descriptor and routed cold expert payloads directly into the existing staging arena before HIP SDMA upload.
+  - Added explicit staging ownership transitions and matching cleanup for HIP-pinned and `posix_memalign` allocations.
+* **Validation**:
+  - Generic 128 MiB direct-I/O fixture: **$6.42\text{ GB/s}$**, bit-exact.
+  - Six real expert blocks (81 MiB total): **$3.17\text{ GiB/s}$** after forced asynchronous submission and 4 MiB aligned subreads, bit-exact against `AeonModelLoader`.
+  - Native pipeline: golden token `69146`, valid six-token generation, **$31.73\text{ tok/s}$** in the chunked-read regression run.
+  - Cold-miss async pipeline: **$32.87\text{ tok/s}$** with 12 VRAM slots and 214 misses per layer in the final run.
+* **Open work**:
+  - The original `1.65\text{ GiB/s}` result was partly an implementation defect: `IORING_OP_READ` submissions executed synchronously inside `io_uring_enter` unless `IOSQE_ASYNC` was set. The corrected path reaches `3.17\text{ GiB/s}` for the same six experts.
+  - The remaining gap to $\ge 6.0\text{ GB/s}$ is workload/layout dependent: a 1 GiB sequential read from the model reaches about `$5.88\text{ GiB/s}$`, while the six routed experts are scattered across a file with `1,552` physical extents. A fresh 128 MiB probe file had only `6` extents.
+  - Unit clarification: each expert is `14,155,776` bytes, exactly `3,456` sectors, which is `13.5 MiB` or `14.155776 MB` decimal. The apparent `13.5 MB` versus `14.15 MB` discrepancy is binary versus decimal notation, not a format change.
+  - End-to-end A/B (`bench_async_prefetch_io_modes`, identical 12-slot native pipeline): direct I/O measured `32.31` and `32.57 tok/s`; mmap source measured `33.57` and `33.22 tok/s`, with identical generated tokens. The mmap case warms its page-cache pages during the warmup step, while O_DIRECT bypasses that cache, so this is a steady-state behavior comparison rather than a cold-cache equivalence test.
+  - Tier 2 warm-cache population remains disabled for this checkpoint because the prior contiguous preload caused host-memory pressure and swap contention.

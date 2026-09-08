@@ -116,6 +116,47 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
 - **Micro-Step 3.2: End-to-End 3-Tier Pipeline Validation**
   - Silicon test measuring end-to-end 3-tier streaming throughput from NVMe $\to$ Host RAM $\to$ GPU VRAM, validating data integrity and measuring throughput in GB/s.
 
+#### Spike 3 Implementation Sequence
+
+The implementation is deliberately staged so storage correctness is established before changing GPU scheduling:
+
+1. **Storage primitive and model contract**
+  - Extend `src/io/direct_io_reader.hpp` with reusable asynchronous request submission and completion harvesting while retaining the existing synchronous `read_direct()` API.
+  - Force regular-file `O_DIRECT` reads onto the asynchronous io_uring worker path and split expert payloads into 4 MiB sector-aligned requests; a single large `IORING_OP_READ` was observed to execute synchronously during `io_uring_enter` on this kernel/device combination.
+  - Unit convention: `AEON_EXPERT_BYTES = 14,155,776` bytes = `13.5 MiB` = `14.155776 MB` decimal = `3,456` 4 KiB sectors. The format is unchanged; earlier `13.5 MB` references used binary MiB terminology.
+  - Open `model_experts.aeon` with `O_DIRECT | O_RDONLY | O_CLOEXEC` and expose validated `(file_offset, byte_length)` metadata through `AeonModelLoader`.
+  - Reject non-sector-aligned buffers, offsets, lengths, invalid expert IDs, short completions, and negative `io_uring` results.
+2. **Staging ownership**
+  - Make each `PrefetchStagingArena` slot's lifetime explicit: available, I/O pending, I/O complete, and GPU transfer pending.
+  - Reuse a slot only after both its direct-I/O completion and HIP SDMA event have been observed.
+  - Track whether host memory came from `hipHostMalloc` or `posix_memalign`; release it with the matching API.
+3. **First implementation gate**
+  - Add a model-backed batch direct-I/O test that reads real expert blocks into aligned staging buffers, compares them byte-for-byte with the existing loader, and reports aggregate throughput and completion latency.
+  - Run this gate with the warm host preload disabled; the previously observed large contiguous Tier 2 preload remains out of scope until segmented allocation and an explicit host-memory budget are implemented.
+4. **Pipeline integration**
+  - Replace only the cold branch of the existing lookahead prefetch boundary in `src/core/v4_pipeline.hpp`.
+  - Submit cold reads while the current layer computes, reap them before the corresponding HIP upload, and preserve the existing Hot VRAM and Warm Host paths.
+  - Record a HIP event for each uploaded staging slot and prevent slot reuse until the SDMA event completes.
+5. **Silicon completion gate**
+  - Validate bit-exact expert payloads, direct NVMe throughput (target >= 6.0 GB/s), cold-read counts, staging stalls, TTFT, decode throughput, and generated-token validity.
+  - Update `PERFORMANCE_LEDGER.md`, this plan, and `AGENTS.md` only after the end-to-end measurements are captured.
+
+The first implementation slice is limited to items 1-3. This keeps an `io_uring` or alignment defect from being confused with a pipeline scheduling defect.
+
+#### Spike 3 Implementation Checkpoint (2026-09-08)
+
+- [x] Added batched `io_uring` submission/completion handling, strict 4KB request validation, and default `IOSQE_ASYNC` execution in `src/io/direct_io_reader.hpp`.
+- [x] Added a dedicated `O_DIRECT` descriptor plus validated expert locations to `AeonModelLoader`.
+- [x] Added staging-slot ownership states and matching HIP/`posix_memalign` cleanup; direct and legacy host fills now share the release lifecycle.
+- [x] Integrated cold expert reads into the native pipeline prefetch boundary while preserving Hot VRAM and Warm Host source paths.
+- [x] Added `tests/test_model_direct_io.cpp` and the `test_model_direct_io` CTest target; the gate now validates 24 aligned 4 MiB subreads for six experts.
+- [x] Silicon checks passed after the async/chunked fix: generic direct I/O (`6.43 GB/s`), model-backed six-expert payload parity (`3.17 GiB/s`), native pipeline golden token `69146`, and async cold-miss generation (`32.87 tok/s`).
+- [x] Root cause isolated: baseline `io_uring_enter` submission took about `45 ms` for six expert reads while completion waits were sub-millisecond; `IOSQE_ASYNC` removed that synchronous submission behavior. A 4 MiB direct-read sweep was also materially faster than 14-16 MiB requests on this device.
+- [ ] The model-backed batch result remains below the `>= 6.0 GB/s` Spike 3 target because the target fixture is a short/sequential workload while routed experts are physically scattered across the 145 GB container. The model file has `1,552` physical extents versus `6` for a fresh 128 MiB probe file on the same NVMe/ext4 filesystem. Repacking/defragmentation and higher-volume queue-saturation measurements remain open.
+- [x] Added `bench_async_prefetch_io_modes`: identical 12-slot native inference produced identical tokens, while two A/B runs measured direct `32.31/32.57 tok/s` versus mmap-source `33.57/33.22 tok/s`. This is not an apples-to-apples cold-cache proof because the mmap case warms its page-cache pages during its warmup step; it does show that replacing the source fill alone does not improve the current end-to-end critical path.
+- [ ] Move direct-I/O completion and GPU upload farther ahead of routed execution, and benchmark cold-cache and steady-state modes separately before claiming an inference-throughput gain.
+- [ ] Full Tier 2 warm-cache integration and end-to-end NVMe -> Host DDR -> VRAM measurement remain open; validation was intentionally run with the large warm preload path disabled.
+
 ---
 
 ## 3. Milestone Verification & Success Criteria

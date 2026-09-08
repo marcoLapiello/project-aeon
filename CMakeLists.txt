@@ -70,6 +70,20 @@ target_link_libraries(bench_wmma_gemm PRIVATE amdhip64)
 add_executable(test_direct_io tests/test_direct_io.cpp)
 target_link_libraries(test_direct_io PRIVATE amdhip64)
 
+# Phase 2 Spike 3 validation: model-backed batched O_DIRECT expert reads
+add_executable(test_model_direct_io tests/test_model_direct_io.cpp)
+target_link_libraries(test_model_direct_io PRIVATE amdhip64)
+add_test(NAME test_model_direct_io COMMAND test_model_direct_io)
+set_tests_properties(test_model_direct_io PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Phase 2 Spike 3 investigation: request shape and queue-width benchmark
+add_executable(bench_model_direct_io tests/bench_model_direct_io.cpp)
+target_link_libraries(bench_model_direct_io PRIVATE amdhip64)
+
+# Phase 2 Spike 3 investigation: native pipeline direct-I/O versus mmap A/B
+add_executable(bench_async_prefetch_io_modes tests/bench_async_prefetch_io_modes.cpp)
+target_link_libraries(bench_async_prefetch_io_modes PRIVATE amdhip64)
+
 # Transfer benchmark: concurrent compute and SDMA overlap
 add_executable(bench_async_overlap tests/bench_async_overlap.cpp)
 target_link_libraries(bench_async_overlap PRIVATE amdhip64)
