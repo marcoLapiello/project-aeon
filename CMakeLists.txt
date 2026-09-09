@@ -58,6 +58,20 @@ target_link_libraries(smoke_check PRIVATE amdhip64)
 add_executable(aeon_info tools/aeon_info.cpp)
 target_link_libraries(aeon_info PRIVATE amdhip64)
 
+# Full-model routing profile driver with durable incremental aggregation
+add_executable(profile_routing tools/profile_routing.cpp)
+target_link_libraries(profile_routing PRIVATE amdhip64)
+execute_process(
+    COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short HEAD
+    OUTPUT_VARIABLE AEON_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT AEON_GIT_COMMIT)
+    set(AEON_GIT_COMMIT "unknown")
+endif()
+target_compile_definitions(profile_routing PRIVATE AEON_GIT_COMMIT=\"${AEON_GIT_COMMIT}\")
+
 # Hardware validation: single-tile Wave32 WMMA smoke test
 add_executable(test_wmma_tile tests/test_wmma_tile.cpp)
 target_link_libraries(test_wmma_tile PRIVATE amdhip64)
@@ -154,6 +168,12 @@ add_executable(test_routing_counter tests/test_routing_counter.cpp)
 target_link_libraries(test_routing_counter PRIVATE amdhip64)
 add_test(NAME test_routing_counter COMMAND test_routing_counter)
 set_tests_properties(test_routing_counter PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Host-side routing profile parser and checkpoint validation
+add_executable(test_routing_profile tests/test_routing_profile.cpp)
+target_link_libraries(test_routing_profile PRIVATE amdhip64)
+add_test(NAME test_routing_profile COMMAND test_routing_profile)
+set_tests_properties(test_routing_profile PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Current architecture validation: dynamic memory budget and global pool
 add_executable(test_dynamic_expert_pool tests/test_dynamic_expert_pool.cpp)

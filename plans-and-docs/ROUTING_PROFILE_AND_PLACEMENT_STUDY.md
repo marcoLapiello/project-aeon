@@ -86,6 +86,7 @@ The profiler must write structured files instead of requiring terminal-log extra
 ```text
 routing-profile/<run_id>/
     metadata.json
+    state.bin
     counts.csv
     ranking.csv
     progress.json
@@ -101,7 +102,7 @@ routing-profile/<run_id>/
 - completed and failed prompt IDs;
 - profiler version and run parameters.
 
-`counts.csv` is the durable aggregate source of truth. `ranking.csv` is regenerated from the counts after each completed prompt. `progress.json` records completed prompt IDs and allows an interrupted run to resume without rerunning successful prompts.
+`state.bin` is the atomic canonical aggregate state. It stores the counters, completed prompt signatures, and failed prompt records. `counts.csv`, `ranking.csv`, and `progress.json` are structured human-readable views regenerated from that state after each completed prompt. `ranking.csv` is derived from the aggregate counts; `progress.json` mirrors the completed prompt IDs used for resume decisions.
 
 Each update must be crash-tolerant: write a temporary file in the same directory, flush and close it, then atomically rename it to the target path. A partially written ranking must never be treated as a completed result.
 
@@ -115,7 +116,7 @@ Prompt IDs must be stable and unique within a run. Before processing a prompt, t
 
 The run stores a compatibility fingerprint in `metadata.json`. New prompts may be added to an existing run only when the model revision, tokenizer/corpus identity, layer count, expert count, top-k, phase rules, and generation settings match that fingerprint. If any of these inputs change, the profiler starts a new run directory rather than mixing incompatible observations.
 
-The aggregate counts are the source of truth across invocations. The ranking is a derived snapshot and must be rebuilt from the counts after every successful prompt, so the current ranking is always available even when data collection is paused between batches.
+The aggregate state is the source of truth across invocations. The ranking is a derived snapshot and must be rebuilt from that state after every successful prompt, so the current ranking is always available even when data collection is paused between batches.
 
 ## 6. Implementation shape
 
