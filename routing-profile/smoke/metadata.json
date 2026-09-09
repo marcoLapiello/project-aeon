@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "profiler_version": "routing-profile-v1",
+  "aeon_git_commit": "b380a10",
+  "compatibility_fingerprint": "routing-profile-v1|aeon_git_commit=b380a10|model_dir=/home/marcolap/project-aeon/models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon|corpus_id=smoke-v1|dataset=profile|mode=aeon|layers=2|experts=256|top_k=6|context_size=256|warm_gib=0|vram_slots=8|model_config_hash=10771917432759556276|model_index_hash=7822625991320622190|phase_rules=prefill-and-decode-v1",
+  "model_dir": "/home/marcolap/project-aeon/models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon",
+  "input_path": "/tmp/aeon-routing-profile-smoke.jsonl",
+  "corpus_id": "smoke-v1",
+  "dataset": "profile",
+  "mode": "aeon",
+  "num_layers": 2,
+  "expert_count": 256,
+  "top_k": 6,
+  "context_size": 256,
+  "warm_gib": 0,
+  "vram_slots": 8,
+  "model_config_hash": 10771917432759556276,
+  "model_index_hash": 7822625991320622190,
+  "input_prompt_count": 1,
+  "completed_prompts": 1,
+  "failed_prompts": 0
+}
