@@ -72,6 +72,15 @@ if(NOT AEON_GIT_COMMIT)
 endif()
 target_compile_definitions(profile_routing PRIVATE AEON_GIT_COMMIT=\"${AEON_GIT_COMMIT}\")
 
+# Native text-in/text-out CLI for the verified DSV4 formatter and pipeline
+add_executable(aeon_chat
+    tools/aeon_chat.cpp
+    src/text/dsv4_tokenizer.cpp
+    src/text/dsv4_chat_formatter.cpp
+    src/text/text_generation.cpp
+)
+target_link_libraries(aeon_chat PRIVATE amdhip64)
+
 # Hardware validation: single-tile Wave32 WMMA smoke test
 add_executable(test_wmma_tile tests/test_wmma_tile.cpp)
 target_link_libraries(test_wmma_tile PRIVATE amdhip64)
@@ -156,6 +165,28 @@ target_link_libraries(bench_v4_generation PRIVATE amdhip64)
 # Current format validation: native Aeon model loader
 add_executable(test_aeon_loader tests/test_aeon_loader.cpp)
 target_link_libraries(test_aeon_loader PRIVATE amdhip64)
+
+# CPU-side validation: native DSV4 tokenizer artifact and ByteLevel-BPE parity
+add_executable(test_dsv4_tokenizer tests/test_dsv4_tokenizer.cpp src/text/dsv4_tokenizer.cpp)
+target_link_libraries(test_dsv4_tokenizer PRIVATE amdhip64)
+add_test(NAME test_dsv4_tokenizer COMMAND test_dsv4_tokenizer)
+set_tests_properties(test_dsv4_tokenizer PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# CPU-side validation: native DSV4 chat/thinking prompt formatting
+add_executable(test_dsv4_chat_formatter
+    tests/test_dsv4_chat_formatter.cpp
+    src/text/dsv4_tokenizer.cpp
+    src/text/dsv4_chat_formatter.cpp
+)
+target_link_libraries(test_dsv4_chat_formatter PRIVATE amdhip64)
+add_test(NAME test_dsv4_chat_formatter COMMAND test_dsv4_chat_formatter)
+set_tests_properties(test_dsv4_chat_formatter PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# CPU-side validation: EOS-aware token generation loop and stop reasons
+add_executable(test_text_generation tests/test_text_generation.cpp src/text/text_generation.cpp)
+target_link_libraries(test_text_generation PRIVATE amdhip64)
+add_test(NAME test_text_generation COMMAND test_text_generation)
+set_tests_properties(test_text_generation PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Current format validation: end-to-end native .aeon pipeline
 add_executable(test_aeon_pipeline tests/test_aeon_pipeline.cpp)

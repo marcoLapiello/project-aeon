@@ -1,6 +1,6 @@
 # Native Text-In/Text-Out Implementation Plan
 
-*Status: proposed implementation plan*
+*Status: native text-in/text-out turn verified; external behavioral correctness gate remains open*
 
 ## 1. Objective
 
@@ -19,6 +19,15 @@ human text/messages
 The final runtime must remain C++20/native HIP with no Python, PyTorch, Transformers, or vLLM dependency. Python/vLLM may be used during preparation and validation as an offline behavioral oracle. The available machine cannot run the complete DSV4 checkpoint through vLLM locally, so final model-behavior comparison must use a compatible external API.
 
 This work is a prerequisite for trustworthy activation profiling. The current `profile_routing` results are plumbing artifacts only and must not drive Hot/Warm placement until the prompt contract and native model behavior have passed the correctness gates below.
+
+## 1.1 Current Implementation Status
+
+- [x] Native versioned tokenizer artifact preparation and C++ ByteLevel-BPE loader.
+- [x] Native DSV4 chat/thinking formatter with exact control-token and multi-turn parity tests.
+- [x] EOS-aware greedy generation with explicit `eos`, `max_new_tokens`, `context_limit`, and `error` stop reasons.
+- [x] `aeon_chat` native CLI and full 43-layer silicon smoke (`What is 2+2?`, 4 generated tokens, `5.57 tok/s`).
+- [x] Full 43-layer unrestricted chat turn reached EOS with a readable answer (`What is the capital of France?` -> `The capital of France is **Paris**.`).
+- [ ] External compatible-reference comparison and activation-profile unlock.
 
 ## 2. Current boundaries and evidence
 

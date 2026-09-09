@@ -54,7 +54,8 @@ struct PipelineScratchBuffers {
     // MoE Activations
     half*  d_ffn_pre{nullptr};      // [16, 4096]
     half*  d_ffn_norm_act{nullptr}; // [16, 4096]
-    float* d_router_logits{nullptr};// [256]
+    half*  d_router_logits_half{nullptr}; // [256] GEMV output
+    float* d_router_logits{nullptr};       // [256] converted router logits
     float* d_topk_weights{nullptr}; // [6]
     int32_t* d_topk_indices{nullptr};// [6]
     int32_t* d_token_id{nullptr};   // [1]
@@ -137,6 +138,7 @@ struct PipelineScratchBuffers {
 
         CHECK_HIP(hipMalloc(&d_ffn_pre, M * H * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_ffn_norm_act, M * H * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_router_logits_half, 256 * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_router_logits, 256 * sizeof(float)));
         CHECK_HIP(hipMalloc(&d_topk_weights, 6 * sizeof(float)));
         CHECK_HIP(hipMalloc(&d_topk_indices, 6 * sizeof(int32_t)));
@@ -196,6 +198,7 @@ struct PipelineScratchBuffers {
 
         if (d_ffn_pre) { (void)hipFree(d_ffn_pre); d_ffn_pre = nullptr; }
         if (d_ffn_norm_act) { (void)hipFree(d_ffn_norm_act); d_ffn_norm_act = nullptr; }
+        if (d_router_logits_half) { (void)hipFree(d_router_logits_half); d_router_logits_half = nullptr; }
         if (d_router_logits) { (void)hipFree(d_router_logits); d_router_logits = nullptr; }
         if (d_topk_weights) { (void)hipFree(d_topk_weights); d_topk_weights = nullptr; }
         if (d_topk_indices) { (void)hipFree(d_topk_indices); d_topk_indices = nullptr; }
@@ -252,6 +255,7 @@ private:
 
         d_ffn_pre = o.d_ffn_pre; o.d_ffn_pre = nullptr;
         d_ffn_norm_act = o.d_ffn_norm_act; o.d_ffn_norm_act = nullptr;
+        d_router_logits_half = o.d_router_logits_half; o.d_router_logits_half = nullptr;
         d_router_logits = o.d_router_logits; o.d_router_logits = nullptr;
         d_topk_weights = o.d_topk_weights; o.d_topk_weights = nullptr;
         d_topk_indices = o.d_topk_indices; o.d_topk_indices = nullptr;

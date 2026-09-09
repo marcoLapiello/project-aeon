@@ -109,6 +109,34 @@ __global__ void __launch_bounds__(32) v4_rmsnorm_wave32_kernel(
     }
 }
 
+__global__ void __launch_bounds__(32) v4_rmsnorm_unit_wave32_kernel(
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
+    int dim,
+    float eps
+) {
+    const int lane = threadIdx.x;
+    const int row = blockIdx.x;
+    const __half* in_row = input + row * dim;
+    __half* out_row = output + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = lane; i < dim; i += 32) {
+        const float value = __half2float(in_row[i]);
+        sum_sq += value * value;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_xor(sum_sq, offset, 32);
+    }
+
+    const float inv_rms = rsqrtf((sum_sq / static_cast<float>(dim)) + eps);
+    for (int i = lane; i < dim; i += 32) {
+        out_row[i] = __float2half(__half2float(in_row[i]) * inv_rms);
+    }
+}
+
 // 2. Wave32 Forward GPT-J RoPE on trailing 64 elements of [T, num_heads, head_dim] or [T, 1, head_dim]
 // Interleaved layout: for k in 0..31: out[2k] = x[2k]*cos - x[2k+1]*sin, out[2k+1] = x[2k]*sin + x[2k+1]*cos
 __global__ void __launch_bounds__(32) v4_forward_rope_wave32_kernel(
@@ -379,18 +407,15 @@ __global__ void v4_half_to_float_n_kernel(
 }
 
 // GPU argmax over the [129280] FP16 logit head (Expert Review Step 5).
-// Phase 1: each block reduces a strided span to a {max, idx} partial written
-// to partial_vals/partial_idx. Phase 2: block 0 reduces the gridDim.x partials
-// to the final winner. First-max-wins on ties (strictly-greater comparison,
-// ascending index) matches the previous CPU sequential argmax exactly.
-constexpr int V4_ARGMAX_BLOCKS = 505; // > #SMs; also the Phase-2 partial count
+// Phase 1 and Phase 2 are separate launches because HIP has no implicit
+// grid-wide barrier between blocks in one ordinary kernel launch.
+constexpr int V4_ARGMAX_BLOCKS = 505;
 
-__global__ void __launch_bounds__(256) v4_argmax_fp16_kernel(
+__global__ void __launch_bounds__(256) v4_argmax_fp16_partial_kernel(
     const __half* __restrict__ logits,
     int n,
     float* __restrict__ partial_vals,   // [V4_ARGMAX_BLOCKS]
-    int32_t* __restrict__ partial_idx,  // [V4_ARGMAX_BLOCKS]
-    int32_t* __restrict__ out_idx       // [1]
+    int32_t* __restrict__ partial_idx   // [V4_ARGMAX_BLOCKS]
 ) {
     __shared__ float s_val[256];
     __shared__ int   s_idx[256];
@@ -427,18 +452,46 @@ __global__ void __launch_bounds__(256) v4_argmax_fp16_kernel(
         partial_vals[blockIdx.x] = s_val[0];
         partial_idx[blockIdx.x]  = s_idx[0];
     }
+}
 
-    // Phase 2: block 0 reduces the gridDim.x block winners (np = 505, trivial)
-    if (blockIdx.x == 0 && tid == 0) {
-        const int np = gridDim.x;
-        float bv = -INFINITY;
-        int   bi = n;
-        for (int b = 0; b < np; ++b) {
-            float pv = partial_vals[b];
-            int   pi = partial_idx[b];
-            if (pv > bv || (pv == bv && pi < bi)) { bv = pv; bi = pi; }
+__global__ void __launch_bounds__(256) v4_argmax_partial_reduce_kernel(
+    const float* __restrict__ partial_vals,
+    const int32_t* __restrict__ partial_idx,
+    int partial_count,
+    int32_t* __restrict__ out_idx
+) {
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+
+    const int tid = threadIdx.x;
+    float best = -INFINITY;
+    int best_i = INT_MAX;
+    for (int i = tid; i < partial_count; i += blockDim.x) {
+        const float value = partial_vals[i];
+        const int index = partial_idx[i];
+        if (value > best || (value == best && index < best_i)) {
+            best = value;
+            best_i = index;
         }
-        out_idx[0] = bi;
+    }
+    s_val[tid] = best;
+    s_idx[tid] = best_i;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float other_value = s_val[tid + stride];
+            const int other_index = s_idx[tid + stride];
+            if (other_value > s_val[tid] ||
+                (other_value == s_val[tid] && other_index < s_idx[tid])) {
+                s_val[tid] = other_value;
+                s_idx[tid] = other_index;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out_idx[0] = s_idx[0];
     }
 }
 __global__ void __launch_bounds__(32) v4_forward_rope_at_pos_wave32_kernel(

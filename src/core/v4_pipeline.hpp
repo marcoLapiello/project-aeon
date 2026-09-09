@@ -18,6 +18,7 @@
 #include "kernel/v4_attention.hpp"
 #include "kernel/v4_pipeline_ops.hpp"
 #include "kernel/w4a16_gemm.hpp"
+#include "text/text_generation.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -101,6 +102,10 @@ public:
 
     const RoutingCounter* routing_counter() const {
         return routing_counter_ ? &*routing_counter_ : nullptr;
+    }
+
+    uint32_t context_capacity() const {
+        return layers.empty() ? 0 : layers.front()->max_seq_len_;
     }
 
     void init(
@@ -771,6 +776,12 @@ public:
                 scratch.d_qa_norm, layer.d_wq_b, scratch.d_q, Q_LORA
             );
 
+            hipLaunchKernelGGL(
+                kernel::v4_rmsnorm_unit_wave32_kernel,
+                dim3(NUM_HEADS), dim3(32), 0, compute_stream,
+                scratch.d_q, scratch.d_q, HEAD_DIM, 1e-6f
+            );
+
             // KV = x_norm @ wkv.T [512]
             hipLaunchKernelGGL(
                 kernel::v4_gemv_fp16_kernel,
@@ -896,24 +907,24 @@ public:
             // H. MoE Routing & Expert Execution
             // -----------------------------------------------------------------
             // 1. Router Logits: gate_weight @ ffn_norm_act [256]
-            // The GEMV writes half logits into d_router_logits (used as a half
-            // scratch), then a device kernel widens them to float in-place for
-            // the router -- replacing the old D2H -> sync -> CPU convert -> H2D
-            // round-trip that drained the pipeline every layer.
+            // Keep the half GEMV output separate from the float router input:
+            // widening in-place would overwrite unread half logits.
             hipLaunchKernelGGL(
                 kernel::v4_gemv_fp16_vec8_kernel,
                 dim3(256, 1), dim3(32), 0, compute_stream,
-                scratch.d_ffn_norm_act, layer.d_gate_weight, reinterpret_cast<half*>(scratch.d_router_logits), H
+                scratch.d_ffn_norm_act, layer.d_gate_weight, scratch.d_router_logits_half, H
             );
             kernel::v4_half_to_float_n_kernel<<<(256 + 255) / 256, 256, 0, compute_stream>>>(
-                reinterpret_cast<const half*>(scratch.d_router_logits), scratch.d_router_logits, 256
+                scratch.d_router_logits_half, scratch.d_router_logits, 256
             );
 
             // Launch Router Kernel (Hash mode for layers 0..2)
             hipLaunchKernelGGL(
                 kernel::moe_router_kernel,
                 dim3(1), dim3(64), 0, compute_stream,
-                scratch.d_router_logits, nullptr, layer.d_tid2eid, scratch.d_token_id,
+                scratch.d_router_logits,
+                layer.is_hash_layer ? nullptr : layer.d_gate_bias,
+                layer.d_tid2eid, scratch.d_token_id,
                 scratch.d_topk_weights, scratch.d_topk_indices,
                 256, 6, 1.5f, true
             );
@@ -1114,9 +1125,14 @@ public:
         // 6. GPU Argmax Sampling over the [129280] logit head: replaces the
         // 258 KB D2H + sync + 129,280-element CPU scan with one device kernel,
         // leaving only a 4-byte result readback on the critical path.
-        kernel::v4_argmax_fp16_kernel<<<kernel::V4_ARGMAX_BLOCKS, 256, 0, compute_stream>>>(
+        kernel::v4_argmax_fp16_partial_kernel<<<kernel::V4_ARGMAX_BLOCKS, 256, 0, compute_stream>>>(
             scratch.d_logits, 129280,
-            scratch.d_argmax_partial_vals, scratch.d_argmax_partial_idx,
+            scratch.d_argmax_partial_vals, scratch.d_argmax_partial_idx
+        );
+        kernel::v4_argmax_partial_reduce_kernel<<<1, 256, 0, compute_stream>>>(
+            scratch.d_argmax_partial_vals,
+            scratch.d_argmax_partial_idx,
+            kernel::V4_ARGMAX_BLOCKS,
             scratch.d_argmax_result
         );
         for (uint32_t staging_idx : releasable_staging_slots) {
@@ -1132,6 +1148,13 @@ public:
         return best_tok;
     }
 
+    void reset_generation_state() {
+        current_seq_len_ = 0;
+        for (auto& l : layers) {
+            CHECK_HIP(hipMemset(l->d_kv_cache, 0, l->max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
+        }
+    }
+
     // Prefill Prompt and Generate Next Tokens
     std::vector<uint32_t> generate(
         const std::vector<uint32_t>& prompt,
@@ -1142,12 +1165,7 @@ public:
         if (prompt.empty()) return {};
 
         std::vector<uint32_t> generated;
-        current_seq_len_ = 0;
-
-        // Reset layer KV caches
-        for (auto& l : layers) {
-            CHECK_HIP(hipMemset(l->d_kv_cache, 0, l->max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
-        }
+        reset_generation_state();
 
         // Prefill Phase
         auto t_prefill_start = std::chrono::high_resolution_clock::now();
@@ -1176,6 +1194,62 @@ public:
         if (out_tok_per_sec) *out_tok_per_sec = tok_sec;
 
         return generated;
+    }
+
+    aeon::text::GenerationResult generate_until_stop(
+        const std::vector<uint32_t>& prompt,
+        const aeon::text::GenerationOptions& options,
+        double* out_ttft_ms = nullptr,
+        double* out_tok_per_sec = nullptr
+    ) {
+        aeon::text::GenerationOptions effective_options = options;
+        if (effective_options.context_limit == 0) {
+            effective_options.context_limit = context_capacity();
+        }
+
+        reset_generation_state();
+        const auto prefill_start = std::chrono::high_resolution_clock::now();
+        std::chrono::high_resolution_clock::time_point prefill_end{};
+        std::chrono::high_resolution_clock::time_point decode_start{};
+        bool decode_started = false;
+
+        const auto result = aeon::text::generate_token_ids(
+            prompt,
+            effective_options,
+            [&](uint32_t token_id, uint32_t position, bool prefill) {
+                if (!prefill && !decode_started) {
+                    prefill_end = std::chrono::high_resolution_clock::now();
+                    decode_start = prefill_end;
+                    decode_started = true;
+                }
+                const auto next = step(
+                    token_id,
+                    position,
+                    prefill ? RoutingPhase::Prefill : RoutingPhase::Decode
+                );
+                if (prefill && position + 1 == prompt.size()) {
+                    prefill_end = std::chrono::high_resolution_clock::now();
+                }
+                return next;
+            }
+        );
+
+        if (out_ttft_ms) {
+            const auto end = prefill_end.time_since_epoch().count() == 0
+                ? std::chrono::high_resolution_clock::now()
+                : prefill_end;
+            *out_ttft_ms = std::chrono::duration<double, std::milli>(end - prefill_start).count();
+        }
+        if (out_tok_per_sec) {
+            if (!decode_started || result.token_ids.size() <= 1) {
+                *out_tok_per_sec = 0.0;
+            } else {
+                const auto decode_end = std::chrono::high_resolution_clock::now();
+                const double decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+                *out_tok_per_sec = (result.token_ids.size() - 1) / (decode_ms / 1000.0);
+            }
+        }
+        return result;
     }
 
     void free_all() {

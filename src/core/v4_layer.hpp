@@ -63,6 +63,7 @@ public:
     int64_t* d_tid2eid{nullptr};     // [129280, 6] (for hash layers)
     const int64_t* host_tid2eid{nullptr}; // Host pointer for lookahead routing
     half*    d_gate_weight{nullptr}; // [256, 4096]
+    float*   d_gate_bias{nullptr};   // [256] correction bias for non-hash layers
 
     // Persistent Sliding-Window KV Cache on Device: [max_seq_len, 512]
     half*  d_kv_cache{nullptr};
@@ -136,6 +137,9 @@ public:
             }
         }
         upload_tensor(loader, pfx + "ffn.gate.weight", &d_gate_weight);
+        if (!is_hash_layer) {
+            upload_tensor(loader, pfx + "ffn.gate.bias", &d_gate_bias);
+        }
 
         // 5. Allocate Persistent KV Cache on Device
         CHECK_HIP(hipMalloc(&d_kv_cache, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
@@ -181,6 +185,7 @@ public:
 
         if (d_tid2eid) { (void)hipFree(d_tid2eid); d_tid2eid = nullptr; }
         if (d_gate_weight) { (void)hipFree(d_gate_weight); d_gate_weight = nullptr; }
+        if (d_gate_bias) { (void)hipFree(d_gate_bias); d_gate_bias = nullptr; }
         if (d_kv_cache) { (void)hipFree(d_kv_cache); d_kv_cache = nullptr; }
     }
 
@@ -215,6 +220,7 @@ private:
         d_tid2eid = o.d_tid2eid; o.d_tid2eid = nullptr;
         host_tid2eid = o.host_tid2eid; o.host_tid2eid = nullptr;
         d_gate_weight = o.d_gate_weight; o.d_gate_weight = nullptr;
+        d_gate_bias = o.d_gate_bias; o.d_gate_bias = nullptr;
 
         d_kv_cache = o.d_kv_cache; o.d_kv_cache = nullptr;
         max_seq_len_ = o.max_seq_len_;
