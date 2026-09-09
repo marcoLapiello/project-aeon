@@ -7,6 +7,16 @@ This document synthesizes findings from a comprehensive global survey into the s
 
 The primary takeaway: The broader open-source ecosystem is independently solving individual pieces of this problem, but remains deeply fragmented. Project Aeon stands to become the first engine to unify custom RDNA3 execution with a multi-tier, look-ahead asynchronous streaming runtime.
 
+## Local Source References
+The five primary reference engines are available locally for direct source comparison:
+- [llama.cpp checkout](../../aeon-references/llama.cpp)
+- [FreeToken checkout](../../aeon-references/freetoken)
+- [Colibri checkout](../../aeon-references/colibri)
+- [vLLM checkout](../../aeon-references/vllm)
+- [SGLang checkout](../../aeon-references/sglang)
+
+These checkouts track the upstream default branches and are not production dependencies. Record the checked-out commit SHA when citing implementation details or reproducing a comparison.
+
 ---
 
 ## 1. AMD & RDNA-Focused Inference Engines

@@ -3,7 +3,7 @@
 ## Executive Summary
 This document records the architectural decision-making regarding model scope (single-model specialization vs. broad multi-architecture support) and details the empirical methodology for analyzing Mixture-of-Experts (MoE) activation entropy. 
 
-To avoid the performance degradation and architectural bloat characteristic of general-purpose engines (such as `llama.cpp`), Project Aeon will adopt a **"Hyper-Specialized V1, Modular Subsystem"** strategy. Phase 1 will target the **DeepSeek fine-grained MoE architecture** exclusively, optimizing low-level RDNA3 compute and memory streaming against its exact operational characteristics before generalizing to other architectures.
+To avoid the performance degradation and architectural bloat characteristic of general-purpose engines (such as [llama.cpp](../../aeon-references/llama.cpp)), Project Aeon will adopt a **"Hyper-Specialized V1, Modular Subsystem"** strategy. Phase 1 will target the **DeepSeek fine-grained MoE architecture** exclusively, optimizing low-level RDNA3 compute and memory streaming against its exact operational characteristics before generalizing to other architectures.
 
 ---
 

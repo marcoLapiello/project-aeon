@@ -16,7 +16,7 @@ The [Project Aeon vision](PROJECT_AEON_VISION.md), Section 4A and Blocker 1, is 
 
 > Data flows uni-directionally from Cold to Warm to Hot, ensuring that the GPU compute engine interacts solely with high-speed memory spaces while transfer operations run fully in the background.
 
-The critical mitigation for the Colibri Trap is equally explicit:
+The critical mitigation for the [Colibri Trap](../../aeon-references/colibri) is equally explicit:
 
 > Never stream synchronously from SSD for the immediate next layer: Tier 3 data transfers must be strictly speculative and asynchronous. If an expert is completely absent from both VRAM and DDR during the active layer pass, the system must trigger host CPU computation fallback rather than stalling the GPU pipeline.
 

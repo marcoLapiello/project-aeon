@@ -31,12 +31,12 @@ Project Aeon synthesizes proven paradigms from leading inference runtimes into a
 
 | Project | Key Concept Adopted | Strategic Value to Aeon |
 | :--- | :--- | :--- |
-| **FreeToken** | **Dynamic Expert Caching & Bandwidth-Adaptive Scheduling ($q^*$)** | Treating VRAM not as a static weight container, but as an active dynamic cache for sparse MoE experts, while offloading excess transfer demands to host compute. |
-| **SGLang** | **RadixTree KV State Tracking** | Preserving token prefix state hierarchically across multi-turn interactions and agentic workflows, eliminating redundant prompt evaluation passes. |
-| **vLLM** | **Paged Memory Management & Asynchronous Scheduling** | Non-contiguous memory allocation for attention contexts to eliminate VRAM fragmentation and enable deterministic execution queues. |
-| **Colibri & "LLM in a Flash"** | **Direct-I/O Asynchronous SSD Streaming** | Treating high-speed NVMe flash memory as an active third tier in the memory hierarchy via OS-bypass direct I/O interfaces. |
+| [**FreeToken**](../../aeon-references/freetoken) | **Dynamic Expert Caching & Bandwidth-Adaptive Scheduling ($q^*$)** | Treating VRAM not as a static weight container, but as an active dynamic cache for sparse MoE experts, while offloading excess transfer demands to host compute. |
+| [**SGLang**](../../aeon-references/sglang) | **RadixTree KV State Tracking** | Preserving token prefix state hierarchically across multi-turn interactions and agentic workflows, eliminating redundant prompt evaluation passes. |
+| [**vLLM**](../../aeon-references/vllm) | **Paged Memory Management & Asynchronous Scheduling** | Non-contiguous memory allocation for attention contexts to eliminate VRAM fragmentation and enable deterministic execution queues. |
+| [**Colibri**](../../aeon-references/colibri) & "LLM in a Flash" | **Direct-I/O Asynchronous SSD Streaming** | Treating high-speed NVMe flash memory as an active third tier in the memory hierarchy via OS-bypass direct I/O interfaces. |
 | **DeepSeek (DS4 / DualPipe)** | **Multi-Head Latent Attention (MLA) & Overlapped Dispatch** | Native handling of compressed latent KV representations and concurrent dispatch/compute synchronization pipelines. |
-| **llama.cpp / Unsloth** | **Quantization Modalities & Container Ecosystem** | Ingesting widely adopted, community-curated low-bit quantization layouts while maintaining structural independence from runtime compute implementations. |
+| [**llama.cpp**](../../aeon-references/llama.cpp) / Unsloth | **Quantization Modalities & Container Ecosystem** | Ingesting widely adopted, community-curated low-bit quantization layouts while maintaining structural independence from runtime compute implementations. |
 
 ---
 

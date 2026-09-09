@@ -5,6 +5,8 @@ This document provides a critical engineering analysis of the potential blockers
 
 To ensure Project Aeon remains a viable, high-throughput production engine (targeting 15–35+ tok/s), each identified bottleneck is analyzed alongside concrete engineering mitigations.
 
+The local [Colibri reference checkout](../../aeon-references/colibri) and [FreeToken reference checkout](../../aeon-references/freetoken) provide the implementation comparisons for the storage-tier and CPU/GPU coprocessing risks discussed below.
+
 ---
 
 ## 1. Blocker 1: The "Cold Miss Avalanche" (The Colibri Trap)
@@ -45,7 +47,7 @@ In standard transformer architectures, the router for Layer $L+1$ computes exper
 1. **Multi-Layer Speculative Prefetching:**
    * Track empirical expert co-activation matrices and sequence-level activation histories to predict expert selection 2–4 layers ahead of the current execution frontier.
 2. **Dynamic Host CPU Coprocessing ($q^*$ Fallback):**
-   * Incorporate the FreeToken coprocessing paradigm: when an expert is missing from GPU memory, dispatch the token hidden state to the Threadripper Pro host CPU via pinned memory.
+   * Incorporate the [FreeToken](../../aeon-references/freetoken) coprocessing paradigm: when an expert is missing from GPU memory, dispatch the token hidden state to the Threadripper Pro host CPU via pinned memory.
    * Compute the missing expert's forward pass using AVX-512 while the GPU continues executing resident experts, merging the output tensors prior to the residual addition.
 
 ---
