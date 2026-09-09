@@ -22,11 +22,13 @@ struct Options {
     uint32_t context_size{4096};
     uint64_t warm_gib{0};
     uint32_t vram_slots{8};
+    bool regenerate_summary{false};
 };
 
 void print_usage(const char* executable) {
     std::cout
         << "Usage: " << executable << " --input <prompts.jsonl> --output-dir <directory> [options]\n"
+        << "       " << executable << " --output-dir <directory> --regenerate-summary\n"
         << "Options:\n"
         << "  --model-dir <path>       Native Aeon model directory\n"
         << "  --input <path>           Tokenized JSONL prompt corpus\n"
@@ -38,6 +40,7 @@ void print_usage(const char* executable) {
         << "  --context-size <count>  Maximum context size (default: 4096)\n"
         << "  --warm-gib <count>       Warm host allocation in GiB (default: 0)\n"
         << "  --vram-slots <count>     Fixed VRAM slots in aeon mode (default: 8)\n"
+        << "  --regenerate-summary     Rebuild summary.csv from existing state.bin only\n"
         << "  --help                   Show this help\n";
 }
 
@@ -71,7 +74,9 @@ Options parse_options(int argc, char** argv) {
             print_usage(argv[0]);
             std::exit(0);
         }
-        if (argument == "--model-dir") {
+        if (argument == "--regenerate-summary") {
+            options.regenerate_summary = true;
+        } else if (argument == "--model-dir") {
             options.model_dir = require_value(argc, argv, index, "--model-dir");
         } else if (argument == "--input") {
             options.input_path = require_value(argc, argv, index, "--input");
@@ -104,8 +109,14 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
-    if (options.input_path.empty() || options.output_dir.empty()) {
-        throw std::runtime_error("--input and --output-dir are required");
+    if (options.output_dir.empty()) {
+        throw std::runtime_error("--output-dir is required");
+    }
+    if (options.regenerate_summary) {
+        return options;
+    }
+    if (options.input_path.empty()) {
+        throw std::runtime_error("--input is required");
     }
     if (options.layers == 0 || options.context_size == 0 || options.vram_slots == 0) {
         throw std::runtime_error("layers, context-size, and vram-slots must be positive");
@@ -157,6 +168,12 @@ void validate_counter(
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        if (options.regenerate_summary) {
+            aeon::core::RoutingProfileStore::regenerate_summary(options.output_dir);
+            std::cout << "[RoutingProfile] regenerated summary="
+                      << (std::filesystem::path(options.output_dir) / "summary.csv") << '\n';
+            return 0;
+        }
         const auto prompts = aeon::core::load_routing_prompts(options.input_path);
 
         aeon::core::RoutingProfileRunConfig run_config;

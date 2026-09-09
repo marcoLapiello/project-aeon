@@ -89,6 +89,7 @@ routing-profile/<run_id>/
     state.bin
     counts.csv
     ranking.csv
+    summary.csv
     progress.json
 ```
 
@@ -102,7 +103,11 @@ routing-profile/<run_id>/
 - completed and failed prompt IDs;
 - profiler version and run parameters.
 
-`state.bin` is the atomic canonical aggregate state. It stores the counters, completed prompt signatures, and failed prompt records. `counts.csv`, `ranking.csv`, and `progress.json` are structured human-readable views regenerated from that state after each completed prompt. `ranking.csv` is derived from the aggregate counts; `progress.json` mirrors the completed prompt IDs used for resume decisions.
+`state.bin` is the atomic canonical aggregate state. It stores the counters, completed prompt signatures, and failed prompt records. `counts.csv`, `ranking.csv`, `summary.csv`, and `progress.json` are structured views regenerated from that state after each completed prompt. `ranking.csv` is derived from the aggregate counts; `summary.csv` is the compact human-readable report; `progress.json` mirrors the completed prompt IDs used for resume decisions.
+
+`summary.csv` contains one row per phase and layer. It reports total selections, the top expert and its probability, cumulative coverage at the top 4, 8, 12, 16, and 32 experts, and the IDs of the top 12 experts. For the complete 43-layer model it therefore contains 86 data rows instead of the 22,016 rows in the full ranking.
+
+To rebuild this compact view without loading the model or rerunning inference, invoke `profile_routing --output-dir <directory> --regenerate-summary`. This maintenance mode reads only the validated `state.bin`; it does not bypass compatibility checks for normal incremental profiling runs.
 
 Each update must be crash-tolerant: write a temporary file in the same directory, flush and close it, then atomically rename it to the target path. A partially written ranking must never be treated as a completed result.
 
@@ -173,7 +178,7 @@ This phase is complete when:
 
 1. The default inference and existing regression tests remain behaviorally unchanged.
 2. `profile_routing` can process tokenized prompts through all 43 layers.
-3. A run produces durable metadata, counts, rankings, and progress files without terminal extraction.
+3. A run produces durable metadata, counts, rankings, a compact summary, and progress files without terminal extraction.
 4. An interrupted run resumes from the last completed prompt.
 5. The output contains exactly 256 ranked expert rows for every measured phase and layer.
 6. The profile and held-out corpora are independently identifiable.

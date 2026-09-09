@@ -64,6 +64,17 @@ int main() {
     }
     assert(ranking_lines == 1 + 2 * 256);
 
+    std::ifstream summary(root / "run" / "summary.csv");
+    size_t summary_lines = 0;
+    while (std::getline(summary, line)) {
+        ++summary_lines;
+    }
+    assert(summary_lines == 1 + 2);
+    summary.close();
+    std::filesystem::remove(root / "run" / "summary.csv");
+    aeon::core::RoutingProfileStore::regenerate_summary(root / "run");
+    assert(std::filesystem::exists(root / "run" / "summary.csv"));
+
     bool duplicate_rejected = false;
     {
         std::ofstream duplicate_corpus(root / "duplicate.jsonl");

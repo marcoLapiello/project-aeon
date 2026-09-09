@@ -608,6 +608,39 @@ public:
         return output.str();
     }
 
+    std::string summary_csv() const {
+        constexpr std::array<uint32_t, 5> coverage_cutoffs{4, 8, 12, 16, 32};
+        const auto rows = ranking_rows();
+
+        std::ostringstream output;
+        output << "phase,layer_id,total_selections,top1_expert,top1_probability,"
+                  "top4_coverage,top8_coverage,top12_coverage,top16_coverage,"
+                  "top32_coverage,top12_experts\n";
+        output << std::setprecision(15);
+        for (uint32_t phase_id = 0; phase_id < RoutingCounter::kPhaseCount; ++phase_id) {
+            const auto phase = static_cast<RoutingPhase>(phase_id);
+            for (uint32_t layer_id = 0; layer_id < num_layers_; ++layer_id) {
+                const size_t base = (static_cast<size_t>(phase_id) * num_layers_ + layer_id) *
+                                    RoutingCounter::kExpertCount;
+                output << phase_name(phase) << ',' << layer_id << ','
+                       << rows[base].total_selections << ','
+                       << rows[base].expert_id << ',' << rows[base].probability;
+                for (uint32_t cutoff : coverage_cutoffs) {
+                    output << ',' << rows[base + cutoff - 1].cumulative_probability;
+                }
+                output << ',';
+                for (uint32_t rank = 0; rank < 12; ++rank) {
+                    if (rank != 0) {
+                        output << ';';
+                    }
+                    output << rows[base + rank].expert_id;
+                }
+                output << '\n';
+            }
+        }
+        return output.str();
+    }
+
 private:
     size_t index(RoutingPhase phase, uint32_t layer_id, uint32_t expert_id) const {
         return (static_cast<size_t>(phase) * num_layers_ + layer_id) * RoutingCounter::kExpertCount + expert_id;
@@ -642,6 +675,36 @@ public:
         checkpoint();
     }
 
+    static void regenerate_summary(const std::filesystem::path& output_dir) {
+        const auto state_path = output_dir / "state.bin";
+        std::ifstream input(state_path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error("failed to open routing profile state " + state_path.string());
+        }
+
+        char magic[8]{};
+        input.read(magic, sizeof(magic));
+        if (!input || std::string(magic, sizeof(magic)) != "AEONRP01") {
+            throw std::runtime_error("invalid routing profile state magic");
+        }
+        const uint32_t version = routing_profile_detail::read_value<uint32_t>(input);
+        const uint32_t layers = routing_profile_detail::read_value<uint32_t>(input);
+        const uint64_t count_size = routing_profile_detail::read_value<uint64_t>(input);
+        const uint64_t expected_count_size = static_cast<uint64_t>(RoutingCounter::kPhaseCount) * layers *
+                                              RoutingCounter::kExpertCount;
+        if (version != 1 || layers == 0 || count_size != expected_count_size) {
+            throw std::runtime_error("routing profile state is incompatible with summary regeneration");
+        }
+
+        RoutingProfileAggregate aggregate(layers);
+        std::vector<uint64_t> counts(static_cast<size_t>(count_size));
+        for (uint64_t& count : counts) {
+            count = routing_profile_detail::read_value<uint64_t>(input);
+        }
+        aggregate.set_raw_counts(std::move(counts));
+        routing_profile_detail::write_text_atomic(output_dir / "summary.csv", aggregate.summary_csv());
+    }
+
     bool is_completed(const RoutingPrompt& prompt) const {
         const auto iterator = completed_.find(prompt.id);
         if (iterator == completed_.end()) {
@@ -670,6 +733,7 @@ public:
         write_state();
         routing_profile_detail::write_text_atomic(output_dir_ / "counts.csv", aggregate_.counts_csv());
         routing_profile_detail::write_text_atomic(output_dir_ / "ranking.csv", aggregate_.ranking_csv());
+        routing_profile_detail::write_text_atomic(output_dir_ / "summary.csv", aggregate_.summary_csv());
         routing_profile_detail::write_text_atomic(output_dir_ / "progress.json", progress_json());
         routing_profile_detail::write_text_atomic(output_dir_ / "metadata.json", metadata_json());
     }
