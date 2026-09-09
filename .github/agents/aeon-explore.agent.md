@@ -1,6 +1,6 @@
 ---
 name: Aeon Explore
-description: Fast read-only codebase exploration and Q&A subagent. Prefer over manually chaining multiple search and file-reading operations to avoid cluttering the main conversation. Safe to call in parallel. Specify thoroughness: quick, medium, or thorough.
+description: Preferred explorer agent for the Aeon Project - fast read-only codebase exploration and Q&A subagent. Prefer over manually chaining multiple search and file-reading operations to avoid cluttering the main conversation. Safe to call in parallel. Specify thoroughness: quick, medium, or thorough.
 argument-hint: Describe WHAT you're looking for and desired thoroughness (quick/medium/thorough)
 tools: [execute/getTerminalOutput, execute/sendToTerminal, execute/runInTerminal, read/readFile, read/viewImage, read/terminalSelection, read/terminalLastCommand, search/codebase, search/fileSearch, search/listDirectory, search/textSearch, search/usages, vscodeGeneral/usages]
 ---
