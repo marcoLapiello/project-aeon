@@ -21,6 +21,7 @@ Always consult these authoritative documents for deep technical specifics:
 - [Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md): Micro-execution plan for single-GPU Core Runtime on real INT4-W4A16 weights.
 - [Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md): Micro-execution plan for Single-GPU 3-Tier Storage & Memory Hierarchy Optimization.
 - [Performance & Accuracy Ledger](plans-and-docs/PERFORMANCE_LEDGER.md): Empirical benchmark ledger recording test conditions, throughput, latencies, and cache behaviors across major milestones.
+- [Native Text-In/Text-Out Implementation Plan](plans-and-docs/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md): Actionable plan for the native DSV4 tokenizer, chat formatter, EOS-aware generation, detokenization, API validation, and future serving layer.
 
 ### Local Reference Implementations
 The primary external source references are maintained as shallow, default-branch checkouts outside this repository. They are for source comparison only, not Aeon build or runtime dependencies:
