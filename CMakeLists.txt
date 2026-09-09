@@ -149,6 +149,12 @@ target_link_libraries(test_aeon_pipeline PRIVATE amdhip64)
 add_test(NAME test_aeon_pipeline COMMAND test_aeon_pipeline)
 set_tests_properties(test_aeon_pipeline PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Measurement plumbing: optional per-layer expert selection counter
+add_executable(test_routing_counter tests/test_routing_counter.cpp)
+target_link_libraries(test_routing_counter PRIVATE amdhip64)
+add_test(NAME test_routing_counter COMMAND test_routing_counter)
+set_tests_properties(test_routing_counter PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Current architecture validation: dynamic memory budget and global pool
 add_executable(test_dynamic_expert_pool tests/test_dynamic_expert_pool.cpp)
 target_link_libraries(test_dynamic_expert_pool PRIVATE amdhip64)

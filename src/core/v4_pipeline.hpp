@@ -8,6 +8,7 @@
 #include "core/host_expert_pool.hpp"
 #include "core/memory_budget.hpp"
 #include "core/prefetch_staging.hpp"
+#include "core/routing_counter.hpp"
 #include "core/safetensors_loader.hpp"
 #include "core/v4_layer.hpp"
 #include "core/v4_pipeline_scratch.hpp"
@@ -29,6 +30,7 @@
 #include <iostream>
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -79,11 +81,26 @@ public:
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion> direct_io_completions_;
     uint64_t next_direct_io_id_{1};
     MemoryBudgetReport budget_report_;
+    std::optional<RoutingCounter> routing_counter_;
 
     V4Pipeline() = default;
 
     ~V4Pipeline() {
         free_all();
+    }
+
+    void enable_routing_counter() {
+        routing_counter_.emplace(num_layers_);
+    }
+
+    void reset_routing_counter() {
+        if (routing_counter_) {
+            routing_counter_->reset();
+        }
+    }
+
+    const RoutingCounter* routing_counter() const {
+        return routing_counter_ ? &*routing_counter_ : nullptr;
     }
 
     void init(
@@ -452,7 +469,7 @@ public:
 
     // Run Single Autoregressive Step for token_id at sequence position `pos`
     // Returns next token ID via greedy argmax
-    uint32_t step(uint32_t token_id, uint32_t pos) {
+    uint32_t step(uint32_t token_id, uint32_t pos, RoutingPhase phase = RoutingPhase::Decode) {
         constexpr int H = kernel::DSV4_HIDDEN_SIZE; // 4096
         constexpr int HC = 4;
         constexpr int HC_DIM = HC * H;             // 16384
@@ -907,6 +924,10 @@ public:
             CHECK_HIP(hipMemcpyAsync(h_topk_indices.data(), scratch.d_topk_indices, 6 * sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream));
             CHECK_HIP(hipStreamSynchronize(compute_stream));
 
+            if (routing_counter_) {
+                routing_counter_->record(phase, l, pos, h_topk_indices.data());
+            }
+
             for (uint32_t staging_idx : releasable_staging_slots) {
                 prefetch_staging_->release_after_gpu_transfer(staging_idx);
             }
@@ -1132,7 +1153,7 @@ public:
         auto t_prefill_start = std::chrono::high_resolution_clock::now();
         uint32_t next_tok = 0;
         for (size_t i = 0; i < prompt.size(); ++i) {
-            next_tok = step(prompt[i], i);
+            next_tok = step(prompt[i], static_cast<uint32_t>(i), RoutingPhase::Prefill);
         }
         auto t_prefill_end = std::chrono::high_resolution_clock::now();
 
@@ -1145,7 +1166,7 @@ public:
         auto t_decode_start = std::chrono::high_resolution_clock::now();
         for (uint32_t step_idx = 1; step_idx < max_new_tokens; ++step_idx) {
             uint32_t pos = prompt.size() + step_idx - 1;
-            next_tok = step(next_tok, pos);
+            next_tok = step(next_tok, pos, RoutingPhase::Decode);
             generated.push_back(next_tok);
         }
         auto t_decode_end = std::chrono::high_resolution_clock::now();
@@ -1173,6 +1194,7 @@ public:
         if (d_final_norm) { (void)hipFree(d_final_norm); d_final_norm = nullptr; }
 
         scratch.free();
+        routing_counter_.reset();
         for (auto& l : layers) {
             if (l) l->free();
         }
