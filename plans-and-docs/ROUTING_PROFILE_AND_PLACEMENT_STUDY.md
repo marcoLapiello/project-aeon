@@ -1,6 +1,6 @@
 # Routing Profile and Frequency-Informed Placement Study
 
-*Status: proposed measurement study*
+*Status: measurement plumbing implemented; multi-prompt data collection is gated on prompt-format and model-correctness validation*
 
 ## 1. Purpose
 
@@ -12,7 +12,31 @@ Produce a reliable per-layer activation ranking for the 256 routed experts in th
 
 This study must not change normal inference behavior, the default expert placement policy, or the established benchmark and regression tests.
 
-## 2. Measurement boundary
+## 2. Prerequisite: prompt format and model correctness
+
+Activation data is not considered valid for placement decisions until the native model path has passed a correctness gate. A pipeline can produce valid-looking token IDs and six expert IDs per layer while still having a numerical or prompt-format defect; in that case, the measured routing distribution would describe the defect rather than the intended model.
+
+The first real-text pilot established the preparation path but is not a correctness result:
+
+- text: `Explain in simple terms how a hot and warm expert cache can reduce inference latency.`;
+- tokenizer: model-local `tokenizer.json`, loaded with `/home/marcolap/.venvs/vllm-023-rocm`;
+- token IDs: 16 IDs, verified against `transformers` `AutoTokenizer`;
+- special tokens: the local `tokenizer_config.json` sets `add_bos_token` and `add_eos_token` to `false` and contains no `chat_template`;
+- execution: one full 43-layer run with `max_new_tokens=8`.
+
+The missing `chat_template` must be investigated, not replaced with an assumed ChatML or generic format. The checkpoint may be a completion-oriented or custom-format model, or the format may be supplied by upstream code rather than this local metadata. The official model contract must be established from the model source/reference implementation before creating the profiling corpus.
+
+Before collecting placement data, implement and validate a text-in/text-out harness that:
+
+1. applies the verified completion or chat format;
+2. tokenizes and records the exact input IDs;
+3. generates until EOS or an explicit maximum, rather than using the eight-token plumbing limit;
+4. decodes the generated IDs to human-readable text; and
+5. compares Aeon with a trusted reference on the same formatted IDs, including generated IDs and logits/top-k outputs, with routed expert IDs compared where practical.
+
+Only after this gate passes may the resulting traces be used to build activation rankings or make Hot/Warm placement decisions.
+
+## 3. Measurement boundary
 
 The profiler must observe the existing routing result after the six selected expert IDs have already been copied to the host. The current pipeline already performs the required synchronization at this point in `src/core/v4_pipeline.hpp`; the profiler should count those IDs rather than add a second router path or collect router logits.
 
@@ -28,7 +52,7 @@ expert_id[6]
 
 The first implementation does not collect router logits, routing weights, entropy, Gini coefficients, transition matrices, or speculative candidate sets. Those are secondary studies and must not expand the initial measurement scope.
 
-## 3. Workload requirements
+## 4. Workload requirements
 
 A single synthetic prompt is not sufficient. The profile must use a corpus of many real, tokenized prompts with enough variety to avoid making the ranking specific to one short trace.
 
@@ -55,7 +79,7 @@ The profiler must label prefill and decode separately. The initial ranking outpu
 
 The corpus must be divided into a profile set and a held-out validation set. The profile set builds the ranking; the held-out set later measures whether that ranking generalizes.
 
-## 4. Aggregation
+## 5. Aggregation
 
 For each phase, layer, and expert, maintain a counter:
 
@@ -79,7 +103,7 @@ phase,layer_id,rank,expert_id,selection_count,total_selections,probability,cumul
 
 The first study only requires the ranking and probability data. Cumulative probability is included because it directly answers how much observed routing traffic is covered by the first `k` experts for a layer and is inexpensive to derive from the ranking.
 
-## 5. Durable output and resumability
+## 6. Durable output and resumability
 
 The profiler must write structured files instead of requiring terminal-log extraction. The proposed output directory is:
 
@@ -123,7 +147,7 @@ The run stores a compatibility fingerprint in `metadata.json`. New prompts may b
 
 The aggregate state is the source of truth across invocations. The ranking is a derived snapshot and must be rebuilt from that state after every successful prompt, so the current ranking is always available even when data collection is paused between batches.
 
-## 6. Implementation shape
+## 7. Implementation shape
 
 Add an optional routing observer or counter to `V4Pipeline`. It is disabled by default and should have no effect on normal execution when disabled. The observer is invoked after the existing host-side router result is available and receives the layer ID, position, phase, and six expert IDs.
 
@@ -139,7 +163,11 @@ Add a dedicated executable, tentatively named `profile_routing`, with responsibi
 
 The profiler must not duplicate model execution logic. It should call the same full-model generation path used by the existing benchmark.
 
-## 7. Validation stages
+## 8. Validation stages
+
+### Stage 0: prompt-format and correctness gate
+
+Complete the prerequisite above before starting the profile corpus. The existing one-prompt run is retained as a plumbing artifact only and must not be used as evidence for placement.
 
 ### Stage 1: instrumentation smoke test
 
@@ -163,7 +191,7 @@ Run the full profile corpus and produce the 43 x 256 rankings for prefill and de
 
 Only after the ranking exists, replay held-out traces or run the runtime with an experimental placement policy. Compare static frequency-ranked placement with the current dynamic LRU policy. Do not modify the default policy as part of the profiling study.
 
-## 8. Benchmark decision
+## 9. Benchmark decision
 
 `bench_full_model` and `profile_routing` have different purposes:
 
@@ -172,18 +200,19 @@ Only after the ranking exists, replay held-out traces or run the runtime with an
 
 The profiler must reuse the same `V4Pipeline::generate` path and model initialization as `bench_full_model`; it must not create a simplified or partial profiling model. The existing benchmark is used first as a short instrumentation sanity check, but it is not the study's data source.
 
-## 9. Definition of done for the first study phase
+## 10. Definition of done for the first study phase
 
 This phase is complete when:
 
 1. The default inference and existing regression tests remain behaviorally unchanged.
 2. `profile_routing` can process tokenized prompts through all 43 layers.
-3. A run produces durable metadata, counts, rankings, a compact summary, and progress files without terminal extraction.
-4. An interrupted run resumes from the last completed prompt.
-5. The output contains exactly 256 ranked expert rows for every measured phase and layer.
-6. The profile and held-out corpora are independently identifiable.
-7. Additional compatible prompts can be added on later invocations without double-counting or losing previous observations.
-8. Incompatible model or profiling settings are rejected or placed in a new run directory.
-9. The profile results are sufficient to choose the next step: frequency-informed placement, a different locality study, or abandoning static frequency placement.
+3. The prompt format and native model output pass the trusted-reference correctness gate before any activation ranking is used for placement.
+4. A run produces durable metadata, counts, rankings, a compact summary, and progress files without terminal extraction.
+5. An interrupted run resumes from the last completed prompt.
+6. The output contains exactly 256 ranked expert rows for every measured phase and layer.
+7. The profile and held-out corpora are independently identifiable.
+8. Additional compatible prompts can be added on later invocations without double-counting or losing previous observations.
+9. Incompatible model or profiling settings are rejected or placed in a new run directory.
+10. The profile results are sufficient to choose the next step: frequency-informed placement, a different locality study, or abandoning static frequency placement.
 
 Placement changes, speculative prefetch, entropy analysis, and other secondary metrics are explicitly outside this first implementation phase.

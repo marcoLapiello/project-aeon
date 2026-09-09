@@ -48,6 +48,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [x] Completed Phase 2 Pipeline Modularization Step 1: carved out HIP utility kernels to `src/kernel/v4_pipeline_ops.hpp`, scratch activation arena to `src/core/v4_pipeline_scratch.hpp`, and layer structure to `src/core/v4_layer.hpp`, cutting the monolithic `v4_pipeline.hpp` from ~1,500 down to 920 lines with full silicon test verification.
 - [x] Completed Phase 2 Pipeline Modularization Step 2: eliminated the dual-cache split, retired per-layer local LRU caches, standardized all pipelines on `UnifiedVRAMExpertPool` + `ExpertRegistry`, and removed hardcoded slot counts in favor of dynamic runtime configuration. Passed bit-exact tests on silicon (`test_dynamic_expert_pool`, `test_aeon_pipeline`, `test_v4_pipeline`).
 - [x] Connected a bounded Hot/Warm/Cold runtime path: segmented Warm Host storage, direct `io_uring` population for initial Hot and Warm residents, VRAM-to-host demotion, safe Warm-to-Hot promotion, and multi-layer staging reuse. The 43-layer silicon smoke test passes with 676 Hot slots, 8 Warm slots, and direct Cold misses; full-capacity performance measurement remains open.
+- [x] Added the optional routing counter and `profile_routing` measurement path: tokenized JSONL input, incremental atomic aggregation, complete 256-expert rankings, compact summaries, resume protection, and full 43-layer execution. A one-prompt real-text pilot completed successfully, but its activation data remains provisional until prompt-format and numerical correctness are validated against a trusted reference.
 
 ### Present (In Progress)
 - [ ] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Single-GPU 3-Tier Storage & Memory Hierarchy Optimization**:
@@ -78,7 +79,19 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
     - [x] Executed Expert Review Step 4 (M18): rewrote the routed-expert W4A16 decode path as a warp-per-row fused INT4 GEMV (`w4a16_gemv_kernel`, coalesced `uint4` streams, FP32 dual-accumulator FMA, shuffle reduction) — `138.8 → 13.9 µs` per GEMM (10×, ~340 GB/s), bit-exact vs CPU FP32 reference, golden token 295 preserved. End-to-end: warm off `4.36 → 5.25 tok/s`, warm 35 GiB `5.11 → 5.79 tok/s`, TTFT `2755 → 1835 ms`.
     - [x] Executed Expert Review Step 2 (M19): re-laid-out `UnifiedVRAMExpertPool` to a single contiguous device allocation with per-slot 13.5 MiB regions byte-identical to the `.aeon` layout (full-expert H2D = 1 `hipMemcpyAsync` instead of 6) and split DMA streams (`sdma_cold_stream` for io_uring uploads, `sdma_stream` for warm/safetensors H2D). Warm 35 GiB `5.79 → 5.88 tok/s`, warm off `5.25 → 5.39 tok/s`, tokens identical to M18; all regressions pass, golden token 295 preserved.
     - [x] Executed Expert Review Step 5 (M20): eliminated the per-layer router-logits D2H/sync/CPU/H2D round-trip (device half→float kernel), added a two-phase GPU argmax over the 129,280-logit head (first-max-wins tie-break identical to CPU; replaces 258 KB D2H + CPU scan with a 4-byte readback), and a vectorized `uint4` FP16 GEMV for router/shared-expert/LM-head projections. Warm 35 GiB `5.88 → 7.10 tok/s` (+20.7%), warm off `5.39 → 6.32 tok/s` (+17.3%); tokens returned to the M15 sequence `[237, 223 ×7]`; all regressions pass, golden token 295 preserved.
-    - [ ] **Next (highest priority)**: Review Step 6 — contiguous `.aeon` repack (fallocate, frequency-ordered) toward the ≥6 GB/s cold-tier target; the step is now dominated by the exposed just-in-time cold-miss read path (`141 ms/token`, ~1,077 cold misses/run).
+    - [ ] **Deferred until correctness gate**: Review Step 6 — contiguous `.aeon` repack (fallocate, frequency-ordered) toward the ≥6 GB/s cold-tier target; the step is now dominated by the exposed just-in-time cold-miss read path (`141 ms/token`, ~1,077 cold misses/run).
+  - [ ] **New prerequisite — prompt format and model correctness gate**:
+    - [x] Located the existing tokenizer tooling in `/home/marcolap/.venvs/vllm-023-rocm` (`tokenizers 0.22.2`, `transformers 5.12.1`, `vllm 0.23.0`) and verified one real prompt against the model's local tokenizer.
+    - [x] Ran that 16-token prompt through all 43 layers with the native profiler; this validates plumbing only, not answer correctness or reference parity.
+    - [ ] Research the upstream model prompt contract and llama.cpp tokenizer/chat-template handling. The local `tokenizer_config.json` has no `chat_template` and explicitly disables automatic BOS/EOS insertion, so no generic template may be assumed.
+    - [ ] Add a text-in/text-out correctness harness with explicit EOS handling and a longer generation limit.
+    - [ ] Compare Aeon against a trusted reference using identical token IDs and prompt formatting; compare generated IDs, logits/top-k outputs, and routed expert IDs where practical.
+    - [ ] Unlock the multi-prompt activation-profiling corpus only after the correctness gate passes.
+
+  - [ ] **Routing Profile and Frequency-Informed Placement Study** ([study plan](plans-and-docs/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)):
+    - [x] Measurement plumbing and durable result artifacts are implemented.
+    - [ ] Build a representative profile/held-out corpus with the verified tokenizer and prompt format.
+    - [ ] Accumulate per-layer probabilities for all 256 experts over many complete 43-layer runs, then evaluate static placement against held-out traces.
 
 ### Future (Upcoming Next)
 - [ ] **Phase 3 — Multi-GPU Pipeline Parallelism**:
