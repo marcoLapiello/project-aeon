@@ -70,6 +70,7 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
   - Startup Initialization:
     - Default policy: round-robin interleaving across layers into Hot VRAM and Warm DDR pools.
     - Optional prior policy: ingest empirical calibration entropy table (`entropy_prior.bin`) if present.
+    - Compare frequency-ordered placement against the profile-derived expert hotlist in the local [DwarfStar (ds4) reference](../../aeon-references/ds4); treat it as a placement prior, not as a substitute for Aeon's raw routing-entropy measurements.
   - Multi-tier eviction policy: Priority score combining decayed activation frequency and recency to prevent cache pollution from transient tokens.
 
 - **Micro-Step 1.4: Pipeline Integration & Verification (`tests/test_dynamic_expert_pool.cpp`)**

@@ -63,6 +63,10 @@ Measures the likelihood of consecutive expert reuse across decode steps:
 $$T_l(i, j) = P(e_{t+1} = j \mid e_t = i)$$
 Significant diagonal mass ($T_l(i, i) \gg \frac{1}{N}$) demonstrates strong temporal locality, proving that loading an expert into VRAM amortizes the I/O transfer cost over multiple subsequent tokens.
 
+### 2.5 DwarfStar Hotlist as a Practical Comparator
+
+The local [DwarfStar (ds4) checkout](../../aeon-references/ds4) contains a generated DeepSeek expert hotlist described as sorted by `hits/weight`. This is useful evidence for comparing frequency-informed expert placement and cache policy against Aeon's current round-robin initialization. The hotlist is a placement prior, not a formal Shannon entropy, Gini coefficient, or transition-matrix measurement; Aeon still needs to collect raw routing decisions over a representative corpus before treating it as an entropy result.
+
 ---
 
 ## 3. Strategic Decision: Single-Model Focus vs. Broad Support

@@ -26,6 +26,7 @@ The primary external source references are maintained as shallow, default-branch
 - [llama.cpp reference checkout](../aeon-references/llama.cpp): portable runtime, expert streaming, quantization, KV state, and serving paths.
 - [FreeToken reference checkout](../aeon-references/freetoken): bandwidth-adaptive CPU/GPU execution, expert caching, prefill streaming, and agent-facing serving.
 - [Colibri reference checkout](../aeon-references/colibri): VRAM/RAM/NVMe tiering, routing-aware placement, direct I/O, prefetch, and persistent KV state.
+- [DwarfStar (ds4) reference checkout](../aeon-references/ds4): DeepSeek-V4-specific kernels, profile-derived expert hotlists, SSD streaming, KV/prefix caching, and native agent serving.
 - [vLLM reference checkout](../aeon-references/vllm): paged memory, prefix/KV caching, scheduling, resource management, and production serving.
 - [SGLang reference checkout](../aeon-references/sglang): radix/HiCache, chunked prefill, MoE scheduling, disaggregation, and AMD paths.
 
@@ -38,7 +39,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 
 ### Past (Completed)
 - [x] Initialized the Git repository and validated the target hardware/toolchain: 4x RX 7900 XTX (`gfx1100`), 64 GB host RAM, ROCm 7.2.2, and native `hipcc`.
-- [x] Established shallow local reference checkouts for llama.cpp, FreeToken, Colibri, vLLM, and SGLang under `/home/marcolap/aeon-references/` for comparative source research.
+- [x] Established shallow local reference checkouts for llama.cpp, FreeToken, Colibri, DwarfStar (ds4), vLLM, and SGLang under `/home/marcolap/aeon-references/` for comparative source research.
 - [x] Completed the architectural research, model specialization decisions, and Phase 0 foundations. The project now has a working HIP/CMake base, hardware discovery, Wave32 WMMA validation, direct-I/O primitives, SDMA overlap checks, and the original toy MoE cache path. See [Phase 0 Execution Plan](plans-and-docs/PHASE_0_EXECUTION_PLAN.md).
 - [x] Completed Phase 1: a single-GPU DeepSeek-V4 INT4-W4A16 runtime with configuration and Safetensors loading, fused kernels, MoE routing, sliding-window attention, transformer blocks, and multi-layer autoregressive generation. See [Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md).
 - [x] Completed Phase 2 Spike 0: lossless Safetensors-to-`.aeon` repacking with separate dense and routed-expert containers, 4096-byte alignment, expert indexing, and bit-exact verification. See [Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) and [Performance & Accuracy Ledger](plans-and-docs/PERFORMANCE_LEDGER.md).

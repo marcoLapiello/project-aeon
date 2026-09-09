@@ -8,14 +8,17 @@ This document synthesizes findings from a comprehensive global survey into the s
 The primary takeaway: The broader open-source ecosystem is independently solving individual pieces of this problem, but remains deeply fragmented. Project Aeon stands to become the first engine to unify custom RDNA3 execution with a multi-tier, look-ahead asynchronous streaming runtime.
 
 ## Local Source References
-The five primary reference engines are available locally for direct source comparison:
+The six primary reference engines are available locally for direct source comparison:
 - [llama.cpp checkout](../../aeon-references/llama.cpp)
 - [FreeToken checkout](../../aeon-references/freetoken)
 - [Colibri checkout](../../aeon-references/colibri)
+- [DwarfStar (ds4) checkout](../../aeon-references/ds4)
 - [vLLM checkout](../../aeon-references/vllm)
 - [SGLang checkout](../../aeon-references/sglang)
 
 These checkouts track the upstream default branches and are not production dependencies. Record the checked-out commit SHA when citing implementation details or reproducing a comparison.
+
+DwarfStar is the closest DeepSeek-V4-specific comparator in this set. Its generated expert hotlist is a useful reference for frequency-informed placement and SSD-cache policy, but it should not be treated as a formal Shannon, Gini, or transition-matrix activation-entropy analysis.
 
 ---
 

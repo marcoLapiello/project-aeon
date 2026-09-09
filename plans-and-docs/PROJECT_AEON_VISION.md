@@ -35,6 +35,7 @@ Project Aeon synthesizes proven paradigms from leading inference runtimes into a
 | [**SGLang**](../../aeon-references/sglang) | **RadixTree KV State Tracking** | Preserving token prefix state hierarchically across multi-turn interactions and agentic workflows, eliminating redundant prompt evaluation passes. |
 | [**vLLM**](../../aeon-references/vllm) | **Paged Memory Management & Asynchronous Scheduling** | Non-contiguous memory allocation for attention contexts to eliminate VRAM fragmentation and enable deterministic execution queues. |
 | [**Colibri**](../../aeon-references/colibri) & "LLM in a Flash" | **Direct-I/O Asynchronous SSD Streaming** | Treating high-speed NVMe flash memory as an active third tier in the memory hierarchy via OS-bypass direct I/O interfaces. |
+| [**DwarfStar (ds4)**](../../aeon-references/ds4) | **DeepSeek-V4-specific kernels, profile-derived expert hotlists & agent serving** | Comparing model-specific routing placement, SSD expert streaming, KV/prefix reuse, and native tool-using workflows against Aeon's specialized runtime. |
 | **DeepSeek (DS4 / DualPipe)** | **Multi-Head Latent Attention (MLA) & Overlapped Dispatch** | Native handling of compressed latent KV representations and concurrent dispatch/compute synchronization pipelines. |
 | [**llama.cpp**](../../aeon-references/llama.cpp) / Unsloth | **Quantization Modalities & Container Ecosystem** | Ingesting widely adopted, community-curated low-bit quantization layouts while maintaining structural independence from runtime compute implementations. |
 

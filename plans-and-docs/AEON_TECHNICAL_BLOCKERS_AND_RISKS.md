@@ -5,7 +5,7 @@ This document provides a critical engineering analysis of the potential blockers
 
 To ensure Project Aeon remains a viable, high-throughput production engine (targeting 15–35+ tok/s), each identified bottleneck is analyzed alongside concrete engineering mitigations.
 
-The local [Colibri reference checkout](../../aeon-references/colibri) and [FreeToken reference checkout](../../aeon-references/freetoken) provide the implementation comparisons for the storage-tier and CPU/GPU coprocessing risks discussed below.
+The local [Colibri reference checkout](../../aeon-references/colibri), [DwarfStar reference checkout](../../aeon-references/ds4), and [FreeToken reference checkout](../../aeon-references/freetoken) provide implementation comparisons for the storage-tier, DeepSeek-specific placement, and CPU/GPU coprocessing risks discussed below.
 
 ---
 

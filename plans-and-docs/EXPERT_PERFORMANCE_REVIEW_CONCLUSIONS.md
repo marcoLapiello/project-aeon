@@ -42,6 +42,8 @@ This is the deepest issue. It is a capability we never built, not necessarily a 
 
 We never ran this profiling. The 664-slot hot pool is populated round-robin by `expert_registry.hpp::populate_round_robin`, not by measured activation frequency. We are caching arbitrary experts rather than the empirically hottest experts. The vision was designed around power-law clustering, with 70-90% of routing volume concentrated in a predictable subset, but we have not measured whether DeepSeek-V4 actually exhibits that behavior or exploited it if it does.
 
+The local [DwarfStar (ds4) reference](../../aeon-references/ds4) provides a useful comparator: its generated DeepSeek hotlist is sorted by profile-derived `hits/weight`. That supports testing frequency-ordered placement, but it does not provide the raw corpus or formal entropy statistics needed to validate Aeon's $H$, $G$, or transition-matrix hypotheses.
+
 ### The three structural gaps
 
 #### 1. No frequency-informed placement
