@@ -16,6 +16,7 @@ Always consult these authoritative documents for deep technical specifics:
 - [Technical Blockers & Risk Analysis](plans-and-docs/AEON_TECHNICAL_BLOCKERS_AND_RISKS.md): Analysis of cold-miss traps (Colibri trap), prefetch horizons, ROCm SDMA jitter, and engineering mitigations.
 - [Specialization Strategy & Entropy Analysis](plans-and-docs/AEON_SPECIALIZATION_AND_ENTROPY_ANALYSIS.md): Rationale for Phase 1 single-model focus (DeepSeek MoE) and empirical activation entropy formulas.
 - [Research & Inspiration Survey](plans-and-docs/AEON_RESEARCH_AND_INSPIRATION.md): Prior art review (hipfire, zinc, Flash-MoE, llama.cpp PR #25294).
+- [Reference Expert Caching & Cold Streaming Analysis](plans-and-docs/REFERENCE_EXPERT_CACHING_AND_COLD_STREAMING_ANALYSIS.md): Detailed source comparison of FreeToken, Colibri, and DwarfStar expert caches and cold-tier streaming.
 - [Phase 0 Execution Plan](plans-and-docs/PHASE_0_EXECUTION_PLAN.md): Step-by-step micro-plan for foundational spikes and hardware validation.
 - [Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md): Micro-execution plan for single-GPU Core Runtime on real INT4-W4A16 weights.
 - [Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md): Micro-execution plan for Single-GPU 3-Tier Storage & Memory Hierarchy Optimization.
