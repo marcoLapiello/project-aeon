@@ -14,7 +14,7 @@ struct SwizzledW2ExpertPtrs {
     const half* s2[kAeonSwizzledMaxExperts];
 };
 
-template <int WAVES, int RPW, int LPR, int ITERS, bool STAGE_ACTIVATION = false>
+template <int WAVES, int RPW, int LPR, int ITERS>
 __global__ __launch_bounds__(WAVES * 32)
 void aeon_moe_fused_w2_accum_kernel(
     const half* __restrict__ expert_hidden,
@@ -39,24 +39,11 @@ void aeon_moe_fused_w2_accum_kernel(
     const int slice = lane % LPR;
     const size_t block_offset = static_cast<size_t>(row_block) * ITERS * 32;
 
-    const half* activation = expert_hidden + static_cast<size_t>(expert) * (LPR * ITERS * 32);
-    extern __shared__ uint4 shared_activation_words[];
-    const half* activation_source = activation;
-    if constexpr (STAGE_ACTIVATION) {
-        uint4* staged_activation = shared_activation_words;
-        constexpr int activation_words = ITERS * LPR * 32 / 8;
-        const uint4* source_activation = reinterpret_cast<const uint4*>(activation);
-        for (int index = threadIdx.x; index < activation_words; index += blockDim.x) {
-            staged_activation[index] = source_activation[index];
-        }
-        __syncthreads();
-        activation_source = reinterpret_cast<const half*>(staged_activation);
-    }
-
     float accumulator = 0.0f;
     if (expert < expert_count && row < N) {
         const uint4* w2 = weights.w2[expert];
         const half* s2 = weights.s2[expert];
+        const half* activation = expert_hidden + static_cast<size_t>(expert) * (LPR * ITERS * 32);
         uint4 current_words = w2[block_offset + lane];
         float current_scale = __half2float(s2[block_offset + lane]);
 
@@ -70,7 +57,7 @@ void aeon_moe_fused_w2_accum_kernel(
             }
 
             const half2* activation_pairs =
-                reinterpret_cast<const half2*>(activation_source + group * 32);
+                reinterpret_cast<const half2*>(activation + group * 32);
             accumulator += current_scale *
                            swizzled_group_dot(current_words, activation_pairs);
             current_words = next_words;
@@ -113,7 +100,7 @@ void aeon_moe_fused_w2_accum_kernel(
     }
 }
 
-template <int WAVES, int RPW, int LPR, int ITERS, bool STAGE_ACTIVATION = false>
+template <int WAVES, int RPW, int LPR, int ITERS>
 inline void dispatch_aeon_moe_fused_w2_accum(
     const half* expert_hidden,
     const SwizzledW2ExpertPtrs& weights,
@@ -136,14 +123,11 @@ inline void dispatch_aeon_moe_fused_w2_accum(
     constexpr int threads_per_block = WAVES * 32;
     const dim3 block(threads_per_block);
     const dim3 grid((N / RPW + WAVES - 1) / WAVES, expert_count);
-    constexpr size_t shared_bytes = STAGE_ACTIVATION
-        ? static_cast<size_t>(ITERS * LPR * 32) * sizeof(half)
-        : 0;
-    aeon_moe_fused_w2_accum_kernel<WAVES, RPW, LPR, ITERS, STAGE_ACTIVATION>
-        <<<grid, block, shared_bytes, stream>>>(expert_hidden, weights, topk_weights,
-                                                initial_output,
-                                                output_f32, output_f16, counters,
-                                                expert_count, N);
+    aeon_moe_fused_w2_accum_kernel<WAVES, RPW, LPR, ITERS>
+        <<<grid, block, 0, stream>>>(expert_hidden, weights, topk_weights,
+                          initial_output,
+                                      output_f32, output_f16, counters,
+                                      expert_count, N);
 }
 
 } // namespace aeon::kernel

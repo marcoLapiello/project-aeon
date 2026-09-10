@@ -24,7 +24,7 @@ __device__ __forceinline__ float aeon_swiglu_clamped(float gate, float up, float
     return (gate / (1.0f + expf(-gate))) * up;
 }
 
-template <int WAVES, int RPW, int LPR, int ITERS, bool STAGE_ACTIVATION = false>
+template <int WAVES, int RPW, int LPR, int ITERS>
 __global__ __launch_bounds__(WAVES * 32)
 void aeon_moe_fused_w13_swiglu_kernel(
     const half* __restrict__ activation,
@@ -51,19 +51,6 @@ void aeon_moe_fused_w13_swiglu_kernel(
     const int row = row_block * RPW + lane / LPR;
     const int slice = lane % LPR;
     const size_t block_offset = static_cast<size_t>(row_block) * ITERS * 32;
-
-    extern __shared__ uint4 shared_activation_words[];
-    const half* activation_source = activation;
-    if constexpr (STAGE_ACTIVATION) {
-        uint4* staged_activation = shared_activation_words;
-        constexpr int activation_words = ITERS * LPR * 32 / 8;
-        const uint4* source_activation = reinterpret_cast<const uint4*>(activation);
-        for (int index = threadIdx.x; index < activation_words; index += blockDim.x) {
-            staged_activation[index] = source_activation[index];
-        }
-        __syncthreads();
-        activation_source = reinterpret_cast<const half*>(staged_activation);
-    }
 
     if (blockIdx.y == 0 && output_f32 != nullptr) {
         for (int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -99,7 +86,7 @@ void aeon_moe_fused_w13_swiglu_kernel(
             }
 
             const half2* activation_pairs =
-                reinterpret_cast<const half2*>(activation_source + group * 32);
+                reinterpret_cast<const half2*>(activation + group * 32);
             gate_accumulator += current_s1 *
                                 swizzled_group_dot(current_w1, activation_pairs);
             up_accumulator += current_s3 *
@@ -123,7 +110,7 @@ void aeon_moe_fused_w13_swiglu_kernel(
     }
 }
 
-template <int WAVES, int RPW, int LPR, int ITERS, bool STAGE_ACTIVATION = false>
+template <int WAVES, int RPW, int LPR, int ITERS>
 inline void dispatch_aeon_moe_fused_w13_swiglu(
     const half* activation,
     const SwizzledW13ExpertPtrs& weights,
@@ -145,13 +132,10 @@ inline void dispatch_aeon_moe_fused_w13_swiglu(
     constexpr int threads_per_block = WAVES * 32;
     const dim3 block(threads_per_block);
     const dim3 grid((N / RPW + WAVES - 1) / WAVES, expert_count);
-    constexpr size_t shared_bytes = STAGE_ACTIVATION
-        ? static_cast<size_t>(ITERS * LPR * 32) * sizeof(half)
-        : 0;
-    aeon_moe_fused_w13_swiglu_kernel<WAVES, RPW, LPR, ITERS, STAGE_ACTIVATION>
-        <<<grid, block, shared_bytes, stream>>>(activation, weights, expert_hidden,
-                                                output_f32, output_dim,
-                                                expert_count, N, swiglu_limit);
+    aeon_moe_fused_w13_swiglu_kernel<WAVES, RPW, LPR, ITERS>
+        <<<grid, block, 0, stream>>>(activation, weights, expert_hidden,
+                                      output_f32, output_dim,
+                                      expert_count, N, swiglu_limit);
 }
 
 } // namespace aeon::kernel
