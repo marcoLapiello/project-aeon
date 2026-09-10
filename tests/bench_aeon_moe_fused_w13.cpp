@@ -37,7 +37,18 @@ constexpr int RPW = 4;
 constexpr int LPR = 8;
 constexpr int ITERS = 16;
 constexpr int BENCHMARK_ITERATIONS = 100;
+constexpr std::size_t MALL_BYTES = 96ull << 20;
+constexpr std::size_t COLD_WORKING_SET_BYTES = 4 * MALL_BYTES;
 constexpr float SWIGLU_LIMIT = 10.0f;
+
+struct ColdW13Set {
+    uint8_t* storage = nullptr;
+    std::array<uint32_t*, EXPERTS> w1{};
+    std::array<uint32_t*, EXPERTS> w3{};
+    std::array<half*, EXPERTS> s1{};
+    std::array<half*, EXPERTS> s3{};
+    aeon::kernel::SwizzledW13ExpertPtrs fused{};
+};
 
 uint32_t make_source_word(std::size_t word_index, uint32_t seed) {
     uint32_t word = 0;
@@ -76,6 +87,42 @@ double elapsed_us(hipEvent_t start, hipEvent_t stop, int iterations) {
     float elapsed_ms = 0.0f;
     CHECK_HIP(hipEventElapsedTime(&elapsed_ms, start, stop));
     return static_cast<double>(elapsed_ms) * 1000.0 / iterations;
+}
+
+void initialize_cold_set(
+    ColdW13Set& set,
+    const std::array<uint32_t*, EXPERTS>& base_w1,
+    const std::array<uint32_t*, EXPERTS>& base_w3,
+    const std::array<half*, EXPERTS>& base_s1,
+    const std::array<half*, EXPERTS>& base_s3,
+    std::size_t packed_bytes,
+    std::size_t scale_bytes,
+    std::size_t set_bytes
+) {
+    CHECK_HIP(hipMalloc(&set.storage, set_bytes));
+    std::size_t offset = 0;
+    for (int expert = 0; expert < EXPERTS; ++expert) {
+        set.w1[expert] = reinterpret_cast<uint32_t*>(set.storage + offset);
+        offset += packed_bytes;
+        set.s1[expert] = reinterpret_cast<half*>(set.storage + offset);
+        offset += scale_bytes;
+        set.w3[expert] = reinterpret_cast<uint32_t*>(set.storage + offset);
+        offset += packed_bytes;
+        set.s3[expert] = reinterpret_cast<half*>(set.storage + offset);
+        offset += scale_bytes;
+        set.fused.w1[expert] = reinterpret_cast<const uint4*>(set.w1[expert]);
+        set.fused.s1[expert] = set.s1[expert];
+        set.fused.w3[expert] = reinterpret_cast<const uint4*>(set.w3[expert]);
+        set.fused.s3[expert] = set.s3[expert];
+        CHECK_HIP(hipMemcpy(set.w1[expert], base_w1[expert], packed_bytes,
+                            hipMemcpyDeviceToDevice));
+        CHECK_HIP(hipMemcpy(set.s1[expert], base_s1[expert], scale_bytes,
+                            hipMemcpyDeviceToDevice));
+        CHECK_HIP(hipMemcpy(set.w3[expert], base_w3[expert], packed_bytes,
+                            hipMemcpyDeviceToDevice));
+        CHECK_HIP(hipMemcpy(set.s3[expert], base_s3[expert], scale_bytes,
+                            hipMemcpyDeviceToDevice));
+    }
 }
 
 } // namespace
@@ -138,6 +185,19 @@ int main() {
         device_weights.s3[expert] = device_s3[expert];
     }
 
+    const std::size_t packed_bytes = packed_words * sizeof(uint32_t);
+    const std::size_t scale_bytes = scale_count * sizeof(half);
+    const std::size_t expert_set_bytes = EXPERTS *
+        (2 * packed_bytes + 2 * scale_bytes);
+    const std::size_t cold_set_count =
+        (COLD_WORKING_SET_BYTES + expert_set_bytes - 1) / expert_set_bytes + 1;
+    std::vector<ColdW13Set> cold_sets(cold_set_count);
+    for (ColdW13Set& cold_set : cold_sets) {
+        initialize_cold_set(cold_set, device_w1, device_w3, device_s1, device_s3,
+                            packed_bytes, scale_bytes, expert_set_bytes);
+    }
+    CHECK_HIP(hipDeviceSynchronize());
+
     for (int expert = 0; expert < EXPERTS; ++expert) {
         aeon::kernel::dispatch_aeon_w4a16_swizzled_gemv<WAVES, RPW, LPR, ITERS>(
             device_activation, device_w1[expert], device_s1[expert],
@@ -172,10 +232,16 @@ int main() {
     }
 
     hipEvent_t baseline_start, baseline_stop, fused_start, fused_stop;
+    hipEvent_t cold_baseline_start, cold_baseline_stop;
+    hipEvent_t cold_fused_start, cold_fused_stop;
     CHECK_HIP(hipEventCreate(&baseline_start));
     CHECK_HIP(hipEventCreate(&baseline_stop));
     CHECK_HIP(hipEventCreate(&fused_start));
     CHECK_HIP(hipEventCreate(&fused_stop));
+    CHECK_HIP(hipEventCreate(&cold_baseline_start));
+    CHECK_HIP(hipEventCreate(&cold_baseline_stop));
+    CHECK_HIP(hipEventCreate(&cold_fused_start));
+    CHECK_HIP(hipEventCreate(&cold_fused_stop));
 
     CHECK_HIP(hipEventRecord(baseline_start, 0));
     for (int iteration = 0; iteration < BENCHMARK_ITERATIONS; ++iteration) {
@@ -213,10 +279,62 @@ int main() {
               << " us, speedup=" << (baseline_us / fused_us)
               << "x, output max diff=" << max_error << std::endl;
 
+    CHECK_HIP(hipEventRecord(cold_baseline_start, 0));
+    for (int iteration = 0; iteration < BENCHMARK_ITERATIONS; ++iteration) {
+        const ColdW13Set& cold_set =
+            cold_sets[static_cast<std::size_t>(iteration) % cold_sets.size()];
+        for (int expert = 0; expert < EXPERTS; ++expert) {
+            aeon::kernel::dispatch_aeon_w4a16_swizzled_gemv<WAVES, RPW, LPR, ITERS>(
+                device_activation, cold_set.w1[expert], cold_set.s1[expert],
+                device_gate, N, K);
+            aeon::kernel::dispatch_aeon_w4a16_swizzled_gemv<WAVES, RPW, LPR, ITERS>(
+                device_activation, cold_set.w3[expert], cold_set.s3[expert],
+                device_up, N, K);
+            aeon::kernel::v4_pipeline_swiglu_clamp_kernel<<<(N + 255) / 256, 256>>>(
+                device_gate, device_up,
+                device_baseline_hidden + static_cast<size_t>(expert) * N,
+                N, SWIGLU_LIMIT);
+        }
+    }
+    CHECK_HIP(hipEventRecord(cold_baseline_stop, 0));
+    CHECK_HIP(hipEventSynchronize(cold_baseline_stop));
+
+    CHECK_HIP(hipEventRecord(cold_fused_start, 0));
+    for (int iteration = 0; iteration < BENCHMARK_ITERATIONS; ++iteration) {
+        const ColdW13Set& cold_set =
+            cold_sets[static_cast<std::size_t>(iteration) % cold_sets.size()];
+        aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<WAVES, RPW, LPR, ITERS>(
+            device_activation, cold_set.fused, device_fused_hidden,
+            nullptr, 0,
+            EXPERTS, N, K, SWIGLU_LIMIT);
+    }
+    CHECK_HIP(hipEventRecord(cold_fused_stop, 0));
+    CHECK_HIP(hipEventSynchronize(cold_fused_stop));
+
+    const double cold_baseline_us = elapsed_us(
+        cold_baseline_start, cold_baseline_stop, BENCHMARK_ITERATIONS);
+    const double cold_fused_us = elapsed_us(
+        cold_fused_start, cold_fused_stop, BENCHMARK_ITERATIONS);
+    const double cold_fused_gbps =
+        static_cast<double>(expert_set_bytes) / cold_fused_us / 1000.0;
+    std::cout << std::fixed << std::setprecision(3)
+              << "W1/W3 cold rotation: " << cold_set_count << " sets / "
+              << (static_cast<double>(cold_set_count * expert_set_bytes) /
+                  (1024.0 * 1024.0))
+              << " MiB working set, current 18 launches=" << cold_baseline_us
+              << " us, fused 1 launch=" << cold_fused_us
+              << " us, speedup=" << (cold_baseline_us / cold_fused_us)
+              << "x, fused weight BW=" << cold_fused_gbps << " GB/s"
+              << std::endl;
+
     CHECK_HIP(hipEventDestroy(baseline_start));
     CHECK_HIP(hipEventDestroy(baseline_stop));
     CHECK_HIP(hipEventDestroy(fused_start));
     CHECK_HIP(hipEventDestroy(fused_stop));
+    CHECK_HIP(hipEventDestroy(cold_baseline_start));
+    CHECK_HIP(hipEventDestroy(cold_baseline_stop));
+    CHECK_HIP(hipEventDestroy(cold_fused_start));
+    CHECK_HIP(hipEventDestroy(cold_fused_stop));
     CHECK_HIP(hipFree(device_activation));
     CHECK_HIP(hipFree(device_gate));
     CHECK_HIP(hipFree(device_up));
@@ -227,6 +345,9 @@ int main() {
         CHECK_HIP(hipFree(device_w3[expert]));
         CHECK_HIP(hipFree(device_s1[expert]));
         CHECK_HIP(hipFree(device_s3[expert]));
+    }
+    for (ColdW13Set& cold_set : cold_sets) {
+        CHECK_HIP(hipFree(cold_set.storage));
     }
     return 0;
 }
