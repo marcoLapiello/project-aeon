@@ -2,6 +2,8 @@
 
 Physical hardware verification benchmarks, latencies, throughputs, and cache behaviors across major development milestones on AMD Radeon RX 7900 XTX (`gfx1100`).
 
+* **Status**: Living benchmark record. Detailed entries continue through M22; the summary matrix remains a compact baseline through M10 so that later measurements stay in their full experimental context below. Do not use the historical M20 figures without the qualification in the detailed entries and [DOCUMENTATION_STATUS.md](DOCUMENTATION_STATUS.md).
+
 ---
 
 ## 1. Hardware Testbed Baseline
@@ -183,7 +185,7 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
 * **Interpretation**: Warm is now demonstrably active and beneficial: `+17.8%` decode throughput versus the direct-cold control. The stable `59.3%` Hot hit rate is expected because Hot capacity and the routed access sequence are unchanged; Warm capacity changes lower-tier service cost, not Hot residency capacity.
 
 ### M16: Demotion-Free Warm Path & Pre-Staging Shared-Expert Enqueue (Expert Review Step 1)
-* **Date**: 2026-09-08 | **Status**: Completed; hypothesis-defining result | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](EXPERT_PERFORMANCE_REVIEW.md)
+* **Date**: 2026-09-08 | **Status**: Completed; hypothesis-defining result | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md)
 * **Changes**:
   - Removed Hot→Warm D2H demotion from the request path: evicted Hot experts return directly to Cold NVMe (weights are immutable; payload always re-readable from disk). Eliminates 14.15 MB of VRAM→host DMA per eviction.
   - Warm hits upload H2D **directly from pinned warm segments** via SDMA (new `PrefetchStagingArena::begin_direct_transfer` borrows the slot event; `HostExpertPool::is_slot_pinned` gates the fast path, with an unpinned-segment staging fallback). Warm-hit traffic drops from ~42 MB (memcpy + demotion + upload) to ~14 MB.
@@ -195,7 +197,7 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
 * **Interpretation — the decode loop is latency-bound, not bandwidth-bound**: despite a 3× traffic reduction per warm hit, throughput matches M15 (`5.11` vs `5.15 tok/s`). Warm coverage also drained (684 → 157 warm hits) because evictions no longer refill Warm — yet throughput was unchanged. Both facts prove the per-request byte volume is irrelevant today: the binding constraint is the **synchronous just-in-time dispatch** (2 `hipStreamSynchronize`/layer, cold io_uring read exposed on the critical path of every routed layer, ~3.5 ms × 43 layers ≈ 150 ms of the 196 ms step). This directly mandates Step 3 of the review roadmap: speculative cross-token prefetch to create a real prefetch horizon.
 
 ### M17: Routing-Locality Measurement — Historical Speculation Rejected (Expert Review Step 3)
-* **Date**: 2026-09-08 | **Status**: Completed; negative result, roadmap re-prioritized | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](EXPERT_PERFORMANCE_REVIEW.md)
+* **Date**: 2026-09-08 | **Status**: Completed; negative result, roadmap re-prioritized | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md)
 * **Instrumentation**: env-gated (`AEON_MEASURE_LOCALITY=1`) per-layer 4-token top-6 history in `V4Pipeline`, reporting coverage of each token's top-6 set by the union of the previous n tokens' sets (n = 1..4) — the exact ceiling of any history-based speculative prefetcher. Zero-cost when disabled; all regressions pass unchanged.
 * **Measured on silicon** (Warm 35 GiB profile, context 4096, 4 prompt → 8 gen, 400 gated-layer pairs):
   - n=1 union: mean coverage `3.38/6` (56%), P(full 6/6) = 17.5%
@@ -207,9 +209,9 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
 * **Caveat**: the benchmark's repetitive output (`223` ×7) inflates absolute locality; a diverse prompt lowers coverage and hit rate together, leaving the conclusion (history-based speculation ≈ LRU capture) intact.
 
 ### M18: W4A16 Decode GEMV Rewrite — 10× Routed-Expert GEMM Speedup (Expert Review Step 4)
-* **Date**: 2026-09-08 | **Status**: Completed | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](EXPERT_PERFORMANCE_REVIEW.md)
+* **Date**: 2026-09-08 | **Status**: Completed | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md)
 * **Root cause (profiling the old kernel)**: `wmma_fused_int4_gemm_kernel` launched 32–64 thread blocks on 96 CUs and serialized 256 dependent global→LDS→WMMA rounds behind 2 `__syncthreads` per K-step: `138.8 µs` for a job whose memory floor is ~4.4 µs (4.7 MiB packed weights+scales @ 960 GB/s). Decode runs a single token, so 15/16 of the M=16 WMMA tile was padding.
-* **Change**: new `w4a16_gemv_kernel` decode path in [w4a16_gemm.hpp](../src/kernel/w4a16_gemm.hpp) — one Wave32 warp per output row, perfectly coalesced `uint4` weight streams (1 uint4 = 32 nibbles = exactly one 32-wide scale group), inline FP32 dequant-FMA with dual accumulators, warp-shuffle reduction, no LDS/`__syncthreads`; 2048–4096 warps of parallel work. `dispatch_w4a16_gemm` routes `M==1` to it; the pipeline's three routed-expert GEMM calls now pass `M=1`. The WMMA kernel is retained for `M>1`.
+* **Change**: new `w4a16_gemv_kernel` decode path in [w4a16_gemm.hpp](../../src/kernel/w4a16_gemm.hpp) — one Wave32 warp per output row, perfectly coalesced `uint4` weight streams (1 uint4 = 32 nibbles = exactly one 32-wide scale group), inline FP32 dequant-FMA with dual accumulators, warp-shuffle reduction, no LDS/`__syncthreads`; 2048–4096 warps of parallel work. `dispatch_w4a16_gemm` routes `M==1` to it; the pipeline's three routed-expert GEMM calls now pass `M=1`. The WMMA kernel is retained for `M>1`.
 * **Kernel-level silicon results** (`test_w4a16_wmma` sub-test 4, new): w1/w3 (N=2048, K=4096) `138.8 → 13.9 µs` (10.0×, 340 GB/s effective); w2 (N=4096, K=2048) `13.9 µs` (338 GB/s). Full-N output **bit-exact vs CPU FP32 reference** (max diff `0`).
 * **Regression validation**: `test_w4a16_wmma` (incl. real-checkpoint sub-test, diff 0), `test_v4_moe_layer`, `test_v4_pipeline`, `test_aeon_pipeline`, `test_dynamic_expert_pool`, `test_hot_warm_cold_pipeline` (**golden token `295` preserved** — 43-layer forward numerics unchanged at argmax granularity), `test_async_prefetch` — all pass.
 * **End-to-end A/B** (context 4096, 4 prompt → 8 gen):
@@ -219,7 +221,7 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
 * **Interpretation**: routed-expert GEMM time fell from ~108 ms to ~11 ms per token, but step latency only dropped 23 ms — the loop is now dominated by the exposed just-in-time miss path (2 `hipStreamSynchronize`/layer + ~3.5 ms cold io_uring reads; 1,077 cold misses this run) and per-miss transfer cost. This raises the value of Step 2 (contiguous per-slot VRAM layout — 1 memcpy/expert instead of 6 — plus DMA stream split), Step 5 (sync/argmax overheads), and Step 6 (contiguous `.aeon` repack).
 
 ### M19: Contiguous Per-Slot VRAM Layout & DMA Stream Split (Expert Review Step 2)
-* **Date**: 2026-09-08 | **Status**: Completed | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](EXPERT_PERFORMANCE_REVIEW.md)
+* **Date**: 2026-09-08 | **Status**: Completed | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md)
 * **Changes**:
   - `UnifiedVRAMExpertPool` re-laid-out from six SoA sub-tensor allocations to **one contiguous device allocation with per-slot 13.5 MiB regions byte-identical to the `.aeon` layout** (`static_assert`-enforced). Full-expert H2D upload is now **1 `hipMemcpyAsync` instead of 6** (per-sub-tensor getters derive from the slot base; `upload_from_pointers`/`download_to_host_expert` kept for the safetensors path).
   - **DMA stream split**: new `sdma_cold_stream` dedicated to io_uring staging→VRAM uploads; warm-hit and safetensors H2D stay on `sdma_stream`. A burst of cold-completing io_uring experts no longer head-of-line blocks warm-hit transfers.
@@ -227,10 +229,11 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
 * **Controlled A/B** (context 4096, 4 prompt → 8 gen):
   - Warm 35 GiB: `5.79 → 5.88 tok/s` (`172.6 → 170.0 ms/tok`), TTFT `1835 → 1803 ms`.
   - Warm off: `5.25 → 5.39 tok/s` (`190.4 → 185.6 ms/tok`).
+* **Interpretation**: +1.5–2.7% — modest but real, and structurally important: per-expert PCIe transfer is now a single sequential SDMA burst with far less submission overhead, and the io_uring cold path is decoupled from warm-hit latency. The step remained dominated by the just-in-time cold-miss read exposure; the next levers were Step 5 (single-sync router and GPU argmax) and Step 6 (contiguous `.aeon` repack).
 
 ### M20: Per-Layer CPU-Stall Removal & GPU Argmax (Expert Review Step 5)
-* **Date**: 2026-09-08 | **Status**: Completed | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](EXPERT_PERFORMANCE_REVIEW.md)
-* **Changes** ([v4_attention.hpp](../src/kernel/v4_attention.hpp), [v4_pipeline.hpp](../src/core/v4_pipeline.hpp), [v4_pipeline_scratch.hpp](../src/core/v4_pipeline_scratch.hpp)):
+* **Date**: 2026-09-08 | **Status**: Completed | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`, 43 layers) | **Review**: [Expert Performance Review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md)
+* **Changes** ([v4_attention.hpp](../../src/kernel/v4_attention.hpp), [v4_pipeline.hpp](../../src/core/v4_pipeline.hpp), [v4_pipeline_scratch.hpp](../../src/core/v4_pipeline_scratch.hpp)):
   - **Router-logits round-trip eliminated**: the old path did D2H of 256 halves → `hipStreamSynchronize` → CPU half→float → H2D **every layer** just to satisfy the router kernel's float input. Replaced with a device-side `v4_half_to_float_n_kernel` — removes 43 full pipeline drains per token.
   - **GPU argmax over the 129,280-logit head**: new two-phase `v4_argmax_fp16_kernel` (505 blocks × 256 threads, block partials + grid reduction, first-max-wins tie-break identical to the CPU sequential scan). Replaces the 258 KB D2H + sync + 129,280-element CPU loop with a 4-byte result readback.
   - **Vectorized FP16 GEMV** (`v4_gemv_fp16_vec8_kernel`): lanes stream 8 halves/iteration via `uint4` + FP32 FMA (vs 1 half in `v4_gemv_fp16_kernel`). Applied to the router GEMV, shared-expert w1/w3/w2, and the LM head (the LM head alone moves 1.06 GB/token; ~8× fewer global transactions).
@@ -240,7 +243,6 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
   - Warm off: `5.39 → 6.32 tok/s` (`185.6 → 158.2 ms/tok`), +17.3%.
   - Generated tokens returned to the M15 sequence `[237, 223 ×7]` — the vectorized LM head's FP32 summation order resolves the near-tie argmax the same way as the pre-M18 path, further confirming the M18 flip was tie-break noise rather than a numerics error.
 * **Interpretation**: removing the 43 per-layer router round-trips and the per-token 258 KB readback + CPU scan cut ~29 ms/token. The step is now dominated by the exposed just-in-time cold-miss read path (io_uring latency + ~2.4 novel experts/layer). **Next**: Step 6 — contiguous `.aeon` repack (fallocate, frequency-ordered) to raise the cold tier from ~3.2 GB/s toward the ≥6 GB/s target, directly shrinking the exposed miss window.
-* **Interpretation**: +1.5–2.7% — modest but real, and structurally important: per-expert PCIe transfer is now a single sequential SDMA burst with far less submission overhead, and the io_uring cold path is decoupled from warm-hit latency. The step remains dominated by the just-in-time cold-miss read exposure (~2.4 novel experts/layer × ~3.5 ms) — next lever is Step 5 (single-sync router + GPU argmax to remove per-layer CPU stalls) and Step 6 (contiguous `.aeon` repack to raise cold-tier read bandwidth toward 6 GB/s).
 
 ### M21: Native Text-In/Text-Out Frontend and 43-Layer Smoke
 * **Date**: 2026-09-09 | **Status**: Native path passed; external behavior gate open | **Model**: DeepSeek-V4 INT4-W4A16 (`.aeon`)

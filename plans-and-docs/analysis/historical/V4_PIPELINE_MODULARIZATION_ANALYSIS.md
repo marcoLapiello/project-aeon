@@ -1,18 +1,20 @@
 # V4 Pipeline Modularization Analysis
 
+*Status: historical pre-refactor analysis. The first three extraction and ownership steps are implemented; use [CODEBASE_MAP.md](../../status/CODEBASE_MAP.md) and [DOCUMENTATION_STATUS.md](../../status/DOCUMENTATION_STATUS.md) for the current structure.*
+
 ## Purpose
 
-`src/core/v4_pipeline.hpp` is the current integration point for the DeepSeek-V4
-runtime, but it has grown into a 1,500-line header containing several distinct
-ownership and execution concerns. This document records the duplication and
-modularization findings before structural changes are made.
+`src/core/v4_pipeline.hpp` was the original integration point for the DeepSeek-V4
+runtime and had grown into a roughly 1,500-line header containing several distinct
+ownership and execution concerns. This document records the duplication findings
+and the outcome of the initial structural changes.
 
 The goal is to reduce parallel implementations and clarify ownership without
 changing inference behavior.
 
-## Current Responsibilities
+## Pre-refactor Responsibilities
 
-`v4_pipeline.hpp` currently contains:
+Before the refactor, `v4_pipeline.hpp` contained:
 
 - Four pipeline-local HIP utility kernels.
 - `VRAMExpertSlot` and `HostExpertSource` data structures.
@@ -24,8 +26,13 @@ changing inference behavior.
   memory-budget setup, expert-tier orchestration, one-token execution, greedy
   sampling, generation, and cleanup.
 
-These are separate concerns even though they currently participate in one
-header-only implementation.
+The current split is `src/kernel/v4_pipeline_ops.hpp` for pipeline utility
+kernels, `src/core/v4_pipeline_scratch.hpp` for scratch ownership, and
+`src/core/v4_layer.hpp` for layer-local structures. Production residency is
+handled by `UnifiedVRAMExpertPool`, `HostExpertPool`, and `ExpertRegistry`.
+
+These were separate concerns even though they originally participated in one
+header-only implementation; the current ownership split is described above.
 
 ## Duplication Findings
 
@@ -98,39 +105,19 @@ components:
 - `src/core/expert_registry.hpp` for global residency, tier transitions, and
   LRU tracking.
 
-The local path and global path are currently intentional modes, but they have
-parallel concepts for slot ownership, streaming, residency, eviction, and
-statistics. This is the most important duplication to resolve before adding
-asynchronous prefetching: two cache implementations will otherwise require
-two separate prefetch and correctness paths.
-
-Recommended direction: define a common expert-device view and residency
-manager boundary. The local per-layer cache and the global multi-layer pool can
-remain separate implementations behind that boundary until the global path is
-complete.
+The global tier path is now the production path used by the `.aeon` pipeline.
+The old layer-local cache remains only as compatibility/reference structure where
+needed; new tiering work should extend the global ownership model rather than add
+another cache implementation.
 
 ### Model initialization
 
-`V4Pipeline::init()`, `init_aeon()`, and `init_dynamic_global()` repeat most of
-the following work:
+`V4Pipeline::init()`, `init_aeon()`, and `init_dynamic_global()` still repeat
+some model-resource setup. The model-source differences and global-pool setup
+are real, so a shared initialization helper is optional follow-up work rather
+than a prerequisite for the current runtime.
 
-- HIP stream creation.
-- RoPE table initialization and device upload.
-- Embedding binding.
-- LM-head allocation and upload.
-- Hyper-Connections head allocation and upload.
-- Final normalization allocation and upload.
-- Scratch allocation.
-- Layer construction.
-
-The model-source differences and global-pool setup are real, but the shared
-resource setup should not be copied across three initialization functions.
-
-Recommended direction: introduce a loader/resource initialization helper that
-accepts a model-source abstraction or narrowly shared loader operations. Keep
-the three public initialization entry points for compatibility.
-
-### Hyper-Connections execution gap
+### Hyper-Connections execution gap (resolved)
 
 The original production `step()` path split HC execution across the CPU and
 GPU. It copied the residual to the host, computed the RMS and 24-value
@@ -148,28 +135,11 @@ an incremental implementation gap. The existing GPU HC kernels covered only:
 The initial 16,384-to-24 projection and the pre-combination reduction did not
 have production GPU kernels.
 
-A first device-side replacement was added experimentally with
-`hc_project_kernel` and `hc_pre_combine_kernel`. It passed numerical tests, but
-the projection kernel used one Wave32 block to process all 24 output
-projections sequentially. Under the two-layer benchmark this reduced decode
-throughput to approximately 49 tok/s, while restoring the old CPU HC path
-under the same zero-miss cache configuration recovered approximately 90 tok/s.
-
-Therefore Step 3 is still open. The current GPU path is functionally correct
-but not performance-accepted. Do not proceed to Spike 2 performance
-measurements until this gap is resolved, because the HC regression would
-contaminate SDMA and expert-prefetch results.
-
-Required resolution:
-
-1. Keep the CPU implementation as a reference and temporary performance
-   baseline.
-2. Benchmark the projection and pre-combination stages independently with
-   HIP events.
-3. Redesign the GPU projection to parallelize across output projections as
-   well as reduction lanes, and optimize or fuse the pre-combination stage.
-4. Validate numerical parity and recover the prior two-layer throughput before
-   making the device path the production default.
+A device-side replacement with `hc_project_kernel` and `hc_pre_combine_kernel`
+was then parallelized across 24 Wave32 blocks with vectorized loads/stores. The
+result passed numerical tests and recovered approximately 123 tok/s on the
+two-layer zero-miss benchmark. The HC CPU round trips are therefore no longer
+an active blocker; the measurements are recorded in [PERFORMANCE_LEDGER.md](../../status/PERFORMANCE_LEDGER.md).
 
 ## Logic That Is Already Reused Correctly
 
@@ -183,16 +153,15 @@ kernel headers:
 - `kernel/moe_router.hpp` for MoE routing.
 - `kernel/w4a16_gemm.hpp` for INT4-W4A16 WMMA GEMM.
 
-The four pipeline-local utility kernels are small and legitimate, but they do
-not need to live in the pipeline header:
+The four pipeline-local utility kernels were small and legitimate, but did not
+need to live in the pipeline header:
 
 - Clamped SwiGLU.
 - Weighted expert-output accumulation.
 - FP16-to-FP32 conversion.
 - FP32-to-FP16 conversion.
 
-They should move to a focused kernel header such as
-`src/kernel/v4_pipeline_ops.hpp`.
+They now live in `src/kernel/v4_pipeline_ops.hpp`.
 
 ## Resource-Management Duplication
 
@@ -213,38 +182,34 @@ move-only ownership semantics than `V4Layer` and `PipelineScratchBuffers`.
 Recommended direction: make extracted resource owners consistently move-only
 RAII types, but avoid broad error-handling changes during the first split.
 
-## Proposed Modularization Order
+## Modularization Outcome and Remaining Follow-up
 
-The safest sequence is mechanical first, architectural second:
+The mechanical sequence was completed as follows:
 
-1. Extract the four pipeline utility kernels into
+1. [x] Extract the pipeline utility kernels into
    `src/kernel/v4_pipeline_ops.hpp`.
-2. Extract `PipelineScratchBuffers` into
+2. [x] Extract `PipelineScratchBuffers` into
    `src/core/v4_pipeline_scratch.hpp`.
-3. Extract `VRAMExpertSlot`, `HostExpertSource`, and `V4Layer` into
+3. [x] Extract `VRAMExpertSlot`, `HostExpertSource`, and `V4Layer` into
    `src/core/v4_layer.hpp`.
-4. Preserve the existing local-cache fallback while defining the common expert
-   residency boundary needed by the global path.
-5. Extract model-level resources and shared initialization helpers.
-6. Extract the `step()` implementation into a focused execution component.
-7. Keep `generate()` as the public orchestration API until the execution split
-   is stable.
-8. Revisit `v4_block.hpp` after the production types have stable ownership and
-   shape contracts.
+4. [x] Standardize production tiering on the global VRAM pool and registry;
+   remove the dual-cache split and hardcoded slot assumptions.
+5. [ ] Consider a later model-resource initialization helper if repeated setup
+   becomes a maintenance problem.
+6. [ ] Revisit a deeper `step()` extraction only if it removes real complexity;
+   the current header boundary is not an active correctness blocker.
+7. [x] Keep `generate()` as the public orchestration API.
+8. [ ] Revisit shared shape/metadata contracts with `v4_block.hpp` only when a
+   concrete duplication affects an active change.
 
-Each early step should preserve public member names where practical because
-current tests inspect `pipeline.layers` and `pipeline.expert_registry_`
-directly.
+The extraction preserved public member names where practical because current
+tests inspect `pipeline.layers` and `pipeline.expert_registry_` directly.
 
 ## Architectural Conclusion
 
-`v4_pipeline.hpp` is duplicating meaningful *responsibilities* from other
-headers, but it is not generally duplicating the core GPU algorithms. The main
-problems are parallel representations of a transformer block, two expert-cache
-architectures, repeated initialization, and repeated manual resource cleanup.
-
-The correct next move is therefore modularization with ownership boundaries,
-not a broad rewrite. The first extraction should be behavior-neutral and
-focused on moving types and utility kernels. Expert residency unification and
-the removal of host-side HC synchronization should follow only after targeted
-validation is in place.
+`v4_pipeline.hpp` originally duplicated meaningful *responsibilities* from
+other headers, but not the core GPU algorithms. The high-value cleanup is now
+complete: utility kernels, scratch ownership, layer structure, global expert
+residency, and HC synchronization have focused ownership boundaries. Further
+splitting is optional maintenance work and should be justified by a concrete
+change rather than treated as an unfinished phase.

@@ -40,7 +40,8 @@ The core model execution path already accepts token IDs and returns token IDs:
   - `V4Pipeline::generate(const std::vector<uint32_t>& prompt, uint32_t max_new_tokens, ...)` performs prompt prefill and autoregressive decoding.
   - The prompt loop is currently marked `RoutingPhase::Prefill`.
   - The decode loop is currently marked `RoutingPhase::Decode`.
-  - Generation currently returns exactly `max_new_tokens` IDs and does not stop when EOS is produced.
+  - The legacy `V4Pipeline::generate(...)` raw-ID API remains fixed-length and does not stop on EOS by itself.
+  - The native text wrapper in `src/text/text_generation.*`, used by `aeon_chat`, adds EOS-aware stopping, context limits, and explicit stop reasons around token generation.
   - The first returned generated token is produced by the final prompt-prefill step.
 - `src/core/routing_counter.hpp` and `src/core/routing_profile.hpp`
   - provide optional routing observation and durable profile aggregation;
@@ -540,7 +541,7 @@ tests/test_dsv4_chat_formatter.cpp
 tests/test_text_generation.cpp
 tests/fixtures/dsv4_text/*
 CMakeLists.txt
-plans-and-docs/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md
+plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md
 AGENTS.md
 ```
 

@@ -10,18 +10,17 @@ Aeon solves the memory wall for massive MoE models (e.g., DeepSeek-V4 architectu
 
 ---
 
-## 2. Foundational Documentation
-Always consult these authoritative documents for deep technical specifics:
-- [Vision & Architecture Roadmap](plans-and-docs/PROJECT_AEON_VISION.md): Architectural pillars, multi-GPU topology, hardware target philosophy.
-- [Technical Blockers & Risk Analysis](plans-and-docs/AEON_TECHNICAL_BLOCKERS_AND_RISKS.md): Analysis of cold-miss traps (Colibri trap), prefetch horizons, ROCm SDMA jitter, and engineering mitigations.
-- [Specialization Strategy & Entropy Analysis](plans-and-docs/AEON_SPECIALIZATION_AND_ENTROPY_ANALYSIS.md): Rationale for Phase 1 single-model focus (DeepSeek MoE) and empirical activation entropy formulas.
-- [Research & Inspiration Survey](plans-and-docs/AEON_RESEARCH_AND_INSPIRATION.md): Prior art review (hipfire, zinc, Flash-MoE, llama.cpp PR #25294).
-- [Reference Expert Caching & Cold Streaming Analysis](plans-and-docs/REFERENCE_EXPERT_CACHING_AND_COLD_STREAMING_ANALYSIS.md): Detailed source comparison of FreeToken, Colibri, and DwarfStar expert caches and cold-tier streaming.
-- [Phase 0 Execution Plan](plans-and-docs/PHASE_0_EXECUTION_PLAN.md): Step-by-step micro-plan for foundational spikes and hardware validation.
-- [Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md): Micro-execution plan for single-GPU Core Runtime on real INT4-W4A16 weights.
-- [Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md): Micro-execution plan for Single-GPU 3-Tier Storage & Memory Hierarchy Optimization.
-- [Performance & Accuracy Ledger](plans-and-docs/PERFORMANCE_LEDGER.md): Empirical benchmark ledger recording test conditions, throughput, latencies, and cache behaviors across major milestones.
-- [Native Text-In/Text-Out Implementation Plan](plans-and-docs/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md): Actionable plan for the native DSV4 tokenizer, chat formatter, EOS-aware generation, detokenization, API validation, and future serving layer.
+## 2. Documentation and References
+Use [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) for the current plan inventory, open gates, and historical-document boundaries.
+
+Current execution records:
+- [Phase 2 Execution Plan](plans-and-docs/execution/active/PHASE_2_EXECUTION_PLAN.md): single-GPU Hot/Warm/Cold runtime and remaining cold-tier work.
+- [Native Text-In/Text-Out Plan](plans-and-docs/execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md): native frontend status and correctness gates.
+- [Routing Profile Study](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md): profiler contract and placement-study gates.
+- [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md): authoritative silicon measurements.
+- [Expert Performance Review Conclusions](plans-and-docs/analysis/current/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md): current latency diagnosis and measurement priorities.
+
+Completed plans and historical rationale remain available through the status index. Do not use an old checklist or review as current implementation evidence.
 
 ### Local Reference Implementations
 The primary external source references are maintained as shallow, default-branch checkouts outside this repository. They are for source comparison only, not Aeon build or runtime dependencies:
@@ -37,74 +36,23 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 ---
 
 ## 3. Progress Tracking & State of Execution
-*Keep this section up-to-date at the end of every significant task or session.*
+*Status: 2026-09-10. Keep this summary current; put detailed measurements and historical execution notes in the linked documents.*
 
-### Past (Completed)
-- [x] Initialized the Git repository and validated the target hardware/toolchain: 4x RX 7900 XTX (`gfx1100`), 64 GB host RAM, ROCm 7.2.2, and native `hipcc`.
-- [x] Established shallow local reference checkouts for llama.cpp, FreeToken, Colibri, DwarfStar (ds4), vLLM, and SGLang under `/home/marcolap/aeon-references/` for comparative source research.
-- [x] Completed the architectural research, model specialization decisions, and Phase 0 foundations. The project now has a working HIP/CMake base, hardware discovery, Wave32 WMMA validation, direct-I/O primitives, SDMA overlap checks, and the original toy MoE cache path. See [Phase 0 Execution Plan](plans-and-docs/PHASE_0_EXECUTION_PLAN.md).
-- [x] Completed Phase 1: a single-GPU DeepSeek-V4 INT4-W4A16 runtime with configuration and Safetensors loading, fused kernels, MoE routing, sliding-window attention, transformer blocks, and multi-layer autoregressive generation. See [Phase 1 Execution Plan](plans-and-docs/PHASE_1_EXECUTION_PLAN.md).
-- [x] Completed Phase 2 Spike 0: lossless Safetensors-to-`.aeon` repacking with separate dense and routed-expert containers, 4096-byte alignment, expert indexing, and bit-exact verification. See [Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) and [Performance & Accuracy Ledger](plans-and-docs/PERFORMANCE_LEDGER.md).
-- [x] Completed the implementation portion of Phase 2 Spike 1: dynamic memory budgeting, startup feasibility checks, a unified VRAM expert pool, Host RAM expert staging, expert residency tracking, and full-model silicon benchmarks. The original contiguous three-tier preload was blocked by host-memory pressure; the later bounded segmented Warm-tier integration is recorded below.
-- [x] Completed Phase 2 Pipeline Modularization Step 1: carved out HIP utility kernels to `src/kernel/v4_pipeline_ops.hpp`, scratch activation arena to `src/core/v4_pipeline_scratch.hpp`, and layer structure to `src/core/v4_layer.hpp`, cutting the monolithic `v4_pipeline.hpp` from ~1,500 down to 920 lines with full silicon test verification.
-- [x] Completed Phase 2 Pipeline Modularization Step 2: eliminated the dual-cache split, retired per-layer local LRU caches, standardized all pipelines on `UnifiedVRAMExpertPool` + `ExpertRegistry`, and removed hardcoded slot counts in favor of dynamic runtime configuration. Passed bit-exact tests on silicon (`test_dynamic_expert_pool`, `test_aeon_pipeline`, `test_v4_pipeline`).
-- [x] Connected a bounded Hot/Warm/Cold runtime path: segmented Warm Host storage, direct `io_uring` population for initial Hot and Warm residents, VRAM-to-host demotion, safe Warm-to-Hot promotion, and multi-layer staging reuse. The 43-layer silicon smoke test passes with 676 Hot slots, 8 Warm slots, and direct Cold misses; full-capacity performance measurement remains open.
-- [x] Added the optional routing counter and `profile_routing` measurement path: tokenized JSONL input, incremental atomic aggregation, complete 256-expert rankings, compact summaries, resume protection, and full 43-layer execution. A one-prompt real-text pilot completed successfully, but its activation data remains provisional until prompt-format and numerical correctness are validated against a trusted reference.
+### Completed milestones
+- [x] Phase 0 foundations and the Phase 1 single-GPU runtime gates are implemented. Phase 1 remains bounded by the open full-model correctness work described in the text plan.
+- [x] Phase 2 Spike 0: lossless Safetensors-to-`.aeon` repacking, sector alignment, indexing, and bit-exact verification.
+- [x] Phase 2 Spike 1: runtime feasibility budgeting, unified Hot VRAM pool, residency registry, and silicon validation.
+- [x] Phase 2 Spike 2: asynchronous SDMA staging and overlap validation under cold misses.
+- [x] Phase 2 Spike 3 bounded integration: direct `io_uring` cold reads, segmented Warm Host storage, Hot/Warm/Cold promotion, and 43-layer regression coverage.
+- [x] Pipeline modularization Steps 1-3: extracted pipeline operations/scratch/layer ownership, unified the production expert cache path, and removed the HC/router CPU round trips.
+- [x] Native text milestone: tokenizer, DSV4 formatter, EOS-aware generation, detokenization, `aeon_chat`, and a complete simple 43-layer text turn.
+- [x] Routing profiler plumbing: optional observation, resumable aggregation, complete rankings, compact summaries, and regeneration mode.
 
-### Present (In Progress)
-- [ ] **[Phase 2 Execution Plan](plans-and-docs/PHASE_2_EXECUTION_PLAN.md) — Single-GPU 3-Tier Storage & Memory Hierarchy Optimization**:
-  - [x] Spike 0: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification.
-  - [x] Spike 1: Dynamic memory budgeting & Global Unified VRAM Expert Pool.
-  - [ ] Pipeline Architecture Cleanup & Refactoring:
-    - [x] Step 1: Mechanical modularization (extract ops, scratch buffers, layer context).
-    - [x] Step 2: Eliminate dual-cache split (retire per-layer local LRU cache, standardize on Unified VRAM Pool + ExpertRegistry, scrub hardcoded slot numbers).
-    - [x] Step 3: Purge host-side HC synchronization roundtrips in token step loop.
-      - Resolved blocking performance gap: redesigned `hc_project_kernel` with 24 parallel Wave32 blocks and `float4` vectorized loads ($1,188\ \mu\text{s} \to 9.2\ \mu\text{s}$, $129\times$ kernel speedup) and vectorized `hc_pre_combine_kernel`.
-      - Exceeded baseline: decode throughput accelerated from 49 tok/s to **122.9 tok/s** on 2 layers with bit-exact CPU reference parity on physical silicon.
-  - [x] Spike 2: Dual-stream asynchronous SDMA prefetching & PCIe latency hiding:
-    - [x] Micro-Step 2.1: Lookahead Routing & Prefetch Horizon Pipeline.
-    - [x] Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream (`PrefetchStagingArena`).
-    - [x] Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon (`test_async_prefetch` passing with +71.5% decode speedup under cold misses).
-      - Note: Inter-layer lookahead confirmed that single-threaded CPU `memcpy` from unpinned `mmap` backing pages ($85\text{ MB/step}$) bottlenecks prefetching, making Spike 3 Direct I/O the critical unlock.
-  - [ ] Spike 3: Linux `io_uring` Direct I/O NVMe Cold Tier integration.
-    - [x] Implemented batched `io_uring` requests, validated expert offsets, dedicated `O_DIRECT` model descriptor, and staging-slot ownership cleanup.
-    - [x] Corrected synchronous regular-file submissions by enabling `IOSQE_ASYNC` and splitting expert payloads into 4 MiB aligned subreads.
-    - [x] Integrated direct cold reads into the native pipeline and passed model parity plus silicon generation regressions.
-    - [x] Replaced contiguous Warm Host allocation with segmented slabs and populated bounded Hot/Warm residents through direct I/O; added Hot-to-Warm DMA demotion and safe multi-layer staging reuse.
-    - [x] Ran the full 43-layer benchmark with 606 direct-populated Warm slots (`7.99 GiB`): 555 Warm hits and 601 Cold misses, with valid output at `3.98 tok/s`.
-    - [x] Ran the target 35 GiB Warm profile with 2,654 direct-populated slots: 684 Warm hits and 472 Cold misses, with valid output at `3.95 tok/s`; the run completed but increased observed swap usage by approximately `0.7 GiB`.
-    - [x] Removed the synchronous Hot-to-Warm demotion wait and validated the controlled A/B: `4.37 tok/s` with Warm disabled versus `5.15 tok/s` with the 35 GiB Warm profile; output remained identical.
-    - [x] Executed Expert Review Step 1 ([Expert Performance Review](plans-and-docs/EXPERT_PERFORMANCE_REVIEW.md)): deleted Hot-to-Warm D2H demotion from the request path, warm hits now upload directly from pinned segments (no staging memcpy), and shared-expert kernels enqueue before CPU staging dispatch. M16 A/B: `4.36` vs `5.11 tok/s` — throughput unchanged despite 3× less warm-hit traffic, proving the loop is latency-bound by just-in-time dispatch, not bandwidth-bound.
-    - [ ] Reduce host-memory pressure, reach the `>= 6.0 GB/s` model-backed throughput target, and complete controlled Tier 2 end-to-end measurements; remaining work is dominated by physical expert placement and storage-layout optimization.
-    - [x] Executed Expert Review Step 3 measurement (M17): per-layer n-token-union top-6 coverage instrumentation (`AEON_MEASURE_LOCALITY=1`) showed gated-layer coverage saturates at 3.60/6 (60%) for n=2 — equal to the already-measured 59.3% VRAM hot-hit rate. LRU residency at 664 slots already harvests all historical routing locality; history-based speculative prefetch would add ≤1% hits, so it was rejected. The residual ~2.4 cold misses/layer are genuinely novel experts. (Instrumentation removed after the conclusion was recorded.)
-    - [x] Executed Expert Review Step 4 (M18): rewrote the routed-expert W4A16 decode path as a warp-per-row fused INT4 GEMV (`w4a16_gemv_kernel`, coalesced `uint4` streams, FP32 dual-accumulator FMA, shuffle reduction) — `138.8 → 13.9 µs` per GEMM (10×, ~340 GB/s), bit-exact vs CPU FP32 reference, golden token 295 preserved. End-to-end: warm off `4.36 → 5.25 tok/s`, warm 35 GiB `5.11 → 5.79 tok/s`, TTFT `2755 → 1835 ms`.
-    - [x] Executed Expert Review Step 2 (M19): re-laid-out `UnifiedVRAMExpertPool` to a single contiguous device allocation with per-slot 13.5 MiB regions byte-identical to the `.aeon` layout (full-expert H2D = 1 `hipMemcpyAsync` instead of 6) and split DMA streams (`sdma_cold_stream` for io_uring uploads, `sdma_stream` for warm/safetensors H2D). Warm 35 GiB `5.79 → 5.88 tok/s`, warm off `5.25 → 5.39 tok/s`, tokens identical to M18; all regressions pass, golden token 295 preserved.
-    - [x] Executed Expert Review Step 5 (M20): eliminated the per-layer router-logits D2H/sync/CPU/H2D round-trip (device half→float kernel), added a two-phase GPU argmax over the 129,280-logit head (first-max-wins tie-break identical to CPU; replaces 258 KB D2H + CPU scan with a 4-byte readback), and a vectorized `uint4` FP16 GEMV for router/shared-expert/LM-head projections. Warm 35 GiB `5.88 → 7.10 tok/s` (+20.7%), warm off `5.39 → 6.32 tok/s` (+17.3%); tokens returned to the M15 sequence `[237, 223 ×7]`; all regressions pass, golden token 295 preserved.
-    - [x] Completed the first native text-in/text-out gate: `aeon_chat` accepts a verified DSV4 chat prompt, generates without a fixed output cap, decodes natively, and stops on EOS. The 43-layer `What is the capital of France?` turn returned `The capital of France is **Paris**.` with generated IDs `[671, 6102, 294, 8760, 344, 2619, 51119, 42499, 1]`.
-    - [x] Corrected native inference blockers exposed by the real turn: overlapping FP16/FP32 router buffers, same-launch GPU argmax reduction race, missing weight-free post-`wq_b` query RMSNorm, and missing non-hash gate correction bias. Focused attention, router, pipeline, and text tests pass.
-    - [x] Reconciled the apparent text-performance regression: current corrected synthetic 4→8 generation measures `4.30 tok/s` with Warm disabled and `4.71 tok/s` with 35 GiB Warm; the diverse real text turn measures `3.03 tok/s` cold and `3.35 tok/s` warm. Historical M20 `6.32/7.10 tok/s` used an incorrect inference path, a warmed registry, and a repetitive synthetic route, so it is not an apples-to-apples correctness baseline.
-    - [ ] **Deferred until correctness gate**: Review Step 6 — contiguous `.aeon` repack (fallocate, frequency-ordered) toward the ≥6 GB/s cold-tier target; the step is now dominated by the exposed just-in-time cold-miss read path (`141 ms/token`, ~1,077 cold misses/run).
-  - [ ] **New prerequisite — prompt format and model correctness gate**:
-    - [x] Located the existing tokenizer tooling in `/home/marcolap/.venvs/vllm-023-rocm` (`tokenizers 0.22.2`, `transformers 5.12.1`, `vllm 0.23.0`) and verified one real prompt against the model's local tokenizer.
-    - [x] Ran that 16-token prompt through all 43 layers with the native profiler; this validates plumbing only, not answer correctness or reference parity.
-    - [x] Reproduced the bundled DSV4 formatter contract in native C++ for chat and thinking modes, including exact BOS/role/thinking token IDs and multi-turn reasoning-drop behavior.
-    - [x] Added the native tokenizer artifact/loader, formatter tests, EOS/context-limit generation tests, and `aeon_chat`; a 43-layer `What is 2+2?` smoke produced four token IDs at `5.57 tok/s` with explicit `max_new_tokens` stopping.
-    - [x] Corrected native inference blockers found by the first unrestricted turn: overlapping router half/float buffers, same-launch GPU argmax reduction race, missing post-`wq_b` query RMSNorm, and missing non-hash gate correction bias.
-    - [x] Completed a real 43-layer text turn without an output cap: `What is the capital of France?` -> `The capital of France is **Paris**.` with `eos` stopping.
-    - [x] Researched the upstream DSV4 prompt contract and reference tokenizer/chat handling. The local `tokenizer_config.json` has no `chat_template` and explicitly disables automatic BOS/EOS insertion, so the native formatter remains explicit and model-specific.
-    - [x] Add a text-in/text-out correctness harness with explicit EOS handling and a longer generation limit.
-    - [ ] Implement and validate DeepSeek-V4 compressed/indexed attention for layers 2-42; the current native path still uses fixed 128-token sliding-window attention and the simple text turn is not a long-context parity claim.
-    - [ ] Compare Aeon against a trusted reference using identical token IDs and prompt formatting; compare generated IDs, logits/top-k outputs, and routed expert IDs where practical.
-    - [ ] Unlock the multi-prompt activation-profiling corpus only after the correctness gate passes.
-
-  - [ ] **Routing Profile and Frequency-Informed Placement Study** ([study plan](plans-and-docs/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)):
-    - [x] Measurement plumbing and durable result artifacts are implemented.
-    - [ ] Build a representative profile/held-out corpus with the verified tokenizer and prompt format.
-    - [ ] Accumulate per-layer probabilities for all 256 experts over many complete 43-layer runs, then evaluate static placement against held-out traces.
-
-### Future (Upcoming Next)
-- [ ] **Phase 3 — Multi-GPU Pipeline Parallelism**:
-  - 4-card stage partitioning across P2P PCIe links and 1F1B micro-batching.
+### Open gates
+- [ ] **Model correctness:** validate compressed/indexed attention for layers 2-42 and compare identical formatted inputs and outputs with a trusted compatible reference before using traces for placement.
+- [ ] **Cold-tier performance:** characterize cold-cache and steady-state behavior, reduce host-memory pressure, improve physical `.aeon` placement, and test whether the exposed just-in-time miss path needs a new scheduling or CPU-fallback design. The model-backed `>= 6.0 GB/s` target remains open.
+- [ ] **Routing placement study:** collect representative profile and held-out corpora with the verified text contract, then evaluate frequency-informed placement against dynamic LRU.
+- [ ] **Phase 3:** multi-GPU pipeline parallelism and 1F1B scheduling remain future work.
 
 ---
 
@@ -121,6 +69,6 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 2. **Hardware-Grounded Verification**: Test and benchmark on physical hardware (`gfx1100`) at every step.
 3. **Commit Messages**: Follow standard conventional commits format (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `perf:`).
 4. **Maintenance of AGENTS.md**: Update the "Progress Tracking & State of Execution" section whenever milestones or micro-steps transition between Past, Present, and Future.
-5. **Empirical Milestone Logging**: For every significant milestone or architectural transition, log the exact test conditions, throughput (tok/s), latencies (TTFT, decode step ms), and cache metrics in [Performance & Accuracy Ledger](plans-and-docs/PERFORMANCE_LEDGER.md). Do not log noise for small code edits; log meaningful, comparable system-level milestones to provide clear before-and-after tracking on the path to production.
+5. **Empirical Milestone Logging**: For every significant milestone or architectural transition, log the exact test conditions, throughput (tok/s), latencies (TTFT, decode step ms), and cache metrics in [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md). Do not log noise for small code edits; log meaningful, comparable system-level milestones to provide clear before-and-after tracking on the path to production.
 6. **Strategic codebase searching**: When you need to collect any info from the codebase or search for specific code or entities, use the search subagent tool.
 7. **Modular, Scalable and Mantainable**: avoid growing monolitic files with mixed concerns, extract those concerns in separate smaller and focused modules, reuse and improve existing modules, avoid duplications and redundancies.

@@ -1,5 +1,7 @@
 # Project Aeon: Global Competitive Landscape & Prior Art Survey
 
+*Status: prior-art reference. This static survey preserves comparative research and inspiration; it is not evidence that the described external techniques or Aeon follow-up ideas are implemented.*
+
 ## Executive Summary
 This document synthesizes findings from a comprehensive global survey into the state of local LLM inference engines, focusing on two distinct technical branches:
 1. **AMD / RDNA-Native Inference Engines** (bare-metal ISA, bypassing generic wrappers and CUDA-centric layers).
@@ -9,12 +11,12 @@ The primary takeaway: The broader open-source ecosystem is independently solving
 
 ## Local Source References
 The six primary reference engines are available locally for direct source comparison:
-- [llama.cpp checkout](../../aeon-references/llama.cpp)
-- [FreeToken checkout](../../aeon-references/freetoken)
-- [Colibri checkout](../../aeon-references/colibri)
-- [DwarfStar (ds4) checkout](../../aeon-references/ds4)
-- [vLLM checkout](../../aeon-references/vllm)
-- [SGLang checkout](../../aeon-references/sglang)
+- [llama.cpp checkout](../../../../aeon-references/llama.cpp)
+- [FreeToken checkout](../../../../aeon-references/freetoken)
+- [Colibri checkout](../../../../aeon-references/colibri)
+- [DwarfStar (ds4) checkout](../../../../aeon-references/ds4)
+- [vLLM checkout](../../../../aeon-references/vllm)
+- [SGLang checkout](../../../../aeon-references/sglang)
 
 These checkouts track the upstream default branches and are not production dependencies. Record the checked-out commit SHA when citing implementation details or reproducing a comparison.
 

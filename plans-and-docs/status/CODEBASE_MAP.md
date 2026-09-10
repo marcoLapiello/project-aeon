@@ -1,5 +1,7 @@
 # Project Aeon Codebase Map
 
+*Status: current runtime map, audited 2026-09-10.*
+
 This document distinguishes the current inference engine from validation programs,
 hardware spikes, and offline tooling. A file being built by CMake does not by itself
 mean that it is part of the production runtime.
@@ -22,12 +24,17 @@ The production-facing implementation is:
 - `src/core/vram_expert_pool.hpp` - Tier 1 hot expert pool.
 - `src/core/host_expert_pool.hpp` - Tier 2 warm expert pool.
 - `src/core/expert_registry.hpp` - expert residency and usage tracking.
-- `plans-and-docs/V4_PIPELINE_MODULARIZATION_ANALYSIS.md` - duplication findings and the proposed extraction order for `v4_pipeline.hpp`.
+- `src/core/prefetch_staging.hpp` - bounded pinned staging and HIP event ownership.
+- `src/io/direct_io_reader.hpp` - validated batched `io_uring`/`O_DIRECT` cold reads.
+- `src/text/` - native tokenizer, DSV4 formatter, and text-generation support.
 - `src/kernel/*.hpp` - attention, W4A16 GEMM, routing, and Hyper-Connections kernels.
 
-The direct-I/O layer is not yet on this path. `src/io/aligned_allocator.hpp` and
-`src/io/direct_io_reader.hpp` are validated infrastructure for the planned cold
-NVMe tier, but the current pipeline still uses the existing mapped expert access.
+`V4Pipeline::init_aeon()` opens both the mapped expert container and a dedicated
+`O_DIRECT` descriptor. The cold request path uses `DirectIOReader` and the
+staging arena before upload on `sdma_cold_stream`; mapped access remains available
+as a source for comparison and legacy paths. The bounded Hot/Warm/Cold path is
+implemented, while physical layout, cold-cache measurement, and latency-hiding
+acceptance remain open in [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md).
 
 ## Active production validation
 
@@ -39,6 +46,14 @@ kept prominent while Phase 2 is in progress:
 - `tests/test_dynamic_expert_pool.cpp`
 - `tests/bench_dynamic_pool.cpp`
 - `tests/bench_full_model.cpp`
+- `tests/test_model_direct_io.cpp`
+- `tests/test_async_prefetch.cpp`
+- `tests/test_hot_warm_cold_pipeline.cpp`
+- `tests/test_dsv4_tokenizer.cpp`
+- `tests/test_dsv4_chat_formatter.cpp`
+- `tests/test_text_generation.cpp`
+- `tools/profile_routing.cpp` / `profile_routing`
+- `tools/aeon_chat.cpp` / `aeon_chat`
 
 `tests/bench_full_model.cpp` is a benchmark, not a correctness test. Its results
 belong in `PERFORMANCE_LEDGER.md` only when a run completes with clearly recorded
@@ -73,7 +88,7 @@ as part of every normal engine run:
 - `src/smoke.cpp` / `smoke_check` - compiler and HIP toolchain sanity check.
 - `tools/aeon_info.cpp` / `aeon_info` - hardware and topology inspection.
 - `tests/test_wmma_tile.cpp` and `tests/bench_wmma_gemm.cpp` - Phase 0 WMMA checks.
-- `tests/test_direct_io.cpp` - direct-I/O primitive check.
+- `tests/test_direct_io.cpp` - standalone direct-I/O primitive check.
 - `tests/bench_async_overlap.cpp` - compute/SDMA overlap benchmark.
 - `tests/test_toy_moe_layer.cpp` - earlier toy cache pipeline.
 
@@ -86,9 +101,8 @@ validation set, rather than deleted casually.
 - `scripts/convert_safetensors_to_aeon.py` is the current production model preparation
   tool. It creates `model_dense.aeon`, `model_experts.aeon`, and the expert index.
 - `scripts/prepare_rdna.py` is an older synthetic formatter for the original toy
-  `AEON` layout. It does not create the current `AEON_DENSE`/`AEON_EXPERTS` format and
-  should be treated as legacy until the toy experiment is archived or the script is
-  explicitly repurposed.
+  `AEON` layout. It does not create the current `AEON_DENSE`/`AEON_EXPERTS` format
+  and is retained only for historical diagnostics.
 
 ## Cleanup rule
 

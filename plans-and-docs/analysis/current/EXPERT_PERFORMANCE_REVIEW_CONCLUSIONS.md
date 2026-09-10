@@ -12,11 +12,11 @@ The numbers do not match the vision, and that is a meaningful signal. The gap is
 
 ### Vision vs. implementation
 
-The [Project Aeon vision](PROJECT_AEON_VISION.md), Section 4A and Blocker 1, is unambiguous about the intended data flow:
+The [Project Aeon vision](../../reference/strategy/PROJECT_AEON_VISION.md), Section 4A and Blocker 1, is unambiguous about the intended data flow:
 
 > Data flows uni-directionally from Cold to Warm to Hot, ensuring that the GPU compute engine interacts solely with high-speed memory spaces while transfer operations run fully in the background.
 
-The critical mitigation for the [Colibri Trap](../../aeon-references/colibri) is equally explicit:
+The critical mitigation for the [Colibri Trap](../../../../aeon-references/colibri) is equally explicit:
 
 > Never stream synchronously from SSD for the immediate next layer: Tier 3 data transfers must be strictly speculative and asynchronous. If an expert is completely absent from both VRAM and DDR during the active layer pass, the system must trigger host CPU computation fallback rather than stalling the GPU pipeline.
 
@@ -34,7 +34,7 @@ The vision's own analysis in Blocker 1 predicted this: reactive streaming at the
 
 ### Why the hit rate is stuck near 57%
 
-This is the deepest issue. It is a capability we never built, not necessarily a bug. The caching thesis in the [specialization and entropy analysis](AEON_SPECIALIZATION_AND_ENTROPY_ANALYSIS.md), Sections 2.3-2.4, rests on these assumptions:
+This is the deepest issue. It is a capability we never built, not necessarily a bug. The caching thesis in the [specialization and entropy analysis](../../reference/strategy/AEON_SPECIALIZATION_AND_ENTROPY_ANALYSIS.md), Sections 2.3-2.4, rests on these assumptions:
 
 > Aeon will incorporate an offline profiling utility (`aeon profile`) to measure model predictability. A Gini coefficient $G > 0.6$ confirms that pinning the top 20% of experts will capture the majority of token compute passes.
 
@@ -42,7 +42,7 @@ This is the deepest issue. It is a capability we never built, not necessarily a 
 
 We never ran this profiling. The 664-slot hot pool is populated round-robin by `expert_registry.hpp::populate_round_robin`, not by measured activation frequency. We are caching arbitrary experts rather than the empirically hottest experts. The vision was designed around power-law clustering, with 70-90% of routing volume concentrated in a predictable subset, but we have not measured whether DeepSeek-V4 actually exhibits that behavior or exploited it if it does.
 
-The local [DwarfStar (ds4) reference](../../aeon-references/ds4) provides a useful comparator: its generated DeepSeek hotlist is sorted by profile-derived `hits/weight`. That supports testing frequency-ordered placement, but it does not provide the raw corpus or formal entropy statistics needed to validate Aeon's $H$, $G$, or transition-matrix hypotheses.
+The local [DwarfStar (ds4) reference](../../../../aeon-references/ds4) provides a useful comparator: its generated DeepSeek hotlist is sorted by profile-derived `hits/weight`. That supports testing frequency-ordered placement, but it does not provide the raw corpus or formal entropy statistics needed to validate Aeon's $H$, $G$, or transition-matrix hypotheses.
 
 ### The three structural gaps
 

@@ -1,18 +1,20 @@
 # Project Aeon: Technical Blockers, Failure Modes & Engineering Mitigations
 
+*Status: risk analysis. The failure modes and mitigations remain useful design input, but some recommendations are hypotheses or have since been tested. Treat [PHASE_2_EXECUTION_PLAN.md](../../execution/active/PHASE_2_EXECUTION_PLAN.md) and [EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md](../../analysis/current/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md) as the current execution references.*
+
 ## Executive Summary
 This document provides a critical engineering analysis of the potential blockers, structural traps, and failure modes that could jeopardize Project Aeon. Many offloading and streaming experiments (such as Colibri) achieve theoretical feasibility on paper but degrade to single-digit or sub-token-per-second throughput (1–2 tok/s) in real-world workloads.
 
 To ensure Project Aeon remains a viable, high-throughput production engine (targeting 15–35+ tok/s), each identified bottleneck is analyzed alongside concrete engineering mitigations.
 
-The local [Colibri reference checkout](../../aeon-references/colibri), [DwarfStar reference checkout](../../aeon-references/ds4), and [FreeToken reference checkout](../../aeon-references/freetoken) provide implementation comparisons for the storage-tier, DeepSeek-specific placement, and CPU/GPU coprocessing risks discussed below.
+The local [Colibri reference checkout](../../../../aeon-references/colibri), [DwarfStar reference checkout](../../../../aeon-references/ds4), and [FreeToken reference checkout](../../../../aeon-references/freetoken) provide implementation comparisons for the storage-tier, DeepSeek-specific placement, and CPU/GPU coprocessing risks discussed below.
 
 ---
 
 ## 1. Blocker 1: The "Cold Miss Avalanche" (The Colibri Trap)
 
 ### Mechanism of Failure
-Naive offloading engines stream weights reactively. When the router selects $K$ active experts for Layer $L$, any expert not resident in memory forces the engine to halt GPU computation, issue I/O requests, wait for data arrival over PCIe/NVMe, and only then proceed with computation. 
+Naive offloading engines stream weights reactively. When the router selects $K$ active experts for Layer $L$, any expert not resident in memory forces the engine to halt GPU computation, issue I/O requests, wait for data arrival over PCIe/NVMe, and only then proceed with computation.
 
 Because matrix multiplication on RDNA3 compute units completes in hundreds of microseconds, an unmitigated 10–20 ms storage latency causes the GPU compute engines to sit idle 95–98% of the execution time.
 
@@ -47,7 +49,7 @@ In standard transformer architectures, the router for Layer $L+1$ computes exper
 1. **Multi-Layer Speculative Prefetching:**
    * Track empirical expert co-activation matrices and sequence-level activation histories to predict expert selection 2–4 layers ahead of the current execution frontier.
 2. **Dynamic Host CPU Coprocessing ($q^*$ Fallback):**
-   * Incorporate the [FreeToken](../../aeon-references/freetoken) coprocessing paradigm: when an expert is missing from GPU memory, dispatch the token hidden state to the Threadripper Pro host CPU via pinned memory.
+   * Incorporate the [FreeToken](../../../../aeon-references/freetoken) coprocessing paradigm: when an expert is missing from GPU memory, dispatch the token hidden state to the Threadripper Pro host CPU via pinned memory.
    * Compute the missing expert's forward pass using AVX-512 while the GPU continues executing resident experts, merging the output tensors prior to the residual addition.
 
 ---

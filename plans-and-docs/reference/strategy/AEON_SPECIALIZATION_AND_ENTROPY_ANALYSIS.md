@@ -1,9 +1,11 @@
 # Project Aeon: Architecture Specialization Strategy & Activation Entropy Analysis
 
-## Executive Summary
-This document records the architectural decision-making regarding model scope (single-model specialization vs. broad multi-architecture support) and details the empirical methodology for analyzing Mixture-of-Experts (MoE) activation entropy. 
+*Status: historical strategic analysis. Its specialization rationale and entropy methodology remain useful, but the phase roadmap near the end predates the current execution taxonomy. Current Phase 2 is the single-GPU storage/memory hierarchy effort and current Phase 3 is multi-GPU pipeline parallelism; use [DOCUMENTATION_STATUS.md](../../status/DOCUMENTATION_STATUS.md) for live status.*
 
-To avoid the performance degradation and architectural bloat characteristic of general-purpose engines (such as [llama.cpp](../../aeon-references/llama.cpp)), Project Aeon will adopt a **"Hyper-Specialized V1, Modular Subsystem"** strategy. Phase 1 will target the **DeepSeek fine-grained MoE architecture** exclusively, optimizing low-level RDNA3 compute and memory streaming against its exact operational characteristics before generalizing to other architectures.
+## Executive Summary
+This document records the architectural decision-making regarding model scope (single-model specialization vs. broad multi-architecture support) and details the empirical methodology for analyzing Mixture-of-Experts (MoE) activation entropy.
+
+To avoid the performance degradation and architectural bloat characteristic of general-purpose engines (such as [llama.cpp](../../../../aeon-references/llama.cpp)), Project Aeon will adopt a **"Hyper-Specialized V1, Modular Subsystem"** strategy. Phase 1 will target the **DeepSeek fine-grained MoE architecture** exclusively, optimizing low-level RDNA3 compute and memory streaming against its exact operational characteristics before generalizing to other architectures.
 
 ---
 
@@ -15,7 +17,7 @@ To avoid the performance degradation and architectural bloat characteristic of g
   * Specific experts specialize in indentation whitespace, brackets, punctuation, and variable tokens.
   * Other experts trigger consistently on mathematical operators, numeric strings, and logical delimiters.
   * Other experts activate on grammatical structures (passive voice, conjunctions, clause transitions).
-* **Predictability Implication:** 
+* **Predictability Implication:**
   Even though experts do not correspond to broad semantic domains, **coding, mathematical, and conversational tasks produce highly non-random, stable expert activation patterns**. In a programming session, the high frequency of punctuation, indentation, and syntax tokens concentrates 70–90% of routing volume into a persistent, predictable subset of experts.
 
 ### 1.2 Cross-Architecture Variance
@@ -65,7 +67,7 @@ Significant diagonal mass ($T_l(i, i) \gg \frac{1}{N}$) demonstrates strong temp
 
 ### 2.5 DwarfStar Hotlist as a Practical Comparator
 
-The local [DwarfStar (ds4) checkout](../../aeon-references/ds4) contains a generated DeepSeek expert hotlist described as sorted by `hits/weight`. This is useful evidence for comparing frequency-informed expert placement and cache policy against Aeon's current round-robin initialization. The hotlist is a placement prior, not a formal Shannon entropy, Gini coefficient, or transition-matrix measurement; Aeon still needs to collect raw routing decisions over a representative corpus before treating it as an entropy result.
+The local [DwarfStar (ds4) checkout](../../../../aeon-references/ds4) contains a generated DeepSeek expert hotlist described as sorted by `hits/weight`. This is useful evidence for comparing frequency-informed expert placement and cache policy against Aeon's current round-robin initialization. The hotlist is a placement prior, not a formal Shannon entropy, Gini coefficient, or transition-matrix measurement; Aeon still needs to collect raw routing decisions over a representative corpus before treating it as an entropy result.
 
 ---
 
@@ -130,7 +132,11 @@ To avoid technical lock-in while maintaining maximum single-model performance, t
 
 ---
 
-## 5. Development Phasing Roadmap
+## 5. Historical Development Phasing Roadmap
+
+The phase labels below are preserved as the original strategy record. They are
+not the current implementation plan or a claim that the listed extensions are
+implemented.
 
 * **Phase 1 (Proof of Feasibility & Speed):**
   * Target: DeepSeek fine-grained MoE on 4x RX 7900 XTX + Threadripper Pro.

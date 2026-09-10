@@ -10,9 +10,9 @@ The references are comparative source material only. They are not Aeon build or 
 
 | Reference | Local checkout | Revision | Scope caveat |
 | --- | --- | --- | --- |
-| FreeToken | `../../aeon-references/freetoken` | `3d919e9bd94fc5454bdb50e09659648443e30f5e` | The GPU LRU implementation is supplied by the pinned external `flashlib==0.3.0` dependency. |
-| Colibri | `../../aeon-references/colibri` | `fd93c41aa6ae2c7d1cc1a1e2d6b79dbe6d341708` | DeepSeek V4 is an amalgamated `c/deepseek_v4.c`; its unit list is generated and source line locations can move. |
-| DwarfStar (DS4) | `../../aeon-references/ds4` | `6289c516273979173abbc062209a81dd3706b804` | The checkout is shallow with one visible grafted commit; hotlist generation data is not present locally. |
+| FreeToken | `../../../../aeon-references/freetoken` | `3d919e9bd94fc5454bdb50e09659648443e30f5e` | The GPU LRU implementation is supplied by the pinned external `flashlib==0.3.0` dependency. |
+| Colibri | `../../../../aeon-references/colibri` | `fd93c41aa6ae2c7d1cc1a1e2d6b79dbe6d341708` | DeepSeek V4 is an amalgamated `c/deepseek_v4.c`; its unit list is generated and source line locations can move. |
+| DwarfStar (DS4) | `../../../../aeon-references/ds4` | `6289c516273979173abbc062209a81dd3706b804` | The checkout is shallow with one visible grafted commit; hotlist generation data is not present locally. |
 
 No files were modified in any reference checkout during this investigation.
 
