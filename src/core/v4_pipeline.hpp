@@ -14,6 +14,8 @@
 #include "core/v4_pipeline_scratch.hpp"
 #include "core/vram_expert_pool.hpp"
 #include "kernel/hc_sinkhorn.hpp"
+#include "kernel/aeon_moe_fused_w13.hpp"
+#include "kernel/aeon_moe_fused_w2.hpp"
 #include "kernel/moe_router.hpp"
 #include "kernel/v4_attention.hpp"
 #include "kernel/v4_pipeline_ops.hpp"
@@ -72,6 +74,7 @@ public:
 
     uint32_t num_layers_{0};
     uint32_t current_seq_len_{0};
+    bool swizzled_moe_enabled_{false};
 
     // Unified VRAM expert pool, warm host pool, and expert registry.
     std::unique_ptr<UnifiedVRAMExpertPool> unified_vram_pool_;
@@ -120,6 +123,7 @@ public:
 
         num_layers_ = num_layers;
         current_seq_len_ = 0;
+        swizzled_moe_enabled_ = false;
 
         // 1. Initialize streams
         CHECK_HIP(hipStreamCreate(&compute_stream));
@@ -202,10 +206,12 @@ public:
         uint32_t num_layers = 2,
         uint32_t unified_vram_slots = 0,
         uint32_t max_seq_len = 4096,
-        bool enable_direct_io = true
+        bool enable_direct_io = true,
+        bool use_swizzled_experts = false
     ) {
         num_layers_ = num_layers;
         current_seq_len_ = 0;
+        swizzled_moe_enabled_ = use_swizzled_experts;
 
         // 1. Initialize streams
         CHECK_HIP(hipStreamCreate(&compute_stream));
@@ -214,7 +220,11 @@ public:
 
         // 2. Open Aeon Model via Zero-Copy Mmap
         std::cout << "[Pipeline] Opening native Aeon model from " << aeon_model_dir << "..." << std::endl;
-        aeon_loader.open_model(aeon_model_dir);
+        if (swizzled_moe_enabled_) {
+            aeon_loader.open_model_swizzled(aeon_model_dir);
+        } else {
+            aeon_loader.open_model(aeon_model_dir);
+        }
         if (enable_direct_io) {
             direct_io_reader_ = std::make_unique<aeon::io::DirectIOReader>(64);
         }
@@ -293,7 +303,8 @@ public:
     void init_dynamic_global(
         const std::string& aeon_model_dir,
         const AeonRuntimeConfig& runtime_cfg,
-        uint32_t num_layers = 2
+        uint32_t num_layers = 2,
+        bool use_swizzled_experts = false
     ) {
         std::cout << "================================================================================" << std::endl;
         std::cout << "      Project Aeon — Dynamic VRAM Budget & Global Expert Pool Pipeline          " << std::endl;
@@ -301,6 +312,7 @@ public:
 
         num_layers_ = num_layers;
         current_seq_len_ = 0;
+        swizzled_moe_enabled_ = use_swizzled_experts;
 
         // 1. Initialize streams
         CHECK_HIP(hipStreamCreate(&compute_stream));
@@ -309,7 +321,11 @@ public:
 
         // 2. Open Model Containers
         std::cout << "[Pipeline] Opening native .aeon model from " << aeon_model_dir << "..." << std::endl;
-        aeon_loader.open_model(aeon_model_dir);
+        if (swizzled_moe_enabled_) {
+            aeon_loader.open_model_swizzled(aeon_model_dir);
+        } else {
+            aeon_loader.open_model(aeon_model_dir);
+        }
         direct_io_reader_ = std::make_unique<aeon::io::DirectIOReader>(64);
         std::cout << "  > Dense tensors indexed: " << aeon_loader.total_dense_tensors() << std::endl;
 
@@ -1023,6 +1039,7 @@ public:
                 pending_transfers[k].staging_idx = active_prefetch.staging_indices[k];
             }
 
+            if (!swizzled_moe_enabled_) {
             // 3. 6 Routed Experts (INT4-W4A16 WMMA GEMM)
             for (int k = 0; k < 6; ++k) {
                 float expert_weight = h_topk_weights[k];
@@ -1075,6 +1092,50 @@ public:
                     dim3((H + 255) / 256), dim3(256), 0, compute_stream,
                     scratch.d_moe_accum, scratch.d_expert_down, expert_weight, H
                 );
+            }
+            } else {
+                // Parallel swizzled path: all six routed experts are represented
+                // in two pointer bundles and consumed by two fused dispatches.
+                kernel::SwizzledW13ExpertPtrs fused_w13{};
+                kernel::SwizzledW2ExpertPtrs fused_w2{};
+                for (int k = 0; k < 6; ++k) {
+                    const int32_t slot = pending_transfers[k].vram_slot;
+                    if (pending_transfers[k].is_prefetched && prefetch_staging_) {
+                        CHECK_HIP(hipStreamWaitEvent(
+                            compute_stream,
+                            prefetch_staging_->events[pending_transfers[k].staging_idx], 0));
+                    }
+
+                    fused_w13.w1[k] = reinterpret_cast<const uint4*>(
+                        unified_vram_pool_->get_w1_packed(slot));
+                    fused_w13.s1[k] = unified_vram_pool_->get_w1_scale(slot);
+                    fused_w13.w3[k] = reinterpret_cast<const uint4*>(
+                        unified_vram_pool_->get_w3_packed(slot));
+                    fused_w13.s3[k] = unified_vram_pool_->get_w3_scale(slot);
+                    fused_w2.w2[k] = reinterpret_cast<const uint4*>(
+                        unified_vram_pool_->get_w2_packed(slot));
+                    fused_w2.s2[k] = unified_vram_pool_->get_w2_scale(slot);
+                }
+
+                layer.cache_hits = expert_registry_->hits_hot;
+                layer.cache_misses = expert_registry_->hits_warm + expert_registry_->misses_cold;
+
+                kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
+                    scratch.d_ffn_norm_act,
+                    fused_w13,
+                    scratch.d_swizzled_expert_hidden,
+                    scratch.d_swizzled_moe_accum_f32,
+                    H,
+                    6, INTER_DIM, H, 10.0f, compute_stream);
+                kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
+                    scratch.d_swizzled_expert_hidden,
+                    fused_w2,
+                    scratch.d_topk_weights,
+                    scratch.d_moe_accum,
+                    scratch.d_swizzled_moe_accum_f32,
+                    scratch.d_moe_accum,
+                    scratch.d_swizzled_counters,
+                    6, H, INTER_DIM, compute_stream);
             }
 
             for (int k = 0; k < 6; ++k) {

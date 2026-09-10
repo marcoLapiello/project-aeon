@@ -2,7 +2,7 @@
 
 Physical hardware verification benchmarks, latencies, throughputs, and cache behaviors across major development milestones on AMD Radeon RX 7900 XTX (`gfx1100`).
 
-* **Status**: Living benchmark record. Detailed entries continue through M22; the summary matrix remains a compact baseline through M10 so that later measurements stay in their full experimental context below. Do not use the historical M20 figures without the qualification in the detailed entries and [DOCUMENTATION_STATUS.md](DOCUMENTATION_STATUS.md).
+* **Status**: Living benchmark record. Detailed entries continue through M23; the summary matrix remains a compact baseline through M10 so that later measurements stay in their full experimental context below. Do not use the historical M20 figures without the qualification in the detailed entries and [DOCUMENTATION_STATUS.md](DOCUMENTATION_STATUS.md).
 
 ---
 
@@ -257,3 +257,18 @@ Physical hardware verification benchmarks, latencies, throughputs, and cache beh
 * **Silicon configuration**: 43 layers, context capacity 1024, 674 hot VRAM slots, Warm tier disabled, chat prompt `What is the capital of France?`, generation bounded only by EOS/context capacity.
 * **Measured result**: generated IDs `[671, 6102, 294, 8760, 344, 2619, 51119, 42499, 1]`; stop reason `eos`; TTFT `4,084.13 ms`; decode `3.04 tok/s`; decoded response `The capital of France is **Paris**.`
 * **Interpretation**: A complete native human-language turn now works without a fixed output cap. This validates the simple chat path and EOS behavior, but does not yet establish parity across a broader corpus or prove the still-missing compressed/indexed attention path for longer-context model correctness.
+
+### M23: Stage 1 Swizzled and Fused Expert Kernel Measurement
+* **Date**: 2026-09-10 | **Status**: GPU-side measurement complete; full-model impact remains open | **Target**: Radeon RX 7900 XTX (`gfx1100`)
+* **Scope**: Synthetic weights, isolated HIP-event timing, version-2 swizzled artifact layout, and fused expert kernels. These measurements exclude model loading, NVMe reads, staging, cache misses, routing, and the rest of the transformer pipeline.
+* **Individual GEMV results**:
+  - W1/W3 (`N=2048,K=4096`): `12.822 -> 11.152 us`, `1.150x`; effective packed-weight plus scale bandwidth `368 -> 423 GB/s`; output max diff `0.000`.
+  - W2 (`N=4096,K=2048`): `13.077 -> 10.926 us`, `1.197x`; effective bandwidth `361 -> 432 GB/s`; output max diff `0.000`.
+  - W1/W3 pair, two launches versus dual launch: `29.012 -> 15.816 us`, `1.834x`; output max diff `0.000`.
+* **Six-expert fused results**:
+  - W1/W3 plus SwiGLU: `147.557 -> 39.775 us`, `3.710x`, reducing 18 launches to 1; output max diff `0.016`.
+  - W2 plus weighted accumulation: `107.486 -> 28.652 us`, `3.751x`, reducing 12 launches to 1; output max diff `0.002`.
+* The W1/W3 fused baseline uses twelve swizzled GEMV launches plus six existing SwiGLU launches, isolating fusion after layout conversion. The W2 fused baseline compares the source-layout current GEMV plus accumulation against the fused swizzled path, so it combines layout and fusion. The fused differences are FP16 output differences against the separate-launch baselines and remain within the focused correctness thresholds.
+* The historical `M=16,N=2048,K=4096` WMMA check reran at `149.234 us` (`1.799 TFLOP/s`). It is not a direct comparison target for this Stage 1 decode path, which operates at `M=1`.
+* `rocprofv2 --kernel-trace` confirmed Wave32 dispatches and the expected launch reduction. In the 101-iteration trace, fused W1/W3 used 101 fused kernels instead of 1,212 swizzled GEMV plus 606 SwiGLU kernels; fused W2 used 101 fused kernels instead of 606 GEMV plus 606 accumulation kernels. The installed v2 counter backend rejected the GL2C group as unsupported and emitted zero SQ counter values, so no `FETCH_SIZE` or `MemUnitStalled` claim is made from this run.
+* **Interpretation**: The new kernels deliver real GPU-side improvements in the isolated decode workloads: roughly 15-20% for individual swizzled GEMVs, 1.83x for dual W1/W3, and 3.7x for the six-expert fused paths. The unchanged approximately 3 tok/s full-model text throughput is therefore not evidence against the kernels; that run remains dominated by cold expert service and just-in-time transfer/dispatch latency. End-to-end impact requires a separate full-model measurement with the cold path controlled.

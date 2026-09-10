@@ -30,6 +30,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 | --- | --- | --- |
 | [EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md](../analysis/current/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md) | Current analysis | Explains the remaining latency-bound cold-miss problem and the measurements needed before another scheduling policy is added. |
 | [EXPERT_KERNELS_REVIEW.md](../analysis/current/EXPERT_KERNELS_REVIEW.md) | Current review | Records the pending kernel-geometry, quant-layout, bottleneck, and interface questions for the next kernel investigation. |
+| [EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md](../analysis/current/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) | Current implementation report | Compares the external Stage 1 proposal with the implemented version-2 path, records measured GPU-side effects, and documents the remaining full-model gate. |
 
 ## Completed execution records
 
@@ -44,8 +45,9 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 
 1. **Correctness:** compare identical formatted IDs and outputs against a trusted compatible reference; implement and validate compressed/indexed attention for longer-context layers 2-42.
 2. **Cold tier:** characterize cold-cache and steady-state behavior, improve physical `.aeon` placement/extent layout, reduce host-memory pressure, and decide whether further scheduling or CPU fallback work is justified by measurements.
-3. **Placement study:** collect profile and held-out corpora with the verified text contract, then compare measured placement against dynamic LRU. Do not use the existing pilot for placement decisions.
-4. **Scaling:** Phase 3 multi-GPU pipeline parallelism remains future work.
+3. **Stage 1 end-to-end validation:** compare the version-2 swizzled path with the version-1 baseline under controlled Hot/Warm conditions, while preserving the runtime residency invariant and checking broader output parity.
+4. **Placement study:** collect profile and held-out corpora with the verified text contract, then compare measured placement against dynamic LRU. Do not use the existing pilot for placement decisions.
+5. **Scaling:** Phase 3 multi-GPU pipeline parallelism remains future work.
 
 ## Historical and reference documents
 

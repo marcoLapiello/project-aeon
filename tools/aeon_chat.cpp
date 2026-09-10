@@ -26,6 +26,7 @@ struct Options {
     bool thinking_mode{false};
     bool until_eos{false};
     bool diagnostic{false};
+    bool swizzled_experts{false};
 };
 
 void print_usage(const char* executable) {
@@ -41,6 +42,7 @@ void print_usage(const char* executable) {
         << "  --layers <count>         Pipeline layers (default: 43)\n"
         << "  --context-size <count>   KV-cache/context capacity (default: 4096)\n"
         << "  --warm-gib <count>       Warm host allocation in GiB (default: 0)\n"
+        << "  --swizzled-experts       Use the parallel version-2 swizzled expert artifact\n"
         << "  --diagnostic             Print rendered prompt, IDs, and timings\n"
         << "  --help                   Show this help\n";
 }
@@ -100,6 +102,8 @@ Options parse_options(int argc, char** argv) {
             options.warm_gib = parse_unsigned(
                 require_value(argc, argv, index, "--warm-gib"), "--warm-gib"
             );
+        } else if (argument == "--swizzled-experts") {
+            options.swizzled_experts = true;
         } else if (argument == "--diagnostic") {
             options.diagnostic = true;
         } else {
@@ -154,7 +158,8 @@ int main(int argc, char** argv) {
         runtime_config.preload_warm_host = options.warm_gib > 0;
 
         aeon::core::V4Pipeline pipeline;
-        pipeline.init_dynamic_global(options.model_dir, runtime_config, options.layers);
+        pipeline.init_dynamic_global(
+            options.model_dir, runtime_config, options.layers, options.swizzled_experts);
 
         aeon::text::GenerationOptions generation_options;
         if (options.until_eos) {

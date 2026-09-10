@@ -136,6 +136,52 @@ add_test(NAME test_hc_sinkhorn COMMAND test_hc_sinkhorn)
 add_executable(test_w4a16_wmma tests/test_w4a16_wmma.cpp)
 target_link_libraries(test_w4a16_wmma PRIVATE amdhip64)
 
+# Host-side validation: parallel W4A16 swizzle layout contract
+add_executable(test_w4a16_swizzle tests/test_w4a16_swizzle.cpp)
+target_link_libraries(test_w4a16_swizzle PRIVATE amdhip64)
+add_test(NAME test_w4a16_swizzle COMMAND test_w4a16_swizzle)
+set_tests_properties(test_w4a16_swizzle PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Silicon validation: parallel swizzled W4A16 decode GEMV
+add_executable(test_w4a16_swizzled_gemv tests/test_w4a16_swizzled_gemv.cpp)
+target_link_libraries(test_w4a16_swizzled_gemv PRIVATE amdhip64)
+add_test(NAME test_w4a16_swizzled_gemv COMMAND test_w4a16_swizzled_gemv)
+set_tests_properties(test_w4a16_swizzled_gemv PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Silicon validation: fused parallel swizzled W1/W3 GEMV
+add_executable(test_w4a16_swizzled_dual_gemv tests/test_w4a16_swizzled_dual_gemv.cpp)
+target_link_libraries(test_w4a16_swizzled_dual_gemv PRIVATE amdhip64)
+add_test(NAME test_w4a16_swizzled_dual_gemv COMMAND test_w4a16_swizzled_dual_gemv)
+set_tests_properties(test_w4a16_swizzled_dual_gemv PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Silicon validation: six-expert fused W1/W3 plus clamped SwiGLU
+add_executable(test_aeon_moe_fused_w13 tests/test_aeon_moe_fused_w13.cpp)
+target_link_libraries(test_aeon_moe_fused_w13 PRIVATE amdhip64)
+add_test(NAME test_aeon_moe_fused_w13 COMMAND test_aeon_moe_fused_w13)
+set_tests_properties(test_aeon_moe_fused_w13 PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Silicon validation: six-expert fused W2 weighted accumulation
+add_executable(test_aeon_moe_fused_w2 tests/test_aeon_moe_fused_w2.cpp)
+target_link_libraries(test_aeon_moe_fused_w2 PRIVATE amdhip64)
+add_test(NAME test_aeon_moe_fused_w2 COMMAND test_aeon_moe_fused_w2)
+set_tests_properties(test_aeon_moe_fused_w2 PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Benchmark: current versus parallel swizzled W4A16 decode GEMV
+add_executable(bench_w4a16_swizzled_gemv tests/bench_w4a16_swizzled_gemv.cpp)
+target_link_libraries(bench_w4a16_swizzled_gemv PRIVATE amdhip64)
+
+# Benchmark: two current W1/W3 launches versus one parallel dual launch
+add_executable(bench_w4a16_swizzled_dual_gemv tests/bench_w4a16_swizzled_dual_gemv.cpp)
+target_link_libraries(bench_w4a16_swizzled_dual_gemv PRIVATE amdhip64)
+
+# Benchmark: six separate routed W1/W3/SwiGLU paths versus one fused dispatch
+add_executable(bench_aeon_moe_fused_w13 tests/bench_aeon_moe_fused_w13.cpp)
+target_link_libraries(bench_aeon_moe_fused_w13 PRIVATE amdhip64)
+
+# Benchmark: six routed W2/accumulation paths versus one fused dispatch
+add_executable(bench_aeon_moe_fused_w2 tests/bench_aeon_moe_fused_w2.cpp)
+target_link_libraries(bench_aeon_moe_fused_w2 PRIVATE amdhip64)
+
 # Regression test: dual-mode MoE router
 add_executable(test_moe_router tests/test_moe_router.cpp)
 target_link_libraries(test_moe_router PRIVATE amdhip64)
@@ -165,6 +211,14 @@ target_link_libraries(bench_v4_generation PRIVATE amdhip64)
 # Current format validation: native Aeon model loader
 add_executable(test_aeon_loader tests/test_aeon_loader.cpp)
 target_link_libraries(test_aeon_loader PRIVATE amdhip64)
+
+# Parallel format validation: version-2 swizzled Aeon model loader
+add_executable(test_aeon_swizzled_loader tests/test_aeon_swizzled_loader.cpp)
+target_link_libraries(test_aeon_swizzled_loader PRIVATE amdhip64)
+
+# Silicon smoke test: opt-in swizzled fused-expert pipeline path
+add_executable(test_aeon_swizzled_pipeline tests/test_aeon_swizzled_pipeline.cpp)
+target_link_libraries(test_aeon_swizzled_pipeline PRIVATE amdhip64)
 
 # CPU-side validation: native DSV4 tokenizer artifact and ByteLevel-BPE parity
 add_executable(test_dsv4_tokenizer tests/test_dsv4_tokenizer.cpp src/text/dsv4_tokenizer.cpp)

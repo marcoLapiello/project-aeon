@@ -47,10 +47,33 @@ public:
     AeonModelLoader& operator=(AeonModelLoader&&) = default;
 
     void open_model(const std::string& model_dir) {
+        open_model_variant(model_dir, "model_experts.aeon", "model_experts.index", 1);
+    }
+
+    void open_model_swizzled(const std::string& model_dir) {
+        open_model_variant(model_dir, "model_experts_swizzled.aeon",
+                           "model_experts_swizzled.index", 2);
+    }
+
+    uint32_t expert_format_version() const {
+        return expert_format_version_;
+    }
+
+private:
+    void open_model_variant(
+        const std::string& model_dir,
+        const std::string& experts_filename,
+        const std::string& index_filename,
+        uint32_t expected_expert_version
+    ) {
         model_dir_ = model_dir;
         open_dense(model_dir + "/model_dense.aeon");
-        open_experts(model_dir + "/model_experts.aeon", model_dir + "/model_experts.index");
+        open_experts(model_dir + "/" + experts_filename,
+                     model_dir + "/" + index_filename,
+                     expected_expert_version);
     }
+
+public:
 
     // Dense tensor query interface matching SafetensorsLoader
     bool has_tensor(const std::string& name) const {
@@ -130,6 +153,7 @@ public:
 
         dense_tensors_.clear();
         expert_offsets_.clear();
+        expert_format_version_ = 0;
     }
 
 private:
@@ -183,7 +207,11 @@ private:
                   << " tensors (data starts at 0x" << std::hex << data_start << std::dec << ")." << std::endl;
     }
 
-    void open_experts(const std::string& experts_path, const std::string& index_path) {
+    void open_experts(
+        const std::string& experts_path,
+        const std::string& index_path,
+        uint32_t expected_version
+    ) {
         // 1. Read index table
         int idx_fd = ::open(index_path.c_str(), O_RDONLY);
         if (idx_fd < 0) {
@@ -212,6 +240,14 @@ private:
             throw std::runtime_error("AeonModelLoader: Invalid expert index magic!");
         }
 
+        const uint32_t index_version = *reinterpret_cast<const uint32_t*>(idx_buf.data() + 12);
+        if (index_version != expected_version) {
+            throw std::runtime_error(
+                "AeonModelLoader: Unexpected expert index version " +
+                std::to_string(index_version) + ", expected " +
+                std::to_string(expected_version));
+        }
+
         num_layers_ = *reinterpret_cast<const uint32_t*>(idx_buf.data() + 16);
         experts_per_layer_ = *reinterpret_cast<const uint32_t*>(idx_buf.data() + 20);
         uint64_t expert_bytes = *reinterpret_cast<const uint64_t*>(idx_buf.data() + 24);
@@ -221,6 +257,11 @@ private:
         }
 
         uint32_t total_experts = num_layers_ * experts_per_layer_;
+        const size_t required_index_bytes = 32 + static_cast<size_t>(total_experts) * 16;
+        if (idx_buf.size() < required_index_bytes) {
+            throw std::runtime_error("AeonModelLoader: Expert index has incomplete entries!");
+        }
+        expert_format_version_ = index_version;
         expert_offsets_.resize(total_experts);
 
         const uint64_t* entries = reinterpret_cast<const uint64_t*>(idx_buf.data() + 32);
@@ -324,6 +365,7 @@ private:
     const uint8_t* experts_mmap_base_{nullptr};
     uint32_t num_layers_{0};
     uint32_t experts_per_layer_{0};
+    uint32_t expert_format_version_{0};
     std::vector<uint64_t> expert_offsets_;
 };
 

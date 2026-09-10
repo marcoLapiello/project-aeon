@@ -71,6 +71,11 @@ struct PipelineScratchBuffers {
     half*  d_expert_swiglu{nullptr};// [16, 2048]
     half*  d_expert_down{nullptr};  // [16, 4096]
 
+    // Parallel swizzled routed-expert path: [8, 2048], [4096], and [64]
+    half* d_swizzled_expert_hidden{nullptr};
+    float* d_swizzled_moe_accum_f32{nullptr};
+    int32_t* d_swizzled_counters{nullptr};
+
     // Head Activations
     half*  d_hc_head_out{nullptr};  // [4096]
     half*  d_head_norm{nullptr};    // [4096]
@@ -155,6 +160,11 @@ struct PipelineScratchBuffers {
         CHECK_HIP(hipMalloc(&d_expert_swiglu, M * 2048 * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_expert_down, M * H * sizeof(half)));
 
+        CHECK_HIP(hipMalloc(&d_swizzled_expert_hidden, 8 * 2048 * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_swizzled_moe_accum_f32, H * sizeof(float)));
+        CHECK_HIP(hipMalloc(&d_swizzled_counters, 64 * sizeof(int32_t)));
+        CHECK_HIP(hipMemset(d_swizzled_counters, 0, 64 * sizeof(int32_t)));
+
         CHECK_HIP(hipMalloc(&d_hc_head_out, H * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_head_norm, H * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_logits, 129280 * sizeof(half)));
@@ -214,6 +224,9 @@ struct PipelineScratchBuffers {
         if (d_expert_up) { (void)hipFree(d_expert_up); d_expert_up = nullptr; }
         if (d_expert_swiglu) { (void)hipFree(d_expert_swiglu); d_expert_swiglu = nullptr; }
         if (d_expert_down) { (void)hipFree(d_expert_down); d_expert_down = nullptr; }
+        if (d_swizzled_expert_hidden) { (void)hipFree(d_swizzled_expert_hidden); d_swizzled_expert_hidden = nullptr; }
+        if (d_swizzled_moe_accum_f32) { (void)hipFree(d_swizzled_moe_accum_f32); d_swizzled_moe_accum_f32 = nullptr; }
+        if (d_swizzled_counters) { (void)hipFree(d_swizzled_counters); d_swizzled_counters = nullptr; }
 
         if (d_hc_head_out) { (void)hipFree(d_hc_head_out); d_hc_head_out = nullptr; }
         if (d_head_norm) { (void)hipFree(d_head_norm); d_head_norm = nullptr; }
@@ -271,6 +284,9 @@ private:
         d_expert_up = o.d_expert_up; o.d_expert_up = nullptr;
         d_expert_swiglu = o.d_expert_swiglu; o.d_expert_swiglu = nullptr;
         d_expert_down = o.d_expert_down; o.d_expert_down = nullptr;
+        d_swizzled_expert_hidden = o.d_swizzled_expert_hidden; o.d_swizzled_expert_hidden = nullptr;
+        d_swizzled_moe_accum_f32 = o.d_swizzled_moe_accum_f32; o.d_swizzled_moe_accum_f32 = nullptr;
+        d_swizzled_counters = o.d_swizzled_counters; o.d_swizzled_counters = nullptr;
 
         d_hc_head_out = o.d_hc_head_out; o.d_hc_head_out = nullptr;
         d_head_norm = o.d_head_norm; o.d_head_norm = nullptr;
