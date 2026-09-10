@@ -38,6 +38,7 @@ constexpr int RPW = 8;
 constexpr int LPR = 4;
 constexpr int ITERS = 16;
 constexpr int BENCHMARK_ITERATIONS = 100;
+constexpr int BENCHMARK_TRIALS = 5;
 
 uint32_t make_source_word(std::size_t word_index, uint32_t seed) {
     uint32_t word = 0;
@@ -108,6 +109,9 @@ int main() {
     float* device_fused_f32 = nullptr;
     half* device_fused_f16 = nullptr;
     int* device_counters = nullptr;
+    float* device_staged_f32 = nullptr;
+    half* device_staged_f16 = nullptr;
+    int* device_staged_counters = nullptr;
     CHECK_HIP(hipMalloc(&device_hidden, host_hidden.size() * sizeof(half)));
     CHECK_HIP(hipMalloc(&device_topk_weights, EXPERTS * sizeof(float)));
     CHECK_HIP(hipMalloc(&device_baseline, N * sizeof(half)));
@@ -115,6 +119,9 @@ int main() {
     CHECK_HIP(hipMalloc(&device_fused_f32, N * sizeof(float)));
     CHECK_HIP(hipMalloc(&device_fused_f16, N * sizeof(half)));
     CHECK_HIP(hipMalloc(&device_counters, (N / (WAVES * RPW)) * sizeof(int)));
+    CHECK_HIP(hipMalloc(&device_staged_f32, N * sizeof(float)));
+    CHECK_HIP(hipMalloc(&device_staged_f16, N * sizeof(half)));
+    CHECK_HIP(hipMalloc(&device_staged_counters, (N / (WAVES * RPW)) * sizeof(int)));
     CHECK_HIP(hipMemcpy(device_hidden, host_hidden.data(), host_hidden.size() * sizeof(half), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(device_topk_weights, host_topk_weights.data(), EXPERTS * sizeof(float), hipMemcpyHostToDevice));
 
@@ -158,15 +165,30 @@ int main() {
         EXPERTS, N, K);
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
+    CHECK_HIP(hipMemset(device_staged_f32, 0, N * sizeof(float)));
+    CHECK_HIP(hipMemset(device_staged_f16, 0, N * sizeof(half)));
+    CHECK_HIP(hipMemset(device_staged_counters, 0, (N / (WAVES * RPW)) * sizeof(int)));
+    aeon::kernel::dispatch_aeon_moe_fused_w2_accum<WAVES, RPW, LPR, ITERS, true>(
+        device_hidden, device_weights, device_topk_weights,
+        nullptr,
+        device_staged_f32, device_staged_f16, device_staged_counters,
+        EXPERTS, N, K);
+    CHECK_HIP(hipGetLastError());
+    CHECK_HIP(hipDeviceSynchronize());
 
     std::vector<half> baseline(N);
     std::vector<half> fused(N);
+    std::vector<half> staged(N);
     CHECK_HIP(hipMemcpy(baseline.data(), device_baseline, N * sizeof(half), hipMemcpyDeviceToHost));
     CHECK_HIP(hipMemcpy(fused.data(), device_fused_f16, N * sizeof(half), hipMemcpyDeviceToHost));
+    CHECK_HIP(hipMemcpy(staged.data(), device_staged_f16, N * sizeof(half), hipMemcpyDeviceToHost));
     float max_difference = 0.0f;
+    float max_staged_difference = 0.0f;
     for (int row = 0; row < N; ++row) {
         max_difference = std::max(max_difference,
             std::abs(__half2float(baseline[row]) - __half2float(fused[row])));
+        max_staged_difference = std::max(max_staged_difference,
+            std::abs(__half2float(fused[row]) - __half2float(staged[row])));
     }
 
     hipEvent_t baseline_start, baseline_stop, fused_start, fused_stop;
@@ -174,6 +196,9 @@ int main() {
     CHECK_HIP(hipEventCreate(&baseline_stop));
     CHECK_HIP(hipEventCreate(&fused_start));
     CHECK_HIP(hipEventCreate(&fused_stop));
+    hipEvent_t staged_start, staged_stop;
+    CHECK_HIP(hipEventCreate(&staged_start));
+    CHECK_HIP(hipEventCreate(&staged_stop));
 
     CHECK_HIP(hipEventRecord(baseline_start, 0));
     for (int iteration = 0; iteration < BENCHMARK_ITERATIONS; ++iteration) {
@@ -189,29 +214,76 @@ int main() {
     CHECK_HIP(hipEventRecord(baseline_stop, 0));
     CHECK_HIP(hipEventSynchronize(baseline_stop));
 
-    CHECK_HIP(hipEventRecord(fused_start, 0));
-    for (int iteration = 0; iteration < BENCHMARK_ITERATIONS; ++iteration) {
-        aeon::kernel::dispatch_aeon_moe_fused_w2_accum<WAVES, RPW, LPR, ITERS>(
-            device_hidden, device_weights, device_topk_weights,
-            nullptr,
-            device_fused_f32, device_fused_f16, device_counters,
-            EXPERTS, N, K);
+    std::array<double, BENCHMARK_TRIALS> direct_samples{};
+    std::array<double, BENCHMARK_TRIALS> staged_samples{};
+    for (int trial = 0; trial < BENCHMARK_TRIALS; ++trial) {
+        const bool direct_first = (trial % 2) == 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool run_direct = direct_first ? pass == 0 : pass == 1;
+            hipEvent_t start = run_direct ? fused_start : staged_start;
+            hipEvent_t stop = run_direct ? fused_stop : staged_stop;
+            if (run_direct) {
+                CHECK_HIP(hipMemset(device_fused_f32, 0, N * sizeof(float)));
+                CHECK_HIP(hipMemset(device_fused_f16, 0, N * sizeof(half)));
+                CHECK_HIP(hipMemset(device_counters, 0, (N / (WAVES * RPW)) * sizeof(int)));
+            } else {
+                CHECK_HIP(hipMemset(device_staged_f32, 0, N * sizeof(float)));
+                CHECK_HIP(hipMemset(device_staged_f16, 0, N * sizeof(half)));
+                CHECK_HIP(hipMemset(device_staged_counters, 0, (N / (WAVES * RPW)) * sizeof(int)));
+            }
+            CHECK_HIP(hipDeviceSynchronize());
+            CHECK_HIP(hipEventRecord(start, 0));
+            for (int iteration = 0; iteration < BENCHMARK_ITERATIONS; ++iteration) {
+                if (run_direct) {
+                    aeon::kernel::dispatch_aeon_moe_fused_w2_accum<WAVES, RPW, LPR, ITERS>(
+                        device_hidden, device_weights, device_topk_weights,
+                        nullptr,
+                        device_fused_f32, device_fused_f16, device_counters,
+                        EXPERTS, N, K);
+                } else {
+                    aeon::kernel::dispatch_aeon_moe_fused_w2_accum<WAVES, RPW, LPR, ITERS, true>(
+                        device_hidden, device_weights, device_topk_weights,
+                        nullptr,
+                        device_staged_f32, device_staged_f16, device_staged_counters,
+                        EXPERTS, N, K);
+                }
+            }
+            CHECK_HIP(hipEventRecord(stop, 0));
+            CHECK_HIP(hipEventSynchronize(stop));
+            const double sample_us = elapsed_us(start, stop, BENCHMARK_ITERATIONS);
+            if (run_direct) {
+                direct_samples[trial] = sample_us;
+            } else {
+                staged_samples[trial] = sample_us;
+            }
+        }
     }
-    CHECK_HIP(hipEventRecord(fused_stop, 0));
-    CHECK_HIP(hipEventSynchronize(fused_stop));
 
+    auto median = [](std::array<double, BENCHMARK_TRIALS> samples) {
+        std::sort(samples.begin(), samples.end());
+        return samples[BENCHMARK_TRIALS / 2];
+    };
     const double baseline_us = elapsed_us(baseline_start, baseline_stop, BENCHMARK_ITERATIONS);
-    const double fused_us = elapsed_us(fused_start, fused_stop, BENCHMARK_ITERATIONS);
+    const double fused_us = median(direct_samples);
+    const double staged_us = median(staged_samples);
+    const auto direct_range = std::minmax_element(direct_samples.begin(), direct_samples.end());
+    const auto staged_range = std::minmax_element(staged_samples.begin(), staged_samples.end());
     std::cout << std::fixed << std::setprecision(3)
               << "W2 + accumulation: current 12 launches=" << baseline_us
-              << " us, fused 1 launch=" << fused_us
-              << " us, speedup=" << (baseline_us / fused_us)
-              << "x, output max diff=" << max_difference << std::endl;
+              << " us, fused direct median=" << fused_us
+              << " us [" << *direct_range.first << "," << *direct_range.second << "]"
+              << ", fused staged median=" << staged_us
+              << " us [" << *staged_range.first << "," << *staged_range.second << "]"
+              << " us, direct/staged=" << (fused_us / staged_us)
+              << "x, baseline/direct max diff=" << max_difference
+              << ", direct/staged max diff=" << max_staged_difference << std::endl;
 
     CHECK_HIP(hipEventDestroy(baseline_start));
     CHECK_HIP(hipEventDestroy(baseline_stop));
     CHECK_HIP(hipEventDestroy(fused_start));
     CHECK_HIP(hipEventDestroy(fused_stop));
+    CHECK_HIP(hipEventDestroy(staged_start));
+    CHECK_HIP(hipEventDestroy(staged_stop));
     CHECK_HIP(hipFree(device_hidden));
     CHECK_HIP(hipFree(device_topk_weights));
     CHECK_HIP(hipFree(device_baseline));
@@ -219,6 +291,9 @@ int main() {
     CHECK_HIP(hipFree(device_fused_f32));
     CHECK_HIP(hipFree(device_fused_f16));
     CHECK_HIP(hipFree(device_counters));
+    CHECK_HIP(hipFree(device_staged_f32));
+    CHECK_HIP(hipFree(device_staged_f16));
+    CHECK_HIP(hipFree(device_staged_counters));
     for (int expert = 0; expert < EXPERTS; ++expert) {
         CHECK_HIP(hipFree(device_source_packed[expert]));
         CHECK_HIP(hipFree(device_source_scale[expert]));

@@ -104,3 +104,28 @@ The 101-iteration kernel trace showed the expected launch reduction:
 - The opt-in two-layer pipeline smoke test completes a valid token on silicon.
 - A full-model baseline/swizzled text A/B produced identical generated IDs and the same English response in the prior validation run.
 - No controlled 43-layer throughput comparison isolates Stage 1 yet. The current full-model text run remains approximately `3 tok/s` and is dominated by cold expert service and just-in-time transfer/dispatch latency. The measurements above establish GPU-side improvement, not an end-to-end speedup claim.
+
+## 8. Activation-staging A/B experiment
+
+The expert's proposed activation staging was implemented as an opt-in template variant, `STAGE_ACTIVATION=true`, in both fused kernels. The production calls continue to use the default `false` variant, so this experiment does not change the runtime path.
+
+The staged variant cooperatively copies the complete activation vector into dynamic shared/LDS memory before the dot-product loop:
+
+- W1/W3: `8 KiB` activation tile per block.
+- W2: `4 KiB` activation tile per block.
+- Both variants use the same weights, launch geometry, inputs, output type, and FP32 accumulation.
+- Five alternating HIP-event trials were used for W1/W3. W2 was repeated with the same kernel-only timing method after moving buffer resets outside the timed region.
+
+| Kernel | Direct activation reads | LDS-staged activation | Direct/staged | Output difference |
+|---|---:|---:|---:|---:|
+| Six-expert W1/W3 plus SwiGLU | `37.170 us` median (`37.052-37.202`) | `41.354 us` median (`40.526-42.040`) | `0.899x` | `0.000` |
+| Six-expert W2 plus accumulation, run 1 | `26.045 us` median (`25.868-26.307`) | `25.937 us` median (`24.517-26.565`) | `1.004x` | `0.000` |
+| Six-expert W2 plus accumulation, repeat | `25.361 us` median (`24.564-32.930`) | `24.988 us` median (`24.044-25.459`) | `1.015x` | `0.000` |
+
+Interpretation:
+
+- W1/W3 staging is consistently worse by approximately `11.2%`. The direct path's cacheable activation reads are cheaper than the extra cooperative LDS copy, barrier, and shared-memory traffic for this workload.
+- W2 staging is effectively neutral. Its small median advantage of approximately `0.4-1.5%` is within the observed run-to-run variation and is not enough to justify a separate production path.
+- If both dispatches were staged, the representative medians would increase the combined isolated W1/W3 plus W2 time from approximately `63.2 us` to `67.3 us`, about `6%` slower. This is an isolated kernel estimate, not a full-model result.
+
+**Decision:** the expert's activation-staging idea was tested and is not adopted in the production path. The direct-global activation implementation is currently better for W1/W3 and statistically tied for W2. The staging template remains available in the benchmark code for future hardware or launch-configuration comparisons.
