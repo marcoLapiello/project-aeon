@@ -1,6 +1,6 @@
 # Project Aeon Documentation Status
 
-Status audited on 2026-09-10 against `HEAD` (`843f993`, `feat: complete native text turn`) and the current source tree.
+Status audited on 2026-09-11 against `HEAD` (`843f993`, `feat: complete native text turn`) and the current source tree.
 
 This file is the navigation point for project state. Detailed benchmark numbers belong in [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md); design rationale belongs in the reference and vision documents; this file and [AGENTS.md](../../AGENTS.md) should stay concise.
 
@@ -14,13 +14,14 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 - `reference/strategy/`: vision, risk, and specialization documents.
 - `reference/prior-art/`: external research and comparative implementation studies.
 
-## Active execution documents
+## Execution documents
 
 | Document | State | Purpose |
 | --- | --- | --- |
-| [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md) | Open | Active single-GPU cold-tier, storage-layout, and memory-pressure work. Spikes 0-2 are complete; Spike 3 has a bounded implementation but open acceptance gates. |
+| [WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md](../execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) | Active | Next implementation priority: persistent Warm ownership, asynchronous refill, transfer safety, and source-tier supply telemetry. |
+| [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md) | Paused | Paused single-GPU cold-tier, storage-layout, and memory-pressure work. Spikes 0-2 are complete; Spike 3 has a bounded implementation but open acceptance gates. |
 | [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](../execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) | Open | Native text path is implemented; external behavioral comparison and longer-context attention correctness remain open. |
-| [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) | Open | Routing observer and durable profiler are implemented; representative profile/held-out data and placement evaluation are still gated. |
+| [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) | Open; evidence gated | Routing observer and durable profiler are implemented; representative profile/held-out data and placement evaluation remain gated by model correctness. |
 | [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Living record | Authoritative silicon results, regressions, and milestone measurements. |
 | [CODEBASE_MAP.md](CODEBASE_MAP.md) | Current map | Describes the production runtime, validation targets, and legacy diagnostics. |
 
@@ -28,8 +29,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 
 | Document | State | Purpose |
 | --- | --- | --- |
-| [EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md](../analysis/current/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md) | Current analysis | Explains the remaining latency-bound cold-miss problem and the measurements needed before another scheduling policy is added. |
-| [EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md](../analysis/current/EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md) | Current analysis | Records the registry, Hot/Warm/Cold residency findings and the recommended deadline-aware rolling layer-residency direction for Stage 2. |
+| [EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md](../analysis/current/EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md) | Current analysis | Records the registry, Hot/Warm/Cold residency findings and the rationale for the deferred rolling-residency direction. Implementation sequencing is in the active Warm-tier plan. |
 | [DEEPSEEK_V4_FLASH_AEON_COMPARISON.md](../analysis/current/DEEPSEEK_V4_FLASH_AEON_COMPARISON.md) | Current analysis | Compares the selected 0731 checkpoint contract with Aeon quantization, attention, runtime, and hardware behavior. |
 | [EXPERT_KERNELS_REVIEW.md](../analysis/current/EXPERT_KERNELS_REVIEW.md) | Current review | Records the pending kernel-geometry, quant-layout, bottleneck, and interface questions for the next kernel investigation. |
 | [EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md](../analysis/current/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) | Current implementation report | Compares the external Stage 1 proposal with the implemented version-2 path, records measured GPU-side effects, and documents the remaining full-model gate. |
@@ -45,11 +45,12 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 
 ## Open work
 
-1. **Correctness:** compare identical formatted IDs and outputs against a trusted compatible reference; implement and validate compressed/indexed attention for longer-context layers 2-42.
-2. **Cold tier:** characterize cold-cache and steady-state behavior, improve physical `.aeon` placement/extent layout, reduce host-memory pressure, and decide whether further scheduling or CPU fallback work is justified by measurements.
-3. **Stage 1 end-to-end validation:** compare the version-2 swizzled path with the version-1 baseline under controlled Hot/Warm conditions, while preserving the runtime residency invariant and checking broader output parity.
-4. **Placement study:** collect profile and held-out corpora with the verified text contract, then compare measured placement against dynamic LRU. Do not use the existing pilot for placement decisions.
-5. **Scaling:** Phase 3 multi-GPU pipeline parallelism remains future work.
+1. **Warm-tier foundation:** execute [WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md](../execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md), including persistent refill, transfer ownership, and source-tier telemetry.
+2. **Correctness:** compare identical formatted IDs and outputs against a trusted compatible reference; implement and validate compressed/indexed attention for longer-context layers 2-42.
+3. **Cold tier:** after the Warm-tier foundation, characterize cold-cache and steady-state behavior, improve physical `.aeon` placement/extent layout, reduce host-memory pressure, and decide whether further scheduling or CPU fallback work is justified by measurements.
+4. **Stage 1 end-to-end validation:** compare the version-2 swizzled path with the version-1 baseline under controlled Hot/Warm conditions, while preserving the runtime residency invariant and checking broader output parity.
+5. **Placement study:** collect profile and held-out corpora with the verified text contract, then compare measured placement against dynamic LRU. Do not use the existing pilot for placement decisions.
+6. **Scaling:** Phase 3 multi-GPU pipeline parallelism remains future work.
 
 ## Historical and reference documents
 
@@ -57,5 +58,6 @@ These documents remain useful, but they are not current checklists:
 
 - [V4_PIPELINE_MODULARIZATION_ANALYSIS.md](../analysis/historical/V4_PIPELINE_MODULARIZATION_ANALYSIS.md) records the pre-refactor duplication analysis and completed extraction decisions.
 - [EXPERT_PERFORMANCE_REVIEW.md](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md) records the M15-era source review and the implemented M16-M20 follow-up steps; use the conclusions document and ledger for current status.
+- [EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md](../analysis/historical/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md) records the historical latency diagnosis that led to the current Warm-tier and supply-chain sequencing.
 - [PROJECT_AEON_VISION.md](../reference/strategy/PROJECT_AEON_VISION.md), [AEON_TECHNICAL_BLOCKERS_AND_RISKS.md](../reference/strategy/AEON_TECHNICAL_BLOCKERS_AND_RISKS.md), and [AEON_SPECIALIZATION_AND_ENTROPY_ANALYSIS.md](../reference/strategy/AEON_SPECIALIZATION_AND_ENTROPY_ANALYSIS.md) preserve strategic rationale and hypotheses.
 - [AEON_RESEARCH_AND_INSPIRATION.md](../reference/prior-art/AEON_RESEARCH_AND_INSPIRATION.md) and [REFERENCE_EXPERT_CACHING_AND_COLD_STREAMING_ANALYSIS.md](../reference/prior-art/REFERENCE_EXPERT_CACHING_AND_COLD_STREAMING_ANALYSIS.md) preserve external research and comparative implementation evidence.

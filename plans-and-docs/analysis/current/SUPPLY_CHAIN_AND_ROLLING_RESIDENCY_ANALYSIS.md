@@ -1,8 +1,10 @@
 # Supply Chain and Rolling Residency Analysis
 
-**Date:** 2026-09-10  
-**Status:** Current analysis and Stage 2 direction  
+**Date:** 2026-09-11
+**Status:** Current analysis and Stage 2 direction
 **Scope:** Hot/Warm/Cold expert residency, registry behavior, dynamic allocation, and a future layer-aware rolling supply scheduler. This document records the brainstorming conclusions and recommended stages; it is not a claim that the proposed policy has been implemented or measured.
+
+**Implementation handoff (2026-09-11):** The broad Phase 2 continuation is paused. The next implementation is governed by the focused [Warm-Tier Repair and Supply Telemetry Plan](../../execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md). This document remains the technical rationale for later placement and rolling-residency decisions, not their active checklist.
 
 ## Executive conclusion
 
@@ -399,13 +401,17 @@ all physical slot maps agree with catalog entries.
 
 ### Stage 2.1 - Repair Hot/Warm residency
 
+The active implementation decision is persistent asynchronous Hot-to-Warm refill by default whenever Warm capacity is configured. The no-refill behavior is retained only as a diagnostic control and for `WARM=0`; it is not the intended production policy.
+
 Implement the disjoint ownership model and an explicit Warm refill policy:
 
 - promote Warm to Hot by swapping with a selected Hot victim;
-- admit selected Hot victims into freed Warm slots asynchronously when worthwhile;
+- attempt to demote every eligible Hot victim into a valid Warm destination asynchronously;
 - evict Warm victims to Cold without copying because the NVMe copy is canonical;
 - keep Warm logically full whenever capacity and transfer policy allow;
 - protect current-layer leases from eviction.
+
+The request path must distinguish persistent Warm ownership from transient host staging. A Cold request may use `Cold NVMe -> transient staging -> Hot VRAM`; it must not be forced through persistent Warm merely because host memory is physically involved. Demotion may be dropped or deferred when no safe destination or transfer capacity exists, but it must never block the request path.
 
 Acceptance gate:
 
@@ -415,12 +421,7 @@ no duplicate Hot/Warm experts exist;
 Warm service counts remain measurable after repeated promotions.
 ```
 
-Measure both variants:
-
-1. strict disjoint swap with D2H refill;
-2. demotion-free eviction with a persistent profile-protected Warm set.
-
-Do not assume the extra D2H traffic is beneficial until the end-to-end wait and Cold-read reduction justify it.
+Use demotion-free eviction only as the control comparison. The production decision is based on whether asynchronous refill maintains Warm occupancy and reduces Cold bytes and exposed wait without introducing a critical-path D2H dependency.
 
 ### Stage 2.2 - Build the evidence-backed placement input
 
