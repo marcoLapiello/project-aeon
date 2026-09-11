@@ -101,6 +101,74 @@ The exact C++ enum and ownership layout may follow existing conventions, but the
 9. A second request for an expert with a pending transfer joins or waits for the existing operation; it must not submit a duplicate read or publish a conflicting owner.
 10. With `host_capacity == 0`, no Warm state or D2H refill is attempted and the current Cold behavior remains available as the control path.
 
+### 3.4 Normative state and ownership contract
+
+The implementation must model residency, transfer progress, publication, lease
+protection, and slot availability as separate dimensions. `LEASED` and
+`RECLAIMABLE` are not alternative persistent residency owners. A catalog entry
+has one persistent `owner` and may additionally be leased, transfer-protected,
+unpublished, or reclaimable according to the following contract:
+
+| Dimension | Required values | Meaning |
+| --- | --- | --- |
+| `owner` | `COLD`, `HOT`, `WARM` | The only persistent owner of the expert payload. |
+| `operation` | `NONE`, `IO_PENDING`, `PROMOTION_PENDING`, `DEMOTION_PENDING` | The logical operation that is changing or supplying the owner. |
+| `gpu_transfer` | `NONE`, `H2D_PENDING`, `D2H_PENDING` | The outstanding GPU transfer, if any. |
+| `publication` | `PUBLISHED`, `UNPUBLISHED` | Whether request lookup may return the owner and slot. |
+| `lease` | `UNLEASED`, `LEASED` | Whether a consumer event protects the payload from eviction or reuse. |
+| `slot_state` | `UNALLOCATED`, `ACTIVE`, `RECLAIMABLE` | Whether the associated physical slot can be allocated, used, or reused. |
+
+Reservations and publication are serialized by the registry ownership boundary.
+No lookup may observe an unpublished owner. A pending request for an expert
+joins the existing operation by operation ID and consumer event; it does not
+submit another I/O or transfer.
+
+The following transitions are normative:
+
+| Path | Preconditions | Ownership while pending | Commit and failure behavior |
+| --- | --- | --- | --- |
+| Hot hit | Published `HOT` entry with no conflicting transfer | Remains `HOT`; lease is acquired before return | Return the VRAM slot and touch Hot LRU. No transfer is submitted. |
+| Cold request | Reclaimable Hot destination and transient staging slot | Expert remains logically `COLD`; staging is not persistent ownership | On read and H2D completion, publish `HOT`. On read or H2D failure, publish no Hot entry and return the destination and staging slot after their events complete. |
+| Warm promotion | Published `WARM` source, protected source slot, and reclaimable Hot destination | Incoming expert remains `WARM` and source-unavailable until H2D completes. The selected Hot victim remains `HOT` but unavailable while D2H is pending. | Publish the incoming `HOT` entry only after H2D readiness. Publish the victim as `WARM` only after D2H completion. A failed H2D leaves the incoming expert Warm; a failed D2H publishes no Warm victim and the victim becomes Cold only after its source slot is safe to reuse. |
+| Hot demotion drop | No safe Warm destination, no queue admission, or host budget failure before D2H submission | Victim remains `HOT` until its lease and consumer event are complete | Evict the victim directly to `COLD` when its slot is reclaimed. No Warm entry or D2H byte is reported. |
+| Pending transfer completion | Matching operation ID and completion event | Existing owner remains protected and unpublished as required above | Publication occurs at most once, then the source and destination slots become reclaimable only when all dependent events and leases are complete. |
+
+An operation submitted to HIP cannot be treated as dropped after submission.
+It must complete or be explicitly cancelled by the backend before its source or
+destination slot is reused. CPU-side request handling may wait for a payload it
+actually consumes, but optional D2H admission must never introduce a blocking
+CPU wait.
+
+### 3.5 Capacity, pressure, and measurement definitions
+
+- One logical Warm slot holds one complete expert payload. `warm_capacity` is
+    the maximum number of such slots; `warm_storage_capacity` is the number of
+    bytes actually allocated for complete payloads; `warm_valid_slots` counts
+    only published, transfer-complete Warm entries.
+- The configured host budget includes allocated persistent Warm payload bytes,
+  allocator metadata, and all reserved transient staging bytes. Staging bytes
+  count against the host budget but never count as persistent Warm residency.
+  Admission must fail or defer before this budget would be exceeded. The
+  configured budget and actual allocation are reported separately.
+- A **safe Hot victim** is published, unleased, not transfer-protected, and
+    backed by a consumer event that has completed. A **safe Warm destination** is
+    either an unused host slot or a published Warm victim with the same
+    protection conditions. The incoming Warm source is never a destination.
+- `transfer capacity` means an available bounded demotion-queue entry and a
+    valid demotion stream. `queue pressure` begins when the number of outstanding
+    demotion operations reaches that queue capacity. A demotion is dropped or
+    deferred before submission; it is not silently counted as complete.
+- A **steady-state measured interval** is the fixed post-warmup interval defined
+    by the run card. A **stable Warm service** means at least one Warm hit in every
+    measured run with Warm enabled and at least one published valid Warm slot at
+    the end of that run. The synthetic fixture additionally checks its exact
+    expected slot counts.
+- `WARM=0` and `host_capacity=0` are valid configurations that disable Warm
+    admission and D2H refill. `hot_capacity=0` is an invalid configuration and
+    must be rejected before inference starts. A positive Warm capacity that
+    cannot hold one complete expert payload is also rejected with a configuration
+    error.
+
 ## 4. Intended Runtime Transitions
 
 ### 4.1 Hot hit
@@ -182,12 +250,22 @@ The routing profiler may still be compiled and smoke-tested as infrastructure, b
 Record a reproducible baseline before changing the runtime state machine:
 
 - same model artifact, device, context, raw-ID prompt, and generation limits;
-- Warm disabled and the current full Warm configuration where host pressure permits;
+- Warm disabled and the current full Warm configuration. If the declared full
+    Warm configuration cannot run within the recorded host budget, mark that
+    baseline unavailable rather than substituting a different capacity;
 - cold-start and post-warmup labels;
 - Prefill and Decode labels;
 - generated IDs and stop condition;
 - current Hot, Warm, and Cold service counts;
 - process RSS and swap before and after the run.
+
+Every baseline and A/B result must have a run card containing the model and
+artifact identifiers, git revision, device and driver/runtime versions, all
+Warm/Hot/staging capacities, host budget, prompt or input hash, generation
+limits, seed, warmup request count, measured request count, and telemetry schema
+version. The run card fixes the workload and configuration before any variant
+is executed; a result with missing fields is incomplete rather than silently
+comparable.
 
 The baseline is a supply-chain control measurement, not model-quality evidence. It must not be mixed with M22 native-text measurements or with the isolated M23/M24 kernel benchmarks.
 
@@ -219,6 +297,37 @@ A long synthetic registry trace can assert all bidirectional slot/catalog invari
 The default output and existing tests remain unchanged when telemetry is disabled.
 ```
 
+Telemetry contract:
+
+- Enabled telemetry is emitted as versioned JSONL. Each `phase_summary` record
+    represents one `phase` and `source_tier` combination and contains
+    `schema_version`, `run_id`, `phase`, `source_tier`, `request_count`,
+    `decode_token_count`, `bytes_from_nvme`, `bytes_from_host`,
+    `logical_bytes_from_warm`, `logical_bytes_from_transient_staging`,
+    `h2d_bytes`, `d2h_bytes`, `nvme_read_service_ns`,
+    `nvme_completion_wait_ns`, `h2d_enqueue_to_ready_ns`,
+    `gpu_readiness_wait_ns`, `optional_demotion_wait_ns`,
+    `staging_wait_ns`, and `staging_reuse_wait_ns`.
+- The same summary records contain `demotion_attempts`,
+    `demotion_completions`, `demotion_drops`, a reason-count map for drops,
+    `hot_occupancy_min`, `hot_occupancy_max`, `warm_valid_slots_min`,
+    `warm_valid_slots_max`, `pending_transfers_max`,
+    `demotion_queue_depth_max`, `warm_pinned_bytes`,
+    `warm_unpinned_bytes`, `rss_bytes_peak`, and `vm_swap_bytes_delta`.
+- Optional `transfer_event` records contain `transfer_id`, `expert_id`,
+  `operation`, `source_slot`, `destination_slot`, `status`, and a drop or
+  failure reason. Transfer and supply byte fields are completed payload bytes;
+  occupancy byte fields report allocated or resident bytes. All duration fields
+  end in `_ns` and are integer nanoseconds, and all occupancy and queue fields
+  are integer slot or operation counts.
+- `phase` is one of `warmup`, `prefill`, or `decode`. `source_tier` is the
+    logical tier that satisfied the request lookup (`hot`, `warm`, `cold`, or
+    `none`), not the transient transport used after a Cold lookup. Counters reset
+    at the warmup-to-measured boundary and every summary identifies that boundary.
+- `optional_demotion_wait_ns` must remain zero for the request path. GPU event
+    dependencies and waits for a payload the request actually consumes are
+    reported separately and must not be folded into optional demotion wait.
+
 ### Stage 2: Implement the persistent Warm state machine
 
 Extend `ExpertRegistry` and the host-pool ownership boundary with explicit reservation and publication operations. Keep the registry responsible for logical ownership and LRU policy; keep `HostExpertPool` responsible for segmented storage, allocation, pinning status, and matching cleanup.
@@ -246,6 +355,24 @@ Add a host-only or lightweight unit test for deterministic transitions, includin
 - repeated promotion/eviction over more transitions than total slots;
 - zero Hot or zero Warm capacity rejection/behavior as appropriate.
 
+The test is a required CTest target named `test_expert_registry_warm_state`.
+Its deterministic fixture uses two Hot slots, two Warm slots, one transient
+staging slot, and expert IDs `0` through `7`. It must execute a hand-written
+sequence covering a Hot hit, promotion with a free Warm destination, promotion
+with a full Warm pool, a Cold request with a successful demotion, a Cold request
+with a dropped demotion, duplicate joining of a pending operation, and pending
+source protection. It then runs at least 10,000 additional transitions with
+fixed seed `0xAE0F` and checks the invariants after every transition.
+
+The fixture must assert exact counters for the hand-written sequence and these
+properties for the complete trace: no duplicate persistent owner, exact
+bidirectional slot/catalog maps, no lookup of an unpublished entry, no reuse of
+a leased or transfer-protected slot, no duplicate publication, zero optional
+demotion waits, and no staging allocation above the configured slot count. A
+configuration with `hot_capacity=0` must be rejected; `warm_capacity=0` and
+`host_capacity=0` must be accepted and must issue no Warm operation or D2H
+transfer.
+
 ### Stage 3: Integrate asynchronous refill into the pipeline
 
 Replace the current demotion-free ownership transition only after Stage 2 passes.
@@ -258,6 +385,9 @@ Replace the current demotion-free ownership transition only after Stage 2 passes
 - Prevent host-slot reuse until the H2D event that consumes the previous host payload has completed.
 - Add single-flight handling for an expert that is already promotion- or demotion-pending.
 - Record all dropped or deferred demotions so a low refill rate is distinguishable from a low request rate.
+- Instrument the CPU request path and fail the focused test if it performs a
+    blocking wait for optional demotion. A HIP event dependency is allowed; a
+    CPU synchronization on that optional D2H is not.
 
 ### Stage 4: Validate on silicon
 
@@ -283,6 +413,37 @@ Required comparisons:
 - RSS and swap deltas;
 - pinned versus unpinned Warm service;
 - staging and queue waits.
+
+The silicon comparison uses a written run card and five independent runs per
+variant. Each run starts from the same initialization procedure and uses the
+same model artifact, device, prompt, seed, generation limits, warmup interval,
+and measured request count. The three variants are `WARM=0`, current
+demotion-free Warm behavior, and repaired persistent Warm behavior. No run may
+be removed because its result is inconvenient; infrastructure failures are
+recorded and rerun with the reason preserved.
+
+The report must contain the median and interquartile range for every latency,
+byte, wait, occupancy, and host-pressure metric, plus the exact generated IDs
+and stop condition for every run. Unless the run card declares a different
+threshold before execution, the default decision rules are:
+
+- repaired persistent Warm must reduce median
+    `bytes_from_nvme / decode_token_count` by at least 5% versus the demotion-free
+    control;
+- Warm service is stable according to Section 3.5, and every measured run has
+    a nonzero Warm-hit count when Warm is enabled;
+- `optional_demotion_wait_ns` is zero, peak staging and pending-transfer counts
+    do not exceed their configured capacities, and persistent plus transient
+    host allocation does not exceed the configured host budget;
+- repaired median TTFT and median Decode step latency are each no more than
+    5% above the demotion-free control. A larger regression is a documented
+    host-pressure tradeoff, not an unqualified pass;
+- generated token IDs and the stop condition are identical across the three
+    variants. A mismatch fails the gate regardless of performance.
+
+If the control produces zero NVMe bytes in the measured interval, the supply
+benefit criterion is `inconclusive` rather than a pass; the report must choose
+a workload with a measurable Cold supply interval before the plan can close.
 
 ### Stage 5: Close or redirect the plan
 
@@ -310,7 +471,8 @@ If the repaired path preserves Warm occupancy but increases exposed GPU wait, ke
 - Warm capacity does not drain during a steady-state run when refill destinations and transfer capacity are available.
 - Repeated promotions produce measurable Warm service after the initial population is consumed.
 - Cold requests remain correct when demotions are dropped.
-- `WARM=0` behavior remains equivalent to the current control within normal measurement variance.
+- `WARM=0` behavior remains equivalent to the current control: identical
+    generated IDs and stop condition, no Warm operations, and no D2H refill.
 - Existing focused Phase 2 tests and the golden-token pipeline tests pass.
 
 ### Gate C: Supply measurement correctness
@@ -325,12 +487,17 @@ If the repaired path preserves Warm occupancy but increases exposed GPU wait, ke
 
 Under an identical post-warmup workload, the repaired path must show:
 
-- lower Cold NVMe bytes per token than the demotion-free control;
-- nonzero and stable Warm service after repeated promotions;
-- no new synchronous wait for optional demotion;
+- at least 5% lower median Cold NVMe bytes per generated Decode token than the
+    demotion-free control, unless the run is marked inconclusive under Stage 4;
+- nonzero Warm service in every measured run and stable Warm service as defined
+    in Section 3.5 after repeated promotions;
+- zero CPU wait for optional demotion, with any consumed-payload wait reported
+    separately;
 - no generated-ID divergence;
-- no unbounded staging, RSS, or swap growth;
-- a decode result that is no worse than the demotion-free control after accounting for run variance, unless the ledger documents a deliberate host-pressure tradeoff.
+- no capacity-bound violation or monotonic post-warmup growth in staging,
+    pending transfers, persistent host allocation, RSS, or swap;
+- median TTFT and Decode step latency no more than 5% above the demotion-free
+    control, unless the ledger documents a deliberate host-pressure tradeoff.
 
 No fixed throughput number is required at this stage. The first performance decision is whether persistent Warm refill lowers the measured supply cost without moving the wait to another queue.
 
