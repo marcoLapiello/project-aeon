@@ -26,15 +26,19 @@ struct AeonRuntimeConfig {
     // User-configurable: target context sequence length (tokens)
     uint32_t context_size{4096};
 
-    // User-configurable: maximum Host RAM to utilize for Warm Tier 2 experts (in bytes).
-    // 0 means auto-allocate up to 70% of physical system RAM.
-    size_t host_ram_bytes{0};
+    // Maximum host budget for persistent Warm payloads plus runtime transport.
+    // Zero disables persistent Warm ownership and D2H refill.
+    size_t warm_host_bytes{0};
+
+    // Allocate the configured Warm capacity without requiring a synchronous
+    // startup fill. This remains enabled by default for compatibility.
+    bool preload_warm_host{true};
+
+    // Diagnostic A/B control. The production default keeps asynchronous refill enabled.
+    bool enable_warm_refill{true};
 
     // Hardware target device index
     int device_id{0};
-
-    // When false, leave the warm-tier capacity unallocated and stream cold experts on demand.
-    bool preload_warm_host{true};
 
 };
 
@@ -61,6 +65,9 @@ struct MemoryBudgetReport {
     size_t hot_vram_bytes{0};
     uint32_t warm_host_slots{0};
     size_t warm_host_bytes{0};
+    size_t configured_host_budget_bytes{0};
+    size_t persistent_warm_host_budget_bytes{0};
+    size_t transient_staging_bytes{0};
     uint32_t cold_nvme_slots{0};
 
     // Diagnostics / recommendations
@@ -100,6 +107,9 @@ struct MemoryBudgetReport {
             << (double)hot_vram_bytes / (1024 * 1024 * 1024) << " GB)\n"
             << "    - Tier 2: Warm Host DDR: " << warm_host_slots << " slots ("
             << (double)warm_host_bytes / (1024 * 1024 * 1024) << " GB)\n"
+            << "    - Configured Host Budget : " << (double)configured_host_budget_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Persistent Warm Budget : " << (double)persistent_warm_host_budget_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Transient Staging    : " << (double)transient_staging_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Tier 3: Cold NVMe SSD: " << cold_nvme_slots << " slots\n"
             << "================================================================================\n";
         return oss.str();
@@ -208,19 +218,31 @@ public:
         report.hot_vram_slots = static_cast<uint32_t>(remaining_for_experts / AEON_EXPERT_BYTES);
         report.hot_vram_bytes = static_cast<size_t>(report.hot_vram_slots) * AEON_EXPERT_BYTES;
 
-        // 8. Calculate Warm Host DDR Expert Pool capacity
-        size_t host_budget = runtime_cfg.preload_warm_host
-            ? ((runtime_cfg.host_ram_bytes > 0)
-                ? std::min(runtime_cfg.host_ram_bytes, report.max_allowed_host_ram_bytes)
-                : report.max_allowed_host_ram_bytes)
-            : 0;
+        // 8. Calculate persistent Warm capacity. Transport staging is allocated
+        // for Cold requests even when Warm is disabled, but it never counts as a
+        // persistent Warm slot.
+        report.transient_staging_bytes = static_cast<size_t>(12) * AEON_EXPERT_BYTES;
+        report.configured_host_budget_bytes = runtime_cfg.warm_host_bytes == 0
+            ? report.transient_staging_bytes
+            : std::min(runtime_cfg.warm_host_bytes, report.max_allowed_host_ram_bytes);
+        const size_t persistent_host_budget = runtime_cfg.warm_host_bytes == 0
+            ? 0
+            : report.configured_host_budget_bytes > report.transient_staging_bytes
+                ? report.configured_host_budget_bytes - report.transient_staging_bytes
+                : 0;
+        report.persistent_warm_host_budget_bytes = persistent_host_budget;
+        if (runtime_cfg.warm_host_bytes > 0 && persistent_host_budget < AEON_EXPERT_BYTES) {
+            report.is_feasible = false;
+            report.rejection_reason = "Warm host budget cannot hold one complete expert after reserving transient staging";
+            return report;
+        }
 
         uint32_t total_experts = static_cast<uint32_t>(model_cfg.num_hidden_layers * model_cfg.n_routed_experts);
         uint32_t remaining_after_vram = (total_experts > report.hot_vram_slots)
             ? (total_experts - report.hot_vram_slots)
             : 0;
 
-        uint32_t host_slots_budgeted = static_cast<uint32_t>(host_budget / AEON_EXPERT_BYTES);
+        uint32_t host_slots_budgeted = static_cast<uint32_t>(persistent_host_budget / AEON_EXPERT_BYTES);
         report.warm_host_slots = std::min(remaining_after_vram, host_slots_budgeted);
         report.warm_host_bytes = static_cast<size_t>(report.warm_host_slots) * AEON_EXPERT_BYTES;
 

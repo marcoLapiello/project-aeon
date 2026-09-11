@@ -24,10 +24,9 @@ int main(int argc, char** argv) {
     aeon::core::AeonRuntimeConfig pipeline_cfg;
     const uint64_t warm_host_gib = argc > 1 ? std::stoull(argv[1]) : 35;
     pipeline_cfg.context_size = 4096; // 4096 tokens context
-    pipeline_cfg.host_ram_bytes = warm_host_gib * 1024ULL * 1024ULL * 1024ULL;
-    pipeline_cfg.preload_warm_host = warm_host_gib > 0;
+    pipeline_cfg.warm_host_bytes = warm_host_gib * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "[Profile] Warm Host budget: " << warm_host_gib << " GiB"
-              << (pipeline_cfg.preload_warm_host ? " (enabled)" : " (disabled)") << std::endl;
+              << (pipeline_cfg.warm_host_bytes > 0 ? " (enabled)" : " (disabled)") << std::endl;
 
     std::cout << "\n[Step 1] Initializing complete 43-layer pipeline..." << std::endl;
     auto t_init_start = std::chrono::high_resolution_clock::now();

@@ -1,10 +1,11 @@
 # Warm-Tier Repair and Supply Telemetry Execution Plan
 
 **Date:** 2026-09-11
-**Status:** Active; next implementation priority
+**Status:** Complete; Stage 4 silicon gate, Stage 5 closure evidence, and second-pass structural corrections recorded
 **Priority:** P0 foundational runtime infrastructure
 **Parent track:** Phase 2 is paused while this plan is executed
 **Scope:** Persistent Hot/Warm residency, asynchronous refill, transfer ownership, and supply-chain telemetry
+**Closure report:** [WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md](WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md)
 
 ## 1. Decision Record
 
@@ -145,6 +146,10 @@ CPU wait.
     the maximum number of such slots; `warm_storage_capacity` is the number of
     bytes actually allocated for complete payloads; `warm_valid_slots` counts
     only published, transfer-complete Warm entries.
+- `preload_warm_host=false` is content-lazy, not allocation-lazy: startup skips
+    Warm payload reads and begins with zero valid Warm entries, while the
+    configured persistent host capacity is still allocated up front. Physical
+    allocation and logical publication are reported separately.
 - The configured host budget includes allocated persistent Warm payload bytes,
   allocator metadata, and all reserved transient staging bytes. Staging bytes
   count against the host budget but never count as persistent Warm residency.
@@ -327,6 +332,12 @@ Telemetry contract:
 - `optional_demotion_wait_ns` must remain zero for the request path. GPU event
     dependencies and waits for a payload the request actually consumes are
     reported separately and must not be folded into optional demotion wait.
+- `demotion_attempts` counts every Hot-victim demotion candidate considered
+    after Warm admission is enabled, including candidates rejected before D2H
+    submission. `demotion_completions` counts successful submitted D2H
+    operations. `demotion_drops` counts pre-submit rejection and submitted
+    transfer failure; the reason map distinguishes queue pressure, unavailable
+    Warm destinations, and transport fallback failures.
 
 ### Stage 2: Implement the persistent Warm state machine
 
@@ -341,7 +352,8 @@ Required behavior:
 - a pending D2H operation is not exposed as a Warm hit;
 - a pending H2D operation is not exposed as a Hot hit;
 - `WARM=0` bypasses all Warm operations;
-- `preload_warm_host=false` can start with valid capacity zero without disabling later refill;
+- `preload_warm_host=false` can start with zero valid entries without disabling
+    later refill; configured host capacity remains an eager physical allocation;
 - pinned and unpinned host segments are reported separately.
 
 Add a host-only or lightweight unit test for deterministic transitions, including:
@@ -368,10 +380,11 @@ The fixture must assert exact counters for the hand-written sequence and these
 properties for the complete trace: no duplicate persistent owner, exact
 bidirectional slot/catalog maps, no lookup of an unpublished entry, no reuse of
 a leased or transfer-protected slot, no duplicate publication, zero optional
-demotion waits, and no staging allocation above the configured slot count. A
-configuration with `hot_capacity=0` must be rejected; `warm_capacity=0` and
-`host_capacity=0` must be accepted and must issue no Warm operation or D2H
-transfer.
+demotion waits, and no staging allocation above the configured slot count. The
+test also exercises a real staging-arena host-to-device event dependency and
+failure release. A configuration with `hot_capacity=0` must be rejected;
+`warm_capacity=0` and `host_capacity=0` must be accepted and must issue no Warm
+operation or D2H transfer.
 
 ### Stage 3: Integrate asynchronous refill into the pipeline
 
@@ -386,8 +399,9 @@ Replace the current demotion-free ownership transition only after Stage 2 passes
 - Add single-flight handling for an expert that is already promotion- or demotion-pending.
 - Record all dropped or deferred demotions so a low refill rate is distinguishable from a low request rate.
 - Instrument the CPU request path and fail the focused test if it performs a
-    blocking wait for optional demotion. A HIP event dependency is allowed; a
-    CPU synchronization on that optional D2H is not.
+    blocking wait for optional demotion. A HIP event dependency and a
+    nonblocking event query are allowed; a CPU synchronization on that optional
+    D2H is not.
 
 ### Stage 4: Validate on silicon
 
@@ -509,7 +523,7 @@ No fixed throughput number is required at this stage. The first performance deci
 | A Warm source slot is overwritten during promotion | Protect the source until H2D completion; use a freed Warm victim or an explicit swap buffer. |
 | A VRAM slot is overwritten before its victim is copied | Enqueue D2H before H2D and publish the new Hot owner only after the dependency chain is complete. |
 | Unpinned host segments cause hidden runtime bounce buffering | Record pinning per segment and route unpinned transfers through a bounded fallback without claiming pinned performance. |
-| Full startup preload causes swap pressure | Separate maximum capacity from initial fill and permit lazy segment allocation/refill. |
+| Full startup preload causes swap pressure | Separate maximum capacity from initial content fill; the current pool allocates configured capacity eagerly and refills publication lazily, so physical allocation remains visible in host-pressure telemetry. |
 | More Warm capacity hides, rather than fixes, a scheduling stall | Measure exposed GPU readiness wait and queue delay; do not use Hot hit rate as the sole success metric. |
 | Current attention approximation contaminates placement conclusions | Keep all routing data in infrastructure-only status until CSA/HCA, compressed state, and reference parity gates pass. |
 

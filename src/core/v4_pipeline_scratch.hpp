@@ -4,13 +4,15 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 
 #ifndef CHECK_HIP
 #define CHECK_HIP(cmd) do { \
     hipError_t err = cmd; \
     if (err != hipSuccess) { \
-        std::cerr << "HIP Error: " << hipGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-        exit(1); \
+        throw std::runtime_error(std::string("HIP Error: ") + hipGetErrorString(err) + \
+            " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
     } \
 } while(0)
 #endif

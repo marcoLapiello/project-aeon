@@ -219,8 +219,7 @@ int main(int argc, char** argv) {
         if (options.mode == "dynamic") {
             aeon::core::AeonRuntimeConfig runtime_config;
             runtime_config.context_size = options.context_size;
-            runtime_config.host_ram_bytes = static_cast<size_t>(options.warm_gib) * 1024ULL * 1024ULL * 1024ULL;
-            runtime_config.preload_warm_host = options.warm_gib > 0;
+            runtime_config.warm_host_bytes = static_cast<size_t>(options.warm_gib) * 1024ULL * 1024ULL * 1024ULL;
             pipeline.init_dynamic_global(options.model_dir, runtime_config, options.layers);
         } else {
             pipeline.init_aeon(options.model_dir, options.layers, options.vram_slots, options.context_size, true);

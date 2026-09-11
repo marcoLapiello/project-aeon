@@ -29,7 +29,7 @@ int main() {
     std::cout << "\n[Test 1] Testing Hard Feasibility Gate with Excessive Context Size (262,144 tokens)..." << std::endl;
     aeon::core::AeonRuntimeConfig overbudget_cfg;
     overbudget_cfg.context_size = 262144; // MLA KV would require ~11.27 GB, exceeding remaining 24GB VRAM
-    overbudget_cfg.host_ram_bytes = 0;   // Auto 80%
+    overbudget_cfg.warm_host_bytes = 0;   // Warm disabled
 
     auto overbudget_report = aeon::core::MemoryBudgetEngine::evaluate(overbudget_cfg, model_cfg, dense_weights_bytes);
     std::cout << overbudget_report.to_string() << std::endl;
@@ -44,7 +44,7 @@ int main() {
     std::cout << "\n[Test 2] Testing Feasibility Gate with Valid 4k Context (4,096 tokens)..." << std::endl;
     aeon::core::AeonRuntimeConfig valid_cfg;
     valid_cfg.context_size = 4096;
-    valid_cfg.host_ram_bytes = 0; // Auto 80%
+    valid_cfg.warm_host_bytes = 0; // Warm disabled
 
     auto valid_report = aeon::core::MemoryBudgetEngine::evaluate(valid_cfg, model_cfg, dense_weights_bytes);
     std::cout << valid_report.to_string() << std::endl;
@@ -56,7 +56,7 @@ int main() {
     // -------------------------------------------------------------------------
     // Test 3: Host-Side Expert Registry Initialization & Tier Tracking
     // -------------------------------------------------------------------------
-    std::cout << "\n[Test 3] Testing ExpertRegistry initialization & round-robin tier assignment..." << std::endl;
+    std::cout << "\n[Test 3] Testing ExpertRegistry initialization & published ownership maps..." << std::endl;
     // Use smaller slot counts for quick unit check
     uint32_t test_vram_slots = 64;
     uint32_t test_host_slots = 128;
@@ -67,22 +67,26 @@ int main() {
     assert(registry.hot_vram_lru.size() == test_vram_slots);
     assert(registry.warm_host_lru.size() == test_host_slots);
 
-    // Verify touch on hot expert
+    // Verify a published Hot request acquires a lease without mutating ownership.
     uint32_t sample_gid = registry.hot_vram_lru.front();
     uint32_t sample_layer = registry.catalog[sample_gid].layer_id;
     uint32_t sample_expert = registry.catalog[sample_gid].expert_id;
-    int32_t slot = registry.touch_hot_expert(sample_layer, sample_expert, 1);
-    assert(slot >= 0);
+    auto hot_request = registry.reserve_request(sample_layer, sample_expert, 1, 2);
+    assert(hot_request.kind == aeon::core::ExpertRequestKind::HOT_HIT);
+    assert(hot_request.vram_slot >= 0);
     assert(registry.hits_hot == 1);
-    std::cout << "  > [PASSED] ExpertRegistry round-robin & hot touch verified (Layer "
-              << sample_layer << ", Expert " << sample_expert << " in Slot " << slot << ").\n";
+    registry.release_lease(sample_gid);
+    assert(registry.invariants_hold());
+    std::cout << "  > [PASSED] ExpertRegistry ownership and Hot lease verified (Layer "
+              << sample_layer << ", Expert " << sample_expert << " in Slot "
+              << hot_request.vram_slot << ").\n";
 
     // -------------------------------------------------------------------------
     // Test 4: Physical Silicon Global VRAM Expert Pool Allocation & Streaming
     // -------------------------------------------------------------------------
-    std::cout << "\n[Test 4] Allocating GlobalVRAMExpertPool on physical silicon (16 slots)..." << std::endl;
+    std::cout << "\n[Test 4] Allocating UnifiedVRAMExpertPool on physical silicon (16 slots)..." << std::endl;
     uint32_t pool_slots = 16;
-    aeon::core::GlobalVRAMExpertPool vram_pool(pool_slots);
+    aeon::core::UnifiedVRAMExpertPool vram_pool(pool_slots);
 
     // Open AeonModelLoader to stream a real expert payload into slot 0
     std::string aeon_model_dir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
@@ -104,7 +108,7 @@ int main() {
     for (size_t i = 0; i < host_w1_check.size(); ++i) {
         assert(host_w1_check[i] == orig_w1[i]);
     }
-    std::cout << "  > [PASSED] GlobalVRAMExpertPool DMA stream & silicon bit-parity verified!\n";
+    std::cout << "  > [PASSED] UnifiedVRAMExpertPool DMA stream & silicon bit-parity verified!\n";
 
     // -------------------------------------------------------------------------
     // Test 5: End-to-End V4Pipeline with Global Unified Pool on Physical Silicon
@@ -113,7 +117,7 @@ int main() {
     aeon::core::V4Pipeline pipeline;
     aeon::core::AeonRuntimeConfig pipeline_cfg;
     pipeline_cfg.context_size = 4096;
-    pipeline_cfg.host_ram_bytes = 0; // auto 80%
+    pipeline_cfg.warm_host_bytes = 0; // Warm disabled
 
     pipeline.init_dynamic_global(aeon_model_dir, pipeline_cfg, 2);
 

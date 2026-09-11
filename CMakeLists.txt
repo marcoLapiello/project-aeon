@@ -266,6 +266,18 @@ target_link_libraries(test_dynamic_expert_pool PRIVATE amdhip64)
 add_test(NAME test_dynamic_expert_pool COMMAND test_dynamic_expert_pool)
 set_tests_properties(test_dynamic_expert_pool PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Host-side validation: persistent Warm ownership, pending transfers, and leases
+add_executable(test_expert_registry_warm_state tests/test_expert_registry_warm_state.cpp)
+target_link_libraries(test_expert_registry_warm_state PRIVATE amdhip64)
+add_test(NAME test_expert_registry_warm_state COMMAND test_expert_registry_warm_state)
+set_tests_properties(test_expert_registry_warm_state PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Host-side validation: versioned, phase-labelled supply telemetry JSONL
+add_executable(test_supply_telemetry tests/test_supply_telemetry.cpp)
+target_link_libraries(test_supply_telemetry PRIVATE amdhip64)
+add_test(NAME test_supply_telemetry COMMAND test_supply_telemetry)
+set_tests_properties(test_supply_telemetry PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Phase 2 end-to-end smoke test: direct hot/warm initialization and cold streaming
 add_executable(test_hot_warm_cold_pipeline tests/test_hot_warm_cold_pipeline.cpp)
 target_link_libraries(test_hot_warm_cold_pipeline PRIVATE amdhip64)

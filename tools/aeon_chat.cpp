@@ -23,6 +23,10 @@ struct Options {
     uint32_t context_size{4096};
     uint32_t max_new_tokens{256};
     uint64_t warm_gib{0};
+    bool preload_warm_host{true};
+    bool enable_warm_refill{true};
+    std::string supply_telemetry_path;
+    std::string supply_telemetry_run_id{"aeon-chat"};
     bool thinking_mode{false};
     bool until_eos{false};
     bool diagnostic{false};
@@ -42,6 +46,10 @@ void print_usage(const char* executable) {
         << "  --layers <count>         Pipeline layers (default: 43)\n"
         << "  --context-size <count>   KV-cache/context capacity (default: 4096)\n"
         << "  --warm-gib <count>       Warm host allocation in GiB (default: 0)\n"
+        << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
+        << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill for A/B control\n"
+        << "  --supply-telemetry <path> Write phase/source supply telemetry JSONL\n"
+        << "  --run-id <id>            Supply telemetry run identifier\n"
         << "  --swizzled-experts       Use the parallel version-2 swizzled expert artifact\n"
         << "  --diagnostic             Print rendered prompt, IDs, and timings\n"
         << "  --help                   Show this help\n";
@@ -102,6 +110,15 @@ Options parse_options(int argc, char** argv) {
             options.warm_gib = parse_unsigned(
                 require_value(argc, argv, index, "--warm-gib"), "--warm-gib"
             );
+        } else if (argument == "--no-warm-preload") {
+            options.preload_warm_host = false;
+        } else if (argument == "--no-warm-refill") {
+            options.enable_warm_refill = false;
+        } else if (argument == "--supply-telemetry") {
+            options.supply_telemetry_path = require_value(
+                argc, argv, index, "--supply-telemetry");
+        } else if (argument == "--run-id") {
+            options.supply_telemetry_run_id = require_value(argc, argv, index, "--run-id");
         } else if (argument == "--swizzled-experts") {
             options.swizzled_experts = true;
         } else if (argument == "--diagnostic") {
@@ -154,12 +171,17 @@ int main(int argc, char** argv) {
         aeon::core::select_compute_device(true);
         aeon::core::AeonRuntimeConfig runtime_config;
         runtime_config.context_size = options.context_size;
-        runtime_config.host_ram_bytes = options.warm_gib * 1024ULL * 1024ULL * 1024ULL;
-        runtime_config.preload_warm_host = options.warm_gib > 0;
+        runtime_config.warm_host_bytes = options.warm_gib * 1024ULL * 1024ULL * 1024ULL;
+        runtime_config.preload_warm_host = options.preload_warm_host;
+        runtime_config.enable_warm_refill = options.enable_warm_refill;
 
         aeon::core::V4Pipeline pipeline;
         pipeline.init_dynamic_global(
             options.model_dir, runtime_config, options.layers, options.swizzled_experts);
+        if (!options.supply_telemetry_path.empty()) {
+            pipeline.enable_supply_telemetry(
+                options.supply_telemetry_path, options.supply_telemetry_run_id);
+        }
 
         aeon::text::GenerationOptions generation_options;
         if (options.until_eos) {

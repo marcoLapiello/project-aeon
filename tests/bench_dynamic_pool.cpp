@@ -20,8 +20,7 @@ int main() {
     aeon::core::V4Pipeline pipeline;
     aeon::core::AeonRuntimeConfig pipeline_cfg;
     pipeline_cfg.context_size = 4096;
-    pipeline_cfg.host_ram_bytes = 35ULL * 1024ULL * 1024ULL * 1024ULL;
-    pipeline_cfg.preload_warm_host = false;
+    pipeline_cfg.warm_host_bytes = 0;
 
     // Benchmark across 2 active layers (matching Milestone 3 test conditions for direct comparison)
     pipeline.init_dynamic_global(aeon_model_dir, pipeline_cfg, 2);

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <iostream>
 #include <list>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,8 +19,8 @@
 #define CHECK_HIP(cmd) do { \
     hipError_t err = cmd; \
     if (err != hipSuccess) { \
-        std::cerr << "HIP Error: " << hipGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-        exit(1); \
+        throw std::runtime_error(std::string("HIP Error: ") + hipGetErrorString(err) + \
+            " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
     } \
 } while(0)
 #endif

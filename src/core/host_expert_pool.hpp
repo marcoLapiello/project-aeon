@@ -1,12 +1,10 @@
 #pragma once
 
 #include "core/aeon_loader.hpp"
-#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
@@ -22,8 +20,6 @@ public:
     static constexpr uint32_t SEGMENT_SLOTS = 64;
 
     uint32_t num_slots{0};
-    // Compatibility view for callers that only need the first segment.
-    uint8_t* h_pinned_buffer{nullptr};
 
     HostExpertPool() = default;
 
@@ -84,6 +80,8 @@ public:
                     }
                     segment.base = static_cast<uint8_t*>(ptr);
                     segment.uses_hip_host_malloc = false;
+                    segment.uses_hip_host_register =
+                        hipHostRegister(segment.base, segment_bytes, hipHostRegisterPortable) == hipSuccess;
                 } else {
                     segment.uses_hip_host_malloc = true;
                 }
@@ -94,7 +92,6 @@ public:
             throw;
         }
 
-        h_pinned_buffer = segments_.front().base;
     }
 
     void free() {
@@ -103,11 +100,13 @@ public:
             if (segment.uses_hip_host_malloc) {
                 (void)hipHostFree(segment.base);
             } else {
+                if (segment.uses_hip_host_register) {
+                    (void)hipHostUnregister(segment.base);
+                }
                 std::free(segment.base);
             }
         }
         segments_.clear();
-        h_pinned_buffer = nullptr;
         num_slots = 0;
     }
 
@@ -139,33 +138,26 @@ public:
         if (slot_idx >= num_slots || segment_idx >= segments_.size()) {
             return false;
         }
-        return segments_[segment_idx].uses_hip_host_malloc;
+         return segments_[segment_idx].uses_hip_host_malloc ||
+             segments_[segment_idx].uses_hip_host_register;
     }
 
-    // Sub-tensor pointers within a host slot
-    const uint32_t* get_w1_packed(uint32_t slot_idx) const {
-        return reinterpret_cast<const uint32_t*>(get_expert_slot_ptr(slot_idx) + AEON_W1_PACKED_OFFSET);
-    }
-    const half* get_w1_scale(uint32_t slot_idx) const {
-        return reinterpret_cast<const half*>(get_expert_slot_ptr(slot_idx) + AEON_W1_SCALE_OFFSET);
-    }
-    const uint32_t* get_w2_packed(uint32_t slot_idx) const {
-        return reinterpret_cast<const uint32_t*>(get_expert_slot_ptr(slot_idx) + AEON_W2_PACKED_OFFSET);
-    }
-    const half* get_w2_scale(uint32_t slot_idx) const {
-        return reinterpret_cast<const half*>(get_expert_slot_ptr(slot_idx) + AEON_W2_SCALE_OFFSET);
-    }
-    const uint32_t* get_w3_packed(uint32_t slot_idx) const {
-        return reinterpret_cast<const uint32_t*>(get_expert_slot_ptr(slot_idx) + AEON_W3_PACKED_OFFSET);
-    }
-    const half* get_w3_scale(uint32_t slot_idx) const {
-        return reinterpret_cast<const half*>(get_expert_slot_ptr(slot_idx) + AEON_W3_SCALE_OFFSET);
+    uint32_t pinned_slot_count() const {
+        uint32_t count = 0;
+        for (const auto& segment : segments_) {
+            if (segment.uses_hip_host_malloc || segment.uses_hip_host_register) {
+                count += segment.slot_count;
+            }
+        }
+        return count;
     }
 
-    // Load expert payload from disk/source into host slot
-    void copy_from(uint32_t slot_idx, const uint8_t* src_payload) {
-        uint8_t* dst = get_expert_slot_ptr(slot_idx);
-        std::memcpy(dst, src_payload, AEON_EXPERT_BYTES);
+    uint32_t unpinned_slot_count() const {
+        return num_slots - pinned_slot_count();
+    }
+
+    size_t allocated_bytes() const {
+        return static_cast<size_t>(num_slots) * AEON_EXPERT_BYTES;
     }
 
 private:
@@ -173,17 +165,16 @@ private:
         uint8_t* base{nullptr};
         uint32_t slot_count{0};
         bool uses_hip_host_malloc{false};
+        bool uses_hip_host_register{false};
     };
 
     std::vector<Segment> segments_;
 
     void move_from(HostExpertPool&& other) {
         num_slots = other.num_slots;
-        h_pinned_buffer = other.h_pinned_buffer;
         segments_ = std::move(other.segments_);
 
         other.num_slots = 0;
-        other.h_pinned_buffer = nullptr;
         other.segments_.clear();
     }
 };

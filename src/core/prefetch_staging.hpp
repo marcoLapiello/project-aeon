@@ -3,19 +3,21 @@
 #include "core/aeon_loader.hpp"
 #include <hip/hip_runtime.h>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #ifndef CHECK_HIP
 #define CHECK_HIP(cmd) do { \
     hipError_t err = cmd; \
     if (err != hipSuccess) { \
-        std::cerr << "HIP Error: " << hipGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-        exit(1); \
+        throw std::runtime_error(std::string("HIP Error: ") + hipGetErrorString(err) + \
+            " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
     } \
 } while(0)
 #endif
@@ -85,6 +87,8 @@ public:
                                          std::to_string(total_bytes / (1024 * 1024)) + " MB of pinned staging memory!");
             }
             h_pinned_base = static_cast<uint8_t*>(ptr);
+            uses_hip_host_register_ =
+                hipHostRegister(h_pinned_base, total_bytes, hipHostRegisterPortable) == hipSuccess;
         } else {
             uses_hip_host_malloc_ = true;
         }
@@ -93,6 +97,7 @@ public:
         for (uint32_t i = 0; i < TOTAL_STAGING_SLOTS; ++i) {
             CHECK_HIP(hipEventCreateWithFlags(&events[i], hipEventDisableTiming));
             slot_states[i] = SlotState::AVAILABLE;
+            available_since_[i] = std::chrono::steady_clock::now();
         }
 
         is_allocated_ = true;
@@ -110,12 +115,17 @@ public:
                 if (uses_hip_host_malloc_) {
                     (void)hipHostFree(h_pinned_base);
                 } else {
+                    if (uses_hip_host_register_) {
+                        (void)hipHostUnregister(h_pinned_base);
+                    }
                     std::free(h_pinned_base);
                 }
                 h_pinned_base = nullptr;
             }
             uses_hip_host_malloc_ = false;
+            uses_hip_host_register_ = false;
             slot_states.fill(SlotState::AVAILABLE);
+            available_since_.fill(std::chrono::steady_clock::now());
             is_allocated_ = false;
         }
     }
@@ -139,12 +149,43 @@ public:
         transition(slot_idx, SlotState::AVAILABLE, SlotState::GPU_TRANSFER_PENDING);
     }
 
+    bool try_begin_direct_transfer(uint32_t& slot_idx) {
+        if (!is_pinned()) return false;
+        for (uint32_t candidate = 0; candidate < TOTAL_STAGING_SLOTS; ++candidate) {
+            if (slot_states[candidate] == SlotState::AVAILABLE) {
+                begin_direct_transfer(candidate);
+                slot_idx = candidate;
+                return true;
+            }
+        }
+        return false;
+    }
+
     void begin_gpu_transfer(uint32_t slot_idx) {
         transition(slot_idx, SlotState::IO_COMPLETE, SlotState::GPU_TRANSFER_PENDING);
     }
 
     void release_after_gpu_transfer(uint32_t slot_idx) {
         transition(slot_idx, SlotState::GPU_TRANSFER_PENDING, SlotState::AVAILABLE);
+        available_since_[slot_idx] = std::chrono::steady_clock::now();
+    }
+
+    void release_after_failure(uint32_t slot_idx) {
+        validate_slot(slot_idx);
+        slot_states[slot_idx] = SlotState::AVAILABLE;
+        available_since_[slot_idx] = std::chrono::steady_clock::now();
+    }
+
+    uint64_t take_reuse_delay_ns(uint32_t slot_idx) {
+        validate_slot(slot_idx);
+        const auto now = std::chrono::steady_clock::now();
+        if (available_since_[slot_idx].time_since_epoch().count() == 0) return 0;
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now - available_since_[slot_idx]).count());
+    }
+
+    bool is_pinned() const {
+        return uses_hip_host_malloc_ || uses_hip_host_register_;
     }
 
     // Direct pointer to contiguous 14.15 MB staging slot
@@ -175,6 +216,8 @@ public:
 
 private:
     bool uses_hip_host_malloc_{false};
+    bool uses_hip_host_register_{false};
+    std::array<std::chrono::steady_clock::time_point, TOTAL_STAGING_SLOTS> available_since_{};
 
     void validate_slot(uint32_t slot_idx) const {
         if (slot_idx >= TOTAL_STAGING_SLOTS) {
@@ -194,15 +237,19 @@ private:
         h_pinned_base = other.h_pinned_base;
         is_allocated_ = other.is_allocated_;
         uses_hip_host_malloc_ = other.uses_hip_host_malloc_;
+        uses_hip_host_register_ = other.uses_hip_host_register_;
         for (uint32_t i = 0; i < TOTAL_STAGING_SLOTS; ++i) {
             events[i] = other.events[i];
             slot_states[i] = other.slot_states[i];
+            available_since_[i] = other.available_since_[i];
             other.events[i] = nullptr;
         }
         other.h_pinned_base = nullptr;
         other.uses_hip_host_malloc_ = false;
+        other.uses_hip_host_register_ = false;
         other.is_allocated_ = false;
         other.slot_states.fill(SlotState::AVAILABLE);
+        other.available_since_.fill(std::chrono::steady_clock::time_point{});
     }
 };
 
