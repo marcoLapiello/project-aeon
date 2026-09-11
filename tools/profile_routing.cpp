@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
             std::filesystem::path(options.model_dir) / "config.json"
         );
         run_config.model_index_hash = aeon::core::routing_profile_detail::fnv1a_file(
-            std::filesystem::path(options.model_dir) / "model_experts.index"
+            std::filesystem::path(options.model_dir) / "model_experts_swizzled.index"
         );
 
         aeon::core::RoutingProfileStore store(options.output_dir, run_config);

@@ -383,12 +383,15 @@ Before interpreting any answer, retain and expand focused tests for:
 - context-limit behavior;
 - deterministic greedy generation loop.
 
-Use the existing native model tests for transformer and kernel correctness:
+Use the existing native model tests for transformer and swizzled-kernel correctness:
 
-- `test_w4a16_wmma`;
+- `test_w4a16_swizzle`;
+- `test_w4a16_swizzled_gemv`;
+- `test_w4a16_swizzled_dual_gemv`;
+- `test_aeon_moe_fused_w13`;
+- `test_aeon_moe_fused_w2`;
 - `test_v4_attention`;
 - `test_v4_block`;
-- `test_v4_moe_layer`;
 - `test_aeon_pipeline`;
 - `test_hot_warm_cold_pipeline`.
 

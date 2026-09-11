@@ -8,6 +8,7 @@ int main() {
 
     aeon::core::AeonModelLoader loader;
     loader.open_model(model_dir);
+    assert(loader.expert_format_version() == 2);
 
     std::cout << "Dense tensors loaded: " << loader.total_dense_tensors() << std::endl;
     assert(loader.total_dense_tensors() == 1271);
@@ -25,6 +26,6 @@ int main() {
     std::cout << "Expert pointers valid. num_layers: " << loader.num_layers()
               << ", experts_per_layer: " << loader.experts_per_layer() << std::endl;
 
-    std::cout << "AeonModelLoader smoke check PASSED!" << std::endl;
+    std::cout << "Swizzled AeonModelLoader smoke check PASSED!" << std::endl;
     return 0;
 }

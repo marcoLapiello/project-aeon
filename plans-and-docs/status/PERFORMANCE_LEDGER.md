@@ -94,7 +94,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: projection `140.34 us` (`1.91 TFLOP/s`); RMSNorm error `<8.4e-4`; Sinkhorn error `<5.96e-8`; router top-6 match `100%`; attention `41.91 us` for 16 tokens (`2.62 us/token`); block `1.80 ms/token`, error `0.0033`
 - **Correctness / service**: all named CPU-reference and assignment checks passed their recorded thresholds
 - **Conclusion / next gate**: Mathematical primitives passed; full-model parity remains a separate gate
-- **Evidence**: `test_w4a16_wmma.cpp`, `test_swiglu_clamp.cpp`, `test_hc_sinkhorn.cpp`, `test_moe_router.cpp`, `test_v4_attention.cpp`, `test_v4_block.cpp`
+- **Evidence**: `test_w4a16_swizzle.cpp`, `test_w4a16_swizzled_gemv.cpp`, `test_swiglu_clamp.cpp`, `test_hc_sinkhorn.cpp`, `test_moe_router.cpp`, `test_v4_attention.cpp`, `test_v4_block.cpp`
 
 ### M3: Autoregressive Pipeline Baseline (Phase 1 Spike 6)
 - **Run**: `2026-09-07`; commit `5e27dd9`; DeepSeek-V4 INT4-W4A16, Safetensors
@@ -275,7 +275,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: W1/W3 `138.8 -> 13.9 us` (`10.0x`, `340 GB/s`); W2 `13.9 us` (`338 GB/s`); Warm off `4.36 -> 5.25 tok/s` (`+20.4%`); Warm on `5.11 -> 5.79 tok/s` (`+13.3%`), TTFT `2,755 -> 1,835 ms`
 - **Correctness / service**: kernel max diff `0` versus CPU FP32; regression suite and golden token `295` passed; output `[237, 201, 1778, ...]` was deterministic and tier-independent, but differs from earlier near-tie argmax output
 - **Conclusion / next gate**: Routed-expert GEMV time fell from approximately `108 ms` to `11 ms/token`, exposing the just-in-time miss path as the next bottleneck
-- **Evidence**: [w4a16_gemm.hpp](../../src/kernel/w4a16_gemm.hpp), `test_w4a16_wmma`, linked review
+- **Evidence**: [aeon_w4a16_swizzled_gemv.hpp](../../src/kernel/aeon_w4a16_swizzled_gemv.hpp), `test_w4a16_swizzled_gemv`, linked review; the former comparison kernel was retired after the v2 promotion.
 
 ### M19: Contiguous Per-Slot VRAM Layout & DMA Stream Split (Expert Review Step 2)
 - **Run**: `2026-09-08`; [review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md); DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
@@ -286,7 +286,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: Warm `35 GiB` `5.79 -> 5.88 tok/s` (`172.6 -> 170.0 ms/token`), TTFT `1,835 -> 1,803 ms`; Warm off `5.25 -> 5.39 tok/s` (`190.4 -> 185.6 ms/token`)
 - **Correctness / service**: one contiguous `13.5 MiB` region per slot and one H2D copy replaced six; separate cold SDMA stream; regression group `5/5` passed; output matched M18
 - **Conclusion / next gate**: Relayout and stream split delivered `+1.5-2.7%`; synchronous cold-read exposure remained dominant
-- **Evidence**: `UnifiedVRAMExpertPool`, `test_dynamic_expert_pool`, `test_aeon_pipeline`, `test_hot_warm_cold_pipeline`, `test_async_prefetch`, `test_w4a16_wmma`
+- **Evidence**: `UnifiedVRAMExpertPool`, `test_dynamic_expert_pool`, `test_aeon_pipeline`, `test_hot_warm_cold_pipeline`, `test_async_prefetch`, `test_w4a16_swizzled_gemv`
 
 ### M20: Per-Layer CPU-Stall Removal & GPU Argmax (Expert Review Step 5)
 - **Run**: `2026-09-08`; commit `HEAD`; [review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md); DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
@@ -330,7 +330,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: W1/W3 `12.822 -> 11.152 us` (`1.150x`, `368 -> 423 GB/s`); W2 `13.077 -> 10.926 us` (`1.197x`, `361 -> 432 GB/s`); dual W1/W3 `29.012 -> 15.816 us` (`1.834x`); fused W1/W3 `147.557 -> 39.775 us` (`3.710x`); fused W2 `107.486 -> 28.652 us` (`3.751x`)
 - **Correctness / service**: individual and dual-launch max diff `0.000`; fused W1/W3 `0.016`, fused W2 `0.002`; launch trace reduced fused paths to 101 kernels; GL2C counters unsupported, so no counter claim
 - **Conclusion / next gate**: Isolated kernels improved, but full-model impact requires a controlled Hot/Warm run; the `M=16` WMMA check at `149.234 us` is not a decode comparison
-- **Evidence**: `bench_aeon_moe_fused_w13`, `bench_aeon_moe_fused_w2`, `rocprofv2 --kernel-trace`
+- **Evidence**: `bench_aeon_moe_fused_w13`, `test_aeon_moe_fused_w13`, `test_aeon_moe_fused_w2`, `rocprofv2 --kernel-trace`
 
 ### M24: Activation-Staging A/B Experiment
 - **Run**: `2026-09-10`; target RX 7900 XTX (`gfx1100`)

@@ -7,7 +7,7 @@
 int main() {
     const std::string model_dir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
     aeon::core::AeonModelLoader loader;
-    loader.open_model_swizzled(model_dir);
+    loader.open_model(model_dir);
 
     assert(loader.expert_format_version() == 2);
     assert(loader.num_layers() == 43);

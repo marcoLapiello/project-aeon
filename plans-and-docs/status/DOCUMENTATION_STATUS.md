@@ -34,7 +34,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 | [GPTQ_AEON_PARALLEL_BACKEND_ANALYSIS.md](../analysis/current/GPTQ_AEON_PARALLEL_BACKEND_ANALYSIS.md) | Current analysis | Records the feasibility, shared-versus-specialized boundary, artifact strategy, and performance gates for a parallel GPTQ-Aeon backend. |
 | [VLLM_RDNA3_DEEPSEEK_V4_REFERENCE_ANALYSIS.md](../analysis/current/VLLM_RDNA3_DEEPSEEK_V4_REFERENCE_ANALYSIS.md) | Current reference analysis | Maps the local vLLM gfx1100 GPTQ/W4A16, fused MoE, DeepSeek-V4 prefill, sparse-attention, indexer, and KV-cache sources to Aeon reuse and adaptation decisions. |
 | [EXPERT_KERNELS_REVIEW.md](../analysis/current/EXPERT_KERNELS_REVIEW.md) | Current review | Records the pending kernel-geometry, quant-layout, bottleneck, and interface questions for the next kernel investigation. |
-| [EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md](../analysis/current/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) | Current implementation report | Compares the external Stage 1 proposal with the implemented version-2 path, records measured GPU-side effects, and documents the remaining full-model gate. |
+| [EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md](../analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) | Historical implementation report | Compares the external Stage 1 proposal with the implemented version-2 path and records the measured GPU-side effects that led to the v2-only promotion. |
 
 ## Completed execution records
 
@@ -45,12 +45,13 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 - The [Warm-tier repair plan](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) is complete. Its repaired default reduced median Decode Cold NVMe bytes by 22.9% versus the demotion-free Warm control across five runs per variant, with identical generated IDs and EOS stop behavior. The second-pass corrections remove the optional-demotion CPU synchronization, remove the undocumented layer filter, distinguish drop reasons, include registered host fallback in pinned accounting, and document the content-lazy/eager-capacity boundary; broader cold-tier and host-pressure work remains open.
 - Native tokenizer, DSV4 formatting, EOS-aware generation, and `aeon_chat` are implemented and have passed the simple 43-layer text turn. This is the native milestone, not external model-behavior parity.
 - Routing counting, resumable aggregation, rankings, compact summaries, and profile regeneration are implemented. The existing pilot remains a plumbing artifact until the correctness gate passes.
+- The version-2 swizzled expert path is now the sole native runtime and conversion path. Loader, pipeline, tests, and active tooling no longer expose the retired baseline format or kernels.
 
 ## Open work
 
 1. **Correctness:** compare identical formatted IDs and outputs against a trusted compatible reference; implement and validate compressed/indexed attention for longer-context layers 2-42.
 2. **Cold tier:** characterize cold-cache and steady-state behavior, improve physical `.aeon` placement/extent layout, reduce host-memory pressure, and decide whether further scheduling or CPU fallback work is justified by measurements.
-3. **Stage 1 end-to-end validation:** compare the version-2 swizzled path with the version-1 baseline under controlled Hot/Warm conditions, while preserving the runtime residency invariant and checking broader output parity.
+3. **Swizzled full-model performance:** characterize representative 43-layer version-2 generation under controlled Hot/Warm conditions, collect useful rocprof counters, and tune occupancy/register pressure beyond the isolated kernel measurements.
 4. **Placement study:** collect profile and held-out corpora with the verified text contract, then compare measured placement against dynamic LRU. Do not use the existing pilot for placement decisions.
 5. **Scaling:** Phase 3 multi-GPU pipeline parallelism remains future work.
 

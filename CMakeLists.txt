@@ -128,10 +128,6 @@ add_executable(test_hc_sinkhorn tests/test_hc_sinkhorn.cpp)
 target_link_libraries(test_hc_sinkhorn PRIVATE amdhip64)
 add_test(NAME test_hc_sinkhorn COMMAND test_hc_sinkhorn)
 
-# Regression test: fused INT4-to-FP16 Wave32 WMMA
-add_executable(test_w4a16_wmma tests/test_w4a16_wmma.cpp)
-target_link_libraries(test_w4a16_wmma PRIVATE amdhip64)
-
 # Host-side validation: parallel W4A16 swizzle layout contract
 add_executable(test_w4a16_swizzle tests/test_w4a16_swizzle.cpp)
 target_link_libraries(test_w4a16_swizzle PRIVATE amdhip64)
@@ -162,29 +158,13 @@ target_link_libraries(test_aeon_moe_fused_w2 PRIVATE amdhip64)
 add_test(NAME test_aeon_moe_fused_w2 COMMAND test_aeon_moe_fused_w2)
 set_tests_properties(test_aeon_moe_fused_w2 PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Benchmark: current versus parallel swizzled W4A16 decode GEMV
-add_executable(bench_w4a16_swizzled_gemv tests/bench_w4a16_swizzled_gemv.cpp)
-target_link_libraries(bench_w4a16_swizzled_gemv PRIVATE amdhip64)
-
-# Benchmark: two current W1/W3 launches versus one parallel dual launch
-add_executable(bench_w4a16_swizzled_dual_gemv tests/bench_w4a16_swizzled_dual_gemv.cpp)
-target_link_libraries(bench_w4a16_swizzled_dual_gemv PRIVATE amdhip64)
-
 # Benchmark: six separate routed W1/W3/SwiGLU paths versus one fused dispatch
 add_executable(bench_aeon_moe_fused_w13 tests/bench_aeon_moe_fused_w13.cpp)
 target_link_libraries(bench_aeon_moe_fused_w13 PRIVATE amdhip64)
 
-# Benchmark: six routed W2/accumulation paths versus one fused dispatch
-add_executable(bench_aeon_moe_fused_w2 tests/bench_aeon_moe_fused_w2.cpp)
-target_link_libraries(bench_aeon_moe_fused_w2 PRIVATE amdhip64)
-
 # Regression test: dual-mode MoE router
 add_executable(test_moe_router tests/test_moe_router.cpp)
 target_link_libraries(test_moe_router PRIVATE amdhip64)
-
-# Regression test: DeepSeek-V4 MoE layer forward pass
-add_executable(test_v4_moe_layer tests/test_v4_moe_layer.cpp)
-target_link_libraries(test_v4_moe_layer PRIVATE amdhip64)
 
 # Regression test: sliding-window attention and rotary embeddings
 add_executable(test_v4_attention tests/test_v4_attention.cpp)
@@ -202,7 +182,7 @@ target_link_libraries(test_aeon_loader PRIVATE amdhip64)
 add_executable(test_aeon_swizzled_loader tests/test_aeon_swizzled_loader.cpp)
 target_link_libraries(test_aeon_swizzled_loader PRIVATE amdhip64)
 
-# Silicon smoke test: opt-in swizzled fused-expert pipeline path
+# Silicon smoke test: v2 swizzled fused-expert pipeline path
 add_executable(test_aeon_swizzled_pipeline tests/test_aeon_swizzled_pipeline.cpp)
 target_link_libraries(test_aeon_swizzled_pipeline PRIVATE amdhip64)
 

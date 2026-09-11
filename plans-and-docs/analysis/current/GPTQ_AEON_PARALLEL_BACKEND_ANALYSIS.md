@@ -430,8 +430,7 @@ converter whose current contract is already validated.
 
 ### Stage 0: protect the current baseline
 
-- Keep `model_dense.aeon`, `model_experts.aeon`, and the version-2 swizzled
-  artifact unchanged.
+- Keep `model_dense.aeon` and the version-2 swizzled expert artifact unchanged.
 - Keep current loader and kernel tests as regression tests.
 - Do not make the current `UnifiedVRAMExpertPool` accept multiple layouts by
   guessing from byte counts.

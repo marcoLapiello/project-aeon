@@ -30,7 +30,6 @@ struct Options {
     bool thinking_mode{false};
     bool until_eos{false};
     bool diagnostic{false};
-    bool swizzled_experts{false};
 };
 
 void print_usage(const char* executable) {
@@ -50,7 +49,6 @@ void print_usage(const char* executable) {
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill for A/B control\n"
         << "  --supply-telemetry <path> Write phase/source supply telemetry JSONL\n"
         << "  --run-id <id>            Supply telemetry run identifier\n"
-        << "  --swizzled-experts       Use the parallel version-2 swizzled expert artifact\n"
         << "  --diagnostic             Print rendered prompt, IDs, and timings\n"
         << "  --help                   Show this help\n";
 }
@@ -119,8 +117,6 @@ Options parse_options(int argc, char** argv) {
                 argc, argv, index, "--supply-telemetry");
         } else if (argument == "--run-id") {
             options.supply_telemetry_run_id = require_value(argc, argv, index, "--run-id");
-        } else if (argument == "--swizzled-experts") {
-            options.swizzled_experts = true;
         } else if (argument == "--diagnostic") {
             options.diagnostic = true;
         } else {
@@ -177,7 +173,7 @@ int main(int argc, char** argv) {
 
         aeon::core::V4Pipeline pipeline;
         pipeline.init_dynamic_global(
-            options.model_dir, runtime_config, options.layers, options.swizzled_experts);
+            options.model_dir, runtime_config, options.layers);
         if (!options.supply_telemetry_path.empty()) {
             pipeline.enable_supply_telemetry(
                 options.supply_telemetry_path, options.supply_telemetry_run_id);

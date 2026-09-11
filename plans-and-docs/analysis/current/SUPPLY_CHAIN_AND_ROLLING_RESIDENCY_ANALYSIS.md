@@ -495,7 +495,7 @@ unbounded staging growth, or pathological prefetch waste.
 
 Compare cold-start and steady-state runs using the same full-model inputs:
 
-- version-1 baseline and opt-in Stage 1 path;
+- the version-2 swizzled production path;
 - Warm disabled, bounded Warm, and full Warm profiles;
 - Prefill and Decode separately;
 - short and diverse prompts;

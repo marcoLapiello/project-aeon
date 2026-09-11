@@ -119,7 +119,7 @@ The current tests establish useful silicon facts:
 
 The tests do not yet establish end-to-end numerical parity with the selected
 DeepSeek-V4 reference implementation. The CPU reference in
-[test_w4a16_wmma.cpp](../../../tests/test_w4a16_wmma.cpp) repeats the same
+[test_w4a16_swizzled_gemv.cpp](../../../tests/test_w4a16_swizzled_gemv.cpp) repeats the same
 nibble and scale assumptions as the GPU kernel. That proves GPU-versus-local
 decoder agreement, not checkpoint-versus-reference-model agreement.
 

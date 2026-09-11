@@ -66,9 +66,12 @@ as regression tests, even though they are not runtime binaries:
 - `tests/test_config_parser.cpp`
 - `tests/test_swiglu_clamp.cpp`
 - `tests/test_hc_sinkhorn.cpp`
-- `tests/test_w4a16_wmma.cpp`
+- `tests/test_w4a16_swizzle.cpp`
+- `tests/test_w4a16_swizzled_gemv.cpp`
+- `tests/test_w4a16_swizzled_dual_gemv.cpp`
+- `tests/test_aeon_moe_fused_w13.cpp`
+- `tests/test_aeon_moe_fused_w2.cpp`
 - `tests/test_moe_router.cpp`
-- `tests/test_v4_moe_layer.cpp`
 - `tests/test_v4_attention.cpp`
 - `tests/test_v4_block.cpp`
 
@@ -95,7 +98,8 @@ validation set, rather than deleted casually.
 ## Offline scripts
 
 - `scripts/convert_safetensors_to_aeon.py` is the current production model preparation
-  tool. It creates `model_dense.aeon`, `model_experts.aeon`, and the expert index.
+  tool. It creates `model_dense.aeon`, `model_experts_swizzled.aeon`, and the version-2
+  swizzled expert index.
 - `scripts/prepare_rdna.py` is an older synthetic formatter for the original toy
   `AEON` layout. It does not create the current `AEON_DENSE`/`AEON_EXPERTS` format
   and is retained only for historical diagnostics.

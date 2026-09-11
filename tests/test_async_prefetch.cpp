@@ -3,10 +3,16 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <string>
 #include <vector>
 #include <cassert>
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 1) {
+        std::cerr << "Usage: " << argv[0] << std::endl;
+        return 2;
+    }
+
     std::cout << "================================================================================" << std::endl;
     std::cout << "  Project Aeon: Dual-Stream Asynchronous SDMA Overlap Benchmark on Silicon      " << std::endl;
     std::cout << "  Model: DeepSeek-V4-Flash-0731 (INT4-W4A16, 2 Layers, Native .aeon format)     " << std::endl;
@@ -19,9 +25,11 @@ int main() {
 
     // 1. Initialize pipeline with small VRAM capacity (12 slots) to induce constant cache misses
     // and stress the asynchronous SDMA prefetching engine
-    std::cout << "\n[Setup] Initializing pipeline with constrained VRAM pool (12 slots) to stress misses..." << std::endl;
+    std::cout << "\n[Setup] Initializing version-2 swizzled pipeline with constrained VRAM pool"
+              << " (12 slots) to stress misses..."
+              << std::endl;
     aeon::core::V4Pipeline pipeline;
-    pipeline.init_aeon(aeon_model_dir, 2, 12, 512);
+    pipeline.init_aeon(aeon_model_dir, 2, 12, 512, true);
 
     // Warmup step
     std::cout << "\n[Step 1] Running warmup forward step..." << std::endl;

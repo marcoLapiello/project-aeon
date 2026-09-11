@@ -19,7 +19,6 @@
 #include "kernel/moe_router.hpp"
 #include "kernel/v4_attention.hpp"
 #include "kernel/v4_pipeline_ops.hpp"
-#include "kernel/w4a16_gemm.hpp"
 #include "text/text_generation.hpp"
 
 #include <hip/hip_fp16.h>
@@ -55,6 +54,12 @@ namespace aeon::core {
 // Complete DeepSeek-V4 Autoregressive Multi-Layer Pipeline Engine
 class V4Pipeline {
 public:
+    struct ExpertTimingPhase {
+        uint64_t routed_layer_count{0};
+        double routed_section_ms{0.0};
+        double expert_compute_ms{0.0};
+    };
+
     AeonModelLoader aeon_loader;
     std::vector<std::unique_ptr<V4Layer>> layers;
     PipelineScratchBuffers scratch;
@@ -75,7 +80,6 @@ public:
 
     uint32_t num_layers_{0};
     uint32_t current_seq_len_{0};
-    bool swizzled_moe_enabled_{false};
 
     // Unified VRAM expert pool, warm host pool, and expert registry.
     std::unique_ptr<UnifiedVRAMExpertPool> unified_vram_pool_;
@@ -88,6 +92,12 @@ public:
     MemoryBudgetReport budget_report_;
     std::optional<RoutingCounter> routing_counter_;
     SupplyTelemetry supply_telemetry_;
+    bool expert_timing_enabled_{false};
+    std::array<ExpertTimingPhase, 2> expert_timing_{};
+    std::vector<hipEvent_t> routed_section_start_events_;
+    std::vector<hipEvent_t> routed_section_stop_events_;
+    std::vector<hipEvent_t> expert_compute_start_events_;
+    std::vector<hipEvent_t> expert_compute_stop_events_;
 
     struct PendingRegistryTransfer {
         uint64_t operation_id{0};
@@ -154,6 +164,38 @@ public:
         supply_telemetry_.flush();
     }
 
+    void enable_expert_timing() {
+        free_expert_timing_events();
+        routed_section_start_events_.resize(num_layers_, nullptr);
+        routed_section_stop_events_.resize(num_layers_, nullptr);
+        const size_t expert_event_count = num_layers_;
+        expert_compute_start_events_.resize(expert_event_count, nullptr);
+        expert_compute_stop_events_.resize(expert_event_count, nullptr);
+        try {
+            for (uint32_t layer = 0; layer < num_layers_; ++layer) {
+                CHECK_HIP(hipEventCreate(&routed_section_start_events_[layer]));
+                CHECK_HIP(hipEventCreate(&routed_section_stop_events_[layer]));
+            }
+            for (size_t index = 0; index < expert_event_count; ++index) {
+                CHECK_HIP(hipEventCreate(&expert_compute_start_events_[index]));
+                CHECK_HIP(hipEventCreate(&expert_compute_stop_events_[index]));
+            }
+        } catch (...) {
+            free_expert_timing_events();
+            throw;
+        }
+        expert_timing_enabled_ = true;
+        reset_expert_timing();
+    }
+
+    void reset_expert_timing() {
+        expert_timing_ = {};
+    }
+
+    const ExpertTimingPhase& expert_timing(RoutingPhase phase) const {
+        return expert_timing_[static_cast<size_t>(phase)];
+    }
+
     uint32_t context_capacity() const {
         return layers.empty() ? 0 : layers.front()->max_seq_len_;
     }
@@ -164,23 +206,17 @@ public:
         uint32_t num_layers = 2,
         uint32_t unified_vram_slots = 0,
         uint32_t max_seq_len = 4096,
-        bool enable_direct_io = true,
-        bool use_swizzled_experts = false
+        bool enable_direct_io = true
     ) {
         num_layers_ = num_layers;
         current_seq_len_ = 0;
-        swizzled_moe_enabled_ = use_swizzled_experts;
 
         // 1. Initialize streams
         initialize_streams();
 
         // 2. Open Aeon Model via Zero-Copy Mmap
         std::cout << "[Pipeline] Opening native Aeon model from " << aeon_model_dir << "..." << std::endl;
-        if (swizzled_moe_enabled_) {
-            aeon_loader.open_model_swizzled(aeon_model_dir);
-        } else {
-            aeon_loader.open_model(aeon_model_dir);
-        }
+        aeon_loader.open_model(aeon_model_dir);
         if (enable_direct_io) {
             direct_io_reader_ = std::make_unique<aeon::io::DirectIOReader>(64);
         }
@@ -259,8 +295,7 @@ public:
     void init_dynamic_global(
         const std::string& aeon_model_dir,
         const AeonRuntimeConfig& runtime_cfg,
-        uint32_t num_layers = 2,
-        bool use_swizzled_experts = false
+        uint32_t num_layers = 2
     ) {
         std::cout << "================================================================================" << std::endl;
         std::cout << "      Project Aeon — Dynamic VRAM Budget & Global Expert Pool Pipeline          " << std::endl;
@@ -268,7 +303,6 @@ public:
 
         num_layers_ = num_layers;
         current_seq_len_ = 0;
-        swizzled_moe_enabled_ = use_swizzled_experts;
         demotion_queue_capacity_ = runtime_cfg.enable_warm_refill
             ? DEMOTION_QUEUE_CAPACITY
             : 0;
@@ -278,11 +312,7 @@ public:
 
         // 2. Open Model Containers
         std::cout << "[Pipeline] Opening native .aeon model from " << aeon_model_dir << "..." << std::endl;
-        if (swizzled_moe_enabled_) {
-            aeon_loader.open_model_swizzled(aeon_model_dir);
-        } else {
-            aeon_loader.open_model(aeon_model_dir);
-        }
+        aeon_loader.open_model(aeon_model_dir);
         direct_io_reader_ = std::make_unique<aeon::io::DirectIOReader>(64);
         std::cout << "  > Dense tensors indexed: " << aeon_loader.total_dense_tensors() << std::endl;
 
@@ -1104,105 +1134,69 @@ public:
                 pending_transfers[k].staging_idx = active_prefetch.staging_indices[k];
             }
 
-            if (!swizzled_moe_enabled_) {
-            // 3. 6 Routed Experts (INT4-W4A16 WMMA GEMM)
-            for (int k = 0; k < 6; ++k) {
-                float expert_weight = h_topk_weights[k];
-                int32_t slot = pending_transfers[k].vram_slot;
+            if (expert_timing_enabled_) {
+                CHECK_HIP(hipEventRecord(
+                    routed_section_start_events_[l], compute_stream));
+            }
 
-                // If this expert was transferred asynchronously on sdma_stream,
-                // wait for transfer to finish before executing expert GEMM
+            // All routed experts use the wave-oriented layout and fused dispatches.
+            kernel::SwizzledW13ExpertPtrs fused_w13{};
+            kernel::SwizzledW2ExpertPtrs fused_w2{};
+            for (int k = 0; k < 6; ++k) {
+                const int32_t slot = pending_transfers[k].vram_slot;
                 if (pending_transfers[k].is_prefetched && prefetch_staging_) {
                     mark_gpu_readiness_wait_start(active_prefetch.operation_ids[k]);
-                    CHECK_HIP(hipStreamWaitEvent(compute_stream, prefetch_staging_->events[pending_transfers[k].staging_idx], 0));
+                    CHECK_HIP(hipStreamWaitEvent(
+                        compute_stream,
+                        prefetch_staging_->events[pending_transfers[k].staging_idx], 0));
                 }
 
-                const uint32_t* d_w1_p = unified_vram_pool_->get_w1_packed(slot);
-                const half*     d_w1_s = unified_vram_pool_->get_w1_scale(slot);
-                const uint32_t* d_w2_p = unified_vram_pool_->get_w2_packed(slot);
-                const half*     d_w2_s = unified_vram_pool_->get_w2_scale(slot);
-                const uint32_t* d_w3_p = unified_vram_pool_->get_w3_packed(slot);
-                const half*     d_w3_s = unified_vram_pool_->get_w3_scale(slot);
-
-                // Update layer statistics from central expert registry
-                layer.cache_hits = expert_registry_->hits_hot;
-                layer.cache_misses = expert_registry_->hits_warm + expert_registry_->misses_cold;
-
-                // w1 & w3 via fused W4A16 (M=1 decode GEMV path; writes row 0)
-                kernel::dispatch_w4a16_gemm(
-                    scratch.d_ffn_norm_act, d_w1_p, d_w1_s,
-                    scratch.d_expert_gate, 1, INTER_DIM, H, compute_stream
-                );
-                kernel::dispatch_w4a16_gemm(
-                    scratch.d_ffn_norm_act, d_w3_p, d_w3_s,
-                    scratch.d_expert_up, 1, INTER_DIM, H, compute_stream
-                );
-
-                // SwiGLU clamp
-                int m_swiglu_blocks = (M_PAD * INTER_DIM + swiglu_threads - 1) / swiglu_threads;
-                hipLaunchKernelGGL(
-                    kernel::v4_pipeline_swiglu_clamp_kernel,
-                    dim3(m_swiglu_blocks), dim3(swiglu_threads), 0, compute_stream,
-                    scratch.d_expert_gate, scratch.d_expert_up, scratch.d_expert_swiglu, M_PAD * INTER_DIM, 10.0f
-                );
-
-                // w2
-                kernel::dispatch_w4a16_gemm(
-                    scratch.d_expert_swiglu, d_w2_p, d_w2_s,
-                    scratch.d_expert_down, 1, H, INTER_DIM, compute_stream
-                );
-
-                // Accumulate row 0
-                hipLaunchKernelGGL(
-                    kernel::v4_pipeline_accumulate_expert_kernel,
-                    dim3((H + 255) / 256), dim3(256), 0, compute_stream,
-                    scratch.d_moe_accum, scratch.d_expert_down, expert_weight, H
-                );
+                fused_w13.w1[k] = reinterpret_cast<const uint4*>(
+                    unified_vram_pool_->get_w1_packed(slot));
+                fused_w13.s1[k] = unified_vram_pool_->get_w1_scale(slot);
+                fused_w13.w3[k] = reinterpret_cast<const uint4*>(
+                    unified_vram_pool_->get_w3_packed(slot));
+                fused_w13.s3[k] = unified_vram_pool_->get_w3_scale(slot);
+                fused_w2.w2[k] = reinterpret_cast<const uint4*>(
+                    unified_vram_pool_->get_w2_packed(slot));
+                fused_w2.s2[k] = unified_vram_pool_->get_w2_scale(slot);
             }
-            } else {
-                // Parallel swizzled path: all six routed experts are represented
-                // in two pointer bundles and consumed by two fused dispatches.
-                kernel::SwizzledW13ExpertPtrs fused_w13{};
-                kernel::SwizzledW2ExpertPtrs fused_w2{};
-                for (int k = 0; k < 6; ++k) {
-                    const int32_t slot = pending_transfers[k].vram_slot;
-                    if (pending_transfers[k].is_prefetched && prefetch_staging_) {
-                        mark_gpu_readiness_wait_start(active_prefetch.operation_ids[k]);
-                        CHECK_HIP(hipStreamWaitEvent(
-                            compute_stream,
-                            prefetch_staging_->events[pending_transfers[k].staging_idx], 0));
-                    }
 
-                    fused_w13.w1[k] = reinterpret_cast<const uint4*>(
-                        unified_vram_pool_->get_w1_packed(slot));
-                    fused_w13.s1[k] = unified_vram_pool_->get_w1_scale(slot);
-                    fused_w13.w3[k] = reinterpret_cast<const uint4*>(
-                        unified_vram_pool_->get_w3_packed(slot));
-                    fused_w13.s3[k] = unified_vram_pool_->get_w3_scale(slot);
-                    fused_w2.w2[k] = reinterpret_cast<const uint4*>(
-                        unified_vram_pool_->get_w2_packed(slot));
-                    fused_w2.s2[k] = unified_vram_pool_->get_w2_scale(slot);
-                }
+            if (expert_timing_enabled_) {
+                const size_t event_index = static_cast<size_t>(l);
+                CHECK_HIP(hipEventRecord(
+                    expert_compute_start_events_[event_index], compute_stream));
+            }
 
-                layer.cache_hits = expert_registry_->hits_hot;
-                layer.cache_misses = expert_registry_->hits_warm + expert_registry_->misses_cold;
+            layer.cache_hits = expert_registry_->hits_hot;
+            layer.cache_misses = expert_registry_->hits_warm + expert_registry_->misses_cold;
 
-                kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
-                    scratch.d_ffn_norm_act,
-                    fused_w13,
-                    scratch.d_swizzled_expert_hidden,
-                    scratch.d_swizzled_moe_accum_f32,
-                    H,
-                    6, INTER_DIM, H, 10.0f, compute_stream);
-                kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
-                    scratch.d_swizzled_expert_hidden,
-                    fused_w2,
-                    scratch.d_topk_weights,
-                    scratch.d_moe_accum,
-                    scratch.d_swizzled_moe_accum_f32,
-                    scratch.d_moe_accum,
-                    scratch.d_swizzled_counters,
-                    6, H, INTER_DIM, compute_stream);
+            kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
+                scratch.d_ffn_norm_act,
+                fused_w13,
+                scratch.d_swizzled_expert_hidden,
+                scratch.d_swizzled_moe_accum_f32,
+                H,
+                6, INTER_DIM, H, 10.0f, compute_stream);
+            kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
+                scratch.d_swizzled_expert_hidden,
+                fused_w2,
+                scratch.d_topk_weights,
+                scratch.d_moe_accum,
+                scratch.d_swizzled_moe_accum_f32,
+                scratch.d_moe_accum,
+                scratch.d_swizzled_counters,
+                6, H, INTER_DIM, compute_stream);
+
+            if (expert_timing_enabled_) {
+                const size_t event_index = static_cast<size_t>(l);
+                CHECK_HIP(hipEventRecord(
+                    expert_compute_stop_events_[event_index], compute_stream));
+            }
+
+            if (expert_timing_enabled_) {
+                CHECK_HIP(hipEventRecord(
+                    routed_section_stop_events_[l], compute_stream));
             }
 
             for (int k = 0; k < 6; ++k) {
@@ -1227,7 +1221,6 @@ public:
             ));
             kernel::v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_in_half, scratch.d_res_in, HC_DIM);
         }
-
         // 3. HC Head Reduction on Final Residual
         hipLaunchKernelGGL(
             kernel::hc_head_wave32_kernel,
@@ -1277,6 +1270,9 @@ public:
             supply_telemetry_.record_decode_token();
         }
         reap_registry_transfers();
+        if (expert_timing_enabled_) {
+            collect_expert_timing(phase);
+        }
         uint32_t best_tok = static_cast<uint32_t>(h_argmax);
 
         current_seq_len_ = pos + 1;
@@ -1407,6 +1403,7 @@ public:
         if (d_final_norm) { (void)hipFree(d_final_norm); d_final_norm = nullptr; }
 
         scratch.free();
+        free_expert_timing_events();
         routing_counter_.reset();
         for (auto& l : layers) {
             if (l) l->free();
@@ -1424,6 +1421,48 @@ public:
     }
 
 private:
+    void free_expert_timing_events() {
+        for (auto event : routed_section_start_events_) {
+            if (event != nullptr) (void)hipEventDestroy(event);
+        }
+        for (auto event : routed_section_stop_events_) {
+            if (event != nullptr) (void)hipEventDestroy(event);
+        }
+        for (auto event : expert_compute_start_events_) {
+            if (event != nullptr) (void)hipEventDestroy(event);
+        }
+        for (auto event : expert_compute_stop_events_) {
+            if (event != nullptr) (void)hipEventDestroy(event);
+        }
+        routed_section_start_events_.clear();
+        routed_section_stop_events_.clear();
+        expert_compute_start_events_.clear();
+        expert_compute_stop_events_.clear();
+        expert_timing_enabled_ = false;
+    }
+
+    void collect_expert_timing(RoutingPhase phase) {
+        auto& stats = expert_timing_[static_cast<size_t>(phase)];
+        for (uint32_t layer = 0; layer < num_layers_; ++layer) {
+            float routed_section_ms = 0.0f;
+            CHECK_HIP(hipEventElapsedTime(
+                &routed_section_ms,
+                routed_section_start_events_[layer],
+                routed_section_stop_events_[layer]));
+
+            float expert_compute_ms = 0.0f;
+            const size_t event_index = static_cast<size_t>(layer);
+            CHECK_HIP(hipEventElapsedTime(
+                &expert_compute_ms,
+                expert_compute_start_events_[event_index],
+                expert_compute_stop_events_[event_index]));
+
+            ++stats.routed_layer_count;
+            stats.routed_section_ms += routed_section_ms;
+            stats.expert_compute_ms += expert_compute_ms;
+        }
+    }
+
     void initialize_streams() {
         CHECK_HIP(hipStreamCreate(&compute_stream));
         CHECK_HIP(hipStreamCreate(&sdma_stream));

@@ -47,12 +47,8 @@ public:
     AeonModelLoader& operator=(AeonModelLoader&&) = default;
 
     void open_model(const std::string& model_dir) {
-        open_model_variant(model_dir, "model_experts.aeon", "model_experts.index", 1);
-    }
-
-    void open_model_swizzled(const std::string& model_dir) {
-        open_model_variant(model_dir, "model_experts_swizzled.aeon",
-                           "model_experts_swizzled.index", 2);
+        open_model_files(model_dir, "model_experts_swizzled.aeon",
+                         "model_experts_swizzled.index", 2);
     }
 
     uint32_t expert_format_version() const {
@@ -60,7 +56,7 @@ public:
     }
 
 private:
-    void open_model_variant(
+    void open_model_files(
         const std::string& model_dir,
         const std::string& experts_filename,
         const std::string& index_filename,
@@ -269,7 +265,7 @@ private:
             expert_offsets_[i] = entries[i * 2]; // (offset, size)
         }
 
-        // 2. Mmap model_experts.aeon
+        // 2. Mmap the swizzled expert payload.
         experts_fd_ = ::open(experts_path.c_str(), O_RDONLY);
         if (experts_fd_ < 0) {
             throw std::runtime_error("AeonModelLoader: Failed to open experts file: " + experts_path);

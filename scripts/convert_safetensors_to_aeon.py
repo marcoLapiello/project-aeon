@@ -11,9 +11,10 @@ Outputs created in destination directory:
    - Header (magic 'AEON_DENSE', version, metadata, tensor directory)
    - Contiguous binary payloads of all 1,271 dense tensors (word embedding, attention projections,
      RMSNorms, Hyper-Connections Sinkhorn tables, shared experts, router gate weights, LM head).
-3. model_experts.aeon:
+3. model_experts_swizzled.aeon:
    - 11,008 routed experts (43 layers x 256 experts)
    - Each expert is strictly 14,155,776 bytes (exactly 3,456 sectors of 4096 bytes).
+    - W1/W3 and W2 payloads use the version-2 Wave32 swizzled layout.
    - Payload layout per expert:
      [W1_packed (4,194,304 B)] [W1_scale (524,288 B)]
      [W2_packed (4,194,304 B)] [W2_scale (524,288 B)]
@@ -21,11 +22,12 @@ Outputs created in destination directory:
    - Offset formula: slot_index = (layer_id * 256 + expert_id)
      file_offset = slot_index * 14,155,776 bytes
    - 100% compliant with Linux io_uring O_DIRECT (4096-byte sector alignment).
-4. model_experts.index:
+4. model_experts_swizzled.index:
    - Compact binary lookup table: (layer_id, expert_id) -> (uint64 file_offset, uint64 byte_length)
    - Plus model architectural metadata.
 
-Zero external dependencies: uses Python standard library only (json, struct, mmap, shutil, os, sys).
+Requires NumPy for the vectorized expert-layout conversion and uses the Python standard
+library for model serialization and validation.
 """
 
 import argparse
@@ -37,13 +39,143 @@ import struct
 import sys
 import time
 
+import numpy as np
+
 SECTOR_SIZE = 4096  # 4KB hardware sector boundary
 EXPERT_RAW_BYTES = 14155776  # 4MB*3 + 512KB*3 = 14,155,776 bytes (exactly 3,456 sectors)
 assert EXPERT_RAW_BYTES % SECTOR_SIZE == 0
 
 AEON_DENSE_MAGIC = b"AEON_DENSE\x00\x00"
 AEON_EXP_MAGIC = b"AEON_EXPERTS\x00\x00"
-AEON_FORMAT_VERSION = 1
+AEON_DENSE_FORMAT_VERSION = 1
+AEON_EXPERT_FORMAT_VERSION = 2
+
+NIBBLE_PERM = np.array([0, 2, 4, 6, 1, 3, 5, 7], dtype=np.int64)
+INVERSE_NIBBLE_PERM = np.argsort(NIBBLE_PERM)
+
+# (tensor offset, rows, K, rows-per-wave, lanes-per-row, dtype)
+EXPERT_TENSOR_LAYOUTS = (
+    (0, 2048, 4096, 4, 8, np.dtype("<u4")),
+    (4194304, 2048, 4096, 4, 8, np.dtype("<f2")),
+    (4718592, 4096, 2048, 8, 4, np.dtype("<u4")),
+    (8912896, 4096, 2048, 8, 4, np.dtype("<f2")),
+    (9437184, 2048, 4096, 4, 8, np.dtype("<u4")),
+    (13631488, 2048, 4096, 4, 8, np.dtype("<f2")),
+)
+
+
+def permute_words(words: np.ndarray) -> np.ndarray:
+    result = np.zeros_like(words)
+    for destination_position, source_position in enumerate(NIBBLE_PERM):
+        result |= (
+            (words >> np.uint32(4 * int(source_position))) & np.uint32(0xF)
+        ) << np.uint32(4 * destination_position)
+    return result
+
+
+def unpermute_words(words: np.ndarray) -> np.ndarray:
+    result = np.zeros_like(words)
+    for destination_position, source_position in enumerate(INVERSE_NIBBLE_PERM):
+        result |= (
+            (words >> np.uint32(4 * int(source_position))) & np.uint32(0xF)
+        ) << np.uint32(4 * destination_position)
+    return result
+
+
+def swizzle_tensor(source: np.ndarray, rows_per_wave: int, lanes_per_row: int) -> np.ndarray:
+    rows, columns = source.shape
+    inner = 4 if source.dtype == np.dtype("<u4") else 1
+    groups = columns // inner
+    iterations = groups // lanes_per_row
+    row_blocks = rows // rows_per_wave
+    reshaped = source.reshape(row_blocks, rows_per_wave, iterations, lanes_per_row, inner)
+    return np.ascontiguousarray(
+        reshaped.transpose(0, 2, 1, 3, 4)
+    ).reshape(-1)
+
+
+def unswizzle_tensor(
+    source: np.ndarray,
+    rows: int,
+    columns: int,
+    rows_per_wave: int,
+    lanes_per_row: int,
+) -> np.ndarray:
+    inner = 4 if source.dtype == np.dtype("<u4") else 1
+    groups = columns // inner
+    iterations = groups // lanes_per_row
+    row_blocks = rows // rows_per_wave
+    reshaped = source.reshape(row_blocks, iterations, rows_per_wave, lanes_per_row, inner)
+    return np.ascontiguousarray(
+        reshaped.transpose(0, 2, 1, 3, 4)
+    ).reshape(rows, columns)
+
+
+def swizzle_expert_payload(source_payload: bytes) -> bytes:
+    if len(source_payload) != EXPERT_RAW_BYTES:
+        raise ValueError(
+            f"Expert payload size mismatch: {len(source_payload)} != {EXPERT_RAW_BYTES}"
+        )
+
+    chunks = []
+    for tensor_offset, rows, K, rows_per_wave, lanes_per_row, dtype in EXPERT_TENSOR_LAYOUTS:
+        if dtype == np.dtype("<u4"):
+            count = rows * (K // 8)
+            source = np.frombuffer(
+                source_payload, dtype=dtype, count=count, offset=tensor_offset
+            ).copy().reshape(rows, K // 8)
+            chunks.append(
+                swizzle_tensor(
+                    permute_words(source), rows_per_wave, lanes_per_row
+                ).tobytes()
+            )
+        else:
+            count = rows * (K // 32)
+            source = np.frombuffer(
+                source_payload, dtype=dtype, count=count, offset=tensor_offset
+            ).copy().reshape(rows, K // 32)
+            chunks.append(
+                swizzle_tensor(source, rows_per_wave, lanes_per_row).tobytes()
+            )
+
+    payload = b"".join(chunks)
+    if len(payload) != EXPERT_RAW_BYTES:
+        raise ValueError(f"Swizzled expert size mismatch: {len(payload)}")
+    return payload
+
+
+def verify_swizzled_expert_payload(source_payload: bytes, swizzled_payload: bytes):
+    if len(source_payload) != EXPERT_RAW_BYTES or len(swizzled_payload) != EXPERT_RAW_BYTES:
+        raise ValueError("Cannot verify an expert payload with an unexpected size")
+
+    for tensor_offset, rows, K, rows_per_wave, lanes_per_row, dtype in EXPERT_TENSOR_LAYOUTS:
+        if dtype == np.dtype("<u4"):
+            count = rows * (K // 8)
+            source = np.frombuffer(
+                source_payload, dtype=dtype, count=count, offset=tensor_offset
+            ).reshape(rows, K // 8)
+            swizzled = np.frombuffer(
+                swizzled_payload, dtype=dtype, count=count, offset=tensor_offset
+            )
+            restored = unpermute_words(
+                unswizzle_tensor(
+                    swizzled, rows, K // 8, rows_per_wave, lanes_per_row
+                )
+            )
+        else:
+            count = rows * (K // 32)
+            source = np.frombuffer(
+                source_payload, dtype=dtype, count=count, offset=tensor_offset
+            ).reshape(rows, K // 32)
+            swizzled = np.frombuffer(
+                swizzled_payload, dtype=dtype, count=count, offset=tensor_offset
+            )
+            restored = unswizzle_tensor(
+                swizzled, rows, K // 32, rows_per_wave, lanes_per_row
+            )
+
+        if source.tobytes() != restored.tobytes():
+            raise AssertionError("Swizzled expert payload failed bit-exact verification")
 
 AUX_FILES_TO_COPY = [
     "config.json",
@@ -205,7 +337,7 @@ def convert_dense_tensors(source_index: SafetensorsIndex,
     dir_json_bytes = json.dumps(dense_directory, indent=2).encode("utf-8")
     header_fmt = "<12sIIQ"
     header_magic = AEON_DENSE_MAGIC
-    header_version = AEON_FORMAT_VERSION
+    header_version = AEON_DENSE_FORMAT_VERSION
     header_tensor_count = len(dense_keys)
     header_dir_len = len(dir_json_bytes)
 
@@ -248,8 +380,9 @@ def convert_routed_experts(source_index: SafetensorsIndex,
                            output_dir: str,
                            max_layers: int = None):
     """
-    Extracts all 11,008 routed experts into model_experts.aeon and generates model_experts.index.
-    Every expert is laid out as a contiguous 14,155,776-byte block (strictly 4KB sector aligned).
+    Extracts all 11,008 routed experts into model_experts_swizzled.aeon and generates
+    model_experts_swizzled.index. Every expert is written in the version-2 Wave32 layout
+    as a contiguous 14,155,776-byte block (strictly 4KB sector aligned).
     """
     total_layers = 43 if max_layers is None else max_layers
     experts_per_layer = 256
@@ -259,8 +392,8 @@ def convert_routed_experts(source_index: SafetensorsIndex,
     print(f"  Step 3: Serializing Routed Experts ({total_layers} layers x 256 experts = {total_experts} total)")
     print("=" * 70)
 
-    output_experts_path = os.path.join(output_dir, "model_experts.aeon")
-    output_index_path = os.path.join(output_dir, "model_experts.index")
+    output_experts_path = os.path.join(output_dir, "model_experts_swizzled.aeon")
+    output_index_path = os.path.join(output_dir, "model_experts_swizzled.index")
 
     total_experts_bytes = total_experts * EXPERT_RAW_BYTES
     print(f"  - Total Payload Size: {total_experts_bytes / (1024**3):.2f} GB")
@@ -273,7 +406,7 @@ def convert_routed_experts(source_index: SafetensorsIndex,
     index_header = struct.pack(
         index_header_fmt,
         AEON_EXP_MAGIC,
-        AEON_FORMAT_VERSION,
+        AEON_EXPERT_FORMAT_VERSION,
         total_layers,
         experts_per_layer,
         EXPERT_RAW_BYTES
@@ -292,7 +425,7 @@ def convert_routed_experts(source_index: SafetensorsIndex,
             f_idx.write(struct.pack("<QQ", off, sz))
     print(f"  - Index table written ({os.path.getsize(output_index_path)} bytes).")
 
-    # Serializing experts into model_experts.aeon
+    # Serialize swizzled experts directly; no legacy-layout artifact is created.
     start_time = time.time()
     tensors_order = [
         ("w1", "weight_packed"),
@@ -322,7 +455,7 @@ def convert_routed_experts(source_index: SafetensorsIndex,
                 if len(expert_bytes) != EXPERT_RAW_BYTES:
                     raise ValueError(f"Expert L{l} E{e} size mismatch: got {len(expert_bytes)}, expected {EXPERT_RAW_BYTES}")
 
-                f_exp.write(expert_bytes)
+                f_exp.write(swizzle_expert_payload(expert_bytes))
                 processed_experts += 1
                 bytes_written += len(expert_bytes)
 
@@ -332,7 +465,7 @@ def convert_routed_experts(source_index: SafetensorsIndex,
             overall_gb = bytes_written / (1024**3)
             print(f"    [Layer {l:02d}/{total_layers-1:02d} done] 256 experts serialized ({layer_mb_s:.1f} MB/s) | Total: {overall_gb:.2f} GB ({total_elapsed:.1f}s)")
 
-    print(f"[Done] model_experts.aeon created: {os.path.getsize(output_experts_path) / (1024**3):.2f} GB in {time.time() - start_time:.1f}s")
+    print(f"[Done] model_experts_swizzled.aeon created: {os.path.getsize(output_experts_path) / (1024**3):.2f} GB in {time.time() - start_time:.1f}s")
 
 
 def verify_conversion(source_index: SafetensorsIndex,
@@ -371,9 +504,21 @@ def verify_conversion(source_index: SafetensorsIndex,
             assert converted_data == source_slice, f"Mismatch in dense tensor: {entry['name']}"
         print("  [Verify Dense] All sampled dense tensors are 100% BIT-EXACT to source Safetensors!")
 
-    # 2. Verify model_experts.aeon
-    experts_path = os.path.join(output_dir, "model_experts.aeon")
+    # 2. Verify the version-2 swizzled expert artifact.
+    experts_path = os.path.join(output_dir, "model_experts_swizzled.aeon")
+    index_path = os.path.join(output_dir, "model_experts_swizzled.index")
     total_layers = 43 if max_layers is None else max_layers
+    with open(index_path, "rb") as f_idx:
+        index_header = f_idx.read(32)
+        magic, version, layers, experts_per_layer, expert_bytes = struct.unpack(
+            "<12sIIIQ", index_header
+        )
+        assert magic == AEON_EXP_MAGIC, "Invalid expert index magic!"
+        assert version == AEON_EXPERT_FORMAT_VERSION, "Invalid expert index version!"
+        assert layers == total_layers, "Unexpected expert index layer count!"
+        assert experts_per_layer == 256, "Unexpected expert index expert count!"
+        assert expert_bytes == EXPERT_RAW_BYTES, "Unexpected expert byte count!"
+
     with open(experts_path, "rb") as f:
         print(f"  [Verify Experts] Checking sample routed experts across {total_layers} layers...")
         sample_experts = [(0, 0), (0, 255), (total_layers - 1, 0), (total_layers - 1, 128)]
@@ -390,10 +535,10 @@ def verify_conversion(source_index: SafetensorsIndex,
                 loc = source_index.tensor_locations[f"layers.{l}.ffn.experts.{e}.{w}.{t}"]
                 expected.extend(mmap_pool.get_slice(loc["shard"], loc["start"], loc["end"]))
 
-            assert exp_data == bytes(expected), f"Mismatch in expert L{l} E{e}!"
-            print(f"    - Layer {l}, Expert {e}: BIT-EXACT match ({len(exp_data)} bytes verified).")
+                verify_swizzled_expert_payload(bytes(expected), exp_data)
+                print(f"    - Layer {l}, Expert {e}: swizzled round-trip is BIT-EXACT ({len(exp_data)} bytes verified).")
 
-    print("  [Verify Experts] All verified experts are 100% BIT-EXACT. Sector alignment confirmed!")
+            print("  [Verify Experts] All verified swizzled experts round-trip bit-exactly. Sector alignment confirmed!")
     print("\n>>> ALL CHECKS PASSED: MODEL SUCCESSFULLY CONVERTED AND VERIFIED <<<")
 
 

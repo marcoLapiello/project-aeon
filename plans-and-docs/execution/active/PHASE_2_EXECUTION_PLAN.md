@@ -33,8 +33,8 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
 - **Micro-Step 0.1: Surgical Model Splitting & Sector-Aligned Serializer (`scripts/prepare_rdna.py`)**
   - Ingest the 34 sharded Safetensors files of `DeepSeek-V4-Flash-0731-INT4-W4A16`.
   - Isolate all dense weights into `model_dense.aeon` (~9.24 GB): Attention projections ($W_q, W_{kv}, W_o$), RMSNorms, Hyper-Connections Sinkhorn tables, Shared Experts, and Router gate weights.
-  - Isolate the 11,008 routed experts (43 layers $\times$ 256 experts) into `model_experts.aeon` (~135 GB): Each expert FFN ($W_1, W_2, W_3$ packed INT4 + FP16 scales) is written as an isolated contiguous block starting at a strictly 4096-byte aligned file offset (`O_DIRECT` compliant).
-  - Generate a compact binary index table `model_experts.index` mapping `(layer_id, expert_id)` to `(uint64_t file_offset, uint64_t byte_length)`.
+  - Isolate the 11,008 routed experts (43 layers $\times$ 256 experts) into `model_experts_swizzled.aeon` (~135 GB): Each expert FFN ($W_1, W_2, W_3$ packed INT4 + FP16 scales) is written in the version-2 Wave32 swizzled layout as an isolated contiguous block starting at a strictly 4096-byte aligned file offset (`O_DIRECT` compliant).
+  - Generate a compact binary index table `model_experts_swizzled.index` mapping `(layer_id, expert_id)` to `(uint64_t file_offset, uint64_t byte_length)`.
 - **Micro-Step 0.2: Bit-Exact Numerical Verification Suite**
   - Implement a verification test comparing the parsed `.aeon` weights against the original Safetensors weights on silicon.
   - Validate that every INT4 nibble and FP16 scale is 100% bit-identical with zero precision loss ($\epsilon = 0.0$).
@@ -118,7 +118,7 @@ Spike 3 checkpoints below.
 *Objective: Complete the 3-tier chain by connecting cold NVMe SSD storage directly to Host DDR staging via Linux `io_uring` with zero kernel page-cache contention, eliminating synchronous CPU `memcpy` stalls from the streaming pipeline.*
 
 - **Micro-Step 3.1: Linux `io_uring` Direct I/O Reader Integration (Tier 3 $\to$ Tier 2)**
-  - Integrate `src/io/direct_io_reader.hpp` into the runtime pipeline targeting `model_experts.aeon`.
+  - Integrate `src/io/direct_io_reader.hpp` into the runtime pipeline targeting `model_experts_swizzled.aeon`.
   - Replace `mmap` + CPU `memcpy` expert retrieval with asynchronous direct streaming of cold experts from NVMe into pinned host DDR staging buffers (`PrefetchStagingArena`) using `O_DIRECT`.
   - Maintain a dynamic Tier 2 warm cache in host RAM ($\approx 35\text{ GB}$) feeding Tier 1 VRAM without triggering OS page-cache bloat or swap thrashing.
 - **Micro-Step 3.2: End-to-End 3-Tier Pipeline Validation**
@@ -132,7 +132,7 @@ The implementation is deliberately staged so storage correctness is established 
   - Extend `src/io/direct_io_reader.hpp` with reusable asynchronous request submission and completion harvesting while retaining the existing synchronous `read_direct()` API.
   - Force regular-file `O_DIRECT` reads onto the asynchronous io_uring worker path and split expert payloads into 4 MiB sector-aligned requests; a single large `IORING_OP_READ` was observed to execute synchronously during `io_uring_enter` on this kernel/device combination.
   - Unit convention: `AEON_EXPERT_BYTES = 14,155,776` bytes = `13.5 MiB` = `14.155776 MB` decimal = `3,456` 4 KiB sectors. The format is unchanged; earlier `13.5 MB` references used binary MiB terminology.
-  - Open `model_experts.aeon` with `O_DIRECT | O_RDONLY | O_CLOEXEC` and expose validated `(file_offset, byte_length)` metadata through `AeonModelLoader`.
+  - Open `model_experts_swizzled.aeon` with `O_DIRECT | O_RDONLY | O_CLOEXEC` and expose validated `(file_offset, byte_length)` metadata through `AeonModelLoader`.
   - Reject non-sector-aligned buffers, offsets, lengths, invalid expert IDs, short completions, and negative `io_uring` results.
 2. **Staging ownership**
   - Make each `PrefetchStagingArena` slot's lifetime explicit: available, I/O pending, I/O complete, and GPU transfer pending.

@@ -3,7 +3,6 @@
 #include "core/config.hpp"
 #include "kernel/hc_sinkhorn.hpp"
 #include "kernel/v4_attention.hpp"
-#include "kernel/w4a16_gemm.hpp"
 #include "kernel/moe_router.hpp"
 
 #include <hip/hip_runtime.h>
