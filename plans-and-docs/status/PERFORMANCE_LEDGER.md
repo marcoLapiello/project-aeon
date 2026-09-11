@@ -344,7 +344,7 @@ explicit comparison key and pass the entry gate.
 - **Evidence**: fused kernel A/B benchmark
 
 ### M25: Persistent Warm Refill and Supply Telemetry Closure
-- **Run**: `2026-09-11`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, `.aeon`, 43 layers; [A/B report](../execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md)
+- **Run**: `2026-09-11`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, `.aeon`, 43 layers; [A/B report](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md)
 - **Class / comparison key**: `E2E / native-text-warm-A/B`
 - **Platform**: `baseline`; RX 7900 XTX, ROCm 7.2.2, Linux 7.0.0-31-generic
 - [ ] **Invalidate for comparison** | **Reason**: `--`

@@ -39,10 +39,10 @@ Do not make foundational dependencies:
   paged attention as a substitute for DeepSeek-V4 MLA/CSA/HCA semantics.
 ```
 
-The current Aeon production priority remains the active [Warm-tier repair and
-supply telemetry plan](../../execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md).
-The GPTQ work can use this document for offline format and kernel reference
-work without changing that runtime path.
+The completed [Warm-tier repair and supply telemetry plan](../../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md)
+is the current runtime baseline for persistent residency and source-tier
+telemetry. The GPTQ work can use this document for offline format and kernel
+reference work without changing that runtime path.
 
 ## 1. Reference checkout and evidence boundary
 

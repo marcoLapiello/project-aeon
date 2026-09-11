@@ -4,7 +4,7 @@
 **Status:** Current analysis and Stage 2 direction
 **Scope:** Hot/Warm/Cold expert residency, registry behavior, dynamic allocation, and a future layer-aware rolling supply scheduler. This document records the brainstorming conclusions and recommended stages; it is not a claim that the proposed policy has been implemented or measured.
 
-**Implementation handoff (2026-09-11):** The broad Phase 2 continuation is paused. The next implementation is governed by the focused [Warm-Tier Repair and Supply Telemetry Plan](../../execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md). This document remains the technical rationale for later placement and rolling-residency decisions, not their active checklist.
+**Implementation handoff (2026-09-11):** The broad Phase 2 continuation remains paused. The focused [Warm-Tier Repair and Supply Telemetry Plan](../../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) is complete; its [closure report](../../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md) records the structural and silicon evidence. This document remains the technical rationale for later placement and rolling-residency decisions, not their active checklist.
 
 ## Executive conclusion
 

@@ -41,9 +41,9 @@ This is the conservative boundary for Project Aeon:
 5. Add GPTQ kernels and integrate them only after tensor-level and layer-level
    correctness gates pass.
 
-The active [Warm-tier repair and supply telemetry plan](../../execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md)
-remains the next production-runtime priority. The GPTQ work can begin with
-offline inventory, conversion, and reference tests without changing that path.
+The completed [Warm-tier repair and supply telemetry plan](../../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md)
+is the production-runtime baseline. The GPTQ work can begin with offline
+inventory, conversion, and reference tests without changing that path.
 
 ## 1. Checkpoint evidence
 
@@ -459,7 +459,7 @@ This stage should not require HIP or alter the production pipeline.
 
 ### Stage 3: generalize the supply boundary
 
-After the active Warm-tier invariants are stable, parameterize the shared
+With the Warm-tier invariants now stable, parameterize the shared
 storage path by the expert format descriptor:
 
 - `AEON_EXPERT_BYTES` becomes a descriptor value at runtime;

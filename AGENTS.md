@@ -14,12 +14,14 @@ Aeon solves the memory wall for massive MoE models (e.g., DeepSeek-V4 architectu
 Use [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) for the current plan inventory, open gates, and historical-document boundaries.
 
 Current execution records:
-- [Warm-Tier Repair and Supply Telemetry Plan](plans-and-docs/execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md): next implementation priority for persistent Warm ownership, asynchronous refill, and source-tier telemetry.
 - [Phase 2 Execution Plan](plans-and-docs/execution/active/PHASE_2_EXECUTION_PLAN.md): paused single-GPU Hot/Warm/Cold runtime and remaining cold-tier work.
 - [Native Text-In/Text-Out Plan](plans-and-docs/execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md): native frontend status and correctness gates.
 - [Routing Profile Study](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md): profiler contract and placement-study gates.
 - [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md): authoritative silicon measurements.
 - [Expert Performance Review Conclusions](plans-and-docs/analysis/historical/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md): historical latency diagnosis and measurement rationale.
+
+Completed execution records:
+- [Warm-Tier Repair and Supply Telemetry Plan](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md): persistent Warm ownership, asynchronous refill, and source-tier telemetry; see the [closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
 
 Completed plans and historical rationale remain available through the status index. Do not use an old checklist or review as current implementation evidence.
 
@@ -49,7 +51,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [x] Native text milestone: tokenizer, DSV4 formatter, EOS-aware generation, detokenization, `aeon_chat`, and a complete simple 43-layer text turn.
 - [x] Routing profiler plumbing: optional observation, resumable aggregation, complete rankings, compact summaries, and regeneration mode.
 - [x] Stage 1 parallel expert-kernel path: version-2 W4A16 swizzled artifact, vectorized Wave32 GEMV, fused six-expert W1/W3 plus clamped SwiGLU, fused W2 FP32 accumulation, opt-in pipeline/CLI integration, and silicon validation. The version-1 path remains the default; the standalone [Stage 1 implementation report](plans-and-docs/analysis/current/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) records the exact proposal differences. The runtime resolves six complete expert payloads into VRAM and waits for transfer events before launch; the kernels do not handle non-resident experts or storage/cache misses.
-- [x] Warm-tier repair and supply telemetry: persistent Warm ownership, event-ordered Hot-to-Warm refill, content-lazy Warm preload with eager configured capacity, transactional transfer failure cleanup, pinned fallback handling, source-tier JSONL telemetry, and the five-run three-variant silicon A/B are recorded in [the closure report](plans-and-docs/execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
+- [x] Warm-tier repair and supply telemetry: persistent Warm ownership, event-ordered Hot-to-Warm refill, content-lazy Warm preload with eager configured capacity, transactional transfer failure cleanup, pinned fallback handling, source-tier JSONL telemetry, and the five-run three-variant silicon A/B are recorded in [the closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
 
 ### Current priority
 - [ ] **Model correctness:** implement and validate the missing CSA/HCA attention, compressed Prefill state, configured RoPE/YaRN behavior, and trusted-reference parity before using routing data for placement decisions.
@@ -59,7 +61,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 
 ### Open gates
 - [ ] **Model correctness:** validate compressed/indexed attention for layers 2-42 and compare identical formatted inputs and outputs with a trusted compatible reference before using traces for placement.
-- [x] **Warm-tier foundation:** persistent Warm ownership, refill, transfer safety, telemetry, and controlled silicon identity gates are closed in the [Warm-tier closure report](plans-and-docs/execution/active/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
+- [x] **Warm-tier foundation:** persistent Warm ownership, refill, transfer safety, telemetry, and controlled silicon identity gates are closed in the [Warm-tier closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
 - [ ] **Cold-tier performance:** characterize cold-cache and steady-state behavior, reduce host-memory pressure, improve physical `.aeon` placement, and test whether the exposed just-in-time miss path needs a new scheduling or CPU-fallback design. The model-backed `>= 6.0 GB/s` target remains open.
 - [ ] **Swizzled full-model performance:** validate representative 43-layer generation with the version-2 artifact under controlled Hot/Warm conditions, collect useful rocprof performance counters, and tune occupancy/register pressure beyond the isolated six-expert benchmarks. A residency invariant violation would produce invalid/stale results or a device memory fault rather than trigger an automatic fallback. The baseline version-1 path remains the default fallback.
 - [ ] **Routing placement study:** collect representative profile and held-out corpora with the verified text contract, then evaluate frequency-informed placement against dynamic LRU.
