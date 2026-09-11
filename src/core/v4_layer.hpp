@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/aeon_loader.hpp"
-#include "core/safetensors_loader.hpp"
 #include "kernel/v4_attention.hpp"
 
 #include <hip/hip_fp16.h>
@@ -145,10 +144,6 @@ public:
         // 5. Allocate Persistent KV Cache on Device
         CHECK_HIP(hipMalloc(&d_kv_cache, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
         CHECK_HIP(hipMemset(d_kv_cache, 0, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
-    }
-
-    void init(int id, const SafetensorsLoader& loader, uint32_t max_seq = 4096) {
-        init_with_loader(id, loader, max_seq);
     }
 
     void init(int id, const AeonModelLoader& loader, uint32_t max_seq = 4096) {

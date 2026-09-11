@@ -9,8 +9,8 @@ mean that it is part of the production runtime.
 ## Current engine path
 
 The current integration point is `src/core/v4_pipeline.hpp`. It is header-only and
-pulls in the model configuration, device setup, transformer block, Aeon loader,
-Safetensors loader, VRAM and host expert pools, registry, and all active kernels.
+pulls in the model configuration, device setup, transformer block, native Aeon
+loader, VRAM and host expert pools, registry, and all active kernels.
 
 The production-facing implementation is:
 
@@ -19,7 +19,6 @@ The production-facing implementation is:
 - `src/core/v4_pipeline.hpp` - multi-layer inference and memory-tier orchestration.
 - `src/core/v4_block.hpp` - transformer block composition.
 - `src/core/aeon_loader.hpp` - native `.aeon` dense and expert container access.
-- `src/core/safetensors_loader.hpp` and `src/core/safetensors.hpp` - source-format loading and parsing.
 - `src/core/memory_budget.hpp` - VRAM/host feasibility calculations and startup checks.
 - `src/core/vram_expert_pool.hpp` - Tier 1 hot expert pool.
 - `src/core/host_expert_pool.hpp` - Tier 2 warm expert pool.
@@ -32,7 +31,7 @@ The production-facing implementation is:
 `V4Pipeline::init_aeon()` opens both the mapped expert container and a dedicated
 `O_DIRECT` descriptor. The cold request path uses `DirectIOReader` and the
 staging arena before upload on `sdma_cold_stream`; mapped access remains available
-as a source for comparison and legacy paths. The bounded Hot/Warm/Cold path is
+as a native `.aeon` source for warm and comparison paths. The bounded Hot/Warm/Cold path is
 implemented, while physical layout, cold-cache measurement, and latency-hiding
 acceptance remain open in [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md).
 
@@ -65,7 +64,6 @@ These targets validate pieces that are already part of the engine and should rem
 as regression tests, even though they are not runtime binaries:
 
 - `tests/test_config_parser.cpp`
-- `tests/test_safetensors_parser.cpp`
 - `tests/test_swiglu_clamp.cpp`
 - `tests/test_hc_sinkhorn.cpp`
 - `tests/test_w4a16_wmma.cpp`
@@ -73,8 +71,6 @@ as regression tests, even though they are not runtime binaries:
 - `tests/test_v4_moe_layer.cpp`
 - `tests/test_v4_attention.cpp`
 - `tests/test_v4_block.cpp`
-- `tests/test_v4_pipeline.cpp`
-- `tests/bench_v4_generation.cpp`
 
 These are not noise: they protect the completed Phase 1 implementation and provide
 smaller failure surfaces when the integrated pipeline changes.

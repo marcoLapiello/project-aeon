@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/safetensors_loader.hpp"
+#include "core/loaded_tensor.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -75,7 +75,7 @@ private:
 
 public:
 
-    // Dense tensor query interface matching SafetensorsLoader
+    // Dense tensor query interface for the native model container.
     bool has_tensor(const std::string& name) const {
         return dense_tensors_.find(name) != dense_tensors_.end();
     }

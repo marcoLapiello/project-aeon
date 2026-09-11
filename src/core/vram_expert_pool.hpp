@@ -138,26 +138,6 @@ public:
                                  TOTAL_EXPERT_BYTES, hipMemcpyDeviceToHost, stream));
     }
 
-    // Stream an expert from individual host pointers (Safetensors host source) into this slot asynchronously
-    void upload_from_pointers(
-        uint32_t slot_idx,
-        const uint32_t* w1_packed, const half* w1_scale,
-        const uint32_t* w2_packed, const half* w2_scale,
-        const uint32_t* w3_packed, const half* w3_scale,
-        hipStream_t stream = 0
-    ) {
-        if (slot_idx >= num_slots) {
-            throw std::runtime_error("UnifiedVRAMExpertPool: Invalid slot index " + std::to_string(slot_idx));
-        }
-
-        CHECK_HIP(hipMemcpyAsync(get_w1_packed(slot_idx), w1_packed, W1_PACKED_BYTES, hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(get_w1_scale(slot_idx),  w1_scale,  W1_SCALE_BYTES,  hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(get_w2_packed(slot_idx), w2_packed, W2_PACKED_BYTES, hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(get_w2_scale(slot_idx),  w2_scale,  W2_SCALE_BYTES,  hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(get_w3_packed(slot_idx), w3_packed, W3_PACKED_BYTES, hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(get_w3_scale(slot_idx),  w3_scale,  W3_SCALE_BYTES,  hipMemcpyHostToDevice, stream));
-    }
-
 private:
     void move_from(UnifiedVRAMExpertPool&& other) {
         num_slots  = other.num_slots;

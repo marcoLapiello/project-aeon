@@ -9,7 +9,6 @@
 #include "core/memory_budget.hpp"
 #include "core/prefetch_staging.hpp"
 #include "core/routing_counter.hpp"
-#include "core/safetensors_loader.hpp"
 #include "core/supply_telemetry.hpp"
 #include "core/v4_layer.hpp"
 #include "core/v4_pipeline_scratch.hpp"
@@ -56,7 +55,6 @@ namespace aeon::core {
 // Complete DeepSeek-V4 Autoregressive Multi-Layer Pipeline Engine
 class V4Pipeline {
 public:
-    SafetensorsLoader loader;
     AeonModelLoader aeon_loader;
     std::vector<std::unique_ptr<V4Layer>> layers;
     PipelineScratchBuffers scratch;
@@ -71,7 +69,7 @@ public:
     half*  d_final_norm{nullptr};          // [4096] on device
 
     hipStream_t compute_stream{0};
-    hipStream_t sdma_stream{0};       // warm-host / safetensors H2D uploads
+    hipStream_t sdma_stream{0};       // Warm Host H2D uploads
     hipStream_t sdma_cold_stream{0};  // io_uring staging -> VRAM cold uploads
     hipStream_t demotion_stream{0};   // lowest-priority Hot -> Warm D2H refills
 
@@ -158,93 +156,6 @@ public:
 
     uint32_t context_capacity() const {
         return layers.empty() ? 0 : layers.front()->max_seq_len_;
-    }
-
-    void init(
-        const std::string& snapshot_dir,
-        uint32_t num_layers = 2,
-        uint32_t unified_vram_slots = 0,
-        uint32_t max_seq_len = 4096
-    ) {
-        std::cout << "================================================================================" << std::endl;
-        std::cout << "        Project Aeon — DeepSeek-V4 Multi-Layer Execution Pipeline               " << std::endl;
-        std::cout << "================================================================================" << std::endl;
-
-        num_layers_ = num_layers;
-        current_seq_len_ = 0;
-        swizzled_moe_enabled_ = false;
-
-        // 1. Initialize streams
-        initialize_streams();
-
-        // 2. Open Safetensors Shards via Zero-Copy Mmap
-        std::cout << "[Pipeline] Opening Safetensors shards from " << snapshot_dir << "..." << std::endl;
-        loader.open_shard(snapshot_dir + "/model-00001.safetensors");
-        loader.open_shard(snapshot_dir + "/model-00002.safetensors");
-        loader.open_shard(snapshot_dir + "/model-00034.safetensors");
-        std::cout << "  > Total tensors indexed: " << loader.total_tensors() << std::endl;
-
-        // 3. Initialize RoPE Tables
-        std::cout << "[Pipeline] Initializing RoPE tables (max_seq=" << max_seq_len << ")..." << std::endl;
-        rope_table.init(max_seq_len, kernel::DSV4_ROPE_THETA, 1.0f);
-
-        // Upload RoPE caches to GPU
-        size_t rope_bytes = rope_table.max_seq_len * rope_table.half_rope * sizeof(float);
-        CHECK_HIP(hipMalloc(&d_cos_cache_, rope_bytes));
-        CHECK_HIP(hipMalloc(&d_sin_cache_, rope_bytes));
-        CHECK_HIP(hipMemcpy(d_cos_cache_, rope_table.cos_cache.data(), rope_bytes, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_sin_cache_, rope_table.sin_cache.data(), rope_bytes, hipMemcpyHostToDevice));
-
-        // 4. Model-level Weights
-        std::cout << "[Pipeline] Binding model-level embeddings and LM head..." << std::endl;
-        host_embed_table = loader.get_data_ptr<half>("embed.weight");
-
-        const auto& head_t = loader.get_tensor("head.weight");
-        std::cout << "  > Uploading LM Head [129280, 4096] (" << (head_t.byte_size / (1024*1024)) << " MB) to VRAM..." << std::endl;
-        CHECK_HIP(hipMalloc(&d_lm_head, head_t.byte_size));
-        CHECK_HIP(hipMemcpy(d_lm_head, head_t.data, head_t.byte_size, hipMemcpyHostToDevice));
-
-        // HC Head
-        const auto& fn_t = loader.get_tensor("hc_head_fn");
-        const auto& base_t = loader.get_tensor("hc_head_base");
-        const auto& sc_t = loader.get_tensor("hc_head_scale");
-        CHECK_HIP(hipMalloc(&d_hc_head_fn, fn_t.byte_size));
-        CHECK_HIP(hipMalloc(&d_hc_head_base, base_t.byte_size));
-        CHECK_HIP(hipMalloc(&d_hc_head_scale, sc_t.byte_size));
-        CHECK_HIP(hipMemcpy(d_hc_head_fn, fn_t.data, fn_t.byte_size, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_hc_head_base, base_t.data, base_t.byte_size, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_hc_head_scale, sc_t.data, sc_t.byte_size, hipMemcpyHostToDevice));
-
-        // Final norm: use layers.0.ffn_norm.weight as fallback if model-level norm.weight is in an un-downloaded shard
-        if (loader.has_tensor("norm.weight")) {
-            const auto& norm_t = loader.get_tensor("norm.weight");
-            CHECK_HIP(hipMalloc(&d_final_norm, norm_t.byte_size));
-            CHECK_HIP(hipMemcpy(d_final_norm, norm_t.data, norm_t.byte_size, hipMemcpyHostToDevice));
-        } else {
-            const auto& norm_t = loader.get_tensor("layers.0.ffn_norm.weight");
-            CHECK_HIP(hipMalloc(&d_final_norm, norm_t.byte_size));
-            CHECK_HIP(hipMemcpy(d_final_norm, norm_t.data, norm_t.byte_size, hipMemcpyHostToDevice));
-        }
-
-        // 5. Allocate Reusable Pipeline Scratch Buffers
-        std::cout << "[Pipeline] Allocating intermediate GPU scratch buffers..." << std::endl;
-        scratch.allocate();
-
-        // 6. Initialize Consecutive Transformer Layers
-        layers.resize(num_layers_);
-        for (uint32_t l = 0; l < num_layers_; ++l) {
-            layers[l] = std::make_unique<V4Layer>();
-            layers[l]->init(l, loader, max_seq_len);
-        }
-
-        // 7. Setup Unified VRAM Pool and Expert Registry
-        uint32_t active_vram_slots = unified_vram_slots > 0 ? unified_vram_slots : std::max(num_layers_ * 8u, 16u);
-        unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(active_vram_slots);
-        expert_registry_ = std::make_unique<ExpertRegistry>(num_layers_, 256, active_vram_slots, 0);
-        prefetch_staging_ = std::make_unique<PrefetchStagingArena>();
-
-        std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers with "
-                  << active_vram_slots << " unified VRAM expert slots." << std::endl;
     }
 
     // Initialize pipeline directly from native .aeon format folder
@@ -776,25 +687,9 @@ public:
                                 request.operation_id, compute_stream, 0, false,
                                 -1, request.vram_slot);
                         } else {
-                            const std::string exp_pfx = "layers." + std::to_string(target_l) + ".ffn.experts." + std::to_string(expert_id) + ".";
-                            const auto* w1_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w1.weight_packed");
-                            const auto* w1_s = loader.get_data_ptr<half>(exp_pfx + "w1.weight_scale");
-                            const auto* w2_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w2.weight_packed");
-                            const auto* w2_s = loader.get_data_ptr<half>(exp_pfx + "w2.weight_scale");
-                            const auto* w3_p = loader.get_data_ptr<uint32_t>(exp_pfx + "w3.weight_packed");
-                            const auto* w3_s = loader.get_data_ptr<half>(exp_pfx + "w3.weight_scale");
-
-                            wait_for_demotion_dependency(request.operation_id, compute_stream);
-                            unified_vram_pool_->upload_from_pointers(
-                                static_cast<uint32_t>(request.vram_slot),
-                                w1_p, w1_s,
-                                w2_p, w2_s,
-                                w3_p, w3_s,
-                                compute_stream
+                            throw std::runtime_error(
+                                "V4Pipeline: native Aeon expert payload unavailable for requested expert"
                             );
-                            record_h2d_event(
-                                request.operation_id, compute_stream, 0, false,
-                                -1, request.vram_slot);
                         }
                     }
                 } catch (...) {
@@ -895,7 +790,7 @@ public:
                 prefetch_staging_->begin_gpu_transfer(staging_idx);
                 // Cold NVMe payloads upload on the dedicated cold-DMA stream so a
                 // burst of io_uring completions never head-of-line blocks warm-hit
-                // or safetensors H2D transfers on sdma_stream.
+                // or Warm Host H2D transfers on sdma_stream.
                 wait_for_demotion_dependency(state.operation_ids[k], sdma_cold_stream);
                 unified_vram_pool_->upload_from_host_expert(
                     static_cast<uint32_t>(state.vram_slots[k]),
@@ -1525,7 +1420,6 @@ public:
         direct_io_reader_.reset();
         registry_transfers_.clear();
         supply_telemetry_.disable();
-        loader.close_all();
         aeon_loader.close_all();
     }
 

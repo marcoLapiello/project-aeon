@@ -49,7 +49,7 @@ The core model execution path already accepts token IDs and returns token IDs:
 - `tools/profile_routing.cpp`
   - is the current tokenized-corpus profiling driver;
   - should eventually accept tokenized prompts emitted by the native or offline text preparation path, but profiling remains blocked until correctness is established.
-- `tests/test_aeon_pipeline.cpp`, `tests/test_v4_pipeline.cpp`, and `tests/test_hot_warm_cold_pipeline.cpp`
+- `tests/test_aeon_pipeline.cpp` and `tests/test_hot_warm_cold_pipeline.cpp`
   - are existing native execution and full-model regression surfaces.
 
 ### 2.2 Model and tokenizer facts
@@ -389,7 +389,6 @@ Use the existing native model tests for transformer and kernel correctness:
 - `test_v4_attention`;
 - `test_v4_block`;
 - `test_v4_moe_layer`;
-- `test_v4_pipeline`;
 - `test_aeon_pipeline`;
 - `test_hot_warm_cold_pipeline`.
 

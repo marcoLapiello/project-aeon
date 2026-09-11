@@ -119,10 +119,6 @@ target_link_libraries(test_toy_moe_layer PRIVATE amdhip64)
 add_executable(test_config_parser tests/test_config_parser.cpp)
 target_link_libraries(test_config_parser PRIVATE amdhip64)
 
-# Regression test: Safetensors header parser
-add_executable(test_safetensors_parser tests/test_safetensors_parser.cpp)
-target_link_libraries(test_safetensors_parser PRIVATE amdhip64)
-
 # Regression test: Wave32 RMSNorm and clamped SwiGLU
 add_executable(test_swiglu_clamp tests/test_swiglu_clamp.cpp)
 target_link_libraries(test_swiglu_clamp PRIVATE amdhip64)
@@ -197,16 +193,6 @@ target_link_libraries(test_v4_attention PRIVATE amdhip64)
 # Regression test: complete DeepSeek-V4 transformer block
 add_executable(test_v4_block tests/test_v4_block.cpp)
 target_link_libraries(test_v4_block PRIVATE amdhip64)
-
-# Regression test: multi-layer pipeline and KV cache
-add_executable(test_v4_pipeline tests/test_v4_pipeline.cpp)
-target_link_libraries(test_v4_pipeline PRIVATE amdhip64)
-add_test(NAME test_v4_pipeline COMMAND test_v4_pipeline)
-set_tests_properties(test_v4_pipeline PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-
-# Baseline benchmark: Safetensors autoregressive generation
-add_executable(bench_v4_generation tests/bench_v4_generation.cpp)
-target_link_libraries(bench_v4_generation PRIVATE amdhip64)
 
 # Current format validation: native Aeon model loader
 add_executable(test_aeon_loader tests/test_aeon_loader.cpp)

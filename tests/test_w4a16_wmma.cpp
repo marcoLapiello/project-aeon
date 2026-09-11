@@ -2,13 +2,13 @@
 #include <hip/hip_fp16.h>
 #include <rocwmma/rocwmma.hpp>
 #include <iostream>
-#include <fstream>
 #include <vector>
 #include <cmath>
 #include <chrono>
 #include <cassert>
 
 #include "core/device.hpp"
+#include "core/aeon_loader.hpp"
 #include "kernel/w4a16_gemm.hpp"
 
 #define CHECK_HIP(cmd) do { \
@@ -266,35 +266,23 @@ int main() {
         std::cout << "[PASS] Block-Tiled Fused INT4 GEMM benchmark passed!" << std::endl;
     }
 
-    // 3. Real Checkpoint Validation: Run Layer 0 Expert 0 W1 weights from model-00001.safetensors
+    // 3. Real Checkpoint Validation: Run Layer 0 Expert 0 W1 weights from native .aeon storage
     {
         std::cout << "\n--- Sub-Test 3: Real DeepSeek-V4 Checkpoint Layer 0 Expert 0 Weights ---" << std::endl;
-        std::string safetensors_path = "models/DeepSeek-V4-Flash-0731-INT4-W4A16/"
-                                      "models--yiminyuan--DeepSeek-V4-Flash-0731-INT4-W4A16/"
-                                      "snapshots/64700592cadaf205fe0c13202061ff4b45afbfd0/model-00001.safetensors";
-
-        std::ifstream file(safetensors_path, std::ios::binary);
-        if (file.is_open()) {
-            uint64_t header_len = 0;
-            file.read(reinterpret_cast<char*>(&header_len), 8);
-            uint64_t data_base = 8 + header_len;
-
+        try {
+            aeon::core::AeonModelLoader loader;
+            loader.open_model("models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon");
+            const uint8_t* expert_payload = loader.get_expert_data(0, 0);
+            const auto* real_w_packed = reinterpret_cast<const uint32_t*>(
+                expert_payload + aeon::core::AEON_W1_PACKED_OFFSET);
+            const auto* real_w_scale = reinterpret_cast<const half*>(
+                expert_payload + aeon::core::AEON_W1_SCALE_OFFSET);
             const uint32_t M = 16;
             const uint32_t N = 2048;
             const uint32_t K = 4096;
 
-            std::vector<uint32_t> real_w_packed(N * (K / 8));
-            std::vector<half> real_w_scale(N * (K / 32));
             std::vector<half> h_a(M * K);
             std::vector<half> h_d_gpu(M * N);
-
-            // Read real w1 packed weights: offset 262420, length 4,194,304 bytes
-            file.seekg(data_base + 262420);
-            file.read(reinterpret_cast<char*>(real_w_packed.data()), real_w_packed.size() * sizeof(uint32_t));
-
-            // Read real w1 scales: offset 5033443628, length 524,288 bytes
-            file.seekg(data_base + 5033443628ULL);
-            file.read(reinterpret_cast<char*>(real_w_scale.data()), real_w_scale.size() * sizeof(half));
 
             for (uint32_t i = 0; i < h_a.size(); ++i) {
                 h_a[i] = __float2half(((i % 13) - 6) * 0.05f);
@@ -306,13 +294,13 @@ int main() {
             half* d_out;
 
             CHECK_HIP(hipMalloc(&d_a, h_a.size() * sizeof(half)));
-            CHECK_HIP(hipMalloc(&d_w_packed, real_w_packed.size() * sizeof(uint32_t)));
-            CHECK_HIP(hipMalloc(&d_w_scale, real_w_scale.size() * sizeof(half)));
+            CHECK_HIP(hipMalloc(&d_w_packed, N * (K / 8) * sizeof(uint32_t)));
+            CHECK_HIP(hipMalloc(&d_w_scale, N * (K / 32) * sizeof(half)));
             CHECK_HIP(hipMalloc(&d_out, h_d_gpu.size() * sizeof(half)));
 
             CHECK_HIP(hipMemcpy(d_a, h_a.data(), h_a.size() * sizeof(half), hipMemcpyHostToDevice));
-            CHECK_HIP(hipMemcpy(d_w_packed, real_w_packed.data(), real_w_packed.size() * sizeof(uint32_t), hipMemcpyHostToDevice));
-            CHECK_HIP(hipMemcpy(d_w_scale, real_w_scale.data(), real_w_scale.size() * sizeof(half), hipMemcpyHostToDevice));
+            CHECK_HIP(hipMemcpy(d_w_packed, real_w_packed, N * (K / 8) * sizeof(uint32_t), hipMemcpyHostToDevice));
+            CHECK_HIP(hipMemcpy(d_w_scale, real_w_scale, N * (K / 32) * sizeof(half), hipMemcpyHostToDevice));
 
             aeon::kernel::dispatch_w4a16_gemm(d_a, d_w_packed, d_w_scale, d_out, M, N, K);
             CHECK_HIP(hipDeviceSynchronize());
@@ -344,8 +332,9 @@ int main() {
             CHECK_HIP(hipFree(d_out));
 
             std::cout << "[PASS] Real Checkpoint INT4-W4A16 Expert 0 GEMM verified on physical silicon!" << std::endl;
-        } else {
-            std::cout << "[SKIP] Could not open safetensors checkpoint for sub-test 3." << std::endl;
+        } catch (const std::exception& error) {
+            std::cout << "[SKIP] Could not open native Aeon checkpoint for sub-test 3: "
+                      << error.what() << std::endl;
         }
     }
 
