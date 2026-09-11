@@ -31,6 +31,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 | --- | --- | --- |
 | [EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md](../analysis/current/EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md) | Current analysis | Records the registry, Hot/Warm/Cold residency findings and the rationale for the deferred rolling-residency direction. Implementation sequencing is in the active Warm-tier plan. |
 | [DEEPSEEK_V4_FLASH_AEON_COMPARISON.md](../analysis/current/DEEPSEEK_V4_FLASH_AEON_COMPARISON.md) | Current analysis | Compares the selected 0731 checkpoint contract with Aeon quantization, attention, runtime, and hardware behavior. |
+| [GPTQ_AEON_PARALLEL_BACKEND_ANALYSIS.md](../analysis/current/GPTQ_AEON_PARALLEL_BACKEND_ANALYSIS.md) | Current analysis | Records the feasibility, shared-versus-specialized boundary, artifact strategy, and performance gates for a parallel GPTQ-Aeon backend. |
 | [EXPERT_KERNELS_REVIEW.md](../analysis/current/EXPERT_KERNELS_REVIEW.md) | Current review | Records the pending kernel-geometry, quant-layout, bottleneck, and interface questions for the next kernel investigation. |
 | [EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md](../analysis/current/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) | Current implementation report | Compares the external Stage 1 proposal with the implemented version-2 path, records measured GPU-side effects, and documents the remaining full-model gate. |
 
