@@ -1,4 +1,4 @@
-# Expert Supply Chain and Rolling Residency Analysis
+# Supply Chain and Rolling Residency Analysis
 
 **Date:** 2026-09-10  
 **Status:** Current analysis and Stage 2 direction  
