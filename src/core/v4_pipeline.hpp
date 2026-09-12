@@ -206,7 +206,8 @@ public:
         uint32_t num_layers = 2,
         uint32_t unified_vram_slots = 0,
         uint32_t max_seq_len = 4096,
-        bool enable_direct_io = true
+        bool enable_direct_io = true,
+        const AeonArtifactSpec& artifact = make_current_swizzled_artifact_spec()
     ) {
         num_layers_ = num_layers;
         current_seq_len_ = 0;
@@ -216,9 +217,15 @@ public:
 
         // 2. Open Aeon Model via Zero-Copy Mmap
         std::cout << "[Pipeline] Opening native Aeon model from " << aeon_model_dir << "..." << std::endl;
-        aeon_loader.open_model(aeon_model_dir);
+        aeon_loader.open_model(aeon_model_dir, artifact);
+        const auto& expert_format = aeon_loader.expert_format();
+        if (expert_format.kind != ExpertFormatKind::SWIZZLED_W4A16) {
+            throw std::runtime_error(
+                "V4Pipeline: selected artifact requires a different weight backend");
+        }
         if (enable_direct_io) {
-            direct_io_reader_ = std::make_unique<aeon::io::DirectIOReader>(64);
+            direct_io_reader_ = std::make_unique<aeon::io::DirectIOReader>(
+                64, true, expert_format.sector_size);
         }
         std::cout << "  > Total dense tensors indexed: " << aeon_loader.total_dense_tensors() << std::endl;
 
@@ -271,9 +278,11 @@ public:
 
         // 7. Setup Unified VRAM Pool and Expert Registry
         uint32_t active_vram_slots = unified_vram_slots > 0 ? unified_vram_slots : std::max(num_layers_ * 8u, 16u);
-        unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(active_vram_slots);
-        expert_registry_ = std::make_unique<ExpertRegistry>(num_layers_, 256, active_vram_slots, 0);
-        prefetch_staging_ = std::make_unique<PrefetchStagingArena>();
+        unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(
+            active_vram_slots, expert_format);
+        expert_registry_ = std::make_unique<ExpertRegistry>(
+            num_layers_, expert_format.experts_per_layer, active_vram_slots, 0);
+        prefetch_staging_ = std::make_unique<PrefetchStagingArena>(expert_format);
 
         // Preload initial hot experts
         for (uint32_t slot = 0; slot < active_vram_slots; ++slot) {
@@ -295,7 +304,8 @@ public:
     void init_dynamic_global(
         const std::string& aeon_model_dir,
         const AeonRuntimeConfig& runtime_cfg,
-        uint32_t num_layers = 2
+        uint32_t num_layers = 2,
+        const AeonArtifactSpec& artifact = make_current_swizzled_artifact_spec()
     ) {
         std::cout << "================================================================================" << std::endl;
         std::cout << "      Project Aeon — Dynamic VRAM Budget & Global Expert Pool Pipeline          " << std::endl;
@@ -312,16 +322,23 @@ public:
 
         // 2. Open Model Containers
         std::cout << "[Pipeline] Opening native .aeon model from " << aeon_model_dir << "..." << std::endl;
-        aeon_loader.open_model(aeon_model_dir);
-        direct_io_reader_ = std::make_unique<aeon::io::DirectIOReader>(64);
+        aeon_loader.open_model(aeon_model_dir, artifact);
+        const auto& expert_format = aeon_loader.expert_format();
+        if (expert_format.kind != ExpertFormatKind::SWIZZLED_W4A16) {
+            throw std::runtime_error(
+                "V4Pipeline: selected artifact requires a different weight backend");
+        }
+        direct_io_reader_ = std::make_unique<aeon::io::DirectIOReader>(
+            64, true, expert_format.sector_size);
         std::cout << "  > Dense tensors indexed: " << aeon_loader.total_dense_tensors() << std::endl;
 
         // Load config
         auto model_cfg = DeepSeekV4Config::load_from_json(aeon_model_dir + "/config.json");
 
         // 3. Evaluate Memory Budget & Feasibility Gate
-        size_t dense_bytes = 15745100992ULL; // model_dense.aeon size
-        budget_report_ = MemoryBudgetEngine::evaluate(runtime_cfg, model_cfg, dense_bytes);
+        const size_t dense_bytes = aeon_loader.dense_file_size();
+        budget_report_ = MemoryBudgetEngine::evaluate(
+            runtime_cfg, model_cfg, dense_bytes, expert_format);
         std::cout << budget_report_.to_string() << std::endl;
 
         if (!budget_report_.is_feasible) {
@@ -379,15 +396,16 @@ public:
         // 8. Allocate Unified VRAM Expert Pool (Hot Pool)
         std::cout << "[Pipeline] Allocating Unified VRAM Expert Pool (" << budget_report_.hot_vram_slots << " slots, "
                   << (budget_report_.hot_vram_bytes / (1024*1024*1024.0)) << " GB)..." << std::endl;
-        unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(budget_report_.hot_vram_slots);
-        prefetch_staging_ = std::make_unique<PrefetchStagingArena>();
+        unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(
+            budget_report_.hot_vram_slots, expert_format);
+        prefetch_staging_ = std::make_unique<PrefetchStagingArena>(expert_format);
 
         // 9. Initialize Expert Registry Catalog
         const uint32_t active_warm_host_slots = budget_report_.warm_host_slots;
         std::cout << "[Pipeline] Initializing Expert Registry (VRAM=" << budget_report_.hot_vram_slots
               << ", Host=" << active_warm_host_slots << ")..." << std::endl;
         expert_registry_ = std::make_unique<ExpertRegistry>(
-            num_layers_, model_cfg.n_routed_experts,
+            num_layers_, expert_format.experts_per_layer,
             budget_report_.hot_vram_slots, active_warm_host_slots,
             runtime_cfg.preload_warm_host
         );
@@ -396,7 +414,7 @@ public:
         std::cout << "[Pipeline] Pre-populating Hot VRAM slots into Unified Pool..." << std::endl;
         const size_t direct_batch_slots = std::max<size_t>(
             1, direct_io_reader_->submission_capacity() /
-               ((AEON_EXPERT_BYTES + aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES - 1) /
+               ((expert_format.payload_bytes + aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES - 1) /
                 aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES));
         for (uint32_t batch_start = 0; batch_start < budget_report_.hot_vram_slots; batch_start += direct_batch_slots) {
             const uint32_t batch_end = std::min<uint32_t>(
@@ -412,7 +430,7 @@ public:
                 if (gid < 0) continue;
                 const auto& entry = expert_registry_->catalog[gid];
                 expert_ids.emplace_back(entry.layer_id, entry.expert_id);
-                buffers.emplace_back(AEON_EXPERT_BYTES);
+                buffers.emplace_back(expert_format.payload_bytes, expert_format.sector_size);
             }
 
             std::vector<uint8_t*> destinations;
@@ -434,10 +452,12 @@ public:
 
         // 11. Allocate and populate the persistent Warm Host DDR pool.
         if (active_warm_host_slots > 0) {
-            const size_t active_warm_host_bytes = static_cast<size_t>(active_warm_host_slots) * AEON_EXPERT_BYTES;
+            const size_t active_warm_host_bytes = static_cast<size_t>(active_warm_host_slots) *
+                                                  expert_format.payload_bytes;
             std::cout << "[Pipeline] Allocating Tier 2 Warm Host DDR Pool (" << active_warm_host_slots << " slots, "
                       << (active_warm_host_bytes / (1024*1024*1024.0)) << " GB)..." << std::endl;
-            host_pool_ = std::make_unique<HostExpertPool>(active_warm_host_slots);
+            host_pool_ = std::make_unique<HostExpertPool>(
+                active_warm_host_slots, expert_format);
 
             if (runtime_cfg.preload_warm_host) {
                 std::cout << "[Pipeline] Pre-populating Warm Host DDR Pool ("
@@ -477,6 +497,7 @@ public:
     uint32_t step(uint32_t token_id, uint32_t pos, RoutingPhase phase = RoutingPhase::Decode) {
         supply_telemetry_.set_phase(phase);
         reap_registry_transfers();
+        const size_t expert_payload_bytes = this->expert_payload_bytes();
 
         constexpr int H = kernel::DSV4_HIDDEN_SIZE; // 4096
         constexpr int HC = 4;
@@ -806,7 +827,7 @@ public:
                     const size_t chunk_offset = chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
                     const size_t expected_bytes = std::min(
                         aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
-                        static_cast<size_t>(AEON_EXPERT_BYTES) - chunk_offset
+                        expert_payload_bytes - chunk_offset
                     );
                     if (completion.result != static_cast<int32_t>(expected_bytes)) {
                         mark_registry_request_failed(
@@ -1421,6 +1442,10 @@ public:
     }
 
 private:
+    size_t expert_payload_bytes() const noexcept {
+        return aeon_loader.expert_format().payload_bytes;
+    }
+
     void free_expert_timing_events() {
         for (auto event : routed_section_start_events_) {
             if (event != nullptr) (void)hipEventDestroy(event);
@@ -1699,13 +1724,13 @@ private:
                                 static_cast<uint32_t>(transfer.demotion_destination_slot)),
                             prefetch_staging_->get_slot_ptr(
                                 static_cast<uint32_t>(transfer.demotion_staging_idx)),
-                            AEON_EXPERT_BYTES);
+                            expert_payload_bytes());
                         prefetch_staging_->release_after_gpu_transfer(
                             static_cast<uint32_t>(transfer.demotion_staging_idx));
                     }
                     expert_registry_->complete_demotion(transfer.operation_id);
                     supply_telemetry_.record_demotion_completion(
-                        transfer.source_tier, AEON_EXPERT_BYTES);
+                        transfer.source_tier, expert_payload_bytes());
                     supply_telemetry_.record_transfer_event(
                         transfer.operation_id,
                         transfer.demoted_expert_id,
@@ -1821,24 +1846,27 @@ private:
                                        request.kind != ExpertRequestKind::PENDING;
         const uint64_t logical_bytes = request.source_tier == ExpertTier::HOT_VRAM
             ? 0
-            : AEON_EXPERT_BYTES;
+            : expert_payload_bytes();
         supply_telemetry_.record_request(
             supply_telemetry_.current_phase(),
             request.source_tier,
             logical_bytes,
-            physical_transfer ? AEON_EXPERT_BYTES : 0,
-            request.source_tier == ExpertTier::COLD_NVME && physical_transfer ? AEON_EXPERT_BYTES : 0,
-            request.source_tier == ExpertTier::WARM_HOST && physical_transfer ? AEON_EXPERT_BYTES : 0,
-            request.source_tier == ExpertTier::COLD_NVME && physical_transfer ? AEON_EXPERT_BYTES : 0
+            physical_transfer ? expert_payload_bytes() : 0,
+            request.source_tier == ExpertTier::COLD_NVME && physical_transfer
+                ? expert_payload_bytes() : 0,
+            request.source_tier == ExpertTier::WARM_HOST && physical_transfer
+                ? expert_payload_bytes() : 0,
+            request.source_tier == ExpertTier::COLD_NVME && physical_transfer
+                ? expert_payload_bytes() : 0
         );
     }
 
     void observe_supply_occupancy(ExpertTier source_tier) {
         const uint64_t warm_pinned_bytes = host_pool_
-            ? static_cast<uint64_t>(host_pool_->pinned_slot_count()) * AEON_EXPERT_BYTES
+            ? static_cast<uint64_t>(host_pool_->pinned_slot_count()) * host_pool_->payload_bytes()
             : 0;
         const uint64_t warm_unpinned_bytes = host_pool_
-            ? static_cast<uint64_t>(host_pool_->unpinned_slot_count()) * AEON_EXPERT_BYTES
+            ? static_cast<uint64_t>(host_pool_->unpinned_slot_count()) * host_pool_->payload_bytes()
             : 0;
         supply_telemetry_.observe_occupancy(
             expert_registry_->published_hot_slots(),
@@ -1864,7 +1892,7 @@ private:
         }
 
         const size_t requests_per_expert =
-            (AEON_EXPERT_BYTES + aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES - 1) /
+            (expert_payload_bytes() + aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES - 1) /
             aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
         const size_t max_batch_experts = std::max<size_t>(
             1, direct_io_reader_->submission_capacity() / requests_per_expert);
@@ -1924,7 +1952,7 @@ private:
                     const size_t chunk_offset = chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
                     const size_t expected_bytes = std::min(
                         aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
-                        static_cast<size_t>(AEON_EXPERT_BYTES) - chunk_offset
+                        expert_payload_bytes() - chunk_offset
                     );
                     if (completion.result != static_cast<int32_t>(expected_bytes)) {
                         throw std::runtime_error("V4Pipeline: direct expert read returned a short payload");

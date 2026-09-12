@@ -41,10 +41,17 @@ class DirectIOReader {
 public:
     static constexpr size_t DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024;
 
-    explicit DirectIOReader(uint32_t queue_depth = 64, bool force_async = true)
-        : queue_depth_(queue_depth), force_async_(force_async) {
+    explicit DirectIOReader(
+        uint32_t queue_depth = 64,
+        bool force_async = true,
+        size_t sector_size = SECTOR_SIZE
+    )
+        : queue_depth_(queue_depth), force_async_(force_async), sector_size_(sector_size) {
         if (queue_depth_ == 0) {
             throw std::invalid_argument("DirectIOReader: queue depth must be greater than zero");
+        }
+        if (sector_size_ == 0 || (sector_size_ & (sector_size_ - 1)) != 0) {
+            throw std::invalid_argument("DirectIOReader: sector size must be a non-zero power of two");
         }
 
         std::memset(&params_, 0, sizeof(params_));
@@ -123,7 +130,7 @@ public:
         uint64_t file_offset,
         uint64_t user_data
     ) {
-        validate_request(fd, aligned_buf, bytes, file_offset);
+        validate_request(fd, aligned_buf, bytes, file_offset, sector_size_);
 
         uint32_t head = __atomic_load_n(sring_head_, __ATOMIC_ACQUIRE);
         uint32_t tail = __atomic_load_n(sring_tail_, __ATOMIC_ACQUIRE);
@@ -156,8 +163,8 @@ public:
         uint64_t first_user_data,
         size_t chunk_bytes = DEFAULT_CHUNK_BYTES
     ) {
-        if (chunk_bytes == 0 || (chunk_bytes % SECTOR_SIZE) != 0) {
-            throw std::invalid_argument("DirectIOReader: chunk length must be a non-zero 4KB multiple");
+        if (chunk_bytes == 0 || (chunk_bytes % sector_size_) != 0) {
+            throw std::invalid_argument("DirectIOReader: chunk length must be a non-zero sector multiple");
         }
 
         size_t request_count = 0;
@@ -200,6 +207,10 @@ public:
 
     uint32_t submission_capacity() const noexcept {
         return params_.sq_entries;
+    }
+
+    size_t sector_size() const noexcept {
+        return sector_size_;
     }
 
     DirectIOCompletion wait_for_completion() {
@@ -246,23 +257,30 @@ public:
     }
 
 private:
-    static void validate_request(int fd, const void* aligned_buf, size_t bytes, uint64_t file_offset) {
+    static void validate_request(
+        int fd,
+        const void* aligned_buf,
+        size_t bytes,
+        uint64_t file_offset,
+        size_t sector_size
+    ) {
         if (fd < 0) {
             throw std::invalid_argument("DirectIOReader: file descriptor must be valid");
         }
-        if (aligned_buf == nullptr || (reinterpret_cast<uintptr_t>(aligned_buf) % SECTOR_SIZE) != 0) {
-            throw std::invalid_argument("DirectIOReader: destination buffer is not 4KB sector aligned");
+        if (aligned_buf == nullptr || (reinterpret_cast<uintptr_t>(aligned_buf) % sector_size) != 0) {
+            throw std::invalid_argument("DirectIOReader: destination buffer is not sector aligned");
         }
-        if (bytes == 0 || bytes > std::numeric_limits<uint32_t>::max() || (bytes % SECTOR_SIZE) != 0) {
-            throw std::invalid_argument("DirectIOReader: read length must be a non-zero 4KB multiple");
+        if (bytes == 0 || bytes > std::numeric_limits<uint32_t>::max() || (bytes % sector_size) != 0) {
+            throw std::invalid_argument("DirectIOReader: read length must be a non-zero sector multiple");
         }
-        if ((file_offset % SECTOR_SIZE) != 0) {
-            throw std::invalid_argument("DirectIOReader: file offset is not 4KB sector aligned");
+        if ((file_offset % sector_size) != 0) {
+            throw std::invalid_argument("DirectIOReader: file offset is not sector aligned");
         }
     }
 
     uint32_t queue_depth_{64};
     bool force_async_{false};
+    size_t sector_size_{SECTOR_SIZE};
     int ring_fd_{-1};
     struct io_uring_params params_;
 

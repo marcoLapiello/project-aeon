@@ -27,6 +27,13 @@ The proposed shape is:
        current .aeon artifacts                  GPTQ-Aeon artifacts
 ```
 
+    The first generalization slice described by this analysis is now implemented
+    for the current backend: artifact specifications, runtime expert-format
+    descriptors, opaque VRAM payload storage, descriptor-driven Warm/staging/budget
+    and direct-I/O sizing, and explicit rejection of non-swizzled artifacts by the
+    current V4 pipeline. GPTQ conversion, decoding, dense binding, and kernels are
+    still intentionally out of scope.
+
 The current model remains the regression baseline. The GPTQ path gets its own
 artifact format, dense-weight representation, expert-payload layout, and
 quantized linear dispatch. The two paths share only contracts that have

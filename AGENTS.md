@@ -17,6 +17,7 @@ Current execution records:
 - [Phase 2 Execution Plan](plans-and-docs/execution/active/PHASE_2_EXECUTION_PLAN.md): paused single-GPU Hot/Warm/Cold runtime and remaining cold-tier work.
 - [Native Text-In/Text-Out Plan](plans-and-docs/execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md): native frontend status and correctness gates.
 - [Routing Profile Study](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md): profiler contract and placement-study gates.
+- [Backend Generalization Execution Plan](plans-and-docs/execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md): descriptor-driven artifact and expert-supply boundary; manifest and second-backend gates.
 - [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md): authoritative silicon measurements.
 - [Expert Performance Review Conclusions](plans-and-docs/analysis/historical/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md): historical latency diagnosis and measurement rationale.
 
@@ -52,6 +53,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [x] Routing profiler plumbing: optional observation, resumable aggregation, complete rankings, compact summaries, and regeneration mode.
 - [x] Stage 1 parallel expert-kernel path: version-2 W4A16 swizzled artifact, vectorized Wave32 GEMV, fused six-expert W1/W3 plus clamped SwiGLU, fused W2 FP32 accumulation, native conversion, sole production-path integration, and silicon validation. The former baseline path and comparison-only kernels were removed after correctness and GPU-side performance validation. The standalone [Stage 1 implementation report](plans-and-docs/analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) records the measured comparison. The runtime resolves six complete expert payloads into VRAM and waits for transfer events before launch; the kernels do not handle non-resident experts or storage/cache misses.
 - [x] Warm-tier repair and supply telemetry: persistent Warm ownership, event-ordered Hot-to-Warm refill, content-lazy Warm preload with eager configured capacity, transactional transfer failure cleanup, pinned fallback handling, source-tier JSONL telemetry, and the five-run three-variant silicon A/B are recorded in [the closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
+- [x] Backend generalization foundation: artifact specifications, runtime expert-format descriptors, opaque VRAM payload storage, descriptor-driven Warm/staging/budget/direct-I/O sizing, and current swizzled-view guards are implemented without changing the v2 runtime contract. The remaining manifest, dense-binding, and second-backend work is tracked in the [Backend Generalization Execution Plan](plans-and-docs/execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md).
 
 ### Current priority
 - [ ] **Model correctness:** implement and validate the missing CSA/HCA attention, compressed Prefill state, configured RoPE/YaRN behavior, and trusted-reference parity before using routing data for placement decisions.
@@ -65,6 +67,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [ ] **Cold-tier performance:** characterize cold-cache and steady-state behavior, reduce host-memory pressure, improve physical `.aeon` placement, and test whether the exposed just-in-time miss path needs a new scheduling or CPU-fallback design. The model-backed `>= 6.0 GB/s` target remains open.
 - [ ] **Swizzled full-model performance:** validate representative 43-layer generation with the version-2 artifact under controlled Hot/Warm conditions, collect useful rocprof performance counters, and tune occupancy/register pressure beyond the isolated six-expert benchmarks. A residency invariant violation would produce invalid/stale results or a device memory fault rather than trigger an automatic fallback.
 - [ ] **Routing placement study:** collect representative profile and held-out corpora with the verified text contract, then evaluate frequency-informed placement against dynamic LRU.
+- [ ] **Backend specialization:** add manifest/backend selection, semantic dense binding, and a second working weight backend before introducing a universal V4 linear-dispatch abstraction.
 - [ ] **Phase 3:** multi-GPU pipeline parallelism and 1F1B scheduling remain future work.
 
 ---

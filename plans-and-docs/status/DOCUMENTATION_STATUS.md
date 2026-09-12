@@ -22,6 +22,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 | [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md) | Paused | Paused single-GPU cold-tier, storage-layout, and memory-pressure work. Spikes 0-2 are complete; Spike 3 has a bounded implementation but open acceptance gates. |
 | [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](../execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) | Open | Native text path is implemented; external behavioral comparison and longer-context attention correctness remain open. |
 | [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) | Open; evidence gated | Routing observer and durable profiler are implemented; representative profile/held-out data and placement evaluation remain gated by model correctness. |
+| [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) | Open; foundation implemented | Descriptor-driven native artifacts, opaque expert supply, and current-backend guarding are implemented; manifest, dense binding, and second-backend gates remain open. |
 | [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Living record | Authoritative silicon results, regressions, and milestone measurements. |
 | [CODEBASE_MAP.md](CODEBASE_MAP.md) | Current map | Describes the production runtime, validation targets, and legacy diagnostics. |
 

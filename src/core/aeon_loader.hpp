@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/aeon_artifact.hpp"
 #include "core/loaded_tensor.hpp"
 
 #include <fcntl.h>
@@ -16,18 +17,6 @@
 #include <vector>
 
 namespace aeon::core {
-
-constexpr uint32_t AEON_SECTOR_SIZE = 4096;
-constexpr size_t   AEON_EXPERT_BYTES = 14155776; // 3,456 sectors of 4096 bytes
-
-// Layout offsets inside one contiguous 14,155,776-byte expert payload:
-// [W1_packed (4MB)] [W1_scale (512KB)] [W2_packed (4MB)] [W2_scale (512KB)] [W3_packed (4MB)] [W3_scale (512KB)]
-constexpr size_t AEON_W1_PACKED_OFFSET = 0;
-constexpr size_t AEON_W1_SCALE_OFFSET  = 4194304;
-constexpr size_t AEON_W2_PACKED_OFFSET = 4718592;
-constexpr size_t AEON_W2_SCALE_OFFSET  = 8912896;
-constexpr size_t AEON_W3_PACKED_OFFSET = 9437184;
-constexpr size_t AEON_W3_SCALE_OFFSET  = 13631488;
 
 class AeonModelLoader {
 public:
@@ -47,26 +36,44 @@ public:
     AeonModelLoader& operator=(AeonModelLoader&&) = default;
 
     void open_model(const std::string& model_dir) {
-        open_model_files(model_dir, "model_experts_swizzled.aeon",
-                         "model_experts_swizzled.index", 2);
+        open_model(model_dir, make_current_swizzled_artifact_spec());
+    }
+
+    void open_model(const std::string& model_dir, const AeonArtifactSpec& artifact) {
+        if (artifact.dense_filename.empty() || artifact.experts_filename.empty() ||
+            artifact.index_filename.empty() || artifact.expected_expert_version == 0 ||
+            artifact.expert_sector_size == 0 ||
+            (artifact.expert_sector_size & (artifact.expert_sector_size - 1)) != 0) {
+            throw std::invalid_argument("AeonModelLoader: artifact specification is incomplete");
+        }
+        open_model_files(model_dir, artifact);
     }
 
     uint32_t expert_format_version() const {
         return expert_format_version_;
     }
 
+    const ExpertFormatDescriptor& expert_format() const noexcept {
+        return expert_format_;
+    }
+
+    size_t dense_file_size() const noexcept {
+        return dense_file_size_;
+    }
+
 private:
     void open_model_files(
         const std::string& model_dir,
-        const std::string& experts_filename,
-        const std::string& index_filename,
-        uint32_t expected_expert_version
+        const AeonArtifactSpec& artifact
     ) {
         model_dir_ = model_dir;
-        open_dense(model_dir + "/model_dense.aeon");
-        open_experts(model_dir + "/" + experts_filename,
-                     model_dir + "/" + index_filename,
-                     expected_expert_version);
+        open_dense(model_dir + "/" + artifact.dense_filename);
+        open_experts(model_dir + "/" + artifact.experts_filename,
+                     model_dir + "/" + artifact.index_filename,
+                     artifact.expected_expert_version,
+                     artifact.expert_format_kind,
+                     artifact.expert_sector_size,
+                     artifact.expected_expert_payload_bytes);
     }
 
 public:
@@ -101,11 +108,13 @@ public:
 
         uint64_t slot_idx = static_cast<uint64_t>(layer_id) * experts_per_layer_ + expert_id;
         uint64_t offset = expert_offsets_[slot_idx];
-        if ((offset % AEON_SECTOR_SIZE) != 0 ||
-            offset > experts_file_size_ || AEON_EXPERT_BYTES > experts_file_size_ - offset) {
+        if (expert_format_.payload_bytes == 0 ||
+            (offset % expert_format_.sector_size) != 0 ||
+            offset > experts_file_size_ ||
+            expert_format_.payload_bytes > experts_file_size_ - offset) {
             throw std::runtime_error("AeonModelLoader: Expert location is invalid or not sector aligned");
         }
-        return ExpertLocation{offset, AEON_EXPERT_BYTES};
+        return ExpertLocation{offset, expert_format_.payload_bytes};
     }
 
     // Expert access interface: provides zero-copy pointers to an expert's contiguous payload in Host DDR.
@@ -150,6 +159,7 @@ public:
         dense_tensors_.clear();
         expert_offsets_.clear();
         expert_format_version_ = 0;
+        expert_format_ = {};
     }
 
 private:
@@ -206,7 +216,10 @@ private:
     void open_experts(
         const std::string& experts_path,
         const std::string& index_path,
-        uint32_t expected_version
+        uint32_t expected_version,
+        ExpertFormatKind expected_kind,
+        uint32_t expert_sector_size,
+        size_t expected_payload_bytes
     ) {
         // 1. Read index table
         int idx_fd = ::open(index_path.c_str(), O_RDONLY);
@@ -248,21 +261,45 @@ private:
         experts_per_layer_ = *reinterpret_cast<const uint32_t*>(idx_buf.data() + 20);
         uint64_t expert_bytes = *reinterpret_cast<const uint64_t*>(idx_buf.data() + 24);
 
-        if (expert_bytes != AEON_EXPERT_BYTES) {
-            throw std::runtime_error("AeonModelLoader: Unexpected expert bytes in index!");
+        if (expected_payload_bytes != 0 && expert_bytes != expected_payload_bytes) {
+            throw std::runtime_error(
+                "AeonModelLoader: Expert payload size does not match the artifact specification");
         }
 
-        uint32_t total_experts = num_layers_ * experts_per_layer_;
+        if (expert_bytes > std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error("AeonModelLoader: Expert payload is too large for this platform");
+        }
+        ExpertFormatDescriptor format{
+            expected_kind,
+            index_version,
+            expert_sector_size,
+            num_layers_,
+            experts_per_layer_,
+            static_cast<size_t>(expert_bytes)
+        };
+        format.validate_catalog();
+
+        const uint64_t total_experts = format.total_experts();
+        if (total_experts > (std::numeric_limits<size_t>::max() - 32) / 16) {
+            throw std::runtime_error("AeonModelLoader: Expert catalog is too large");
+        }
         const size_t required_index_bytes = 32 + static_cast<size_t>(total_experts) * 16;
         if (idx_buf.size() < required_index_bytes) {
             throw std::runtime_error("AeonModelLoader: Expert index has incomplete entries!");
         }
         expert_format_version_ = index_version;
+        expert_format_ = format;
         expert_offsets_.resize(total_experts);
 
         const uint64_t* entries = reinterpret_cast<const uint64_t*>(idx_buf.data() + 32);
-        for (uint32_t i = 0; i < total_experts; ++i) {
-            expert_offsets_[i] = entries[i * 2]; // (offset, size)
+        for (uint64_t i = 0; i < total_experts; ++i) {
+            const uint64_t offset = entries[i * 2];
+            const uint64_t byte_length = entries[i * 2 + 1];
+            if (byte_length != expert_bytes || (offset % format.sector_size) != 0) {
+                throw std::runtime_error(
+                    "AeonModelLoader: Expert index contains an invalid payload entry");
+            }
+            expert_offsets_[static_cast<size_t>(i)] = offset;
         }
 
         // 2. Mmap the swizzled expert payload.
@@ -362,6 +399,7 @@ private:
     uint32_t num_layers_{0};
     uint32_t experts_per_layer_{0};
     uint32_t expert_format_version_{0};
+    ExpertFormatDescriptor expert_format_{};
     std::vector<uint64_t> expert_offsets_;
 };
 

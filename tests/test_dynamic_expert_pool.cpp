@@ -7,6 +7,7 @@
 #include "core/vram_expert_pool.hpp"
 
 #include <cassert>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -19,9 +20,12 @@ int main() {
     aeon::core::select_compute_device(true);
 
     // 2. Load model configuration
+    std::string aeon_model_dir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
     std::string config_path = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon/config.json";
     auto model_cfg = aeon::core::DeepSeekV4Config::load_from_json(config_path);
-    size_t dense_weights_bytes = 15745100992ULL; // 14.66 GB as measured on model_dense.aeon
+    aeon::core::AeonModelLoader loader;
+    loader.open_model(aeon_model_dir);
+    const size_t dense_weights_bytes = loader.dense_file_size();
 
     // -------------------------------------------------------------------------
     // Test 1: Hard Feasibility Gate with Over-Budget Context Length
@@ -31,7 +35,8 @@ int main() {
     overbudget_cfg.context_size = 262144; // MLA KV would require ~11.27 GB, exceeding remaining 24GB VRAM
     overbudget_cfg.warm_host_bytes = 0;   // Warm disabled
 
-    auto overbudget_report = aeon::core::MemoryBudgetEngine::evaluate(overbudget_cfg, model_cfg, dense_weights_bytes);
+    auto overbudget_report = aeon::core::MemoryBudgetEngine::evaluate(
+        overbudget_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
     std::cout << overbudget_report.to_string() << std::endl;
     assert(!overbudget_report.is_feasible);
     assert(overbudget_report.max_viable_context_size > 0);
@@ -46,7 +51,8 @@ int main() {
     valid_cfg.context_size = 4096;
     valid_cfg.warm_host_bytes = 0; // Warm disabled
 
-    auto valid_report = aeon::core::MemoryBudgetEngine::evaluate(valid_cfg, model_cfg, dense_weights_bytes);
+    auto valid_report = aeon::core::MemoryBudgetEngine::evaluate(
+        valid_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
     std::cout << valid_report.to_string() << std::endl;
     assert(valid_report.is_feasible);
     assert(valid_report.hot_vram_slots >= 12); // Must guarantee at least 2*num_experts_per_tok
@@ -88,11 +94,6 @@ int main() {
     uint32_t pool_slots = 16;
     aeon::core::UnifiedVRAMExpertPool vram_pool(pool_slots);
 
-    // Open AeonModelLoader to stream a real expert payload into slot 0
-    std::string aeon_model_dir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
-    aeon::core::AeonModelLoader loader;
-    loader.open_model(aeon_model_dir);
-
     const uint8_t* expert_payload = loader.get_expert_data(0, 0);
     assert(expert_payload != nullptr);
 
@@ -109,6 +110,34 @@ int main() {
         assert(host_w1_check[i] == orig_w1[i]);
     }
     std::cout << "  > [PASSED] UnifiedVRAMExpertPool DMA stream & silicon bit-parity verified!\n";
+
+    // Future backends can use opaque payload slots without exposing swizzled views.
+    aeon::core::ExpertFormatDescriptor opaque_format{
+        aeon::core::ExpertFormatKind::UNKNOWN,
+        7,
+        aeon::core::AEON_SECTOR_SIZE,
+        1,
+        1,
+        aeon::core::AEON_SECTOR_SIZE
+    };
+    aeon::core::ExpertPayloadPool opaque_pool(1, opaque_format);
+    std::vector<uint8_t> opaque_source(opaque_format.payload_bytes, 0x5A);
+    std::vector<uint8_t> opaque_result(opaque_format.payload_bytes, 0);
+    opaque_pool.upload_from_host_expert(0, opaque_source.data(), 0);
+    CHECK_HIP(hipStreamSynchronize(0));
+    opaque_pool.download_to_host_expert(0, opaque_result.data(), 0);
+    CHECK_HIP(hipStreamSynchronize(0));
+    assert(std::memcmp(opaque_source.data(), opaque_result.data(), opaque_source.size()) == 0);
+
+    aeon::core::UnifiedVRAMExpertPool incompatible_pool(1, opaque_format);
+    bool rejected_swizzled_view = false;
+    try {
+        (void)incompatible_pool.get_w1_packed(0);
+    } catch (const std::logic_error&) {
+        rejected_swizzled_view = true;
+    }
+    assert(rejected_swizzled_view);
+    std::cout << "  > [PASSED] Opaque future-format payload storage and view guard verified!\n";
 
     // -------------------------------------------------------------------------
     // Test 5: End-to-End V4Pipeline with Global Unified Pool on Physical Silicon

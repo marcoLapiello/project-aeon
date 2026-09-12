@@ -1,7 +1,7 @@
 #pragma once
 
-#include "core/aeon_loader.hpp"
 #include "core/config.hpp"
+#include "core/expert_format.hpp"
 
 #include <hip/hip_runtime.h>
 #include <sys/sysinfo.h>
@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -65,6 +66,7 @@ struct MemoryBudgetReport {
     size_t hot_vram_bytes{0};
     uint32_t warm_host_slots{0};
     size_t warm_host_bytes{0};
+    size_t expert_payload_bytes{0};
     size_t configured_host_budget_bytes{0};
     size_t persistent_warm_host_budget_bytes{0};
     size_t transient_staging_bytes{0};
@@ -107,6 +109,7 @@ struct MemoryBudgetReport {
             << (double)hot_vram_bytes / (1024 * 1024 * 1024) << " GB)\n"
             << "    - Tier 2: Warm Host DDR: " << warm_host_slots << " slots ("
             << (double)warm_host_bytes / (1024 * 1024 * 1024) << " GB)\n"
+            << "    - Expert Payload Size : " << expert_payload_bytes << " bytes\n"
             << "    - Configured Host Budget : " << (double)configured_host_budget_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Persistent Warm Budget : " << (double)persistent_warm_host_budget_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Transient Staging    : " << (double)transient_staging_bytes / (1024 * 1024 * 1024) << " GB\n"
@@ -121,9 +124,30 @@ public:
     static MemoryBudgetReport evaluate(
         const AeonRuntimeConfig& runtime_cfg,
         const DeepSeekV4Config& model_cfg,
-        size_t dense_weights_bytes
+        size_t dense_weights_bytes,
+        const ExpertFormatDescriptor& expert_format
     ) {
         MemoryBudgetReport report;
+
+        try {
+            expert_format.validate_catalog();
+        } catch (const std::exception& error) {
+            report.rejection_reason = error.what();
+            return report;
+        }
+
+        if (model_cfg.num_hidden_layers < 0 || model_cfg.n_routed_experts < 0 ||
+            expert_format.num_layers != static_cast<uint32_t>(model_cfg.num_hidden_layers) ||
+            expert_format.experts_per_layer != static_cast<uint32_t>(model_cfg.n_routed_experts)) {
+            report.rejection_reason =
+                "Expert format catalog does not match the model configuration";
+            return report;
+        }
+        if (expert_format.total_experts() > std::numeric_limits<uint32_t>::max()) {
+            report.rejection_reason = "Expert format catalog exceeds the runtime ID range";
+            return report;
+        }
+        report.expert_payload_bytes = expert_format.payload_bytes;
 
         // 1. Query physical GPU memory
         size_t free_vram = 0, total_vram = 0;
@@ -177,7 +201,8 @@ public:
         // Minimum active experts needed for execution:
         // 2 * num_experts_per_tok to guarantee compute + prefetch buffering without stalling
         uint32_t min_active_slots = static_cast<uint32_t>(2 * model_cfg.num_experts_per_tok);
-        report.vram_min_active_bytes = static_cast<size_t>(min_active_slots) * AEON_EXPERT_BYTES;
+        report.vram_min_active_bytes = static_cast<size_t>(min_active_slots) *
+                           expert_format.payload_bytes;
 
         // 5. Total essential baseline VRAM required
         size_t baseline_vram_needed = report.vram_dense_bytes +
@@ -215,13 +240,16 @@ public:
                                                      report.vram_scratch_bytes +
                                                      report.vram_headroom_bytes);
         report.vram_available_for_experts = remaining_for_experts;
-        report.hot_vram_slots = static_cast<uint32_t>(remaining_for_experts / AEON_EXPERT_BYTES);
-        report.hot_vram_bytes = static_cast<size_t>(report.hot_vram_slots) * AEON_EXPERT_BYTES;
+        report.hot_vram_slots = static_cast<uint32_t>(
+            remaining_for_experts / expert_format.payload_bytes);
+        report.hot_vram_bytes = static_cast<size_t>(report.hot_vram_slots) *
+                                expert_format.payload_bytes;
 
         // 8. Calculate persistent Warm capacity. Transport staging is allocated
         // for Cold requests even when Warm is disabled, but it never counts as a
         // persistent Warm slot.
-        report.transient_staging_bytes = static_cast<size_t>(12) * AEON_EXPERT_BYTES;
+        report.transient_staging_bytes = static_cast<size_t>(12) *
+                         expert_format.payload_bytes;
         report.configured_host_budget_bytes = runtime_cfg.warm_host_bytes == 0
             ? report.transient_staging_bytes
             : std::min(runtime_cfg.warm_host_bytes, report.max_allowed_host_ram_bytes);
@@ -231,26 +259,43 @@ public:
                 ? report.configured_host_budget_bytes - report.transient_staging_bytes
                 : 0;
         report.persistent_warm_host_budget_bytes = persistent_host_budget;
-        if (runtime_cfg.warm_host_bytes > 0 && persistent_host_budget < AEON_EXPERT_BYTES) {
+        if (runtime_cfg.warm_host_bytes > 0 &&
+            persistent_host_budget < expert_format.payload_bytes) {
             report.is_feasible = false;
             report.rejection_reason = "Warm host budget cannot hold one complete expert after reserving transient staging";
             return report;
         }
 
-        uint32_t total_experts = static_cast<uint32_t>(model_cfg.num_hidden_layers * model_cfg.n_routed_experts);
+        const uint32_t total_experts = static_cast<uint32_t>(expert_format.total_experts());
         uint32_t remaining_after_vram = (total_experts > report.hot_vram_slots)
             ? (total_experts - report.hot_vram_slots)
             : 0;
 
-        uint32_t host_slots_budgeted = static_cast<uint32_t>(persistent_host_budget / AEON_EXPERT_BYTES);
+        uint32_t host_slots_budgeted = static_cast<uint32_t>(
+            persistent_host_budget / expert_format.payload_bytes);
         report.warm_host_slots = std::min(remaining_after_vram, host_slots_budgeted);
-        report.warm_host_bytes = static_cast<size_t>(report.warm_host_slots) * AEON_EXPERT_BYTES;
+        report.warm_host_bytes = static_cast<size_t>(report.warm_host_slots) *
+                                 expert_format.payload_bytes;
 
         // 9. Cold NVMe pool gets the rest
         report.cold_nvme_slots = total_experts - (report.hot_vram_slots + report.warm_host_slots);
 
         report.is_feasible = true;
         return report;
+    }
+
+    static MemoryBudgetReport evaluate(
+        const AeonRuntimeConfig& runtime_cfg,
+        const DeepSeekV4Config& model_cfg,
+        size_t dense_weights_bytes
+    ) {
+        return evaluate(
+            runtime_cfg,
+            model_cfg,
+            dense_weights_bytes,
+            make_current_swizzled_expert_format(
+                model_cfg.num_hidden_layers,
+                model_cfg.n_routed_experts));
     }
 };
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/aeon_loader.hpp"
+#include "core/expert_format.hpp"
 #include <hip/hip_runtime.h>
 #include <array>
 #include <chrono>
@@ -50,6 +50,11 @@ public:
         allocate();
     }
 
+    explicit PrefetchStagingArena(const ExpertFormatDescriptor& format)
+        : format_(format) {
+        allocate();
+    }
+
     ~PrefetchStagingArena() {
         free();
     }
@@ -72,7 +77,8 @@ public:
     void allocate() {
         if (is_allocated_) return;
 
-        size_t total_bytes = static_cast<size_t>(TOTAL_STAGING_SLOTS) * AEON_EXPERT_BYTES;
+        format_.validate_payload();
+        size_t total_bytes = static_cast<size_t>(TOTAL_STAGING_SLOTS) * format_.payload_bytes;
         uses_hip_host_malloc_ = false;
 
         // Allocate pinned host memory
@@ -81,7 +87,7 @@ public:
             std::cerr << "[PrefetchStagingArena] hipHostMalloc failed (" << hipGetErrorString(err)
                       << "), attempting 4KB-aligned posix_memalign..." << std::endl;
             void* ptr = nullptr;
-            int ret = posix_memalign(&ptr, AEON_SECTOR_SIZE, total_bytes);
+            int ret = posix_memalign(&ptr, format_.sector_size, total_bytes);
             if (ret != 0 || ptr == nullptr) {
                 throw std::runtime_error("PrefetchStagingArena: Failed to allocate " +
                                          std::to_string(total_bytes / (1024 * 1024)) + " MB of pinned staging memory!");
@@ -188,19 +194,27 @@ public:
         return uses_hip_host_malloc_ || uses_hip_host_register_;
     }
 
-    // Direct pointer to contiguous 14.15 MB staging slot
+    const ExpertFormatDescriptor& format() const noexcept {
+        return format_;
+    }
+
+    size_t payload_bytes() const noexcept {
+        return format_.payload_bytes;
+    }
+
+    // Direct pointer to one opaque expert payload staging slot.
     uint8_t* get_slot_ptr(uint32_t slot_idx) {
         if (slot_idx >= TOTAL_STAGING_SLOTS) {
             throw std::runtime_error("PrefetchStagingArena: Slot index " + std::to_string(slot_idx) + " out of bounds");
         }
-        return h_pinned_base + static_cast<size_t>(slot_idx) * AEON_EXPERT_BYTES;
+        return h_pinned_base + static_cast<size_t>(slot_idx) * format_.payload_bytes;
     }
 
     const uint8_t* get_slot_ptr(uint32_t slot_idx) const {
         if (slot_idx >= TOTAL_STAGING_SLOTS) {
             throw std::runtime_error("PrefetchStagingArena: Slot index " + std::to_string(slot_idx) + " out of bounds");
         }
-        return h_pinned_base + static_cast<size_t>(slot_idx) * AEON_EXPERT_BYTES;
+        return h_pinned_base + static_cast<size_t>(slot_idx) * format_.payload_bytes;
     }
 
     // Stage expert payload from source (mmap / HostExpertPool) into pinned buffer
@@ -210,13 +224,14 @@ public:
             throw std::runtime_error("PrefetchStagingArena: staging slot is still in use");
         }
         uint8_t* dst = get_slot_ptr(slot_idx);
-        std::memcpy(dst, src_payload, AEON_EXPERT_BYTES);
+        std::memcpy(dst, src_payload, format_.payload_bytes);
         slot_states[slot_idx] = SlotState::IO_COMPLETE;
     }
 
 private:
     bool uses_hip_host_malloc_{false};
     bool uses_hip_host_register_{false};
+    ExpertFormatDescriptor format_{make_current_swizzled_expert_format()};
     std::array<std::chrono::steady_clock::time_point, TOTAL_STAGING_SLOTS> available_since_{};
 
     void validate_slot(uint32_t slot_idx) const {
@@ -238,6 +253,7 @@ private:
         is_allocated_ = other.is_allocated_;
         uses_hip_host_malloc_ = other.uses_hip_host_malloc_;
         uses_hip_host_register_ = other.uses_hip_host_register_;
+        format_ = other.format_;
         for (uint32_t i = 0; i < TOTAL_STAGING_SLOTS; ++i) {
             events[i] = other.events[i];
             slot_states[i] = other.slot_states[i];
@@ -247,6 +263,7 @@ private:
         other.h_pinned_base = nullptr;
         other.uses_hip_host_malloc_ = false;
         other.uses_hip_host_register_ = false;
+        other.format_ = make_current_swizzled_expert_format();
         other.is_allocated_ = false;
         other.slot_states.fill(SlotState::AVAILABLE);
         other.available_since_.fill(std::chrono::steady_clock::time_point{});

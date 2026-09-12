@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/aeon_loader.hpp"
+#include "core/expert_format.hpp"
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
@@ -23,8 +23,12 @@ public:
 
     HostExpertPool() = default;
 
-    explicit HostExpertPool(uint32_t slots) {
-        allocate(slots);
+    explicit HostExpertPool(uint32_t slots)
+        : HostExpertPool(slots, make_current_swizzled_expert_format()) {
+    }
+
+    HostExpertPool(uint32_t slots, const ExpertFormatDescriptor& format) {
+        allocate(slots, format);
     }
 
     ~HostExpertPool() {
@@ -47,7 +51,13 @@ public:
     }
 
     void allocate(uint32_t slots) {
+        allocate(slots, make_current_swizzled_expert_format());
+    }
+
+    void allocate(uint32_t slots, const ExpertFormatDescriptor& format) {
         free();
+        format.validate_payload();
+        format_ = format;
         if (slots == 0) return;
         num_slots = slots;
 
@@ -60,7 +70,7 @@ public:
                 Segment segment;
                 segment.slot_count = std::min(SEGMENT_SLOTS,
                                               num_slots - segment_idx * SEGMENT_SLOTS);
-                const size_t segment_bytes = static_cast<size_t>(segment.slot_count) * AEON_EXPERT_BYTES;
+                const size_t segment_bytes = static_cast<size_t>(segment.slot_count) * format_.payload_bytes;
 
                 hipError_t err = hipHostMalloc(reinterpret_cast<void**>(&segment.base),
                                                 segment_bytes, hipHostMallocPortable);
@@ -72,7 +82,7 @@ public:
                         reported_pinned_fallback = true;
                     }
                     void* ptr = nullptr;
-                    const int ret = posix_memalign(&ptr, AEON_SECTOR_SIZE, segment_bytes);
+                    const int ret = posix_memalign(&ptr, format_.sector_size, segment_bytes);
                     if (ret != 0 || ptr == nullptr) {
                         throw std::runtime_error("HostExpertPool: Failed to allocate " +
                                                  std::to_string(segment_bytes / (1024 * 1024)) +
@@ -110,7 +120,15 @@ public:
         num_slots = 0;
     }
 
-    // Direct pointer to contiguous 14.15 MB expert payload at slot index
+    const ExpertFormatDescriptor& format() const noexcept {
+        return format_;
+    }
+
+    size_t payload_bytes() const noexcept {
+        return format_.payload_bytes;
+    }
+
+    // Direct pointer to one opaque expert payload at slot index.
     uint8_t* get_expert_slot_ptr(uint32_t slot_idx) {
         const uint32_t segment_idx = slot_idx / SEGMENT_SLOTS;
         const uint32_t segment_slot = slot_idx % SEGMENT_SLOTS;
@@ -118,7 +136,7 @@ public:
             segment_slot >= segments_[segment_idx].slot_count) {
             throw std::runtime_error("HostExpertPool: Invalid slot index " + std::to_string(slot_idx));
         }
-        return segments_[segment_idx].base + static_cast<size_t>(segment_slot) * AEON_EXPERT_BYTES;
+        return segments_[segment_idx].base + static_cast<size_t>(segment_slot) * format_.payload_bytes;
     }
 
     const uint8_t* get_expert_slot_ptr(uint32_t slot_idx) const {
@@ -128,7 +146,7 @@ public:
             segment_slot >= segments_[segment_idx].slot_count) {
             throw std::runtime_error("HostExpertPool: Invalid slot index " + std::to_string(slot_idx));
         }
-        return segments_[segment_idx].base + static_cast<size_t>(segment_slot) * AEON_EXPERT_BYTES;
+        return segments_[segment_idx].base + static_cast<size_t>(segment_slot) * format_.payload_bytes;
     }
 
     // True when the segment backing this slot is page-locked (hipHostMalloc),
@@ -157,7 +175,7 @@ public:
     }
 
     size_t allocated_bytes() const {
-        return static_cast<size_t>(num_slots) * AEON_EXPERT_BYTES;
+        return static_cast<size_t>(num_slots) * format_.payload_bytes;
     }
 
 private:
@@ -169,13 +187,16 @@ private:
     };
 
     std::vector<Segment> segments_;
+    ExpertFormatDescriptor format_{make_current_swizzled_expert_format()};
 
     void move_from(HostExpertPool&& other) {
         num_slots = other.num_slots;
         segments_ = std::move(other.segments_);
+        format_ = other.format_;
 
         other.num_slots = 0;
         other.segments_.clear();
+        other.format_ = make_current_swizzled_expert_format();
     }
 };
 

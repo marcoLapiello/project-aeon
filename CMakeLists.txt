@@ -177,10 +177,14 @@ target_link_libraries(test_v4_block PRIVATE amdhip64)
 # Current format validation: native Aeon model loader
 add_executable(test_aeon_loader tests/test_aeon_loader.cpp)
 target_link_libraries(test_aeon_loader PRIVATE amdhip64)
+add_test(NAME test_aeon_loader COMMAND test_aeon_loader)
+set_tests_properties(test_aeon_loader PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Parallel format validation: version-2 swizzled Aeon model loader
 add_executable(test_aeon_swizzled_loader tests/test_aeon_swizzled_loader.cpp)
 target_link_libraries(test_aeon_swizzled_loader PRIVATE amdhip64)
+add_test(NAME test_aeon_swizzled_loader COMMAND test_aeon_swizzled_loader)
+set_tests_properties(test_aeon_swizzled_loader PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Silicon smoke test: v2 swizzled fused-expert pipeline path
 add_executable(test_aeon_swizzled_pipeline tests/test_aeon_swizzled_pipeline.cpp)
