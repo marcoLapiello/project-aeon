@@ -2,6 +2,7 @@
 
 #include "core/aeon_artifact.hpp"
 #include "core/loaded_tensor.hpp"
+#include "core/model_manifest.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -47,6 +48,17 @@ public:
             throw std::invalid_argument("AeonModelLoader: artifact specification is incomplete");
         }
         open_model_files(model_dir, artifact);
+    }
+
+    void open_model(const std::string& model_dir, const AeonModelManifest& manifest) {
+        manifest.validate();
+        open_model(model_dir, manifest.artifact);
+        try {
+            manifest.validate_loaded(expert_format_, dense_file_size_);
+        } catch (...) {
+            close_all();
+            throw;
+        }
     }
 
     uint32_t expert_format_version() const {
