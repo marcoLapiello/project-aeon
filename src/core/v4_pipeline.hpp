@@ -3,6 +3,7 @@
 #include "core/config.hpp"
 #include "core/device.hpp"
 #include "core/aeon_loader.hpp"
+#include "core/expert_backend.hpp"
 #include "io/direct_io_reader.hpp"
 #include "core/expert_registry.hpp"
 #include "core/host_expert_pool.hpp"
@@ -219,7 +220,8 @@ public:
         std::cout << "[Pipeline] Opening native Aeon model from " << aeon_model_dir << "..." << std::endl;
         aeon_loader.open_model(aeon_model_dir, artifact);
         const auto& expert_format = aeon_loader.expert_format();
-        if (expert_format.kind != ExpertFormatKind::SWIZZLED_W4A16) {
+        const auto& backend = ExpertBackendRegistry::resolve(expert_format);
+        if (!backend.supports_v4_pipeline) {
             throw std::runtime_error(
                 "V4Pipeline: selected artifact requires a different weight backend");
         }
@@ -324,7 +326,8 @@ public:
         std::cout << "[Pipeline] Opening native .aeon model from " << aeon_model_dir << "..." << std::endl;
         aeon_loader.open_model(aeon_model_dir, artifact);
         const auto& expert_format = aeon_loader.expert_format();
-        if (expert_format.kind != ExpertFormatKind::SWIZZLED_W4A16) {
+        const auto& backend = ExpertBackendRegistry::resolve(expert_format);
+        if (!backend.supports_v4_pipeline) {
             throw std::runtime_error(
                 "V4Pipeline: selected artifact requires a different weight backend");
         }

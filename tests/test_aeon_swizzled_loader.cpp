@@ -34,6 +34,22 @@ int main() {
     manifest.num_layers = loader.num_layers();
     manifest.experts_per_layer = loader.experts_per_layer();
 
+    const auto& backend = aeon::core::ExpertBackendRegistry::resolve(
+        manifest.weight_backend, loader.expert_format());
+    assert(backend.name == "swizzled_w4a16");
+    assert(backend.supports_v4_pipeline);
+
+    auto incompatible_format = loader.expert_format();
+    incompatible_format.artifact_version += 1;
+    bool rejected_backend_format_mismatch = false;
+    try {
+        (void)aeon::core::ExpertBackendRegistry::resolve(
+            manifest.weight_backend, incompatible_format);
+    } catch (const std::runtime_error&) {
+        rejected_backend_format_mismatch = true;
+    }
+    assert(rejected_backend_format_mismatch);
+
     aeon::core::AeonModelLoader manifest_loader;
     manifest_loader.open_model(model_dir, manifest);
     assert(manifest_loader.expert_format().kind == aeon::core::ExpertFormatKind::SWIZZLED_W4A16);

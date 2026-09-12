@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/aeon_artifact.hpp"
+#include "core/expert_backend.hpp"
 #include "core/expert_format.hpp"
 
 #include <cstddef>
@@ -11,16 +12,6 @@
 namespace aeon::core {
 
 inline constexpr uint32_t AEON_MODEL_MANIFEST_VERSION = 1;
-
-inline const char* expert_backend_name(ExpertFormatKind kind) noexcept {
-    switch (kind) {
-    case ExpertFormatKind::SWIZZLED_W4A16:
-        return "swizzled_w4a16";
-    case ExpertFormatKind::UNKNOWN:
-        return "unknown";
-    }
-    return "unknown";
-}
 
 struct AeonModelManifest {
     uint32_t manifest_version{AEON_MODEL_MANIFEST_VERSION};
@@ -50,7 +41,7 @@ struct AeonModelManifest {
             artifact.expected_expert_payload_bytes == 0) {
             throw std::invalid_argument("AeonModelManifest: artifact identity is incomplete");
         }
-        if (weight_backend != expert_backend_name(artifact.expert_format_kind)) {
+        if (weight_backend != ExpertBackendRegistry::resolve(artifact.expert_format_kind).name) {
             throw std::invalid_argument(
                 "AeonModelManifest: weight backend does not match expert format kind");
         }

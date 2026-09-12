@@ -36,6 +36,15 @@ The manifest contract sub-step is also complete:
 - The legacy artifact overload remains available while conversion-sidecar
   loading and backend factory selection are added in the next sub-step.
 
+The backend-selection and dense-binding sub-steps are now also complete:
+
+- `ExpertBackendRegistry` resolves the manifest backend name or loaded format,
+  validates the exact current swizzled artifact contract, and reports whether
+  the selected backend supports the V4 pipeline.
+- `V4DenseWeightBinding` owns V4 tensor-name mapping and dense device-weight
+  allocation/cleanup, while `V4Layer` retains its existing pointer contract and
+  continues to own layer metadata and KV cache state.
+
 ## Stable boundaries
 
 ### V4 architecture
@@ -53,8 +62,10 @@ direct I/O, registry capacity, and telemetry must not inspect quantization plane
 ### Current weight execution
 
 The swizzled W4A16 views and fused kernels remain behind the current backend
-surface. A future backend must provide its own views and dispatch rather than
-reusing these accessors by byte count or pointer reinterpretation.
+surface. The registry currently provides identity and capability selection, not
+semantic kernel dispatch. A future backend must provide its own views and
+dispatch rather than reusing these accessors by byte count or pointer
+reinterpretation.
 
 ## Acceptance evidence
 
@@ -74,23 +85,19 @@ artifact and execution path remain the regression baseline.
 
 ## Remaining stages
 
-1. **Manifest and backend registry.** Add sidecar parsing and conversion-time
-  generation for the versioned manifest, then select an explicit backend
-  factory. Keep the current default artifact path compatible while the
-  manifest is introduced.
-2. **Dense weight binding boundary.** Extract the current FP16 dense tensor
-   binding from `V4Layer` behind a V4 weight-binding contract only after the
-   model-correctness work establishes the required projection set. Do not add a
-   universal raw-pointer tensor API.
-3. **Linear dispatch boundary.** Introduce semantic projection operations for a
-   second working backend, with backend-owned device storage and kernels. The
-   current fused swizzled path must continue to use its existing correctness
-   tests.
-4. **Architecture composition.** If a future model family differs in attention,
+1. **Manifest completion and backend factory.** Add sidecar parsing and
+  conversion-time generation for the versioned manifest, then select an
+  explicit backend factory. Keep the current default artifact path compatible
+  while the manifest is introduced.
+2. **Linear dispatch boundary.** Introduce semantic projection operations for a
+  second working backend, with backend-owned device storage and kernels. The
+  current fused swizzled path must continue to use its existing correctness
+  tests.
+3. **Architecture composition.** If a future model family differs in attention,
    routing, or cache semantics, add a sibling architecture orchestrator that
    consumes the shared artifact and supply contracts. Do not make V4 constants
    global defaults for unrelated architectures.
-5. **Controlled comparison.** Compare backends with identical token IDs,
+4. **Controlled comparison.** Compare backends with identical token IDs,
    residency state, context, and generation settings. Report dense bytes,
    source-tier bytes, exposed wait, transfer time, and kernel time separately.
 

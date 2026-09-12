@@ -52,8 +52,14 @@ public:
 
     void open_model(const std::string& model_dir, const AeonModelManifest& manifest) {
         manifest.validate();
+        const auto& backend = ExpertBackendRegistry::resolve(manifest.weight_backend);
+        if (backend.format_kind != manifest.artifact.expert_format_kind) {
+            throw std::invalid_argument(
+                "AeonModelLoader: manifest backend does not match its artifact format");
+        }
         open_model(model_dir, manifest.artifact);
         try {
+            backend.validate_format(expert_format_);
             manifest.validate_loaded(expert_format_, dense_file_size_);
         } catch (...) {
             close_all();
