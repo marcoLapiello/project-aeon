@@ -1,7 +1,7 @@
 # Backend Generalization Execution Plan
 
-**Date:** 2026-09-11
-**Status:** Open; artifact and expert-supply foundation implemented
+**Date:** 2026-09-12
+**Status:** Open; manifest, backend selection, dense binding, and source boundaries implemented
 **Scope:** Generalize storage, artifact selection, and runtime ownership boundaries while preserving the current DeepSeek-V4 swizzled backend.
 
 ## Decision
@@ -45,6 +45,26 @@ The backend-selection and dense-binding sub-steps are now also complete:
   allocation/cleanup, while `V4Layer` retains its existing pointer contract and
   continues to own layer metadata and KV cache state.
 
+The manifest completion sub-step is now also complete:
+
+- `AeonModelManifest::load_from_json` parses the versioned sidecar without
+  adding a runtime dependency.
+- The converter writes `model_manifest.json` after a full conversion or with
+  `--verify-only --write-manifest` for an existing artifact set.
+- The loader discovers the sidecar automatically and retains the legacy
+  artifact-specification fallback when it is absent.
+- V4 initialization uses manifest discovery for the current default artifact
+  while preserving explicit custom artifact overrides.
+
+The source tree now makes the ownership boundaries visible:
+
+- `src/infrastructure` contains shared loading, storage, I/O, telemetry,
+  generation, and backend-selection services.
+- `src/architecture/deepseek_v4` contains the DeepSeek-V4 graph, kernels, dense
+  binding, KV state, and DSV4 text behavior.
+- `src/backend/swizzled_w4a16` contains the current expert layout and kernels.
+- `src/platform/rdna3` contains RDNA3/HIP device setup.
+
 ## Stable boundaries
 
 ### V4 architecture
@@ -85,10 +105,9 @@ artifact and execution path remain the regression baseline.
 
 ## Remaining stages
 
-1. **Manifest completion and backend factory.** Add sidecar parsing and
-  conversion-time generation for the versioned manifest, then select an
-  explicit backend factory. Keep the current default artifact path compatible
-  while the manifest is introduced.
+1. **Backend factory completion.** Turn the current registry descriptor into an
+  explicit backend factory when a concrete execution object is needed. Keep
+  sidecar loading and the legacy default artifact path compatible.
 2. **Linear dispatch boundary.** Introduce semantic projection operations for a
   second working backend, with backend-owned device storage and kernels. The
   current fused swizzled path must continue to use its existing correctness

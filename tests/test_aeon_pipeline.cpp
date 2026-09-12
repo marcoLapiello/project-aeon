@@ -1,5 +1,5 @@
-#include "core/device.hpp"
-#include "core/v4_pipeline.hpp"
+#include "platform/rdna3/device.hpp"
+#include "architecture/deepseek_v4/core/v4_pipeline.hpp"
 
 #include <iostream>
 #include <vector>

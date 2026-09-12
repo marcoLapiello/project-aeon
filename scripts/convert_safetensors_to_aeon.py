@@ -7,11 +7,13 @@ Aeon's native production format (.aeon):
 
 Outputs created in destination directory:
 1. config.json, generation_config.json, tokenizer.json, tokenizer_config.json, etc. (physically copied)
-2. model_dense.aeon:
+2. model_manifest.json:
+    - Versioned runtime identity for the model architecture, weight backend, and Aeon artifacts.
+3. model_dense.aeon:
    - Header (magic 'AEON_DENSE', version, metadata, tensor directory)
    - Contiguous binary payloads of all 1,271 dense tensors (word embedding, attention projections,
      RMSNorms, Hyper-Connections Sinkhorn tables, shared experts, router gate weights, LM head).
-3. model_experts_swizzled.aeon:
+4. model_experts_swizzled.aeon:
    - 11,008 routed experts (43 layers x 256 experts)
    - Each expert is strictly 14,155,776 bytes (exactly 3,456 sectors of 4096 bytes).
     - W1/W3 and W2 payloads use the version-2 Wave32 swizzled layout.
@@ -22,7 +24,7 @@ Outputs created in destination directory:
    - Offset formula: slot_index = (layer_id * 256 + expert_id)
      file_offset = slot_index * 14,155,776 bytes
    - 100% compliant with Linux io_uring O_DIRECT (4096-byte sector alignment).
-4. model_experts_swizzled.index:
+5. model_experts_swizzled.index:
    - Compact binary lookup table: (layer_id, expert_id) -> (uint64 file_offset, uint64 byte_length)
    - Plus model architectural metadata.
 
@@ -46,9 +48,11 @@ EXPERT_RAW_BYTES = 14155776  # 4MB*3 + 512KB*3 = 14,155,776 bytes (exactly 3,456
 assert EXPERT_RAW_BYTES % SECTOR_SIZE == 0
 
 AEON_DENSE_MAGIC = b"AEON_DENSE\x00\x00"
-AEON_EXP_MAGIC = b"AEON_EXPERTS\x00\x00"
+AEON_EXP_MAGIC = b"AEON_EXPERTS"
 AEON_DENSE_FORMAT_VERSION = 1
 AEON_EXPERT_FORMAT_VERSION = 2
+AEON_MODEL_MANIFEST_VERSION = 1
+MANIFEST_FILENAME = "model_manifest.json"
 
 NIBBLE_PERM = np.array([0, 2, 4, 6, 1, 3, 5, 7], dtype=np.int64)
 INVERSE_NIBBLE_PERM = np.argsort(NIBBLE_PERM)
@@ -283,6 +287,62 @@ def copy_auxiliary_files(source_dir: str, output_dir: str):
         else:
             print(f"  - Notice: {filename} not found, skipping.")
     print(f"[Done] Copied {copied_count} files successfully.")
+
+
+def write_model_manifest(source_dir: str, output_dir: str):
+    """Writes the runtime identity for the completed native Aeon artifact set."""
+    config_path = os.path.join(source_dir, "config.json")
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        model_config = json.load(config_file)
+
+    model_type = model_config.get("model_type")
+    if not isinstance(model_type, str) or not model_type:
+        raise ValueError("Source config.json does not contain a valid model_type")
+
+    index_path = os.path.join(output_dir, "model_experts_swizzled.index")
+    with open(index_path, "rb") as index_file:
+        index_header = index_file.read(32)
+    if len(index_header) != 32:
+        raise ValueError("Expert index is too small to describe a manifest")
+
+    magic, expert_version, num_layers, experts_per_layer, expert_payload_bytes = struct.unpack(
+        "<12sIIIQ", index_header
+    )
+    if magic != AEON_EXP_MAGIC:
+        raise ValueError("Cannot write manifest for an invalid expert index")
+
+    dense_filename = "model_dense.aeon"
+    experts_filename = "model_experts_swizzled.aeon"
+    dense_path = os.path.join(output_dir, dense_filename)
+    experts_path = os.path.join(output_dir, experts_filename)
+    if not os.path.isfile(dense_path) or not os.path.isfile(experts_path):
+        raise FileNotFoundError("Native Aeon artifacts are missing; cannot write manifest")
+
+    manifest = {
+        "manifest_version": AEON_MODEL_MANIFEST_VERSION,
+        "model_family": model_type.split("_", 1)[0],
+        "architecture": model_type,
+        "weight_backend": "swizzled_w4a16",
+        "dense_file_bytes": os.path.getsize(dense_path),
+        "num_layers": num_layers,
+        "experts_per_layer": experts_per_layer,
+        "artifact": {
+            "dense_filename": dense_filename,
+            "experts_filename": experts_filename,
+            "index_filename": "model_experts_swizzled.index",
+            "dense_format_version": AEON_DENSE_FORMAT_VERSION,
+            "expert_format": "swizzled_w4a16",
+            "expert_format_version": expert_version,
+            "expert_sector_size": SECTOR_SIZE,
+            "expert_payload_bytes": expert_payload_bytes,
+        },
+    }
+
+    manifest_path = os.path.join(output_dir, MANIFEST_FILENAME)
+    with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file, indent=2)
+        manifest_file.write("\n")
+    print(f"[Done] {MANIFEST_FILENAME} created: {manifest_path}")
 
 
 def convert_dense_tensors(source_index: SafetensorsIndex,
@@ -535,8 +595,8 @@ def verify_conversion(source_index: SafetensorsIndex,
                 loc = source_index.tensor_locations[f"layers.{l}.ffn.experts.{e}.{w}.{t}"]
                 expected.extend(mmap_pool.get_slice(loc["shard"], loc["start"], loc["end"]))
 
-                verify_swizzled_expert_payload(bytes(expected), exp_data)
-                print(f"    - Layer {l}, Expert {e}: swizzled round-trip is BIT-EXACT ({len(exp_data)} bytes verified).")
+            verify_swizzled_expert_payload(bytes(expected), exp_data)
+            print(f"    - Layer {l}, Expert {e}: swizzled round-trip is BIT-EXACT ({len(exp_data)} bytes verified).")
 
             print("  [Verify Experts] All verified swizzled experts round-trip bit-exactly. Sector alignment confirmed!")
     print("\n>>> ALL CHECKS PASSED: MODEL SUCCESSFULLY CONVERTED AND VERIFIED <<<")
@@ -554,6 +614,8 @@ def main():
                         help="Limit conversion to first N layers (for quick testing, e.g. --max-layers 1)")
     parser.add_argument("--verify-only", action="store_true",
                         help="Run verification on existing output directory")
+    parser.add_argument("--write-manifest", action="store_true",
+                        help="Write model_manifest.json after verification")
 
     args = parser.parse_args()
 
@@ -563,11 +625,14 @@ def main():
     try:
         if args.verify_only:
             verify_conversion(source_index, mmap_pool, args.output_dir, args.max_layers)
+            if args.write_manifest:
+                write_model_manifest(args.model_dir, args.output_dir)
         else:
             copy_auxiliary_files(args.model_dir, args.output_dir)
             convert_dense_tensors(source_index, mmap_pool, args.output_dir, args.max_layers)
             convert_routed_experts(source_index, mmap_pool, args.output_dir, args.max_layers)
             verify_conversion(source_index, mmap_pool, args.output_dir, args.max_layers)
+            write_model_manifest(args.model_dir, args.output_dir)
     finally:
         mmap_pool.close()
 

@@ -1,4 +1,4 @@
-#include "text/dsv4_chat_formatter.hpp"
+#include "architecture/deepseek_v4/text/dsv4_chat_formatter.hpp"
 
 #include <cassert>
 #include <iostream>

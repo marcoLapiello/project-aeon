@@ -1,4 +1,4 @@
-#include "kernel/moe_router.hpp"
+#include "architecture/deepseek_v4/kernels/moe_router.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>

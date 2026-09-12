@@ -1,6 +1,6 @@
-#include "core/device.hpp"
-#include "kernel/aeon_w4a16_swizzle.hpp"
-#include "kernel/aeon_w4a16_swizzled_gemv.hpp"
+#include "platform/rdna3/device.hpp"
+#include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp"
+#include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>

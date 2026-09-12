@@ -38,7 +38,7 @@ Hot eviction:
     reuse the VRAM slot
 ```
 
-The implementation in `src/core/expert_registry.hpp` has one logical `tier` and one `slot_idx` per expert. `allocate_vram_slot()` explicitly returns Hot victims to Cold, while promotion frees the incoming expert's Warm slot. The runtime path in `src/core/v4_pipeline.hpp` can upload a pinned Warm expert directly to VRAM, but it has no normal operation that publishes the evicted Hot victim into a persistent Warm slot.
+The implementation in `src/infrastructure/core/expert_registry.hpp` has one logical `tier` and one `slot_idx` per expert. `allocate_vram_slot()` explicitly returns Hot victims to Cold, while promotion frees the incoming expert's Warm slot. The runtime path in `src/architecture/deepseek_v4/core/v4_pipeline.hpp` can upload a pinned Warm expert directly to VRAM, but it has no normal operation that publishes the evicted Hot victim into a persistent Warm slot.
 
 The existing measurements establish that Warm is valuable when it remains populated:
 

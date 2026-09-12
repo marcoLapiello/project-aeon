@@ -1,4 +1,4 @@
-#include "core/aeon_loader.hpp"
+#include "infrastructure/core/aeon_loader.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -25,14 +25,14 @@ int main() {
            static_cast<uint64_t>(42 * 256 + 255) * aeon::core::AEON_EXPERT_BYTES);
     assert(loader.get_expert_data(0, 0) != nullptr);
 
-    aeon::core::AeonModelManifest manifest;
-    manifest.model_family = "deepseek";
-    manifest.architecture = "deepseek_v4";
-    manifest.weight_backend = "swizzled_w4a16";
-    manifest.artifact = aeon::core::make_current_swizzled_artifact_spec();
-    manifest.dense_file_bytes = loader.dense_file_size();
-    manifest.num_layers = loader.num_layers();
-    manifest.experts_per_layer = loader.experts_per_layer();
+    const auto manifest = aeon::core::AeonModelManifest::load_from_json(
+        model_dir + "/model_manifest.json");
+    assert(manifest.model_family == "deepseek");
+    assert(manifest.architecture == "deepseek_v4");
+    assert(manifest.weight_backend == "swizzled_w4a16");
+    assert(manifest.dense_file_bytes == loader.dense_file_size());
+    assert(manifest.num_layers == loader.num_layers());
+    assert(manifest.experts_per_layer == loader.experts_per_layer());
 
     const auto& backend = aeon::core::ExpertBackendRegistry::resolve(
         manifest.weight_backend, loader.expert_format());
@@ -54,15 +54,21 @@ int main() {
     manifest_loader.open_model(model_dir, manifest);
     assert(manifest_loader.expert_format().kind == aeon::core::ExpertFormatKind::SWIZZLED_W4A16);
 
-    manifest.weight_backend = "gptq";
+    auto incompatible_manifest = manifest;
+    incompatible_manifest.weight_backend = "gptq";
     bool rejected_backend_mismatch = false;
     try {
         aeon::core::AeonModelLoader incompatible_manifest_loader;
-        incompatible_manifest_loader.open_model("missing-model-directory", manifest);
+        incompatible_manifest_loader.open_model("missing-model-directory", incompatible_manifest);
     } catch (const std::invalid_argument&) {
         rejected_backend_mismatch = true;
     }
     assert(rejected_backend_mismatch);
+
+    aeon::core::AeonModelLoader manifest_discovered_loader;
+    manifest_discovered_loader.open_model(model_dir);
+    assert(manifest_discovered_loader.expert_format().kind ==
+           aeon::core::ExpertFormatKind::SWIZZLED_W4A16);
 
     auto incompatible = aeon::core::make_current_swizzled_artifact_spec();
     incompatible.expected_expert_payload_bytes += aeon::core::AEON_SECTOR_SIZE;

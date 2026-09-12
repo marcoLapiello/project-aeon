@@ -35,15 +35,15 @@ This work is a prerequisite for trustworthy activation profiling. The current `p
 
 The core model execution path already accepts token IDs and returns token IDs:
 
-- `src/core/v4_pipeline.hpp`
+- `src/architecture/deepseek_v4/core/v4_pipeline.hpp`
   - `V4Pipeline::step(uint32_t token_id, uint32_t pos, RoutingPhase phase)` performs one token step.
   - `V4Pipeline::generate(const std::vector<uint32_t>& prompt, uint32_t max_new_tokens, ...)` performs prompt prefill and autoregressive decoding.
   - The prompt loop is currently marked `RoutingPhase::Prefill`.
   - The decode loop is currently marked `RoutingPhase::Decode`.
   - The legacy `V4Pipeline::generate(...)` raw-ID API remains fixed-length and does not stop on EOS by itself.
-  - The native text wrapper in `src/text/text_generation.*`, used by `aeon_chat`, adds EOS-aware stopping, context limits, and explicit stop reasons around token generation.
+  - The native text wrapper in `src/infrastructure/text/text_generation.*`, used by `aeon_chat`, adds EOS-aware stopping, context limits, and explicit stop reasons around token generation.
   - The first returned generated token is produced by the final prompt-prefill step.
-- `src/core/routing_counter.hpp` and `src/core/routing_profile.hpp`
+- `src/infrastructure/core/routing_counter.hpp` and `src/infrastructure/core/routing_profile.hpp`
   - provide optional routing observation and durable profile aggregation;
   - must remain usable with token IDs after the text frontend is added.
 - `tools/profile_routing.cpp`
@@ -198,11 +198,11 @@ Keep responsibilities separate. Do not grow `v4_pipeline.hpp` with tokenizer and
 Recommended modules:
 
 ```text
-src/text/
+src/architecture/deepseek_v4/text/
     dsv4_tokenizer.hpp / dsv4_tokenizer.cpp
     dsv4_chat_formatter.hpp / dsv4_chat_formatter.cpp
+src/infrastructure/text/
     text_generation.hpp / text_generation.cpp
-    text_types.hpp
 ```
 
 If the project continues its header-heavy style for the first slice, use focused header-only modules temporarily, but preserve these ownership boundaries.
@@ -530,13 +530,12 @@ Expected focused implementation surface:
 
 ```text
 scripts/prepare_dsv4_tokenizer.py
-src/text/text_types.hpp
-src/text/dsv4_tokenizer.hpp
-src/text/dsv4_tokenizer.cpp
-src/text/dsv4_chat_formatter.hpp
-src/text/dsv4_chat_formatter.cpp
-src/text/text_generation.hpp
-src/text/text_generation.cpp
+src/architecture/deepseek_v4/text/dsv4_tokenizer.hpp
+src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
+src/architecture/deepseek_v4/text/dsv4_chat_formatter.hpp
+src/architecture/deepseek_v4/text/dsv4_chat_formatter.cpp
+src/infrastructure/text/text_generation.hpp
+src/infrastructure/text/text_generation.cpp
 tools/aeon_chat.cpp
 tests/test_dsv4_tokenizer.cpp
 tests/test_dsv4_chat_formatter.cpp

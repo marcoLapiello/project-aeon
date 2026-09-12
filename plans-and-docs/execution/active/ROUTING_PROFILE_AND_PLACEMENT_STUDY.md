@@ -38,7 +38,7 @@ Only after this gate passes may the resulting traces be used to build activation
 
 ## 3. Measurement boundary
 
-The profiler must observe the existing routing result after the six selected expert IDs have already been copied to the host. The current pipeline already performs the required synchronization at this point in `src/core/v4_pipeline.hpp`; the profiler should count those IDs rather than add a second router path or collect router logits.
+The profiler must observe the existing routing result after the six selected expert IDs have already been copied to the host. The current pipeline already performs the required synchronization at this point in `src/architecture/deepseek_v4/core/v4_pipeline.hpp`; the profiler should count those IDs rather than add a second router path or collect router logits.
 
 The smallest record needed for aggregation is:
 

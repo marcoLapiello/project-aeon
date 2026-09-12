@@ -1,0 +1,19 @@
+{
+  "manifest_version": 1,
+  "model_family": "deepseek",
+  "architecture": "deepseek_v4",
+  "weight_backend": "swizzled_w4a16",
+  "dense_file_bytes": 15744996344,
+  "num_layers": 43,
+  "experts_per_layer": 256,
+  "artifact": {
+    "dense_filename": "model_dense.aeon",
+    "experts_filename": "model_experts_swizzled.aeon",
+    "index_filename": "model_experts_swizzled.index",
+    "dense_format_version": 1,
+    "expert_format": "swizzled_w4a16",
+    "expert_format_version": 2,
+    "expert_sector_size": 4096,
+    "expert_payload_bytes": 14155776
+  }
+}

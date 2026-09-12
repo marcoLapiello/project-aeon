@@ -1,6 +1,6 @@
 # Project Aeon Documentation Status
 
-Status audited on 2026-09-11 against `HEAD` (`b7998dc`, `feat: complete warm-tier refill and supply telemetry`) and the current source tree.
+Status audited on 2026-09-12 against the current source tree.
 
 This file is the navigation point for project state. Detailed benchmark numbers belong in [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md); design rationale belongs in the reference and vision documents; this file and [AGENTS.md](../../AGENTS.md) should stay concise.
 
@@ -22,7 +22,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 | [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md) | Paused | Paused single-GPU cold-tier, storage-layout, and memory-pressure work. Spikes 0-2 are complete; Spike 3 has a bounded implementation but open acceptance gates. |
 | [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](../execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) | Open | Native text path is implemented; external behavioral comparison and longer-context attention correctness remain open. |
 | [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) | Open; evidence gated | Routing observer and durable profiler are implemented; representative profile/held-out data and placement evaluation remain gated by model correctness. |
-| [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) | Open; foundation implemented | Descriptor-driven native artifacts, opaque expert supply, and current-backend guarding are implemented; manifest, dense binding, and second-backend gates remain open. |
+| [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) | Open; foundation implemented | Descriptor-driven native artifacts, opaque expert supply, manifest sidecar, backend capability selection, V4 dense binding, and source ownership boundaries are implemented; explicit factory, semantic dispatch, and second-backend gates remain open. |
 | [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Living record | Authoritative silicon results, regressions, and milestone measurements. |
 | [CODEBASE_MAP.md](CODEBASE_MAP.md) | Current map | Describes the production runtime, validation targets, and legacy diagnostics. |
 
@@ -47,6 +47,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 - Native tokenizer, DSV4 formatting, EOS-aware generation, and `aeon_chat` are implemented and have passed the simple 43-layer text turn. This is the native milestone, not external model-behavior parity.
 - Routing counting, resumable aggregation, rankings, compact summaries, and profile regeneration are implemented. The existing pilot remains a plumbing artifact until the correctness gate passes.
 - The version-2 swizzled expert path is now the sole native runtime and conversion path. Loader, pipeline, tests, and active tooling no longer expose the retired baseline format or kernels.
+- The backend generalization foundation now includes a converter-generated `model_manifest.json`, automatic runtime discovery, explicit source ownership directories, and the current V4 dense-binding boundary. The active backend plan records the remaining factory and second-backend work.
 
 ## Open work
 
@@ -55,6 +56,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 3. **Swizzled full-model performance:** characterize representative 43-layer version-2 generation under controlled Hot/Warm conditions, collect useful rocprof counters, and tune occupancy/register pressure beyond the isolated kernel measurements.
 4. **Placement study:** collect profile and held-out corpora with the verified text contract, then compare measured placement against dynamic LRU. Do not use the existing pilot for placement decisions.
 5. **Scaling:** Phase 3 multi-GPU pipeline parallelism remains future work.
+6. **Backend specialization:** add an explicit backend factory and semantic dispatch after a second working weight backend exists.
 
 ## Historical and reference documents
 

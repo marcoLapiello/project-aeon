@@ -1,4 +1,4 @@
-#include "core/config.hpp"
+#include "architecture/deepseek_v4/core/config.hpp"
 #include <cassert>
 #include <iostream>
 

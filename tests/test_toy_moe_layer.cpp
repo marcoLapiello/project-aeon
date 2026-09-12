@@ -1,5 +1,5 @@
-#include "io/aligned_allocator.hpp"
-#include "io/direct_io_reader.hpp"
+#include "infrastructure/io/aligned_allocator.hpp"
+#include "infrastructure/io/direct_io_reader.hpp"
 
 #include <hip/hip_runtime.h>
 #include <rocwmma/rocwmma.hpp>

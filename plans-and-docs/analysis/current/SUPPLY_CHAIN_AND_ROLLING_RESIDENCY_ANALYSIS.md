@@ -37,7 +37,7 @@ The proposed future policy is called **deadline-aware rolling layer residency**.
 
 ### 1.1 Runtime activation observations exist, but frequency is not a policy
 
-Every routed expert request passes through `ExpertRegistry::touch_hot_expert()` from the layer prefetch path in [v4_pipeline.hpp](../../../src/core/v4_pipeline.hpp). The registry updates:
+Every routed expert request passes through `ExpertRegistry::touch_hot_expert()` from the layer prefetch path in [v4_pipeline.hpp](../../../src/architecture/deepseek_v4/core/v4_pipeline.hpp). The registry updates:
 
 - `activation_count`;
 - `last_step_used`;
@@ -45,7 +45,7 @@ Every routed expert request passes through `ExpertRegistry::touch_hot_expert()` 
 - Hot, Warm, and Cold service counters;
 - the appropriate LRU list.
 
-However, `activation_count`, `last_step_used`, and `moving_frequency` are never read by the admission or eviction code. The implementation in [expert_registry.hpp](../../../src/core/expert_registry.hpp) uses the LRU list for actual decisions.
+However, `activation_count`, `last_step_used`, and `moving_frequency` are never read by the admission or eviction code. The implementation in [expert_registry.hpp](../../../src/infrastructure/core/expert_registry.hpp) uses the LRU list for actual decisions.
 
 The current frequency update is:
 
@@ -64,7 +64,7 @@ working recency policy: yes
 frequency-informed placement: no
 ```
 
-The separate [routing counter](../../../src/core/routing_counter.hpp) collects phase-specific per-layer selection counts, but it is a profiling facility. It does not currently feed the runtime registry or cache policy.
+The separate [routing counter](../../../src/infrastructure/core/routing_counter.hpp) collects phase-specific per-layer selection counts, but it is a profiling facility. It does not currently feed the runtime registry or cache policy.
 
 ### 1.2 LRU is real and independent of the frequency fields
 
@@ -187,7 +187,7 @@ When a Hot expert is evicted:
 3. its Hot slot is reused;
 4. no Warm copy is created.
 
-There is no normal runtime path that consumes `free_host_slots` to refill Warm. The [HostExpertPool](../../../src/core/host_expert_pool.hpp) allocates and exposes byte storage, but it does not decide which experts belong there or rotate entries.
+There is no normal runtime path that consumes `free_host_slots` to refill Warm. The [HostExpertPool](../../../src/infrastructure/core/host_expert_pool.hpp) allocates and exposes byte storage, but it does not decide which experts belong there or rotate entries.
 
 The result is a logically shrinking Warm set. The allocation may still contain stale bytes from a promoted expert, but those bytes do not count as a Warm hit and must not be treated as valid ownership.
 

@@ -28,7 +28,7 @@ Following empirical verification of the official Hugging Face repositories (`dee
 
 ### Spike 1: Model Config, Real Safetensors Parser & 4KB `.aeon` Packer
 - **Micro-Step 1.1: DeepSeek-V4 C++20 Configuration & Metadata Parser**
-  - Implement `src/core/config.hpp` parsing `config.json` (dimensions, HC multipliers, router parameters, compression ratios, SwiGLU limits).
+  - Implement `src/architecture/deepseek_v4/core/config.hpp` parsing `config.json` (dimensions, HC multipliers, router parameters, compression ratios, SwiGLU limits).
   - Add unit test verifying parsing of the official `DeepSeek-V4-Flash-0731` config.
   - *Verification:* Bit-accurate match against JSON schema.
 - **Micro-Step 1.2: INT4 Safetensors Header Parser & Stream Slicer**

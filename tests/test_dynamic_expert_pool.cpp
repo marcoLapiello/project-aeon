@@ -1,10 +1,10 @@
-#include "core/aeon_loader.hpp"
-#include "core/config.hpp"
-#include "core/device.hpp"
-#include "core/expert_registry.hpp"
-#include "core/memory_budget.hpp"
-#include "core/v4_pipeline.hpp"
-#include "core/vram_expert_pool.hpp"
+#include "infrastructure/core/aeon_loader.hpp"
+#include "architecture/deepseek_v4/core/config.hpp"
+#include "platform/rdna3/device.hpp"
+#include "infrastructure/core/expert_registry.hpp"
+#include "architecture/deepseek_v4/core/memory_budget.hpp"
+#include "architecture/deepseek_v4/core/v4_pipeline.hpp"
+#include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 
 #include <cassert>
 #include <cstring>

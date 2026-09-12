@@ -1,8 +1,8 @@
-#include "core/device.hpp"
-#include "kernel/aeon_moe_fused_w13.hpp"
-#include "kernel/aeon_w4a16_swizzle.hpp"
-#include "kernel/aeon_w4a16_swizzled_gemv.hpp"
-#include "kernel/v4_pipeline_ops.hpp"
+#include "platform/rdna3/device.hpp"
+#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
+#include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp"
+#include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp"
+#include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>

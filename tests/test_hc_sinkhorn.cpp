@@ -1,5 +1,5 @@
-#include "core/device.hpp"
-#include "kernel/hc_sinkhorn.hpp"
+#include "platform/rdna3/device.hpp"
+#include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include <algorithm>
 #include <iostream>
 #include <vector>

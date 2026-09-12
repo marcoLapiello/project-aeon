@@ -4,7 +4,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`). This
 ledger keeps historical evidence, but only compares measurements that share an
 explicit comparison key and pass the entry gate.
 
-* **Last normalized**: 2026-09-11
+* **Last normalized**: 2026-09-12
 * **Scope**: latency, throughput, storage supply, cache behavior, and numerical
   correctness across the Aeon milestones.
 * **Status rule**: `[x] Invalidate for comparison` excludes the headline result
@@ -70,6 +70,7 @@ explicit comparison key and pass the entry gate.
 | `routing-locality` | History-based routing coverage; no placement claim | M17 |
 | `direct-io` | Direct-I/O fixtures and model-backed payload reads | M11 |
 | `native-text` | Native text turns; prompt, context, telemetry, and model variant differ | M21-M22, M25-M26 |
+| `refactor-recheck` | Matched pre/post manifest and source-layout refactor check; single run only | M27 |
 | `kernel-stage1` | Isolated synthetic swizzled/fused expert kernels | M23-M24 |
 
 ## 4. Milestone cards
@@ -275,7 +276,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: W1/W3 `138.8 -> 13.9 us` (`10.0x`, `340 GB/s`); W2 `13.9 us` (`338 GB/s`); Warm off `4.36 -> 5.25 tok/s` (`+20.4%`); Warm on `5.11 -> 5.79 tok/s` (`+13.3%`), TTFT `2,755 -> 1,835 ms`
 - **Correctness / service**: kernel max diff `0` versus CPU FP32; regression suite and golden token `295` passed; output `[237, 201, 1778, ...]` was deterministic and tier-independent, but differs from earlier near-tie argmax output
 - **Conclusion / next gate**: Routed-expert GEMV time fell from approximately `108 ms` to `11 ms/token`, exposing the just-in-time miss path as the next bottleneck
-- **Evidence**: [aeon_w4a16_swizzled_gemv.hpp](../../src/kernel/aeon_w4a16_swizzled_gemv.hpp), `test_w4a16_swizzled_gemv`, linked review; the former comparison kernel was retired after the v2 promotion.
+- **Evidence**: [aeon_w4a16_swizzled_gemv.hpp](../../src/backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp), `test_w4a16_swizzled_gemv`, linked review; the former comparison kernel was retired after the v2 promotion.
 
 ### M19: Contiguous Per-Slot VRAM Layout & DMA Stream Split (Expert Review Step 2)
 - **Run**: `2026-09-08`; [review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md); DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
@@ -297,7 +298,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: Warm `35 GiB` `5.88 -> 7.10 tok/s` (`170.0 -> 140.8 ms/token`), TTFT `1,803 -> 1,801 ms`; Warm off `5.39 -> 6.32 tok/s` (`185.6 -> 158.2 ms/token`)
 - **Correctness / service**: device-side router conversion and GPU argmax removed 43 per-layer drains and 258 KB/token CPU readback; golden token `295` and regression group passed; output returned to `[237, 223 x7]`
 - **Conclusion / next gate**: CPU-stall removal cut approximately `29 ms/token`; cold-read latency and novel experts remained the limiting path
-- **Evidence**: [v4_attention.hpp](../../src/kernel/v4_attention.hpp), [v4_pipeline.hpp](../../src/core/v4_pipeline.hpp), [v4_pipeline_scratch.hpp](../../src/core/v4_pipeline_scratch.hpp), linked review
+- **Evidence**: [v4_attention.hpp](../../src/architecture/deepseek_v4/kernels/v4_attention.hpp), [v4_pipeline.hpp](../../src/architecture/deepseek_v4/core/v4_pipeline.hpp), [v4_pipeline_scratch.hpp](../../src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp), linked review
 
 ### M21: Native Text-In/Text-Out Frontend and 43-Layer Smoke
 - **Run**: `2026-09-09`; DeepSeek-V4 INT4-W4A16, `.aeon`
@@ -374,3 +375,14 @@ explicit comparison key and pass the entry gate.
 - **Correctness / service**: all six instrumented runs output `[671, 6102, 294, 8760, 344, 2619, 51119, 42499, 1]` and stopped on `eos`; Warm reduced Cold bytes/token `1,762,394,112 -> 1,052,835,840` (`40.3%`); persistent Warm allocation `37,399,560,192` bytes; unpinned allocation and VmSwap delta `0`
 - **Conclusion / next gate**: Within this instrumented A/B, Warm reduced TTFT `15.9%`, step latency `23.0%`, and increased decode `29.9%`; telemetry adds approximately `5.9%` TTFT and `4.5%` decode cost, so cross-day M22 comparison is only a regression signal
 - **Evidence**: three-run comparison artifact and source-tier telemetry
+
+### M27: Manifest and Source-Layout Refactor Recheck
+- **Run**: `2026-09-12`; current staged refactor versus pre-refactor commit `1c03eb7`; DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
+- **Class / comparison key**: `Integration / refactor-recheck`
+- **Platform**: `baseline`; RX 7900 XTX, ROCm 7.2.2, `gfx1100`
+- [x] **Invalidate for comparison** | **Reason**: single run per revision; stability check only, not a performance claim
+- **Workload / configuration**: `bench_full_model 0`; context `4096`; Warm disabled; 4 prompt tokens, 8 generated tokens; identical model artifact, prompt, warmup, and output
+- **Metrics**: pre-refactor init `7.49 s`, TTFT `1,471.03 ms`, decode `4.06 tok/s`, step `246.03 ms`; current init `7.85 s`, TTFT `1,473.36 ms`, decode `4.17 tok/s`, step `240.10 ms`; service was `1,773/1,065` Hot/Cold versus `1,787/1,051`
+- **Correctness / service**: both revisions produced `[227, 300, 227, 300, 227, 300, 227, 300]`; current full build and CTest `20/20` passed
+- **Conclusion / next gate**: The manifest and source-layout refactor showed no measurable decode regression in this matched run; repeat measurements remain required for a performance claim
+- **Evidence**: `bench_full_model`, current staged tree, isolated worktree at `1c03eb7`

@@ -1,6 +1,6 @@
-#include "core/expert_registry.hpp"
-#include "core/host_expert_pool.hpp"
-#include "core/prefetch_staging.hpp"
+#include "infrastructure/core/expert_registry.hpp"
+#include "infrastructure/core/host_expert_pool.hpp"
+#include "infrastructure/core/prefetch_staging.hpp"
 
 #include <cassert>
 #include <cstdint>

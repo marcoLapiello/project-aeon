@@ -131,13 +131,13 @@ identity space. GPTQ changes how linear weights are stored and evaluated.
 The current runtime combines those concerns in a few concrete classes. For
 example:
 
-- [v4_layer.hpp](../../../src/core/v4_layer.hpp) owns V4 layer state and also
+- [v4_layer.hpp](../../../src/architecture/deepseek_v4/core/v4_layer.hpp) owns V4 layer state and also
   hardcodes FP16 device pointers for attention and shared-expert projections.
-- [vram_expert_pool.hpp](../../../src/core/vram_expert_pool.hpp) hardcodes the
+- [vram_expert_pool.hpp](../../../src/backend/swizzled_w4a16/core/vram_expert_pool.hpp) hardcodes the
   current six-plane expert layout and `AEON_EXPERT_BYTES`.
-- [aeon_loader.hpp](../../../src/core/aeon_loader.hpp) assumes the current
+- [aeon_loader.hpp](../../../src/infrastructure/core/aeon_loader.hpp) assumes the current
   dense container and fixed expert record size.
-- [v4_pipeline.hpp](../../../src/core/v4_pipeline.hpp) selects current
+- [v4_pipeline.hpp](../../../src/architecture/deepseek_v4/core/v4_pipeline.hpp) selects current
   quantized expert pointers directly and hardcodes the current dense byte count
   in the dynamic memory budget path.
 

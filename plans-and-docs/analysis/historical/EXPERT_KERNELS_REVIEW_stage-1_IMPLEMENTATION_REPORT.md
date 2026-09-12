@@ -13,7 +13,7 @@ The version-1 artifact and runtime path remain intact and are not overwritten. T
 
 Stage 1 changes the routed expert execution used by the current single-token path. It does not implement true batched prefill and does not change dense FP16 projections, attention, the router, the shared expert, or the LM head.
 
-Relevant implementation files: [swizzle layout](../../../src/kernel/aeon_w4a16_swizzle.hpp), [swizzled GEMV](../../../src/kernel/aeon_w4a16_swizzled_gemv.hpp), [fused W1/W3](../../../src/kernel/aeon_moe_fused_w13.hpp), [fused W2](../../../src/kernel/aeon_moe_fused_w2.hpp), [repacker](../../../scripts/repack_aeon_experts_swizzled.py), [loader](../../../src/core/aeon_loader.hpp), and [pipeline integration](../../../src/core/v4_pipeline.hpp).
+Relevant implementation files: [swizzle layout](../../../src/backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp), [swizzled GEMV](../../../src/backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp), [fused W1/W3](../../../src/backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp), [fused W2](../../../src/backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp), [repacker](../../../scripts/repack_aeon_experts_swizzled.py), [loader](../../../src/infrastructure/core/aeon_loader.hpp), and [pipeline integration](../../../src/architecture/deepseek_v4/core/v4_pipeline.hpp).
 
 ## 2. Proposal comparison
 

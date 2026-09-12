@@ -77,7 +77,7 @@ This is a release-specific difference that must be resolved from the selected
 checkpoint rather than from a family-level summary. The current C++ config
 parser does not represent `compress_ratios`, `index_topk`, `index_head_dim`, or
 the auxiliary schedule fields. See
-[config.hpp](../../../src/core/config.hpp) and the source snapshot config.
+[config.hpp](../../../src/architecture/deepseek_v4/core/config.hpp) and the source snapshot config.
 
 ## 2. Quantized model compatibility
 
@@ -89,7 +89,7 @@ The conversion/storage path is well grounded for the routed experts.
 copies the packed expert tensors and scales without dequantizing or
 requantizing them. It writes the six source planes in a fixed contiguous
 payload and checks the expected 14,155,776-byte size. The native loader and
-[vram_expert_pool.hpp](../../../src/core/vram_expert_pool.hpp) preserve that
+[vram_expert_pool.hpp](../../../src/backend/swizzled_w4a16/core/vram_expert_pool.hpp) preserve that
 same layout for NVMe, pinned staging, and VRAM.
 
 The current W4A16 kernels assume:
@@ -157,16 +157,16 @@ parts are deliberately tied to this model:
 | Hot/Warm/Cold expert residency | Implemented as a runtime strategy | This is deployment machinery, not a replacement for model semantics. |
 
 The owning implementations are
-[v4_layer.hpp](../../../src/core/v4_layer.hpp),
-[moe_router.hpp](../../../src/kernel/moe_router.hpp),
-[hc_sinkhorn.hpp](../../../src/kernel/hc_sinkhorn.hpp), and
-[v4_pipeline.hpp](../../../src/core/v4_pipeline.hpp).
+[v4_layer.hpp](../../../src/architecture/deepseek_v4/core/v4_layer.hpp),
+[moe_router.hpp](../../../src/architecture/deepseek_v4/kernels/moe_router.hpp),
+[hc_sinkhorn.hpp](../../../src/architecture/deepseek_v4/kernels/hc_sinkhorn.hpp), and
+[v4_pipeline.hpp](../../../src/architecture/deepseek_v4/core/v4_pipeline.hpp).
 
 ## 4. Where the engine is currently an approximation
 
 ### 4.1 Attention is the major correctness blocker
 
-[v4_attention.hpp](../../../src/kernel/v4_attention.hpp) contains a correct
+[v4_attention.hpp](../../../src/architecture/deepseek_v4/kernels/v4_attention.hpp) contains a correct
 local implementation of the currently chosen approximation: causal
 128-token attention over a single 512-wide cached vector, with an attention
 sink and a weighted sum that treats the cached vector as the value as well as
@@ -178,7 +178,7 @@ The production layer owns only:
 d_kv_cache: [max_seq_len, 512] fp16
 ```
 
-and [v4_pipeline.hpp](../../../src/core/v4_pipeline.hpp) invokes
+and [v4_pipeline.hpp](../../../src/architecture/deepseek_v4/core/v4_pipeline.hpp) invokes
 `v4_cached_sliding_window_attn_wave32_kernel` for every layer. There is no
 per-layer dispatch based on `compress_ratio`.
 

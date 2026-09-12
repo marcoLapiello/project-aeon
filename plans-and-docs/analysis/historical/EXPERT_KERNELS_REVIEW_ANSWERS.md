@@ -136,20 +136,26 @@ The active streams are `compute_stream`, `sdma_stream` for warm/safetensors uplo
 
 ## 7. Kernel File Organization
 
-Production kernels are header-defined. There are no standalone production kernel implementation files under `src/kernel` or separate kernel library; the five headers under `src/kernel` are compiled through the HIP C++ targets that include them. The production tree contains 26 `__global__` kernels.
+Production kernels are header-defined. There are no standalone production kernel
+implementation files or separate kernel library; the current headers under
+`src/architecture/deepseek_v4/kernels` and `src/backend/swizzled_w4a16/kernels`
+are compiled through the HIP C++ targets that include them. The production tree
+contains 26 `__global__` kernels. The earlier `w4a16_gemm.hpp` baseline kernel
+referenced in this historical review was retired when the version-2 swizzled
+path became the sole production expert path.
 
-- [src/kernel/w4a16_gemm.hpp](../../../src/kernel/w4a16_gemm.hpp): `wmma_fused_int4_gemm_kernel` for `M>1` W4A16 GEMM, `w4a16_gemv_kernel` for single-token decode, and the inline `dispatch_w4a16_gemm()` selector.
-- [src/kernel/v4_attention.hpp](../../../src/kernel/v4_attention.hpp): Wave32 RMSNorm, batched and single-position RoPE, cached and non-cached sliding-window attention, grouped `W_o_a`, scalar and vectorized FP16 GEMV, FP16-to-FP32 conversion, GPU argmax reduction, and HC head reduction.
-- [src/kernel/moe_router.hpp](../../../src/kernel/moe_router.hpp): `moe_router_kernel` for hash routing and SqrtSoftplus top-6 routing, plus the `softplus_sqrt()` device helper and CPU reference router.
-- [src/kernel/hc_sinkhorn.hpp](../../../src/kernel/hc_sinkhorn.hpp): `hc_project_kernel`, `hc_pre_combine_kernel`, `hc_sinkhorn_normalize_kernel`, and `hc_post_kernel` for Hyper-Connections.
-- [src/kernel/v4_pipeline_ops.hpp](../../../src/kernel/v4_pipeline_ops.hpp): clamped SwiGLU, weighted expert accumulation, and FP16/FP32 conversion kernels.
+- [swizzled W4A16 GEMV](../../../src/backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp): current single-token decode path.
+- [src/architecture/deepseek_v4/kernels/v4_attention.hpp](../../../src/architecture/deepseek_v4/kernels/v4_attention.hpp): Wave32 RMSNorm, batched and single-position RoPE, cached and non-cached sliding-window attention, grouped `W_o_a`, scalar and vectorized FP16 GEMV, FP16-to-FP32 conversion, GPU argmax reduction, and HC head reduction.
+- [src/architecture/deepseek_v4/kernels/moe_router.hpp](../../../src/architecture/deepseek_v4/kernels/moe_router.hpp): `moe_router_kernel` for hash routing and SqrtSoftplus top-6 routing, plus the `softplus_sqrt()` device helper and CPU reference router.
+- [src/architecture/deepseek_v4/kernels/hc_sinkhorn.hpp](../../../src/architecture/deepseek_v4/kernels/hc_sinkhorn.hpp): `hc_project_kernel`, `hc_pre_combine_kernel`, `hc_sinkhorn_normalize_kernel`, and `hc_post_kernel` for Hyper-Connections.
+- [src/architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp](../../../src/architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp): clamped SwiGLU, weighted expert accumulation, and FP16/FP32 conversion kernels.
 
 ### Launch and ownership layers
 
-- [src/core/v4_pipeline.hpp](../../../src/core/v4_pipeline.hpp) contains the host-side `V4Pipeline::step()` orchestration and all production launches; it does not define device kernels.
-- [src/core/v4_layer.hpp](../../../src/core/v4_layer.hpp) owns per-layer weights and the persistent `[max_seq_len,512]` KV cache.
-- [src/core/v4_pipeline_scratch.hpp](../../../src/core/v4_pipeline_scratch.hpp) owns reusable activation, router, expert, logits, and argmax buffers.
-- [src/core/vram_expert_pool.hpp](../../../src/core/vram_expert_pool.hpp) owns contiguous resident expert slots; [src/core/prefetch_staging.hpp](../../../src/core/prefetch_staging.hpp) owns the 12-slot pinned transfer arena.
+- [src/architecture/deepseek_v4/core/v4_pipeline.hpp](../../../src/architecture/deepseek_v4/core/v4_pipeline.hpp) contains the host-side `V4Pipeline::step()` orchestration and all production launches; it does not define device kernels.
+- [src/architecture/deepseek_v4/core/v4_layer.hpp](../../../src/architecture/deepseek_v4/core/v4_layer.hpp) owns per-layer weights and the persistent `[max_seq_len,512]` KV cache.
+- [src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp](../../../src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp) owns reusable activation, router, expert, logits, and argmax buffers.
+- [src/backend/swizzled_w4a16/core/vram_expert_pool.hpp](../../../src/backend/swizzled_w4a16/core/vram_expert_pool.hpp) owns contiguous resident expert slots; [src/infrastructure/core/prefetch_staging.hpp](../../../src/infrastructure/core/prefetch_staging.hpp) owns the 12-slot pinned transfer arena.
 
 The runtime sequence in `V4Pipeline::step()` is:
 
@@ -185,10 +191,10 @@ These files define local validation or benchmark kernels; they are not productio
 ## Sources
 
 - [Model config](../../../models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon/config.json)
-- [Aeon loader and expert layout](../../../src/core/aeon_loader.hpp)
+- [Aeon loader and expert layout](../../../src/infrastructure/core/aeon_loader.hpp)
 - [Converter and serialization contract](../../../scripts/convert_safetensors_to_aeon.py)
-- [W4A16 kernels](../../../src/kernel/w4a16_gemm.hpp)
-- [Pipeline and MoE launch path](../../../src/core/v4_pipeline.hpp)
-- [Attention kernels and KV layout](../../../src/kernel/v4_attention.hpp)
+- [W4A16 kernels](../../../src/backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp)
+- [Pipeline and MoE launch path](../../../src/architecture/deepseek_v4/core/v4_pipeline.hpp)
+- [Attention kernels and KV layout](../../../src/architecture/deepseek_v4/kernels/v4_attention.hpp)
 - [Performance ledger](../../status/PERFORMANCE_LEDGER.md)
 - [Build target and Wave32 flags](../../../CMakeLists.txt)

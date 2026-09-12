@@ -1,5 +1,5 @@
-#include "core/device.hpp"
-#include "core/v4_block.hpp"
+#include "platform/rdna3/device.hpp"
+#include "architecture/deepseek_v4/core/v4_block.hpp"
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

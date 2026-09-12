@@ -45,7 +45,7 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
 ### Spike 1: Dynamic Memory Budgeting, Feasibility Gating & Global Unified VRAM Expert Pool
 *Objective: Eliminate rigid per-layer slot allocations; enforce strict startup hardware feasibility gating; maximize cache hit rate under real Zipfian MoE activation entropy by dynamically sharing VRAM capacity across all 43 layers.*
 
-- **Micro-Step 1.1: Runtime Configuration & Hard Feasibility Gate (`src/core/memory_budget.hpp`)**
+- **Micro-Step 1.1: Runtime Configuration & Hard Feasibility Gate (`src/architecture/deepseek_v4/core/memory_budget.hpp`)**
   - Define `AeonRuntimeConfig` accepting user-specified `context_size` ($T \in [1, \text{max\_position\_embeddings}]$) and `host_ram_bytes`.
   - Enforce internal safety constraints:
     - Fixed VRAM headroom: $\mathbf{300\text{ MB}}$ to prevent OS desktop compositor/GTT memory migration.
@@ -58,12 +58,12 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
     If violated, cleanly reject initialization with detailed diagnostics (displaying current allocation breakdown, available VRAM, and maximum allowable context length $T_{\text{max}}$).
   - Compute dynamic Hot VRAM capacity ($S_{\text{hot}}$ slots) and Warm Host DDR capacity ($S_{\text{warm}}$ slots).
 
-- **Micro-Step 1.2: Global Unified VRAM Expert Pool (`src/core/vram_expert_pool.hpp`)**
+- **Micro-Step 1.2: Global Unified VRAM Expert Pool (`src/backend/swizzled_w4a16/core/vram_expert_pool.hpp`)**
   - Allocate a single, unified flat VRAM slab of $S_{\text{hot}}$ expert slots ($\approx 880$ slots on 24 GB card with $32\text{k}$ context).
   - Flatten weight allocations into contiguous arrays `d_w1_packed`, `d_w1_scale`, `d_w2_packed`, `d_w2_scale`, `d_w3_packed`, `d_w3_scale` indexed by physical `slot_idx \in [0, S_{\text{hot}}-1]`.
   - Provide asynchronous DMA transfer methods to load and evict experts to/from physical slot indices without per-layer fragmentation.
 
-- **Micro-Step 1.3: Host-Side Dynamic Expert Registry (`src/core/expert_registry.hpp`)**
+- **Micro-Step 1.3: Host-Side Dynamic Expert Registry (`src/infrastructure/core/expert_registry.hpp`)**
   - Maintain a lightweight Host CPU catalog ($\approx 528\text{ KB}$) tracking all 11,008 experts ($43 \times 256$).
   - For each expert $(L, E)$, track:
     - Current tier: `Tier::HOT_VRAM`, `Tier::WARM_HOST`, or `Tier::COLD_NVME`.
@@ -103,7 +103,7 @@ Spike 3 checkpoints below.
 - **Micro-Step 2.1: Lookahead Routing & Prefetch Horizon Pipeline**
   - While Layer $L$ is executing its attention and resident shared expert pass, trigger routing calculation for Layer $L+1$.
   - Identify missing experts for Layer $L+1$ ahead of execution time.
-- **Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream (`src/core/prefetch_staging.hpp`)**
+- **Micro-Step 2.2: Double-Buffered Asynchronous SDMA Transfer Stream (`src/infrastructure/core/prefetch_staging.hpp`)**
   - Implemented 12-slot ($170\text{ MB}$) pinned host arena via `hipHostMalloc` (`hipHostMallocPortable`), bypassing OS page-faults and unpinned memory thrashing.
   - Dispatch non-blocking PCIe DMA transfers on dedicated HIP SDMA stream concurrently with compute stream.
   - Synchronize via non-blocking HIP event barriers (`hipEventRecord`, `hipStreamWaitEvent`) immediately before routed MoE execution.
@@ -118,7 +118,7 @@ Spike 3 checkpoints below.
 *Objective: Complete the 3-tier chain by connecting cold NVMe SSD storage directly to Host DDR staging via Linux `io_uring` with zero kernel page-cache contention, eliminating synchronous CPU `memcpy` stalls from the streaming pipeline.*
 
 - **Micro-Step 3.1: Linux `io_uring` Direct I/O Reader Integration (Tier 3 $\to$ Tier 2)**
-  - Integrate `src/io/direct_io_reader.hpp` into the runtime pipeline targeting `model_experts_swizzled.aeon`.
+  - Integrate `src/infrastructure/io/direct_io_reader.hpp` into the runtime pipeline targeting `model_experts_swizzled.aeon`.
   - Replace `mmap` + CPU `memcpy` expert retrieval with asynchronous direct streaming of cold experts from NVMe into pinned host DDR staging buffers (`PrefetchStagingArena`) using `O_DIRECT`.
   - Maintain a dynamic Tier 2 warm cache in host RAM ($\approx 35\text{ GB}$) feeding Tier 1 VRAM without triggering OS page-cache bloat or swap thrashing.
 - **Micro-Step 3.2: End-to-End 3-Tier Pipeline Validation**
@@ -129,7 +129,7 @@ Spike 3 checkpoints below.
 The implementation is deliberately staged so storage correctness is established before changing GPU scheduling:
 
 1. **Storage primitive and model contract**
-  - Extend `src/io/direct_io_reader.hpp` with reusable asynchronous request submission and completion harvesting while retaining the existing synchronous `read_direct()` API.
+  - Extend `src/infrastructure/io/direct_io_reader.hpp` with reusable asynchronous request submission and completion harvesting while retaining the existing synchronous `read_direct()` API.
   - Force regular-file `O_DIRECT` reads onto the asynchronous io_uring worker path and split expert payloads into 4 MiB sector-aligned requests; a single large `IORING_OP_READ` was observed to execute synchronously during `io_uring_enter` on this kernel/device combination.
   - Unit convention: `AEON_EXPERT_BYTES = 14,155,776` bytes = `13.5 MiB` = `14.155776 MB` decimal = `3,456` 4 KiB sectors. The format is unchanged; earlier `13.5 MB` references used binary MiB terminology.
   - Open `model_experts_swizzled.aeon` with `O_DIRECT | O_RDONLY | O_CLOEXEC` and expose validated `(file_offset, byte_length)` metadata through `AeonModelLoader`.
@@ -142,7 +142,7 @@ The implementation is deliberately staged so storage correctness is established 
   - Add a model-backed batch direct-I/O test that reads real expert blocks into aligned staging buffers, compares them byte-for-byte with the existing loader, and reports aggregate throughput and completion latency.
   - The initial gate ran with warm preload disabled; the large contiguous Tier 2 preload is now replaced by segmented allocation and an explicit host-memory budget.
 4. **Pipeline integration**
-  - Replace only the cold branch of the existing lookahead prefetch boundary in `src/core/v4_pipeline.hpp`.
+  - Replace only the cold branch of the existing lookahead prefetch boundary in `src/architecture/deepseek_v4/core/v4_pipeline.hpp`.
   - Submit cold reads while the current layer computes, reap them before the corresponding HIP upload, and preserve the existing Hot VRAM and Warm Host paths.
   - Record a HIP event for each uploaded staging slot and prevent slot reuse until the SDMA event completes.
   - Populate both initial Hot VRAM and Warm Host residents through bounded `O_DIRECT` batches; do not fault routed expert pages through the expert mmap in the dynamic-global path.
@@ -158,7 +158,7 @@ The first implementation slice is limited to items 1-3. This keeps an `io_uring`
 
 #### Spike 3 Implementation Checkpoint (2026-09-08)
 
-- [x] Added batched `io_uring` submission/completion handling, strict 4KB request validation, and default `IOSQE_ASYNC` execution in `src/io/direct_io_reader.hpp`.
+- [x] Added batched `io_uring` submission/completion handling, strict 4KB request validation, and default `IOSQE_ASYNC` execution in `src/infrastructure/io/direct_io_reader.hpp`.
 - [x] Added a dedicated `O_DIRECT` descriptor plus validated expert locations to `AeonModelLoader`.
 - [x] Added staging-slot ownership states and matching HIP/`posix_memalign` cleanup; direct and legacy host fills now share the release lifecycle.
 - [x] Integrated cold expert reads into the native pipeline prefetch boundary while preserving Hot VRAM and Warm Host source paths.

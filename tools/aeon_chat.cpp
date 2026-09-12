@@ -1,9 +1,9 @@
-#include "core/device.hpp"
-#include "core/memory_budget.hpp"
-#include "core/v4_pipeline.hpp"
-#include "text/dsv4_chat_formatter.hpp"
-#include "text/dsv4_tokenizer.hpp"
-#include "text/text_generation.hpp"
+#include "platform/rdna3/device.hpp"
+#include "architecture/deepseek_v4/core/memory_budget.hpp"
+#include "architecture/deepseek_v4/core/v4_pipeline.hpp"
+#include "architecture/deepseek_v4/text/dsv4_chat_formatter.hpp"
+#include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
+#include "infrastructure/text/text_generation.hpp"
 
 #include <cstdlib>
 #include <filesystem>

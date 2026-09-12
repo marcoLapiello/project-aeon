@@ -1,6 +1,6 @@
 # Project Aeon Codebase Map
 
-*Status: current runtime map, audited 2026-09-10.*
+*Status: current runtime map, audited 2026-09-12.*
 
 This document distinguishes the current inference engine from validation programs,
 hardware spikes, and offline tooling. A file being built by CMake does not by itself
@@ -8,25 +8,26 @@ mean that it is part of the production runtime.
 
 ## Current engine path
 
-The current integration point is `src/core/v4_pipeline.hpp`. It is header-only and
+The current integration point is `src/architecture/deepseek_v4/core/v4_pipeline.hpp`. It is header-only and
 pulls in the model configuration, device setup, transformer block, native Aeon
 loader, VRAM and host expert pools, registry, and all active kernels.
 
 The production-facing implementation is:
 
-- `src/core/config.hpp` - model and runtime configuration.
-- `src/core/device.hpp` - HIP device selection and GPU utilities.
-- `src/core/v4_pipeline.hpp` - multi-layer inference and memory-tier orchestration.
-- `src/core/v4_block.hpp` - transformer block composition.
-- `src/core/aeon_loader.hpp` - native `.aeon` dense and expert container access.
-- `src/core/memory_budget.hpp` - VRAM/host feasibility calculations and startup checks.
-- `src/core/vram_expert_pool.hpp` - Tier 1 hot expert pool.
-- `src/core/host_expert_pool.hpp` - Tier 2 warm expert pool.
-- `src/core/expert_registry.hpp` - expert residency and usage tracking.
-- `src/core/prefetch_staging.hpp` - bounded pinned staging and HIP event ownership.
-- `src/io/direct_io_reader.hpp` - validated batched `io_uring`/`O_DIRECT` cold reads.
-- `src/text/` - native tokenizer, DSV4 formatter, and text-generation support.
-- `src/kernel/*.hpp` - attention, W4A16 GEMM, routing, and Hyper-Connections kernels.
+- `src/architecture/deepseek_v4/core/config.hpp` - DeepSeek-V4 model configuration.
+- `src/platform/rdna3/device.hpp` - RDNA3/HIP device selection and GPU utilities.
+- `src/architecture/deepseek_v4/core/v4_pipeline.hpp` - multi-layer inference and memory-tier orchestration.
+- `src/architecture/deepseek_v4/core/v4_block.hpp` - transformer block composition.
+- `src/infrastructure/core/aeon_loader.hpp` - native `.aeon` dense and expert container access.
+- `src/architecture/deepseek_v4/core/memory_budget.hpp` - V4 VRAM/host feasibility calculations and startup checks.
+- `src/backend/swizzled_w4a16/core/vram_expert_pool.hpp` - current backend's Tier 1 hot expert pool.
+- `src/infrastructure/core/host_expert_pool.hpp` - shared Tier 2 warm expert pool.
+- `src/infrastructure/core/expert_registry.hpp` - shared expert residency and usage tracking.
+- `src/infrastructure/core/prefetch_staging.hpp` - shared bounded pinned staging and HIP event ownership.
+- `src/infrastructure/io/direct_io_reader.hpp` - shared validated batched `io_uring`/`O_DIRECT` cold reads.
+- `src/architecture/deepseek_v4/text/` and `src/infrastructure/text/` - DSV4 and generic text support.
+- `src/architecture/deepseek_v4/kernels/` - V4 attention, routing, and Hyper-Connections kernels.
+- `src/backend/swizzled_w4a16/kernels/` - current W4A16 swizzle, GEMV, and fused expert kernels.
 
 `V4Pipeline::init_aeon()` opens both the mapped expert container and a dedicated
 `O_DIRECT` descriptor. The cold request path uses `DirectIOReader` and the
@@ -98,8 +99,8 @@ validation set, rather than deleted casually.
 ## Offline scripts
 
 - `scripts/convert_safetensors_to_aeon.py` is the current production model preparation
-  tool. It creates `model_dense.aeon`, `model_experts_swizzled.aeon`, and the version-2
-  swizzled expert index.
+  tool. It creates `model_manifest.json`, `model_dense.aeon`,
+  `model_experts_swizzled.aeon`, and the version-2 swizzled expert index.
 - `scripts/prepare_rdna.py` is an older synthetic formatter for the original toy
   `AEON` layout. It does not create the current `AEON_DENSE`/`AEON_EXPERTS` format
   and is retained only for historical diagnostics.

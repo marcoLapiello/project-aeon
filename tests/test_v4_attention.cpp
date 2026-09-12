@@ -1,5 +1,5 @@
-#include "core/device.hpp"
-#include "kernel/v4_attention.hpp"
+#include "platform/rdna3/device.hpp"
+#include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

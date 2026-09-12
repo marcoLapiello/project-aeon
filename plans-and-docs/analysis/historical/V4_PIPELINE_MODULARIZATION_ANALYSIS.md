@@ -4,7 +4,7 @@
 
 ## Purpose
 
-`src/core/v4_pipeline.hpp` was the original integration point for the DeepSeek-V4
+`src/architecture/deepseek_v4/core/v4_pipeline.hpp` was the original integration point for the DeepSeek-V4
 runtime and had grown into a roughly 1,500-line header containing several distinct
 ownership and execution concerns. This document records the duplication findings
 and the outcome of the initial structural changes.
@@ -26,9 +26,9 @@ Before the refactor, `v4_pipeline.hpp` contained:
   memory-budget setup, expert-tier orchestration, one-token execution, greedy
   sampling, generation, and cleanup.
 
-The current split is `src/kernel/v4_pipeline_ops.hpp` for pipeline utility
-kernels, `src/core/v4_pipeline_scratch.hpp` for scratch ownership, and
-`src/core/v4_layer.hpp` for layer-local structures. Production residency is
+The current split is `src/architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp` for pipeline utility
+kernels, `src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp` for scratch ownership, and
+`src/architecture/deepseek_v4/core/v4_layer.hpp` for layer-local structures. Production residency is
 handled by `UnifiedVRAMExpertPool`, `HostExpertPool`, and `ExpertRegistry`.
 
 These were separate concerns even though they originally participated in one
@@ -39,8 +39,8 @@ header-only implementation; the current ownership split is described above.
 ### Transformer block representation
 
 There is substantial conceptual overlap between `V4Layer` in
-`src/core/v4_pipeline.hpp` and the following types in
-`src/core/v4_block.hpp`:
+`src/architecture/deepseek_v4/core/v4_pipeline.hpp` and the following types in
+`src/architecture/deepseek_v4/core/v4_block.hpp`:
 
 - `DeepSeekV4BlockWeights`
 - `DeepSeekV4BlockDeviceContext`
@@ -100,9 +100,9 @@ type from `v4_pipeline.hpp` before attempting deeper unification.
 The same general responsibility is implemented by the production tier
 components:
 
-- `src/core/vram_expert_pool.hpp` for the global hot VRAM pool.
-- `src/core/host_expert_pool.hpp` for the warm host pool.
-- `src/core/expert_registry.hpp` for global residency, tier transitions, and
+- `src/backend/swizzled_w4a16/core/vram_expert_pool.hpp` for the global hot VRAM pool.
+- `src/infrastructure/core/host_expert_pool.hpp` for the warm host pool.
+- `src/infrastructure/core/expert_registry.hpp` for global residency, tier transitions, and
   LRU tracking.
 
 The global tier path is now the production path used by the `.aeon` pipeline.
@@ -161,7 +161,7 @@ need to live in the pipeline header:
 - FP16-to-FP32 conversion.
 - FP32-to-FP16 conversion.
 
-They now live in `src/kernel/v4_pipeline_ops.hpp`.
+They now live in `src/architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp`.
 
 ## Resource-Management Duplication
 
@@ -187,11 +187,11 @@ RAII types, but avoid broad error-handling changes during the first split.
 The mechanical sequence was completed as follows:
 
 1. [x] Extract the pipeline utility kernels into
-   `src/kernel/v4_pipeline_ops.hpp`.
+   `src/architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp`.
 2. [x] Extract `PipelineScratchBuffers` into
-   `src/core/v4_pipeline_scratch.hpp`.
+   `src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp`.
 3. [x] Extract `VRAMExpertSlot`, `HostExpertSource`, and `V4Layer` into
-   `src/core/v4_layer.hpp`.
+   `src/architecture/deepseek_v4/core/v4_layer.hpp`.
 4. [x] Standardize production tiering on the global VRAM pool and registry;
    remove the dual-cache split and hardcoded slot assumptions.
 5. [ ] Consider a later model-resource initialization helper if repeated setup

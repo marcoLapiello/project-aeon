@@ -492,11 +492,11 @@ without deleting the source evidence.
 The current Aeon backend is documented by:
 
 ```text
-/home/marcolap/project-aeon/src/kernel/aeon_w4a16_swizzled_gemv.hpp
-/home/marcolap/project-aeon/src/kernel/aeon_w4a16_swizzle.hpp
-/home/marcolap/project-aeon/src/kernel/aeon_w4a16_swizzled_gemv.hpp
-/home/marcolap/project-aeon/src/core/aeon_loader.hpp
-/home/marcolap/project-aeon/src/core/vram_expert_pool.hpp
+/home/marcolap/project-aeon/src/backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp
+/home/marcolap/project-aeon/src/backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp
+/home/marcolap/project-aeon/src/backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp
+/home/marcolap/project-aeon/src/infrastructure/core/aeon_loader.hpp
+/home/marcolap/project-aeon/src/backend/swizzled_w4a16/core/vram_expert_pool.hpp
 ```
 
 It assumes:

@@ -1,4 +1,4 @@
-#include "kernel/aeon_w4a16_swizzle.hpp"
+#include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp"
 
 #include <cassert>
 #include <cmath>

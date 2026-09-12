@@ -1,4 +1,4 @@
-#include "text/text_generation.hpp"
+#include "infrastructure/text/text_generation.hpp"
 
 #include <cassert>
 #include <iostream>

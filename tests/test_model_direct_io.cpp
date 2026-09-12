@@ -1,6 +1,6 @@
-#include "core/aeon_loader.hpp"
-#include "io/aligned_allocator.hpp"
-#include "io/direct_io_reader.hpp"
+#include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/io/aligned_allocator.hpp"
+#include "infrastructure/io/direct_io_reader.hpp"
 
 #include <array>
 #include <cassert>

@@ -40,7 +40,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 ---
 
 ## 3. Progress Tracking & State of Execution
-*Status: 2026-09-11. Keep this summary current; put detailed measurements and historical execution notes in the linked documents.*
+*Status: 2026-09-12. Keep this summary current; put detailed measurements and historical execution notes in the linked documents.*
 
 ### Completed milestones
 - [x] Phase 0 foundations and the Phase 1 single-GPU runtime gates are implemented. Phase 1 remains bounded by the open full-model correctness work described in the text plan.
@@ -51,11 +51,12 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [x] Pipeline modularization Steps 1-3: extracted pipeline operations/scratch/layer ownership, unified the production expert cache path, and removed the HC/router CPU round trips.
 - [x] Versioned model-manifest contract: explicit model-family, architecture, backend, dense-file, artifact, and catalog identity validation is available before runtime device-weight allocation while the legacy artifact path remains compatible.
 - [x] Backend-selection and V4 dense-binding boundaries: the manifest resolves through an explicit expert backend registry, and V4 tensor-name mapping/device ownership is isolated from `V4Layer` while preserving the current pointer contract.
+- [x] Manifest sidecar and source ownership boundaries: the converter writes `model_manifest.json`, the runtime discovers it automatically, and `src/infrastructure`, `src/architecture/deepseek_v4`, `src/backend/swizzled_w4a16`, and `src/platform/rdna3` expose the intended ownership split.
 - [x] Native text milestone: tokenizer, DSV4 formatter, EOS-aware generation, detokenization, `aeon_chat`, and a complete simple 43-layer text turn.
 - [x] Routing profiler plumbing: optional observation, resumable aggregation, complete rankings, compact summaries, and regeneration mode.
 - [x] Stage 1 parallel expert-kernel path: version-2 W4A16 swizzled artifact, vectorized Wave32 GEMV, fused six-expert W1/W3 plus clamped SwiGLU, fused W2 FP32 accumulation, native conversion, sole production-path integration, and silicon validation. The former baseline path and comparison-only kernels were removed after correctness and GPU-side performance validation. The standalone [Stage 1 implementation report](plans-and-docs/analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) records the measured comparison. The runtime resolves six complete expert payloads into VRAM and waits for transfer events before launch; the kernels do not handle non-resident experts or storage/cache misses.
 - [x] Warm-tier repair and supply telemetry: persistent Warm ownership, event-ordered Hot-to-Warm refill, content-lazy Warm preload with eager configured capacity, transactional transfer failure cleanup, pinned fallback handling, source-tier JSONL telemetry, and the five-run three-variant silicon A/B are recorded in [the closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
-- [x] Backend generalization foundation: artifact specifications, runtime expert-format descriptors, opaque VRAM payload storage, descriptor-driven Warm/staging/budget/direct-I/O sizing, current swizzled-view guards, manifest validation, backend capability selection, and V4 dense binding are implemented without changing the v2 runtime contract. Remaining sidecar/factory, semantic dispatch, and second-backend work is tracked in the [Backend Generalization Execution Plan](plans-and-docs/execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md).
+- [x] Backend generalization foundation: artifact specifications, runtime expert-format descriptors, opaque VRAM payload storage, descriptor-driven Warm/staging/budget/direct-I/O sizing, current swizzled-view guards, manifest validation, backend capability selection, V4 dense binding, sidecar generation, and source ownership boundaries are implemented without changing the v2 runtime contract. Remaining backend factory, semantic dispatch, and second-backend work is tracked in the [Backend Generalization Execution Plan](plans-and-docs/execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md).
 
 ### Current priority
 - [ ] **Model correctness:** implement and validate the missing CSA/HCA attention, compressed Prefill state, configured RoPE/YaRN behavior, and trusted-reference parity before using routing data for placement decisions.
@@ -69,7 +70,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [ ] **Cold-tier performance:** characterize cold-cache and steady-state behavior, reduce host-memory pressure, improve physical `.aeon` placement, and test whether the exposed just-in-time miss path needs a new scheduling or CPU-fallback design. The model-backed `>= 6.0 GB/s` target remains open.
 - [ ] **Swizzled full-model performance:** validate representative 43-layer generation with the version-2 artifact under controlled Hot/Warm conditions, collect useful rocprof performance counters, and tune occupancy/register pressure beyond the isolated six-expert benchmarks. A residency invariant violation would produce invalid/stale results or a device memory fault rather than trigger an automatic fallback.
 - [ ] **Routing placement study:** collect representative profile and held-out corpora with the verified text contract, then evaluate frequency-informed placement against dynamic LRU.
-- [ ] **Backend specialization:** add sidecar-driven backend factory selection, semantic dispatch, and a second working weight backend before introducing a universal V4 linear-dispatch abstraction.
+- [ ] **Backend specialization:** add an explicit backend factory, semantic dispatch, and a second working weight backend before introducing a universal V4 linear-dispatch abstraction.
 - [ ] **Phase 3:** multi-GPU pipeline parallelism and 1F1B scheduling remain future work.
 
 ---

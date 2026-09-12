@@ -48,7 +48,7 @@ This actionable plan breaks down the foundational work into discrete, verifiable
 
 ## Spike 3: Asynchronous I/O & SDMA Transfer Overlap
 
-### Micro-Step 3.1: Sector-Aligned Allocator & Direct I/O Reader (`src/io/`)
+### Micro-Step 3.1: Sector-Aligned Allocator & Direct I/O Reader (`src/infrastructure/io/`)
 - **Goal:** Create a lightweight, high-performance reader using Linux `io_uring` with `O_DIRECT`.
 - **Implementation:**
   - Allocate host memory aligned to 4096-byte boundaries (`posix_memalign` / `aligned_alloc`).
