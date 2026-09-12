@@ -78,6 +78,15 @@ architecture contract, not a quantization-format contract.
 `AeonArtifactSpec` selects files and expected identity. `ExpertFormatDescriptor`
 describes the opaque expert records. `ExpertPayloadPool`, Warm storage, staging,
 direct I/O, registry capacity, and telemetry must not inspect quantization planes.
+`TieredExpertSupply` owns the architecture-neutral residency transfer lifecycle:
+opaque payload promotion and demotion, event ordering, staging, direct-I/O
+completion, failure cleanup, and supply timing. An architecture adapter supplies
+global expert IDs, staging slots, and a payload-source mapping; it does not move
+backend-specific views or kernels into this service.
+
+`V4ExpertSupplyCoordinator` is the current adapter: it preserves the six-expert
+routed request shape and alternating staging policy while delegating all
+Hot/Warm/Cold movement to `TieredExpertSupply`.
 
 ### Current weight execution
 
