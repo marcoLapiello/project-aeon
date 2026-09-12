@@ -201,123 +201,15 @@ public:
         return layers.empty() ? 0 : layers.front()->max_seq_len_;
     }
 
-    // Initialize pipeline directly from native .aeon format folder
-    void init_aeon(
+    // Initialize the production runtime from model metadata and runtime policy.
+    void initialize(
         const std::string& aeon_model_dir,
-        uint32_t num_layers = 2,
-        uint32_t unified_vram_slots = 0,
-        uint32_t max_seq_len = 4096,
-        bool enable_direct_io = true,
-        const AeonArtifactSpec& artifact = make_current_swizzled_artifact_spec()
-    ) {
-        num_layers_ = num_layers;
-        current_seq_len_ = 0;
-
-        // 1. Initialize streams
-        initialize_streams();
-
-        // 2. Open Aeon Model via Zero-Copy Mmap
-        std::cout << "[Pipeline] Opening native Aeon model from " << aeon_model_dir << "..." << std::endl;
-        if (is_current_swizzled_artifact_spec(artifact)) {
-            aeon_loader.open_model(aeon_model_dir);
-        } else {
-            aeon_loader.open_model(aeon_model_dir, artifact);
-        }
-        const auto& expert_format = aeon_loader.expert_format();
-        const auto& backend = ExpertBackendRegistry::resolve(expert_format);
-        if (!backend.supports_v4_pipeline) {
-            throw std::runtime_error(
-                "V4Pipeline: selected artifact requires a different weight backend");
-        }
-        if (enable_direct_io) {
-            direct_io_reader_ = std::make_unique<aeon::io::DirectIOReader>(
-                64, true, expert_format.sector_size);
-        }
-        std::cout << "  > Total dense tensors indexed: " << aeon_loader.total_dense_tensors() << std::endl;
-
-        // 3. Initialize RoPE Tables
-        std::cout << "[Pipeline] Initializing RoPE tables (max_seq=" << max_seq_len << ")..." << std::endl;
-        rope_table.init(max_seq_len, kernel::DSV4_ROPE_THETA, 1.0f);
-
-        // Upload RoPE caches to GPU
-        size_t rope_bytes = rope_table.max_seq_len * rope_table.half_rope * sizeof(float);
-        CHECK_HIP(hipMalloc(&d_cos_cache_, rope_bytes));
-        CHECK_HIP(hipMalloc(&d_sin_cache_, rope_bytes));
-        CHECK_HIP(hipMemcpy(d_cos_cache_, rope_table.cos_cache.data(), rope_bytes, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_sin_cache_, rope_table.sin_cache.data(), rope_bytes, hipMemcpyHostToDevice));
-
-        // 4. Model-level Weights
-        std::cout << "[Pipeline] Binding model-level embeddings and LM head..." << std::endl;
-        host_embed_table = aeon_loader.get_data_ptr<half>("embed.weight");
-
-        const auto& head_t = aeon_loader.get_tensor("head.weight");
-        std::cout << "  > Uploading LM Head [129280, 4096] (" << (head_t.byte_size / (1024*1024)) << " MB) to VRAM..." << std::endl;
-        CHECK_HIP(hipMalloc(&d_lm_head, head_t.byte_size));
-        CHECK_HIP(hipMemcpy(d_lm_head, head_t.data, head_t.byte_size, hipMemcpyHostToDevice));
-
-        // HC Head
-        const auto& fn_t = aeon_loader.get_tensor("hc_head_fn");
-        const auto& base_t = aeon_loader.get_tensor("hc_head_base");
-        const auto& sc_t = aeon_loader.get_tensor("hc_head_scale");
-        CHECK_HIP(hipMalloc(&d_hc_head_fn, fn_t.byte_size));
-        CHECK_HIP(hipMalloc(&d_hc_head_base, base_t.byte_size));
-        CHECK_HIP(hipMalloc(&d_hc_head_scale, sc_t.byte_size));
-        CHECK_HIP(hipMemcpy(d_hc_head_fn, fn_t.data, fn_t.byte_size, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_hc_head_base, base_t.data, base_t.byte_size, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_hc_head_scale, sc_t.data, sc_t.byte_size, hipMemcpyHostToDevice));
-
-        // Final norm
-        const auto& norm_t = aeon_loader.get_tensor("norm.weight");
-        CHECK_HIP(hipMalloc(&d_final_norm, norm_t.byte_size));
-        CHECK_HIP(hipMemcpy(d_final_norm, norm_t.data, norm_t.byte_size, hipMemcpyHostToDevice));
-
-        // 5. Allocate Reusable Pipeline Scratch Buffers
-        std::cout << "[Pipeline] Allocating intermediate GPU scratch buffers..." << std::endl;
-        scratch.allocate();
-
-        // 6. Initialize Consecutive Transformer Layers
-        layers.resize(num_layers_);
-        for (uint32_t l = 0; l < num_layers_; ++l) {
-            layers[l] = std::make_unique<V4Layer>();
-            layers[l]->init(l, aeon_loader, max_seq_len);
-        }
-
-        // 7. Setup Unified VRAM Pool and Expert Registry
-        uint32_t active_vram_slots = unified_vram_slots > 0 ? unified_vram_slots : std::max(num_layers_ * 8u, 16u);
-        unified_vram_pool_ = std::make_unique<UnifiedVRAMExpertPool>(
-            active_vram_slots, expert_format);
-        expert_registry_ = std::make_unique<ExpertRegistry>(
-            num_layers_, expert_format.experts_per_layer, active_vram_slots, 0);
-        prefetch_staging_ = std::make_unique<PrefetchStagingArena>(expert_format);
-
-        // Preload initial hot experts
-        for (uint32_t slot = 0; slot < active_vram_slots; ++slot) {
-            int32_t gid = expert_registry_->vram_slots[slot];
-            if (gid >= 0) {
-                uint32_t lay = expert_registry_->catalog[gid].layer_id;
-                uint32_t exp = expert_registry_->catalog[gid].expert_id;
-                const uint8_t* p = aeon_loader.get_expert_data(lay, exp);
-                unified_vram_pool_->upload_from_host_expert(slot, p, compute_stream);
-            }
-        }
-        CHECK_HIP(hipStreamSynchronize(compute_stream));
-
-        std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_ << " chained layers with "
-                  << active_vram_slots << " unified VRAM expert slots in native .aeon format." << std::endl;
-    }
-
-    // Initialize dynamic memory budgeting and the unified VRAM expert pool.
-    void init_dynamic_global(
-        const std::string& aeon_model_dir,
-        const AeonRuntimeConfig& runtime_cfg,
-        uint32_t num_layers = 2,
-        const AeonArtifactSpec& artifact = make_current_swizzled_artifact_spec()
+        const AeonRuntimeConfig& runtime_cfg
     ) {
         std::cout << "================================================================================" << std::endl;
         std::cout << "      Project Aeon — Dynamic VRAM Budget & Global Expert Pool Pipeline          " << std::endl;
         std::cout << "================================================================================" << std::endl;
 
-        num_layers_ = num_layers;
         current_seq_len_ = 0;
         demotion_queue_capacity_ = runtime_cfg.enable_warm_refill
             ? DEMOTION_QUEUE_CAPACITY
@@ -328,11 +220,7 @@ public:
 
         // 2. Open Model Containers
         std::cout << "[Pipeline] Opening native .aeon model from " << aeon_model_dir << "..." << std::endl;
-        if (is_current_swizzled_artifact_spec(artifact)) {
-            aeon_loader.open_model(aeon_model_dir);
-        } else {
-            aeon_loader.open_model(aeon_model_dir, artifact);
-        }
+        aeon_loader.open_model(aeon_model_dir);
         const auto& expert_format = aeon_loader.expert_format();
         const auto& backend = ExpertBackendRegistry::resolve(expert_format);
         if (!backend.supports_v4_pipeline) {
@@ -343,8 +231,14 @@ public:
             64, true, expert_format.sector_size);
         std::cout << "  > Dense tensors indexed: " << aeon_loader.total_dense_tensors() << std::endl;
 
-        // Load config
-        auto model_cfg = DeepSeekV4Config::load_from_json(aeon_model_dir + "/config.json");
+        // Load the architecture contract from the model package. The runtime
+        // policy controls resources; it does not redefine model dimensions.
+        const auto model_cfg = DeepSeekV4Config::load_from_json(aeon_model_dir + "/config.json");
+        if (model_cfg.num_hidden_layers <= 0) {
+            throw std::runtime_error("V4Pipeline: model configuration must declare at least one layer");
+        }
+        validate_supported_model_config(model_cfg);
+        num_layers_ = static_cast<uint32_t>(model_cfg.num_hidden_layers);
 
         // 3. Evaluate Memory Budget & Feasibility Gate
         const size_t dense_bytes = aeon_loader.dense_file_size();
@@ -1321,7 +1215,7 @@ public:
     // Prefill Prompt and Generate Next Tokens
     std::vector<uint32_t> generate(
         const std::vector<uint32_t>& prompt,
-        uint32_t max_new_tokens = 16,
+        uint32_t max_new_tokens,
         double* out_ttft_ms = nullptr,
         double* out_tok_per_sec = nullptr
     ) {
@@ -1453,6 +1347,33 @@ public:
     }
 
 private:
+    void validate_supported_model_config(const DeepSeekV4Config& model_cfg) const {
+        const bool supported =
+            model_cfg.vocab_size == 129280 &&
+            model_cfg.hidden_size == kernel::DSV4_HIDDEN_SIZE &&
+            model_cfg.moe_intermediate_size == 2048 &&
+            model_cfg.num_attention_heads == kernel::DSV4_NUM_HEADS &&
+            model_cfg.num_key_value_heads == 1 &&
+            model_cfg.head_dim == kernel::DSV4_HEAD_DIM &&
+            model_cfg.q_lora_rank == kernel::DSV4_Q_LORA_RANK &&
+            model_cfg.o_lora_rank == kernel::DSV4_O_LORA_RANK &&
+            model_cfg.qk_rope_head_dim == kernel::DSV4_ROPE_DIM &&
+            model_cfg.sliding_window == kernel::DSV4_SLIDING_WINDOW &&
+            model_cfg.n_routed_experts == 256 &&
+            model_cfg.n_shared_experts == 1 &&
+            model_cfg.num_experts_per_tok == 6 &&
+            model_cfg.num_hash_layers == 3 &&
+            std::fabs(model_cfg.routed_scaling_factor - 1.5f) < 1e-6f &&
+            std::fabs(model_cfg.swiglu_limit - 10.0f) < 1e-6f &&
+            model_cfg.hc_mult == 4 &&
+            model_cfg.hc_sinkhorn_iters == 20 &&
+            std::fabs(model_cfg.hc_eps - 1e-6f) < 1e-12f;
+        if (!supported) {
+            throw std::runtime_error(
+                "V4Pipeline: model configuration is incompatible with the current DeepSeek-V4 kernel contract");
+        }
+    }
+
     size_t expert_payload_bytes() const noexcept {
         return aeon_loader.expert_format().payload_bytes;
     }

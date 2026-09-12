@@ -107,7 +107,7 @@ Spike 3 checkpoints below.
   - Implemented 12-slot ($170\text{ MB}$) pinned host arena via `hipHostMalloc` (`hipHostMallocPortable`), bypassing OS page-faults and unpinned memory thrashing.
   - Dispatch non-blocking PCIe DMA transfers on dedicated HIP SDMA stream concurrently with compute stream.
   - Synchronize via non-blocking HIP event barriers (`hipEventRecord`, `hipStreamWaitEvent`) immediately before routed MoE execution.
-- **Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon (`tests/test_async_prefetch.cpp`)**
+- **Micro-Step 2.3: Overlap Verification & Latency Hiding Benchmark on Silicon (historical two-layer checkpoint)**
   - Silicon verification under severe cold-miss conditions (12 VRAM slots, 94% miss rate).
   - TTFT improved by $+36.2\%$ ($111.4\text{ ms} \to 71.1\text{ ms}$) and decode throughput accelerated by $+71.5\%$ ($19.1\text{ tok/s} \to 32.8\text{ tok/s}$).
   - *Key Finding*: Inter-layer lookahead plateaued at $33.1\text{ tok/s}$ because single-threaded CPU `memcpy` from unpinned `mmap` backing pages into pinned staging buffers ($85\text{ MB/step}$) creates a synchronous host memory bus bottleneck, directly affirming the need for Spike 3 Direct I/O.
@@ -166,7 +166,7 @@ The first implementation slice is limited to items 1-3. This keeps an `io_uring`
 - [x] Silicon checks passed after the async/chunked fix: generic direct I/O (`6.43 GB/s`), model-backed six-expert payload parity (`3.17 GiB/s`), native pipeline golden token `69146`, and async cold-miss generation (`32.87 tok/s`).
 - [x] Root cause isolated: baseline `io_uring_enter` submission took about `45 ms` for six expert reads while completion waits were sub-millisecond; `IOSQE_ASYNC` removed that synchronous submission behavior. A 4 MiB direct-read sweep was also materially faster than 14-16 MiB requests on this device.
 - [ ] The model-backed batch result remains below the `>= 6.0 GB/s` Spike 3 target because the target fixture is a short/sequential workload while routed experts are physically scattered across the 145 GB container. The model file has `1,552` physical extents versus `6` for a fresh 128 MiB probe file on the same NVMe/ext4 filesystem. Repacking/defragmentation and higher-volume queue-saturation measurements remain open.
-- [x] Added `bench_async_prefetch_io_modes`: identical 12-slot native inference produced identical tokens, while two A/B runs measured direct `32.31/32.57 tok/s` versus mmap-source `33.57/33.22 tok/s`. This is not an apples-to-apples cold-cache proof because the mmap case warms its page-cache pages during its warmup step; it does show that replacing the source fill alone does not improve the current end-to-end critical path.
+- [x] Historical 12-slot native source A/B produced identical tokens and measured direct `32.31/32.57 tok/s` versus mmap-source `33.57/33.22 tok/s`. The temporary benchmark target was retired when the partial-model initializer was removed. This was not an apples-to-apples cold-cache proof because the mmap case warmed its page-cache pages during its warmup step; it showed that replacing the source fill alone did not improve the then-current end-to-end critical path.
 - [ ] Move direct-I/O completion and GPU upload farther ahead of routed execution, and benchmark cold-cache and steady-state modes separately before claiming an inference-throughput gain.
 - [ ] At the M11 checkpoint, full Tier 2 warm-cache integration and end-to-end NVMe -> Host DDR -> VRAM measurement remained open; the bounded segmented integration is recorded in the checkpoint below.
 

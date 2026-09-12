@@ -97,7 +97,7 @@ The current backend remains validated by:
   swizzled-view guarding, and end-to-end dynamic pipeline execution;
 - `test_expert_registry_warm_state`: Warm ownership and staging transitions;
 - `test_direct_io`: default 4 KiB sector validation;
-- `test_aeon_swizzled_pipeline`: two-layer silicon pipeline smoke;
+- `test_hot_warm_cold_pipeline`: full-model silicon Hot/Warm/Cold pipeline smoke;
 - `ctest --test-dir build -R 'test_aeon_(loader|swizzled_loader)'`.
 
 No performance result is attributed to this refactor. The existing v2 model

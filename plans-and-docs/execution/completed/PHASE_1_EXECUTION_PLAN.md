@@ -88,7 +88,7 @@ Following empirical verification of the official Hugging Face repositories (`dee
   - Chain consecutive layers in single-GPU execution with dynamic weight streaming.
   - The original feasibility implementation used a zero-copy Safetensors loader; the runtime now uses the native `.aeon` loader.
   - Persistent sliding-window ($W=128$) KV cache on device.
-  - *Verification:* `tests/test_aeon_pipeline.cpp` validates chained execution of layers 0 and 1 from native `.aeon` weights on silicon.
+  - *Historical verification:* the retired two-layer native `.aeon` pipeline smoke validated chained execution of layers 0 and 1 on silicon before the full-model initializer became authoritative.
 - **Micro-Step 6.2: Generation Benchmark on Real Checkpoint Slice**
   - Benchmark TTFT (Time to First Token) and token generation speed (tok/s) under real memory offloading.
   - The original Safetensors benchmark was a feasibility measurement; current performance runs use the native `.aeon` benchmarks.

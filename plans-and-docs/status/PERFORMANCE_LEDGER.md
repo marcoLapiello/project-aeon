@@ -161,7 +161,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: short TTFT `32.73 ms`, decode `122.90 tok/s`, step `8.14 ms`, hit `100.0%`; medium TTFT `65.66 ms`, decode `122.60 tok/s`, step `8.16 ms`, hit `100.0%`; HC kernel `1,188 -> 9.2 us`
 - **Correctness / service**: bit-exact within `4.5e-6`; `hc_pre_combine_kernel` `3.5 us`; CPU synchronization roundtrips removed
 - **Conclusion / next gate**: Parallel HC recovered and exceeded M4 throughput by approximately `37%`; full-model impact remained open
-- **Evidence**: `test_aeon_pipeline`, `bench_full_model.cpp`
+- **Evidence**: historical two-layer pipeline smoke, `bench_full_model.cpp`
 
 ### M9: Full 43-Layer Model with Optimized Kernels
 - **Run**: `2026-09-08`; commit `fb2c7c0`; DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
@@ -188,7 +188,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: TTFT `71.10 ms` versus `111.43 ms` (`36.2%` faster); decode `32.78 tok/s` versus synchronous `19.11 tok/s` (`+71.5%`); step `30.51 ms`; service `14 Hot / 208 Cold` (`6.2%` hit)
 - **Correctness / service**: token `69146` at step 0 matched the golden reference; compute and SDMA streams used HIP event barriers
 - **Conclusion / next gate**: Dual-stream transfer overlap improved the severe-miss workload; direct-I/O source integration was the next gate
-- **Evidence**: `test_async_prefetch.cpp`, `PrefetchStagingArena`
+- **Evidence**: historical two-layer async-prefetch smoke, `PrefetchStagingArena`
 
 ### M11: Direct I/O Cold Expert Integration Checkpoint (Phase 2 Spike 3)
 - **Run**: `2026-09-08`; implementation checkpoint; DeepSeek-V4 INT4-W4A16, `.aeon`, 2 layers
@@ -199,7 +199,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: fixture `6.42 GB/s`; six experts (`81 MiB`) `3.17 GiB/s`; native chunked-read `31.73 tok/s`; cold-miss async `32.87 tok/s` with 214 misses/layer; original synchronous-submission result `1.65 GiB/s`
 - **Correctness / service**: payloads bit-exact against `AeonModelLoader`; staging ownership and HIP/`posix_memalign` cleanup passed; each expert is `14,155,776` bytes (`3,456` sectors)
 - **Conclusion / next gate**: Direct-I/O integration works, but physical extent layout, cold-cache equivalence, and the `>=6.0 GB/s` model-backed target remain open
-- **Evidence**: `test_model_direct_io.cpp`, `bench_async_prefetch_io_modes`
+- **Evidence**: `test_model_direct_io.cpp`, historical direct-I/O versus mmap source A/B
 
 ### M12: Direct Warm-Tier Population & Bounded 3-Tier Integration (Phase 2 Spike 3)
 - **Run**: `2026-09-08`; DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
@@ -254,7 +254,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: Warm off `4.36 tok/s` (`229.30 ms/token`), `1,682 Hot / 1,156 Cold`; Warm on `5.11 tok/s` (`195.82 ms/token`), `1,682 Hot / 157 Warm / 999 Cold`; warm traffic reduced from approximately `42 MB` to `14 MB` per hit without a throughput gain over M15
 - **Correctness / service**: regression suite passed; golden token `295`; generated IDs matched M15; shared-expert enqueue moved ahead of prefetch
 - **Conclusion / next gate**: Removing request-path demotion confirmed a latency-bound just-in-time miss path; cross-token prefetch and repeated A/B measurement became the next gates
-- **Evidence**: linked review; `test_model_direct_io`, `test_aeon_pipeline`, `test_dynamic_expert_pool`, `test_async_prefetch`, `test_hot_warm_cold_pipeline`
+- **Evidence**: linked review; `test_model_direct_io`, `test_dynamic_expert_pool`, `test_hot_warm_cold_pipeline`, plus retired two-layer checkpoints
 
 ### M17: Routing-Locality Measurement — Historical Speculation Rejected (Expert Review Step 3)
 - **Run**: `2026-09-08`; [review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md); DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
@@ -287,7 +287,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: Warm `35 GiB` `5.79 -> 5.88 tok/s` (`172.6 -> 170.0 ms/token`), TTFT `1,835 -> 1,803 ms`; Warm off `5.25 -> 5.39 tok/s` (`190.4 -> 185.6 ms/token`)
 - **Correctness / service**: one contiguous `13.5 MiB` region per slot and one H2D copy replaced six; separate cold SDMA stream; regression group `5/5` passed; output matched M18
 - **Conclusion / next gate**: Relayout and stream split delivered `+1.5-2.7%`; synchronous cold-read exposure remained dominant
-- **Evidence**: `UnifiedVRAMExpertPool`, `test_dynamic_expert_pool`, `test_aeon_pipeline`, `test_hot_warm_cold_pipeline`, `test_async_prefetch`, `test_w4a16_swizzled_gemv`
+- **Evidence**: `UnifiedVRAMExpertPool`, `test_dynamic_expert_pool`, `test_hot_warm_cold_pipeline`, historical two-layer checkpoints, `test_w4a16_swizzled_gemv`
 
 ### M20: Per-Layer CPU-Stall Removal & GPU Argmax (Expert Review Step 5)
 - **Run**: `2026-09-08`; commit `HEAD`; [review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md); DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers

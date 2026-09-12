@@ -13,7 +13,7 @@ int main() {
     runtime_cfg.warm_host_bytes = 20ULL * aeon::core::AEON_EXPERT_BYTES;
 
     aeon::core::V4Pipeline pipeline;
-    pipeline.init_dynamic_global(model_dir, runtime_cfg, 43);
+    pipeline.initialize(model_dir, runtime_cfg);
 
     assert(pipeline.expert_registry_);
     assert(pipeline.expert_registry_->host_capacity == 8);

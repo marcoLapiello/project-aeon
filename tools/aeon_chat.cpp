@@ -19,7 +19,6 @@ struct Options {
     std::string model_dir{"models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon"};
     std::string tokenizer_path;
     std::string prompt;
-    uint32_t layers{43};
     uint32_t context_size{4096};
     uint32_t max_new_tokens{256};
     uint64_t warm_gib{0};
@@ -42,7 +41,6 @@ void print_usage(const char* executable) {
         << "  --thinking               Use explicit DSV4 thinking mode\n"
         << "  --max-new-tokens <count> Maximum generated tokens (default: 256)\n"
         << "  --until-eos              Generate until EOS or context capacity\n"
-        << "  --layers <count>         Pipeline layers (default: 43)\n"
         << "  --context-size <count>   KV-cache/context capacity (default: 4096)\n"
         << "  --warm-gib <count>       Warm host allocation in GiB (default: 0)\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
@@ -96,10 +94,6 @@ Options parse_options(int argc, char** argv) {
             options.max_new_tokens = static_cast<uint32_t>(parse_unsigned(
                 require_value(argc, argv, index, "--max-new-tokens"), "--max-new-tokens"
             ));
-        } else if (argument == "--layers") {
-            options.layers = static_cast<uint32_t>(parse_unsigned(
-                require_value(argc, argv, index, "--layers"), "--layers"
-            ));
         } else if (argument == "--context-size") {
             options.context_size = static_cast<uint32_t>(parse_unsigned(
                 require_value(argc, argv, index, "--context-size"), "--context-size"
@@ -130,9 +124,9 @@ Options parse_options(int argc, char** argv) {
     if (options.until_eos && options.max_new_tokens != 256) {
         throw std::runtime_error("--until-eos cannot be combined with --max-new-tokens");
     }
-    if (options.layers == 0 || options.context_size == 0 ||
+    if (options.context_size == 0 ||
         (!options.until_eos && options.max_new_tokens == 0)) {
-        throw std::runtime_error("layers and context-size must be positive; max-new-tokens must be positive unless --until-eos is used");
+        throw std::runtime_error("context-size must be positive; max-new-tokens must be positive unless --until-eos is used");
     }
     if (options.tokenizer_path.empty()) {
         options.tokenizer_path = (std::filesystem::path(options.model_dir) / "tokenizer.aeon").string();
@@ -172,8 +166,7 @@ int main(int argc, char** argv) {
         runtime_config.enable_warm_refill = options.enable_warm_refill;
 
         aeon::core::V4Pipeline pipeline;
-        pipeline.init_dynamic_global(
-            options.model_dir, runtime_config, options.layers);
+        pipeline.initialize(options.model_dir, runtime_config);
         if (!options.supply_telemetry_path.empty()) {
             pipeline.enable_supply_telemetry(
                 options.supply_telemetry_path, options.supply_telemetry_run_id);

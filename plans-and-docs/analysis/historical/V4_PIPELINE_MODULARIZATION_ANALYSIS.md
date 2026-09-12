@@ -112,10 +112,11 @@ another cache implementation.
 
 ### Model initialization
 
-`V4Pipeline::init()`, `init_aeon()`, and `init_dynamic_global()` still repeat
-some model-resource setup. The model-source differences and global-pool setup
-are real, so a shared initialization helper is optional follow-up work rather
-than a prerequisite for the current runtime.
+The historical `init_aeon()` and `init_dynamic_global()` entry points repeated
+model-resource setup and allowed callers to override the model layer count. They
+were removed after this analysis: `V4Pipeline::initialize()` now loads the
+architecture from `config.json`, derives the layer count, evaluates the runtime
+policy, and constructs the single production Hot/Warm/Cold path.
 
 ### Hyper-Connections execution gap (resolved)
 

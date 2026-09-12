@@ -142,13 +142,13 @@ int main() {
     // -------------------------------------------------------------------------
     // Test 5: End-to-End V4Pipeline with Global Unified Pool on Physical Silicon
     // -------------------------------------------------------------------------
-    std::cout << "\n[Test 5] Initializing end-to-end V4Pipeline with Global Unified Pool (2 layers)..." << std::endl;
+    std::cout << "\n[Test 5] Initializing end-to-end full-model V4Pipeline with Global Unified Pool..." << std::endl;
     aeon::core::V4Pipeline pipeline;
     aeon::core::AeonRuntimeConfig pipeline_cfg;
     pipeline_cfg.context_size = 4096;
     pipeline_cfg.warm_host_bytes = 0; // Warm disabled
 
-    pipeline.init_dynamic_global(aeon_model_dir, pipeline_cfg, 2);
+    pipeline.initialize(aeon_model_dir, pipeline_cfg);
 
     // Run forward step (token 1, pos 0)
     std::cout << "\n  > Executing forward step on Global Unified Pool..." << std::endl;

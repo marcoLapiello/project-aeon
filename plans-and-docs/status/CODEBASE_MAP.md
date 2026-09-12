@@ -29,12 +29,14 @@ The production-facing implementation is:
 - `src/architecture/deepseek_v4/kernels/` - V4 attention, routing, and Hyper-Connections kernels.
 - `src/backend/swizzled_w4a16/kernels/` - current W4A16 swizzle, GEMV, and fused expert kernels.
 
-`V4Pipeline::init_aeon()` opens both the mapped expert container and a dedicated
-`O_DIRECT` descriptor. The cold request path uses `DirectIOReader` and the
-staging arena before upload on `sdma_cold_stream`; mapped access remains available
-as a native `.aeon` source for warm and comparison paths. The bounded Hot/Warm/Cold path is
-implemented, while physical layout, cold-cache measurement, and latency-hiding
-acceptance remain open in [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md).
+`V4Pipeline::initialize()` is the sole runtime entry point. It discovers the native
+manifest, loads the model architecture configuration, evaluates the runtime memory
+policy, and opens the dedicated `O_DIRECT` descriptor. The cold request path uses
+`DirectIOReader` and the staging arena before upload on `sdma_cold_stream`; mapped
+access remains available inside the loader for native `.aeon` ownership and
+validation. The bounded Hot/Warm/Cold path is implemented, while physical layout,
+cold-cache measurement, and latency-hiding acceptance remain open in
+[PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md).
 
 ## Active production validation
 
@@ -42,12 +44,10 @@ These targets exercise the current `.aeon` and three-tier direction and should b
 kept prominent while Phase 2 is in progress:
 
 - `tests/test_aeon_loader.cpp`
-- `tests/test_aeon_pipeline.cpp`
+- `tests/test_aeon_swizzled_loader.cpp`
 - `tests/test_dynamic_expert_pool.cpp`
-- `tests/bench_dynamic_pool.cpp`
 - `tests/bench_full_model.cpp`
 - `tests/test_model_direct_io.cpp`
-- `tests/test_async_prefetch.cpp`
 - `tests/test_hot_warm_cold_pipeline.cpp`
 - `tests/test_dsv4_tokenizer.cpp`
 - `tests/test_dsv4_chat_formatter.cpp`

@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
 
     std::cout << "\n[Step 1] Initializing complete 43-layer pipeline..." << std::endl;
     auto t_init_start = std::chrono::high_resolution_clock::now();
-    pipeline.init_dynamic_global(aeon_model_dir, pipeline_cfg, 43);
+    pipeline.initialize(aeon_model_dir, pipeline_cfg);
     auto t_init_end = std::chrono::high_resolution_clock::now();
     double init_sec = std::chrono::duration<double>(t_init_end - t_init_start).count();
     std::cout << "\n  > Complete 43-layer initialization completed in " << std::fixed << std::setprecision(2)

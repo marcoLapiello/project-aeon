@@ -17,11 +17,8 @@ struct Options {
     std::string output_dir;
     std::string corpus_id;
     std::string dataset{"profile"};
-    std::string mode{"dynamic"};
-    uint32_t layers{43};
     uint32_t context_size{4096};
     uint64_t warm_gib{0};
-    uint32_t vram_slots{8};
     bool regenerate_summary{false};
 };
 
@@ -35,11 +32,8 @@ void print_usage(const char* executable) {
         << "  --output-dir <path>      Persistent routing profile directory\n"
         << "  --corpus-id <id>         Stable corpus identity for incremental runs\n"
         << "  --dataset <profile|validation>  Dataset label (default: profile)\n"
-        << "  --mode <dynamic|aeon>    Pipeline initialization mode (default: dynamic)\n"
-        << "  --layers <count>         Layer count (default: 43)\n"
         << "  --context-size <count>  Maximum context size (default: 4096)\n"
         << "  --warm-gib <count>       Warm host allocation in GiB (default: 0)\n"
-        << "  --vram-slots <count>     Fixed VRAM slots in aeon mode (default: 8)\n"
         << "  --regenerate-summary     Rebuild summary.csv from existing state.bin only\n"
         << "  --help                   Show this help\n";
 }
@@ -86,12 +80,6 @@ Options parse_options(int argc, char** argv) {
             options.corpus_id = require_value(argc, argv, index, "--corpus-id");
         } else if (argument == "--dataset") {
             options.dataset = require_value(argc, argv, index, "--dataset");
-        } else if (argument == "--mode") {
-            options.mode = require_value(argc, argv, index, "--mode");
-        } else if (argument == "--layers") {
-            options.layers = static_cast<uint32_t>(parse_unsigned(
-                require_value(argc, argv, index, "--layers"), "--layers"
-            ));
         } else if (argument == "--context-size") {
             options.context_size = static_cast<uint32_t>(parse_unsigned(
                 require_value(argc, argv, index, "--context-size"), "--context-size"
@@ -100,10 +88,6 @@ Options parse_options(int argc, char** argv) {
             options.warm_gib = parse_unsigned(
                 require_value(argc, argv, index, "--warm-gib"), "--warm-gib"
             );
-        } else if (argument == "--vram-slots") {
-            options.vram_slots = static_cast<uint32_t>(parse_unsigned(
-                require_value(argc, argv, index, "--vram-slots"), "--vram-slots"
-            ));
         } else {
             throw std::runtime_error("unknown option: " + argument);
         }
@@ -118,11 +102,8 @@ Options parse_options(int argc, char** argv) {
     if (options.input_path.empty()) {
         throw std::runtime_error("--input is required");
     }
-    if (options.layers == 0 || options.context_size == 0 || options.vram_slots == 0) {
-        throw std::runtime_error("layers, context-size, and vram-slots must be positive");
-    }
-    if (options.mode != "dynamic" && options.mode != "aeon") {
-        throw std::runtime_error("--mode must be dynamic or aeon");
+    if (options.context_size == 0) {
+        throw std::runtime_error("context-size must be positive");
     }
     if (options.dataset != "profile" && options.dataset != "validation") {
         throw std::runtime_error("--dataset must be profile or validation");
@@ -133,8 +114,11 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-void validate_prompt(const aeon::core::RoutingPrompt& prompt, uint32_t context_size) {
-    constexpr uint32_t vocab_size = 129280;
+void validate_prompt(
+    const aeon::core::RoutingPrompt& prompt,
+    uint32_t context_size,
+    uint32_t vocab_size
+) {
     if (prompt.tokens.size() + prompt.max_new_tokens > context_size) {
         throw std::runtime_error("prompt exceeds configured context size");
     }
@@ -175,6 +159,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         const auto prompts = aeon::core::load_routing_prompts(options.input_path);
+        const auto model_config = aeon::core::DeepSeekV4Config::load_from_json(
+            (std::filesystem::path(options.model_dir) / "config.json").string());
+        if (model_config.num_hidden_layers <= 0) {
+            throw std::runtime_error("model configuration must declare at least one layer");
+        }
 
         aeon::core::RoutingProfileRunConfig run_config;
     #ifdef AEON_GIT_COMMIT
@@ -184,11 +173,9 @@ int main(int argc, char** argv) {
         run_config.input_path = std::filesystem::absolute(options.input_path).string();
         run_config.corpus_id = options.corpus_id;
         run_config.dataset = options.dataset;
-        run_config.mode = options.mode;
-        run_config.num_layers = options.layers;
+        run_config.num_layers = static_cast<uint32_t>(model_config.num_hidden_layers);
         run_config.context_size = options.context_size;
         run_config.warm_gib = options.warm_gib;
-        run_config.vram_slots = options.vram_slots;
         run_config.input_prompt_count = prompts.size();
         run_config.model_config_hash = aeon::core::routing_profile_detail::fnv1a_file(
             std::filesystem::path(options.model_dir) / "config.json"
@@ -217,19 +204,19 @@ int main(int argc, char** argv) {
 
         aeon::core::select_compute_device(true);
         aeon::core::V4Pipeline pipeline;
-        if (options.mode == "dynamic") {
-            aeon::core::AeonRuntimeConfig runtime_config;
-            runtime_config.context_size = options.context_size;
-            runtime_config.warm_host_bytes = static_cast<size_t>(options.warm_gib) * 1024ULL * 1024ULL * 1024ULL;
-            pipeline.init_dynamic_global(options.model_dir, runtime_config, options.layers);
-        } else {
-            pipeline.init_aeon(options.model_dir, options.layers, options.vram_slots, options.context_size, true);
-        }
+        aeon::core::AeonRuntimeConfig runtime_config;
+        runtime_config.context_size = options.context_size;
+        runtime_config.warm_host_bytes = static_cast<size_t>(options.warm_gib) * 1024ULL * 1024ULL * 1024ULL;
+        pipeline.initialize(options.model_dir, runtime_config);
         pipeline.enable_routing_counter();
 
         for (const auto& prompt : pending) {
             try {
-                validate_prompt(prompt, options.context_size);
+                validate_prompt(
+                    prompt,
+                    options.context_size,
+                    static_cast<uint32_t>(model_config.vocab_size)
+                );
                 pipeline.reset_routing_counter();
                 const auto generated = pipeline.generate(prompt.tokens, prompt.max_new_tokens);
                 if (generated.size() != prompt.max_new_tokens) {
@@ -239,7 +226,7 @@ int main(int argc, char** argv) {
                 if (counter == nullptr) {
                     throw std::runtime_error("routing counter was not enabled");
                 }
-                validate_counter(*counter, prompt, options.layers);
+                validate_counter(*counter, prompt, run_config.num_layers);
                 store.add_prompt(prompt, *counter);
                 store.checkpoint();
                 std::cout << "[RoutingProfile] completed id=" << prompt.id

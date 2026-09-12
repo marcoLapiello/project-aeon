@@ -103,10 +103,6 @@ set_tests_properties(test_model_direct_io PROPERTIES WORKING_DIRECTORY ${CMAKE_C
 add_executable(bench_model_direct_io tests/bench_model_direct_io.cpp)
 target_link_libraries(bench_model_direct_io PRIVATE amdhip64)
 
-# Phase 2 Spike 3 investigation: native pipeline direct-I/O versus mmap A/B
-add_executable(bench_async_prefetch_io_modes tests/bench_async_prefetch_io_modes.cpp)
-target_link_libraries(bench_async_prefetch_io_modes PRIVATE amdhip64)
-
 # Transfer benchmark: concurrent compute and SDMA overlap
 add_executable(bench_async_overlap tests/bench_async_overlap.cpp)
 target_link_libraries(bench_async_overlap PRIVATE amdhip64)
@@ -186,10 +182,6 @@ target_link_libraries(test_aeon_swizzled_loader PRIVATE amdhip64)
 add_test(NAME test_aeon_swizzled_loader COMMAND test_aeon_swizzled_loader)
 set_tests_properties(test_aeon_swizzled_loader PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Silicon smoke test: v2 swizzled fused-expert pipeline path
-add_executable(test_aeon_swizzled_pipeline tests/test_aeon_swizzled_pipeline.cpp)
-target_link_libraries(test_aeon_swizzled_pipeline PRIVATE amdhip64)
-
 # CPU-side validation: native DSV4 tokenizer artifact and ByteLevel-BPE parity
 add_executable(test_dsv4_tokenizer tests/test_dsv4_tokenizer.cpp src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp)
 target_link_libraries(test_dsv4_tokenizer PRIVATE amdhip64)
@@ -211,18 +203,6 @@ add_executable(test_text_generation tests/test_text_generation.cpp src/infrastru
 target_link_libraries(test_text_generation PRIVATE amdhip64)
 add_test(NAME test_text_generation COMMAND test_text_generation)
 set_tests_properties(test_text_generation PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-
-# Current format validation: end-to-end native .aeon pipeline
-add_executable(test_aeon_pipeline tests/test_aeon_pipeline.cpp)
-target_link_libraries(test_aeon_pipeline PRIVATE amdhip64)
-add_test(NAME test_aeon_pipeline COMMAND test_aeon_pipeline)
-set_tests_properties(test_aeon_pipeline PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-
-# Measurement plumbing: optional per-layer expert selection counter
-add_executable(test_routing_counter tests/test_routing_counter.cpp)
-target_link_libraries(test_routing_counter PRIVATE amdhip64)
-add_test(NAME test_routing_counter COMMAND test_routing_counter)
-set_tests_properties(test_routing_counter PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Host-side routing profile parser and checkpoint validation
 add_executable(test_routing_profile tests/test_routing_profile.cpp)
@@ -253,16 +233,6 @@ add_executable(test_hot_warm_cold_pipeline tests/test_hot_warm_cold_pipeline.cpp
 target_link_libraries(test_hot_warm_cold_pipeline PRIVATE amdhip64)
 add_test(NAME test_hot_warm_cold_pipeline COMMAND test_hot_warm_cold_pipeline)
 set_tests_properties(test_hot_warm_cold_pipeline PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-
-# Phase 2 Spike 2 validation: dual-stream asynchronous SDMA prefetching
-add_executable(test_async_prefetch tests/test_async_prefetch.cpp)
-target_link_libraries(test_async_prefetch PRIVATE amdhip64)
-add_test(NAME test_async_prefetch COMMAND test_async_prefetch)
-set_tests_properties(test_async_prefetch PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-
-# Current architecture benchmark: global VRAM expert pool generation
-add_executable(bench_dynamic_pool tests/bench_dynamic_pool.cpp)
-target_link_libraries(bench_dynamic_pool PRIVATE amdhip64)
 
 # Current architecture benchmark: full 43-layer autoregressive generation
 add_executable(bench_full_model tests/bench_full_model.cpp)

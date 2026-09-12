@@ -26,10 +26,8 @@ int main() {
     config.model_dir = "model";
     config.input_path = corpus_path.string();
     config.corpus_id = "test-corpus";
-    config.mode = "aeon";
     config.num_layers = 1;
     config.context_size = 64;
-    config.vram_slots = 8;
 
     aeon::core::RoutingProfileStore store(root / "run", config);
     aeon::core::RoutingCounter first_counter(1);

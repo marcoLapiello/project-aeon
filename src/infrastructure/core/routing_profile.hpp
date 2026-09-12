@@ -443,29 +443,25 @@ struct RoutingProfileRunConfig {
     std::string input_path;
     std::string corpus_id;
     std::string dataset{"profile"};
-    std::string mode{"dynamic"};
-    uint32_t num_layers{43};
+    uint32_t num_layers{0};
     uint32_t context_size{4096};
     uint64_t warm_gib{0};
-    uint32_t vram_slots{8};
     uint64_t model_config_hash{0};
     uint64_t model_index_hash{0};
     uint64_t input_prompt_count{0};
 
     std::string compatibility_fingerprint() const {
         std::ostringstream fingerprint;
-        fingerprint << "routing-profile-v1"
+        fingerprint << "routing-profile-v2"
                     << "|aeon_git_commit=" << aeon_git_commit
                     << "|model_dir=" << model_dir
                     << "|corpus_id=" << corpus_id
                     << "|dataset=" << dataset
-                    << "|mode=" << mode
                     << "|layers=" << num_layers
                     << "|experts=" << RoutingCounter::kExpertCount
                     << "|top_k=" << RoutingCounter::kTopK
                     << "|context_size=" << context_size
                     << "|warm_gib=" << warm_gib
-                    << "|vram_slots=" << vram_slots
                     << "|model_config_hash=" << model_config_hash
                     << "|model_index_hash=" << model_index_hash
                     << "|phase_rules=prefill-and-decode-v1";
@@ -656,6 +652,9 @@ public:
         : output_dir_(std::move(output_dir)),
           config_(std::move(config)),
           aggregate_(config_.num_layers) {
+                if (config_.num_layers == 0) {
+                        throw std::invalid_argument("routing profile requires a positive model layer count");
+                }
         std::filesystem::create_directories(output_dir_);
         const auto metadata_path = output_dir_ / "metadata.json";
         const auto state_path = output_dir_ / "state.bin";
@@ -855,7 +854,7 @@ private:
         std::ostringstream output;
         output << "{\n"
                << "  \"format_version\": 1,\n"
-               << "  \"profiler_version\": \"routing-profile-v1\",\n"
+               << "  \"profiler_version\": \"routing-profile-v2\",\n"
                << "  \"aeon_git_commit\": \"" << routing_profile_detail::json_escape(config_.aeon_git_commit) << "\",\n"
                << "  \"compatibility_fingerprint\": \""
                << routing_profile_detail::json_escape(config_.compatibility_fingerprint()) << "\",\n"
@@ -863,13 +862,11 @@ private:
                << "  \"input_path\": \"" << routing_profile_detail::json_escape(config_.input_path) << "\",\n"
                << "  \"corpus_id\": \"" << routing_profile_detail::json_escape(config_.corpus_id) << "\",\n"
                << "  \"dataset\": \"" << routing_profile_detail::json_escape(config_.dataset) << "\",\n"
-               << "  \"mode\": \"" << routing_profile_detail::json_escape(config_.mode) << "\",\n"
                << "  \"num_layers\": " << config_.num_layers << ",\n"
                << "  \"expert_count\": " << RoutingCounter::kExpertCount << ",\n"
                << "  \"top_k\": " << RoutingCounter::kTopK << ",\n"
                << "  \"context_size\": " << config_.context_size << ",\n"
                << "  \"warm_gib\": " << config_.warm_gib << ",\n"
-               << "  \"vram_slots\": " << config_.vram_slots << ",\n"
                << "  \"model_config_hash\": " << config_.model_config_hash << ",\n"
                << "  \"model_index_hash\": " << config_.model_index_hash << ",\n"
                << "  \"input_prompt_count\": " << config_.input_prompt_count << ",\n"
