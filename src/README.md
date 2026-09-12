@@ -10,7 +10,7 @@ src/infrastructure/                 Model-independent runtime services
   backend_registry/                 Backend identity and capability selection
 
 src/architecture/deepseek_v4/       DeepSeek-V4 graph and model semantics
-  core/                              V4 config, pipeline, layers, dense binding, KV state
+  core/                              V4 config, pipeline, model resources, supply coordination, layers, dense binding, KV state
   kernels/                           V4 attention, routing, HC, and pipeline operations
   text/                              DSV4 tokenizer and chat formatting
 

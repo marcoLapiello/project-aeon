@@ -9,14 +9,18 @@ mean that it is part of the production runtime.
 ## Current engine path
 
 The current integration point is `src/architecture/deepseek_v4/core/v4_pipeline.hpp`. It is header-only and
-pulls in the model configuration, device setup, transformer block, native Aeon
-loader, VRAM and host expert pools, registry, and all active kernels.
+owns the V4 execution schedule and generation API. Model-level GPU allocations
+are owned by `v4_model_resources.hpp`; Hot/Warm/Cold transfer state, prefetch,
+direct-I/O materialization, and supply telemetry are owned by
+`v4_expert_supply.hpp`.
 
 The production-facing implementation is:
 
 - `src/architecture/deepseek_v4/core/config.hpp` - DeepSeek-V4 model configuration.
 - `src/platform/rdna3/device.hpp` - RDNA3/HIP device selection and GPU utilities.
-- `src/architecture/deepseek_v4/core/v4_pipeline.hpp` - multi-layer inference and memory-tier orchestration.
+- `src/architecture/deepseek_v4/core/v4_pipeline.hpp` - multi-layer V4 execution schedule and generation orchestration.
+- `src/architecture/deepseek_v4/core/v4_model_resources.hpp` - RoPE caches and model-level resident weights.
+- `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` - Hot/Warm/Cold transfer state, prefetch, and supply telemetry coordination.
 - `src/architecture/deepseek_v4/core/v4_block.hpp` - transformer block composition.
 - `src/infrastructure/core/aeon_loader.hpp` - native `.aeon` dense and expert container access.
 - `src/architecture/deepseek_v4/core/memory_budget.hpp` - V4 VRAM/host feasibility calculations and startup checks.

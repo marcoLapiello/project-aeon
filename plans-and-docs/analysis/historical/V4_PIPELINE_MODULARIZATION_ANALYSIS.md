@@ -27,9 +27,11 @@ Before the refactor, `v4_pipeline.hpp` contained:
   sampling, generation, and cleanup.
 
 The current split is `src/architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp` for pipeline utility
-kernels, `src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp` for scratch ownership, and
-`src/architecture/deepseek_v4/core/v4_layer.hpp` for layer-local structures. Production residency is
-handled by `UnifiedVRAMExpertPool`, `HostExpertPool`, and `ExpertRegistry`.
+kernels, `src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp` for scratch ownership,
+`src/architecture/deepseek_v4/core/v4_layer.hpp` for layer-local structures,
+`src/architecture/deepseek_v4/core/v4_model_resources.hpp` for model-level device resources, and
+`src/architecture/deepseek_v4/core/v4_expert_supply.hpp` for transfer and prefetch coordination.
+Production residency is handled by `UnifiedVRAMExpertPool`, `HostExpertPool`, and `ExpertRegistry`.
 
 These were separate concerns even though they originally participated in one
 header-only implementation; the current ownership split is described above.

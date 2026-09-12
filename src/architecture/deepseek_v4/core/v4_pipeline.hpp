@@ -8,6 +8,8 @@
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "architecture/deepseek_v4/core/memory_budget.hpp"
+#include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
+#include "architecture/deepseek_v4/core/v4_model_resources.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
 #include "infrastructure/core/routing_counter.hpp"
 #include "infrastructure/core/supply_telemetry.hpp"
@@ -64,15 +66,6 @@ public:
     AeonModelLoader aeon_loader;
     std::vector<std::unique_ptr<V4Layer>> layers;
     PipelineScratchBuffers scratch;
-    kernel::RopeTable rope_table;
-
-    // Model Level Resident Weights
-    const half* host_embed_table{nullptr}; // [129280, 4096] in host / mmap
-    float* d_hc_head_fn{nullptr};          // [4, 16384]
-    float* d_hc_head_base{nullptr};        // [4]
-    float* d_hc_head_scale{nullptr};       // [1]
-    half*  d_lm_head{nullptr};             // [129280, 4096] on device
-    half*  d_final_norm{nullptr};          // [4096] on device
 
     hipStream_t compute_stream{0};
     hipStream_t sdma_stream{0};       // Warm Host H2D uploads
@@ -91,6 +84,7 @@ public:
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion> direct_io_completions_;
     uint64_t next_direct_io_id_{1};
     MemoryBudgetReport budget_report_;
+    V4ExpertSupplyCoordinator expert_supply_;
     std::optional<RoutingCounter> routing_counter_;
     SupplyTelemetry supply_telemetry_;
     bool expert_timing_enabled_{false};
@@ -99,39 +93,6 @@ public:
     std::vector<hipEvent_t> routed_section_stop_events_;
     std::vector<hipEvent_t> expert_compute_start_events_;
     std::vector<hipEvent_t> expert_compute_stop_events_;
-
-    struct PendingRegistryTransfer {
-        uint64_t operation_id{0};
-        uint32_t global_expert_id{0};
-        uint32_t demoted_expert_id{0};
-        ExpertTier source_tier{ExpertTier::COLD_NVME};
-        SupplyTelemetryPhase phase{SupplyTelemetryPhase::Decode};
-        std::chrono::steady_clock::time_point h2d_enqueued_at{};
-        hipEvent_t demotion_event{nullptr};
-        hipEvent_t h2d_event{nullptr};
-        uint32_t staging_idx{0};
-        bool has_staging{false};
-        bool h2d_submitted{false};
-        int32_t demotion_source_slot{-1};
-        int32_t demotion_destination_slot{-1};
-        int32_t demotion_staging_idx{-1};
-        bool demotion_uses_staging{false};
-        bool demotion_submitted{false};
-        int32_t h2d_source_slot{-1};
-        int32_t h2d_destination_slot{-1};
-        std::chrono::steady_clock::time_point io_submitted_at{};
-        uint64_t nvme_read_service_ns{0};
-        uint64_t nvme_completion_wait_ns{0};
-        uint64_t staging_wait_ns{0};
-        uint64_t staging_reuse_wait_ns{0};
-        std::chrono::steady_clock::time_point staging_acquired_at{};
-        std::chrono::steady_clock::time_point gpu_wait_started_at{};
-        bool request_failed{false};
-        std::string failure_reason;
-    };
-    std::vector<PendingRegistryTransfer> registry_transfers_;
-    static constexpr uint64_t DEMOTION_QUEUE_CAPACITY = 2;
-    uint64_t demotion_queue_capacity_{DEMOTION_QUEUE_CAPACITY};
 
     V4Pipeline() = default;
 
@@ -211,10 +172,6 @@ public:
         std::cout << "================================================================================" << std::endl;
 
         current_seq_len_ = 0;
-        demotion_queue_capacity_ = runtime_cfg.enable_warm_refill
-            ? DEMOTION_QUEUE_CAPACITY
-            : 0;
-
         // 1. Initialize streams
         initialize_streams();
 
@@ -250,40 +207,9 @@ public:
             throw std::runtime_error("V4Pipeline: Feasibility gate REJECTED startup: " + budget_report_.rejection_reason);
         }
 
-        // 4. Initialize RoPE Tables
-        std::cout << "[Pipeline] Initializing RoPE tables (max_seq=" << runtime_cfg.context_size << ")..." << std::endl;
-        rope_table.init(runtime_cfg.context_size, kernel::DSV4_ROPE_THETA, 1.0f);
-
-        size_t rope_bytes = rope_table.max_seq_len * rope_table.half_rope * sizeof(float);
-        CHECK_HIP(hipMalloc(&d_cos_cache_, rope_bytes));
-        CHECK_HIP(hipMalloc(&d_sin_cache_, rope_bytes));
-        CHECK_HIP(hipMemcpy(d_cos_cache_, rope_table.cos_cache.data(), rope_bytes, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_sin_cache_, rope_table.sin_cache.data(), rope_bytes, hipMemcpyHostToDevice));
-
-        // 5. Model-level Weights (LM Head & Norms)
-        std::cout << "[Pipeline] Binding model-level embeddings and LM head..." << std::endl;
-        host_embed_table = aeon_loader.get_data_ptr<half>("embed.weight");
-
-        const auto& head_t = aeon_loader.get_tensor("head.weight");
-        std::cout << "  > Uploading LM Head [129280, 4096] (" << (head_t.byte_size / (1024*1024)) << " MB) to VRAM..." << std::endl;
-        CHECK_HIP(hipMalloc(&d_lm_head, head_t.byte_size));
-        CHECK_HIP(hipMemcpy(d_lm_head, head_t.data, head_t.byte_size, hipMemcpyHostToDevice));
-
-        // HC Head
-        const auto& fn_t = aeon_loader.get_tensor("hc_head_fn");
-        const auto& base_t = aeon_loader.get_tensor("hc_head_base");
-        const auto& sc_t = aeon_loader.get_tensor("hc_head_scale");
-        CHECK_HIP(hipMalloc(&d_hc_head_fn, fn_t.byte_size));
-        CHECK_HIP(hipMalloc(&d_hc_head_base, base_t.byte_size));
-        CHECK_HIP(hipMalloc(&d_hc_head_scale, sc_t.byte_size));
-        CHECK_HIP(hipMemcpy(d_hc_head_fn, fn_t.data, fn_t.byte_size, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_hc_head_base, base_t.data, base_t.byte_size, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_hc_head_scale, sc_t.data, sc_t.byte_size, hipMemcpyHostToDevice));
-
-        // Final norm
-        const auto& norm_t = aeon_loader.get_tensor("norm.weight");
-        CHECK_HIP(hipMalloc(&d_final_norm, norm_t.byte_size));
-        CHECK_HIP(hipMemcpy(d_final_norm, norm_t.data, norm_t.byte_size, hipMemcpyHostToDevice));
+        // 4. Initialize model-level device resources.
+        std::cout << "[Pipeline] Initializing RoPE tables and model-level weights..." << std::endl;
+        model_resources_.initialize(aeon_loader, runtime_cfg.context_size);
 
         // 6. Allocate Intermediate GPU Scratch Buffers
         std::cout << "[Pipeline] Allocating intermediate GPU scratch buffers..." << std::endl;
@@ -392,6 +318,26 @@ public:
             }
         }
 
+        expert_supply_.configure(
+            &aeon_loader,
+            unified_vram_pool_.get(),
+            host_pool_.get(),
+            expert_registry_.get(),
+            prefetch_staging_.get(),
+            &supply_telemetry_,
+            direct_io_reader_.get(),
+            &direct_io_completions_,
+            &next_direct_io_id_,
+            compute_stream,
+            sdma_stream,
+            sdma_cold_stream,
+            demotion_stream,
+            expert_format.payload_bytes,
+            runtime_cfg.enable_warm_refill
+                ? V4ExpertSupplyCoordinator::DEFAULT_DEMOTION_QUEUE_CAPACITY
+                : 0
+        );
+
         std::cout << "[Pipeline] Engine ready! Configured for " << num_layers_
                   << " layers with " << budget_report_.hot_vram_slots << " hot VRAM slots and "
                   << active_warm_host_slots << " active warm host slots." << std::endl;
@@ -402,7 +348,6 @@ public:
     uint32_t step(uint32_t token_id, uint32_t pos, RoutingPhase phase = RoutingPhase::Decode) {
         supply_telemetry_.set_phase(phase);
         reap_registry_transfers();
-        const size_t expert_payload_bytes = this->expert_payload_bytes();
 
         constexpr int H = kernel::DSV4_HIDDEN_SIZE; // 4096
         constexpr int HC = 4;
@@ -419,7 +364,7 @@ public:
         constexpr int INTER_DIM = 2048;
 
         // 1. Embed Token & Replicate to 4 HC streams
-        const half* token_emb = host_embed_table + token_id * H;
+        const half* token_emb = model_resources_.host_embed_table + token_id * H;
 
         // Replicate embedding across 4 streams into d_res_in_half on GPU
         // Shape [4, 4096]
@@ -433,336 +378,8 @@ public:
         int32_t h_token = static_cast<int32_t>(token_id);
         CHECK_HIP(hipMemcpyAsync(scratch.d_token_id, &h_token, sizeof(int32_t), hipMemcpyHostToDevice, compute_stream));
 
-        // State tracking for inter-layer prefetching across pipeline stages
-        struct LayerPrefetchState {
-            std::array<int32_t, 6> vram_slots{-1, -1, -1, -1, -1, -1};
-            std::array<uint32_t, 6> global_expert_ids{0, 0, 0, 0, 0, 0};
-            std::array<uint64_t, 6> operation_ids{0, 0, 0, 0, 0, 0};
-            std::array<bool, 6> is_prefetched{false, false, false, false, false, false};
-            std::array<uint32_t, 6> staging_indices{0, 0, 0, 0, 0, 0};
-            std::array<bool, 6> io_pending{false, false, false, false, false, false};
-            std::array<uint64_t, 6> io_user_data{0, 0, 0, 0, 0, 0};
-            std::array<uint32_t, 6> io_request_counts{0, 0, 0, 0, 0, 0};
-        };
         std::vector<uint32_t> releasable_staging_slots;
         std::vector<uint32_t> leased_experts;
-
-        auto dispatch_layer_prefetch = [&](uint32_t target_l, const std::vector<int32_t>& topk_experts) -> LayerPrefetchState {
-            LayerPrefetchState state;
-            uint32_t buf_offset = (target_l % 2) * 6;
-            bool submitted_direct_io = false;
-
-            std::array<int, 6> request_order{0, 1, 2, 3, 4, 5};
-            auto reservation_priority = [&](int request_index) {
-                const uint32_t gid = expert_registry_->get_global_id(
-                    target_l, static_cast<uint32_t>(topk_experts[request_index]));
-                const auto& entry = expert_registry_->catalog[gid];
-                if (entry.owner == ExpertTier::HOT_VRAM &&
-                    entry.operation == ExpertOperation::NONE &&
-                    entry.publication == ExpertPublication::PUBLISHED) {
-                    return 0;
-                }
-                if (entry.owner == ExpertTier::HOT_VRAM) {
-                    return 1;
-                }
-                return 2;
-            };
-            std::stable_sort(request_order.begin(), request_order.end(), [&](int left, int right) {
-                return reservation_priority(left) < reservation_priority(right);
-            });
-
-            for (int request_order_index = 0; request_order_index < 6; ++request_order_index) {
-                const int k = request_order[request_order_index];
-                uint32_t expert_id = static_cast<uint32_t>(topk_experts[k]);
-                ExpertRequestReservation request;
-                for (;;) {
-                    request = expert_registry_->reserve_request(
-                        target_l, expert_id, pos, demotion_queue_capacity_);
-                    if (request.kind != ExpertRequestKind::PENDING) {
-                        break;
-                    }
-
-                    const auto* pending = find_registry_transfer(request.operation_id);
-                    const auto& pending_entry = expert_registry_->catalog[request.global_expert_id];
-                    if (pending_entry.operation != ExpertOperation::DEMOTION_PENDING) {
-                        break;
-                    }
-                    const hipError_t h2d_status = pending != nullptr && pending->h2d_event != nullptr
-                        ? hipEventQuery(pending->h2d_event)
-                        : hipErrorNotReady;
-                    if (h2d_status == hipSuccess) {
-                        expert_registry_->release_lease(request.global_expert_id);
-                        reap_registry_transfers();
-                        continue;
-                    }
-                    if (h2d_status != hipErrorNotReady) {
-                        throw std::runtime_error(
-                            "V4Pipeline: failed to query an optional demotion dependency "
-                            "(layer=" + std::to_string(target_l) +
-                            ", expert=" + std::to_string(expert_id) +
-                            ", operation=" + std::to_string(request.operation_id) + ")"
-                        );
-                    }
-                    expert_registry_->release_lease(request.global_expert_id);
-                    throw std::runtime_error(
-                        "V4Pipeline: request encountered an in-flight optional demotion; "
-                        "request-path CPU synchronization is forbidden "
-                        "(layer=" + std::to_string(target_l) +
-                        ", expert=" + std::to_string(expert_id) +
-                        ", operation=" + std::to_string(request.operation_id) + ")"
-                    );
-                }
-                state.vram_slots[k] = request.vram_slot;
-                state.global_expert_ids[k] = request.global_expert_id;
-                state.operation_ids[k] = request.operation_id;
-
-                record_supply_request(request);
-                observe_supply_occupancy(request.source_tier);
-                leased_experts.push_back(request.global_expert_id);
-
-                if (request.kind == ExpertRequestKind::HOT_HIT) {
-                    continue;
-                }
-
-                if (request.kind == ExpertRequestKind::PENDING) {
-                    const auto* pending = find_registry_transfer(request.operation_id);
-                    if (pending == nullptr || !pending->h2d_submitted) {
-                        throw std::runtime_error(
-                            "V4Pipeline: duplicate request joined before its transfer was submitted "
-                            "(layer=" + std::to_string(target_l) +
-                            ", k=" + std::to_string(k) +
-                            ", expert=" + std::to_string(expert_id) +
-                            ", gid=" + std::to_string(request.global_expert_id) +
-                            ", operation=" + std::to_string(request.operation_id) +
-                            ", transfer=" + (pending == nullptr ? "missing" : "present") +
-                            ", h2d=" + (pending != nullptr && pending->h2d_submitted ? "submitted" : "pending") + ")"
-                        );
-                    }
-                    state.is_prefetched[k] = pending->has_staging;
-                    state.staging_indices[k] = pending->staging_idx;
-                    continue;
-                }
-
-                try {
-                    schedule_demotion(request);
-                    const bool source_is_warm = request.source_tier == ExpertTier::WARM_HOST;
-                    const int32_t source_slot = request.source_host_slot;
-                    const bool can_direct_read = request.source_tier == ExpertTier::COLD_NVME &&
-                                                 direct_io_reader_ &&
-                                                 aeon_loader.total_dense_tensors() > 0 &&
-                                                 prefetch_staging_;
-                    ensure_registry_transfer(request.operation_id, request.global_expert_id);
-
-                    if (can_direct_read) {
-                        const uint32_t staging_idx = buf_offset + k;
-                        bind_staging(request.operation_id, staging_idx);
-                        const auto location = aeon_loader.get_expert_location(target_l, expert_id);
-                        const uint64_t request_id = next_direct_io_id_;
-
-                        prefetch_staging_->begin_io(staging_idx);
-                        const size_t request_count = direct_io_reader_->submit_read_chunks(
-                            aeon_loader.expert_direct_fd(),
-                            prefetch_staging_->get_slot_ptr(staging_idx),
-                            location.byte_length,
-                            location.file_offset,
-                            request_id
-                        );
-                        next_direct_io_id_ += request_count;
-
-                        state.staging_indices[k] = staging_idx;
-                        state.io_pending[k] = true;
-                        state.io_user_data[k] = request_id;
-                        state.io_request_counts[k] = static_cast<uint32_t>(request_count);
-                        submitted_direct_io = true;
-                    } else if (source_is_warm && host_pool_ && source_slot >= 0 &&
-                               host_pool_->is_slot_pinned(static_cast<uint32_t>(source_slot))) {
-                        const uint32_t staging_idx = buf_offset + k;
-                        bind_staging(request.operation_id, staging_idx);
-                        prefetch_staging_->begin_direct_transfer(staging_idx);
-                        wait_for_demotion_dependency(request.operation_id, sdma_stream);
-                        unified_vram_pool_->upload_from_host_expert(
-                            static_cast<uint32_t>(request.vram_slot),
-                            host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(source_slot)),
-                            sdma_stream
-                        );
-                        CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
-                        record_h2d_event(
-                            request.operation_id, sdma_stream, staging_idx, true,
-                            source_slot, request.vram_slot);
-
-                        state.is_prefetched[k] = true;
-                        state.staging_indices[k] = staging_idx;
-                    } else if (source_is_warm) {
-                        const uint32_t staging_idx = buf_offset + k;
-                        auto* transfer = find_registry_transfer(request.operation_id);
-                        transfer->staging_idx = staging_idx;
-                        transfer->has_staging = true;
-                        prefetch_staging_->stage_payload(
-                            staging_idx,
-                            host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(source_slot))
-                        );
-                        const uint8_t* pinned_payload = prefetch_staging_->get_slot_ptr(staging_idx);
-                        prefetch_staging_->begin_gpu_transfer(staging_idx);
-                        wait_for_demotion_dependency(request.operation_id, sdma_stream);
-                        unified_vram_pool_->upload_from_host_expert(
-                            static_cast<uint32_t>(request.vram_slot), pinned_payload, sdma_stream);
-                        CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
-                        record_h2d_event(
-                            request.operation_id, sdma_stream, staging_idx, true,
-                            static_cast<int32_t>(staging_idx), request.vram_slot);
-
-                        state.is_prefetched[k] = true;
-                        state.staging_indices[k] = staging_idx;
-                    } else {
-                        const uint8_t* src_ptr = nullptr;
-                        if (aeon_loader.total_dense_tensors() > 0) {
-                            src_ptr = aeon_loader.get_expert_data(target_l, expert_id);
-                        }
-
-                        if (src_ptr && prefetch_staging_) {
-                            const uint32_t staging_idx = buf_offset + k;
-                            bind_staging(request.operation_id, staging_idx);
-                            prefetch_staging_->stage_payload(staging_idx, src_ptr);
-                            const uint8_t* pinned_payload = prefetch_staging_->get_slot_ptr(staging_idx);
-                            prefetch_staging_->begin_gpu_transfer(staging_idx);
-                            wait_for_demotion_dependency(request.operation_id, sdma_stream);
-                            unified_vram_pool_->upload_from_host_expert(
-                                static_cast<uint32_t>(request.vram_slot), pinned_payload, sdma_stream);
-                            CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_stream));
-                            record_h2d_event(
-                                request.operation_id, sdma_stream, staging_idx, true,
-                                static_cast<int32_t>(staging_idx), request.vram_slot);
-
-                            state.is_prefetched[k] = true;
-                            state.staging_indices[k] = staging_idx;
-                        } else if (src_ptr) {
-                            wait_for_demotion_dependency(request.operation_id, compute_stream);
-                            unified_vram_pool_->upload_from_host_expert(
-                                static_cast<uint32_t>(request.vram_slot), src_ptr, compute_stream);
-                            record_h2d_event(
-                                request.operation_id, compute_stream, 0, false,
-                                -1, request.vram_slot);
-                        } else {
-                            throw std::runtime_error(
-                                "V4Pipeline: native Aeon expert payload unavailable for requested expert"
-                            );
-                        }
-                    }
-                } catch (...) {
-                    mark_registry_request_failed(request.operation_id, "transfer_submission_failure");
-                    reap_registry_transfers();
-                    throw;
-                }
-            }
-            if (submitted_direct_io) {
-                try {
-                    direct_io_reader_->submit_pending_reads();
-                } catch (...) {
-                    for (int k = 0; k < 6; ++k) {
-                        if (state.io_pending[k]) {
-                            mark_registry_request_failed(
-                                state.operation_ids[k], "nvme_submit_failure");
-                        }
-                    }
-                    throw;
-                }
-                const auto submitted_at = std::chrono::steady_clock::now();
-                for (int k = 0; k < 6; ++k) {
-                    if (!state.io_pending[k]) continue;
-                    auto* transfer = find_registry_transfer(state.operation_ids[k]);
-                    if (transfer != nullptr) {
-                        transfer->io_submitted_at = submitted_at;
-                    }
-                }
-            }
-            return state;
-        };
-
-        auto materialize_layer_prefetch = [&](LayerPrefetchState& state) {
-            for (int k = 0; k < 6; ++k) {
-                if (!state.io_pending[k]) {
-                    continue;
-                }
-
-                const size_t request_count = state.io_request_counts[k];
-                for (size_t chunk = 0; chunk < request_count; ++chunk) {
-                    const uint64_t request_id = state.io_user_data[k] + chunk;
-                    auto completion_it = direct_io_completions_.find(request_id);
-                    const bool waited_for_completion = completion_it == direct_io_completions_.end();
-                    const auto wait_started_at = std::chrono::steady_clock::now();
-                    while (completion_it == direct_io_completions_.end()) {
-                        if (!direct_io_reader_) {
-                            mark_registry_request_failed(
-                                state.operation_ids[k], "nvme_reader_unavailable");
-                            throw std::runtime_error("V4Pipeline: direct I/O request has no reader");
-                        }
-                        aeon::io::DirectIOCompletion completion;
-                        try {
-                            completion = direct_io_reader_->wait_for_completion();
-                        } catch (...) {
-                            mark_registry_request_failed(
-                                state.operation_ids[k], "nvme_completion_wait_failure");
-                            throw;
-                        }
-                        direct_io_completions_[completion.user_data] = completion;
-                        completion_it = direct_io_completions_.find(request_id);
-                    }
-
-                    const auto completion = completion_it->second;
-                    direct_io_completions_.erase(completion_it);
-                    const auto completed_at = std::chrono::steady_clock::now();
-                    if (auto* transfer = find_registry_transfer(state.operation_ids[k])) {
-                        if (transfer->io_submitted_at.time_since_epoch().count() != 0) {
-                            transfer->nvme_read_service_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    completed_at - transfer->io_submitted_at).count());
-                        }
-                        if (waited_for_completion) {
-                            transfer->nvme_completion_wait_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    completed_at - wait_started_at).count());
-                        }
-                    }
-                    if (completion.result < 0) {
-                        mark_registry_request_failed(
-                            state.operation_ids[k], "nvme_read_failure");
-                        throw std::runtime_error("V4Pipeline: direct expert read failed: " +
-                                                 std::string(strerror(-completion.result)));
-                    }
-                    const size_t chunk_offset = chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
-                    const size_t expected_bytes = std::min(
-                        aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
-                        expert_payload_bytes - chunk_offset
-                    );
-                    if (completion.result != static_cast<int32_t>(expected_bytes)) {
-                        mark_registry_request_failed(
-                            state.operation_ids[k], "nvme_short_read");
-                        throw std::runtime_error("V4Pipeline: direct expert read returned a short payload");
-                    }
-                }
-
-                const uint32_t staging_idx = state.staging_indices[k];
-                prefetch_staging_->complete_io(staging_idx);
-                prefetch_staging_->begin_gpu_transfer(staging_idx);
-                // Cold NVMe payloads upload on the dedicated cold-DMA stream so a
-                // burst of io_uring completions never head-of-line blocks warm-hit
-                // or Warm Host H2D transfers on sdma_stream.
-                wait_for_demotion_dependency(state.operation_ids[k], sdma_cold_stream);
-                unified_vram_pool_->upload_from_host_expert(
-                    static_cast<uint32_t>(state.vram_slots[k]),
-                    prefetch_staging_->get_slot_ptr(staging_idx),
-                    sdma_cold_stream
-                );
-                CHECK_HIP(hipEventRecord(prefetch_staging_->events[staging_idx], sdma_cold_stream));
-                record_h2d_event(
-                    state.operation_ids[k], sdma_cold_stream, staging_idx, true,
-                    static_cast<int32_t>(staging_idx), state.vram_slots[k]);
-
-                state.is_prefetched[k] = true;
-                state.io_pending[k] = false;
-            }
-        };
-
         // 2. Execute Consecutive Transformer Layers
         for (uint32_t l = 0; l < num_layers_; ++l) {
             auto& layer = *layers[l];
@@ -851,14 +468,14 @@ public:
             hipLaunchKernelGGL(
                 kernel::v4_forward_rope_at_pos_wave32_kernel,
                 dim3(NUM_HEADS), dim3(32), 0, compute_stream,
-                scratch.d_q, d_cos_cache_, d_sin_cache_, pos,
+                scratch.d_q, model_resources_.d_cos_cache, model_resources_.d_sin_cache, pos,
                 NUM_HEADS, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2
             );
 
             hipLaunchKernelGGL(
                 kernel::v4_forward_rope_at_pos_wave32_kernel,
                 dim3(1), dim3(32), 0, compute_stream,
-                scratch.d_kv_norm_act, d_cos_cache_, d_sin_cache_, pos,
+                scratch.d_kv_norm_act, model_resources_.d_cos_cache, model_resources_.d_sin_cache, pos,
                 1, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2
             );
 
@@ -885,7 +502,7 @@ public:
             hipLaunchKernelGGL(
                 kernel::v4_inverse_rope_at_pos_wave32_kernel,
                 dim3(NUM_HEADS), dim3(32), 0, compute_stream,
-                scratch.d_attn_out, d_cos_cache_, d_sin_cache_, pos,
+                scratch.d_attn_out, model_resources_.d_cos_cache, model_resources_.d_sin_cache, pos,
                 NUM_HEADS, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2
             );
 
@@ -1048,11 +665,12 @@ public:
                 uint32_t staging_idx{0};
             };
             std::array<PendingPrefetch, 6> pending_transfers;
-            LayerPrefetchState active_prefetch = dispatch_layer_prefetch(l, h_topk_indices);
+            auto active_prefetch = expert_supply_.dispatch_layer_prefetch(
+                l, pos, h_topk_indices, leased_experts);
 
             // Let cold NVMe reads overlap the shared expert pass; materialization
             // still completes before the first routed expert consumes each slot.
-            materialize_layer_prefetch(active_prefetch);
+            expert_supply_.materialize_layer_prefetch(active_prefetch);
 
             for (int k = 0; k < 6; ++k) {
                 pending_transfers[k].vram_slot = active_prefetch.vram_slots[k];
@@ -1151,7 +769,10 @@ public:
         hipLaunchKernelGGL(
             kernel::hc_head_wave32_kernel,
             dim3(1), dim3(32), 0, compute_stream,
-            scratch.d_res_in, d_hc_head_fn, d_hc_head_base, d_hc_head_scale,
+            scratch.d_res_in,
+            model_resources_.d_hc_head_fn,
+            model_resources_.d_hc_head_base,
+            model_resources_.d_hc_head_scale,
             scratch.d_hc_head_out, H, HC, 1e-6f, 1e-6f
         );
 
@@ -1159,14 +780,14 @@ public:
         hipLaunchKernelGGL(
             kernel::v4_rmsnorm_wave32_kernel,
             dim3(1), dim3(32), 0, compute_stream,
-            scratch.d_hc_head_out, d_final_norm, scratch.d_head_norm, H, 1e-6f
+            scratch.d_hc_head_out, model_resources_.d_final_norm, scratch.d_head_norm, H, 1e-6f
         );
 
         // 5. LM Head Projection: logits = head_norm @ lm_head.T [129280]
         hipLaunchKernelGGL(
             kernel::v4_gemv_fp16_vec8_kernel,
             dim3(129280, 1), dim3(32), 0, compute_stream,
-            scratch.d_head_norm, d_lm_head, scratch.d_logits, H
+            scratch.d_head_norm, model_resources_.d_lm_head, scratch.d_logits, H
         );
 
         // 6. GPU Argmax Sampling over the [129280] logit head: replaces the
@@ -1320,13 +941,7 @@ public:
         if (sdma_stream) { (void)hipStreamDestroy(sdma_stream); sdma_stream = 0; }
         if (sdma_cold_stream) { (void)hipStreamDestroy(sdma_cold_stream); sdma_cold_stream = 0; }
         if (demotion_stream) { (void)hipStreamDestroy(demotion_stream); demotion_stream = 0; }
-        if (d_cos_cache_) { (void)hipFree(d_cos_cache_); d_cos_cache_ = nullptr; }
-        if (d_sin_cache_) { (void)hipFree(d_sin_cache_); d_sin_cache_ = nullptr; }
-        if (d_lm_head) { (void)hipFree(d_lm_head); d_lm_head = nullptr; }
-        if (d_hc_head_fn) { (void)hipFree(d_hc_head_fn); d_hc_head_fn = nullptr; }
-        if (d_hc_head_base) { (void)hipFree(d_hc_head_base); d_hc_head_base = nullptr; }
-        if (d_hc_head_scale) { (void)hipFree(d_hc_head_scale); d_hc_head_scale = nullptr; }
-        if (d_final_norm) { (void)hipFree(d_final_norm); d_final_norm = nullptr; }
+        model_resources_.free();
 
         scratch.free();
         free_expert_timing_events();
@@ -1341,7 +956,7 @@ public:
         prefetch_staging_.reset();
         direct_io_completions_.clear();
         direct_io_reader_.reset();
-        registry_transfers_.clear();
+        expert_supply_.clear();
         supply_telemetry_.disable();
         aeon_loader.close_all();
     }
@@ -1439,150 +1054,26 @@ private:
         }
     }
 
+    using PendingRegistryTransfer = V4ExpertSupplyCoordinator::PendingRegistryTransfer;
+
     PendingRegistryTransfer& ensure_registry_transfer(uint64_t operation_id, uint32_t gid) {
-        for (auto& transfer : registry_transfers_) {
-            if (transfer.operation_id == operation_id) {
-                return transfer;
-            }
-        }
-        registry_transfers_.push_back(PendingRegistryTransfer{});
-        auto& transfer = registry_transfers_.back();
-        transfer.operation_id = operation_id;
-        transfer.global_expert_id = gid;
-        transfer.source_tier = expert_registry_->catalog[gid].owner;
-        transfer.phase = supply_telemetry_.current_phase();
-        return transfer;
+        return expert_supply_.ensure_registry_transfer(operation_id, gid);
     }
 
     PendingRegistryTransfer* find_registry_transfer(uint64_t operation_id) {
-        for (auto& transfer : registry_transfers_) {
-            if (transfer.operation_id == operation_id) {
-                return &transfer;
-            }
-        }
-        return nullptr;
+        return expert_supply_.find_registry_transfer(operation_id);
     }
 
     const PendingRegistryTransfer* find_registry_transfer(uint64_t operation_id) const {
-        for (const auto& transfer : registry_transfers_) {
-            if (transfer.operation_id == operation_id) {
-                return &transfer;
-            }
-        }
-        return nullptr;
+        return expert_supply_.find_registry_transfer(operation_id);
     }
 
     void schedule_demotion(const ExpertRequestReservation& request) {
-        if (request.demotion) {
-            auto& transfer = ensure_registry_transfer(
-                request.operation_id, request.global_expert_id);
-            transfer.demoted_expert_id = request.demotion->victim_gid;
-            transfer.demotion_source_slot = static_cast<int32_t>(
-                request.demotion->source_vram_slot);
-            transfer.demotion_destination_slot = static_cast<int32_t>(
-                request.demotion->destination_host_slot);
-            supply_telemetry_.record_demotion_attempt(transfer.source_tier);
-            uint8_t* destination = host_pool_->get_expert_slot_ptr(
-                request.demotion->destination_host_slot);
-            if (!host_pool_->is_slot_pinned(request.demotion->destination_host_slot)) {
-                uint32_t staging_idx = 0;
-                if (prefetch_staging_ == nullptr ||
-                    !prefetch_staging_->try_begin_direct_transfer(staging_idx)) {
-                    expert_registry_->drop_demotion(request.operation_id);
-                    supply_telemetry_.record_demotion_drop(
-                        transfer.source_tier, "unpinned_fallback_unavailable");
-                    supply_telemetry_.record_transfer_event(
-                        request.operation_id,
-                        transfer.demoted_expert_id,
-                        "d2h",
-                        transfer.demotion_source_slot,
-                        transfer.demotion_destination_slot,
-                        "drop",
-                        "unpinned_fallback_unavailable");
-                    return;
-                }
-                transfer.demotion_staging_idx = static_cast<int32_t>(staging_idx);
-                transfer.demotion_uses_staging = true;
-                destination = prefetch_staging_->get_slot_ptr(staging_idx);
-            }
-            try {
-                CHECK_HIP(hipEventCreateWithFlags(&transfer.demotion_event, hipEventDisableTiming));
-                unified_vram_pool_->download_to_host_expert(
-                    request.demotion->source_vram_slot,
-                    destination,
-                    demotion_stream
-                );
-                transfer.demotion_submitted = true;
-                CHECK_HIP(hipEventRecord(transfer.demotion_event, demotion_stream));
-            } catch (...) {
-                if (!transfer.demotion_submitted) {
-                    expert_registry_->drop_demotion(request.operation_id);
-                    if (transfer.demotion_staging_idx >= 0 && prefetch_staging_) {
-                        prefetch_staging_->release_after_failure(
-                            static_cast<uint32_t>(transfer.demotion_staging_idx));
-                    }
-                    if (transfer.demotion_event != nullptr) {
-                        (void)hipEventDestroy(transfer.demotion_event);
-                        transfer.demotion_event = nullptr;
-                    }
-                    supply_telemetry_.record_demotion_drop(
-                        transfer.source_tier, "d2h_submission_failure");
-                    supply_telemetry_.record_transfer_event(
-                        request.operation_id,
-                        transfer.demoted_expert_id,
-                        "d2h",
-                        transfer.demotion_source_slot,
-                        transfer.demotion_destination_slot,
-                        "failed",
-                        "d2h_submission_failure");
-                }
-                throw;
-            }
-            supply_telemetry_.record_transfer_event(
-                request.operation_id,
-                transfer.demoted_expert_id,
-                "d2h",
-                transfer.demotion_source_slot,
-                transfer.demotion_destination_slot,
-                "submitted");
-            return;
-        }
-
-        if (expert_registry_->host_capacity == 0) {
-            return;
-        }
-
-        auto& transfer = ensure_registry_transfer(
-            request.operation_id, request.global_expert_id);
-        for (const auto& entry : expert_registry_->catalog) {
-            if (entry.operation_id == request.operation_id &&
-                entry.operation == ExpertOperation::DEMOTION_PENDING) {
-                const char* drop_reason = expert_demotion_drop_reason_name(
-                    entry.demotion_drop_reason);
-                transfer.demoted_expert_id = entry.global_expert_id;
-                transfer.demotion_source_slot = entry.slot_idx;
-                transfer.demotion_destination_slot = -1;
-                supply_telemetry_.record_demotion_attempt(request.source_tier);
-                supply_telemetry_.record_demotion_drop(
-                    request.source_tier, drop_reason);
-                supply_telemetry_.record_transfer_event(
-                    request.operation_id,
-                    entry.global_expert_id,
-                    "d2h",
-                    entry.slot_idx,
-                    -1,
-                    "drop",
-                    drop_reason);
-                break;
-            }
-        }
+        expert_supply_.schedule_demotion(request);
     }
 
     void wait_for_demotion_dependency(uint64_t operation_id, hipStream_t stream) {
-        const auto* transfer = find_registry_transfer(operation_id);
-        if (transfer != nullptr && transfer->demotion_event != nullptr) {
-            CHECK_HIP(hipStreamWaitEvent(stream, transfer->demotion_event, 0));
-        }
+        expert_supply_.wait_for_demotion_dependency(operation_id, stream);
     }
 
     void record_h2d_event(
@@ -1593,222 +1084,32 @@ private:
         int32_t source_slot,
         int32_t destination_slot
     ) {
-        auto* transfer = find_registry_transfer(operation_id);
-        if (transfer == nullptr) {
-            throw std::logic_error("V4Pipeline: H2D completion has no registry transfer");
-        }
-        if (transfer->h2d_event != nullptr) {
-            throw std::logic_error("V4Pipeline: duplicate H2D submission for one expert operation");
-        }
-        CHECK_HIP(hipEventCreateWithFlags(&transfer->h2d_event, hipEventDisableTiming));
-        CHECK_HIP(hipEventRecord(transfer->h2d_event, stream));
-        transfer->staging_idx = staging_idx;
-        transfer->has_staging = has_staging;
-        transfer->h2d_source_slot = source_slot;
-        transfer->h2d_destination_slot = destination_slot;
-        transfer->h2d_enqueued_at = std::chrono::steady_clock::now();
-        if (has_staging && transfer->staging_acquired_at.time_since_epoch().count() != 0) {
-            transfer->staging_wait_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    transfer->h2d_enqueued_at - transfer->staging_acquired_at).count());
-        }
-        transfer->h2d_submitted = true;
+        expert_supply_.record_h2d_event(
+            operation_id, stream, staging_idx, has_staging, source_slot, destination_slot);
     }
 
     void bind_staging(uint64_t operation_id, uint32_t staging_idx) {
-        auto* transfer = find_registry_transfer(operation_id);
-        if (transfer == nullptr) {
-            throw std::logic_error("V4Pipeline: staging binding has no registry transfer");
-        }
-        transfer->staging_idx = staging_idx;
-        transfer->has_staging = true;
-        transfer->staging_acquired_at = std::chrono::steady_clock::now();
-        transfer->staging_reuse_wait_ns = prefetch_staging_->take_reuse_delay_ns(staging_idx);
+        expert_supply_.bind_staging(operation_id, staging_idx);
     }
 
     void mark_gpu_readiness_wait_start(uint64_t operation_id) {
-        auto* transfer = find_registry_transfer(operation_id);
-        if (transfer != nullptr && transfer->gpu_wait_started_at.time_since_epoch().count() == 0) {
-            transfer->gpu_wait_started_at = std::chrono::steady_clock::now();
-        }
+        expert_supply_.mark_gpu_readiness_wait_start(operation_id);
     }
 
     void mark_registry_request_failed(uint64_t operation_id, const std::string& reason) {
-        auto* transfer = find_registry_transfer(operation_id);
-        if (transfer == nullptr) return;
-        transfer->request_failed = true;
-        transfer->failure_reason = reason;
-        if (transfer->has_staging && !transfer->h2d_submitted && prefetch_staging_) {
-            prefetch_staging_->release_after_failure(transfer->staging_idx);
-        }
+        expert_supply_.mark_registry_request_failed(operation_id, reason);
     }
 
     void reap_registry_transfers() {
-        for (size_t index = 0; index < registry_transfers_.size();) {
-            auto& transfer = registry_transfers_[index];
-            bool demotion_ready = transfer.demotion_event == nullptr;
-            if (transfer.demotion_event != nullptr) {
-                const hipError_t result = hipEventQuery(transfer.demotion_event);
-                if (result == hipSuccess) {
-                    if (transfer.demotion_uses_staging && prefetch_staging_) {
-                        std::memcpy(
-                            host_pool_->get_expert_slot_ptr(
-                                static_cast<uint32_t>(transfer.demotion_destination_slot)),
-                            prefetch_staging_->get_slot_ptr(
-                                static_cast<uint32_t>(transfer.demotion_staging_idx)),
-                            expert_payload_bytes());
-                        prefetch_staging_->release_after_gpu_transfer(
-                            static_cast<uint32_t>(transfer.demotion_staging_idx));
-                    }
-                    expert_registry_->complete_demotion(transfer.operation_id);
-                    supply_telemetry_.record_demotion_completion(
-                        transfer.source_tier, expert_payload_bytes());
-                    supply_telemetry_.record_transfer_event(
-                        transfer.operation_id,
-                        transfer.demoted_expert_id,
-                        "d2h",
-                        transfer.demotion_source_slot,
-                        transfer.demotion_destination_slot,
-                        "complete");
-                    (void)hipEventDestroy(transfer.demotion_event);
-                    transfer.demotion_event = nullptr;
-                    demotion_ready = true;
-                } else if (result != hipErrorNotReady) {
-                    if (transfer.demotion_uses_staging && prefetch_staging_) {
-                        prefetch_staging_->release_after_failure(
-                            static_cast<uint32_t>(transfer.demotion_staging_idx));
-                    }
-                    expert_registry_->fail_demotion(transfer.operation_id);
-                    supply_telemetry_.record_demotion_drop(
-                        transfer.source_tier, "d2h_failure");
-                    supply_telemetry_.record_transfer_event(
-                        transfer.operation_id,
-                        transfer.demoted_expert_id,
-                        "d2h",
-                        transfer.demotion_source_slot,
-                        transfer.demotion_destination_slot,
-                        "failed",
-                        "d2h_failure");
-                    (void)hipEventDestroy(transfer.demotion_event);
-                    transfer.demotion_event = nullptr;
-                    demotion_ready = true;
-                }
-            }
-
-            if (transfer.request_failed && !transfer.h2d_submitted) {
-                if (!demotion_ready) {
-                    ++index;
-                    continue;
-                }
-                expert_registry_->fail_request(transfer.operation_id);
-                supply_telemetry_.record_transfer_event(
-                    transfer.operation_id,
-                    transfer.global_expert_id,
-                    "h2d",
-                    transfer.h2d_source_slot,
-                    transfer.h2d_destination_slot,
-                    "failed",
-                    transfer.failure_reason.c_str());
-                registry_transfers_.erase(
-                    registry_transfers_.begin() + static_cast<std::ptrdiff_t>(index));
-                continue;
-            }
-
-            if (!transfer.h2d_submitted || transfer.h2d_event == nullptr || !demotion_ready) {
-                ++index;
-                continue;
-            }
-
-            const hipError_t result = hipEventQuery(transfer.h2d_event);
-            if (result == hipErrorNotReady) {
-                ++index;
-                continue;
-            }
-            if (result != hipSuccess) {
-                if (transfer.has_staging && prefetch_staging_) {
-                    prefetch_staging_->release_after_failure(transfer.staging_idx);
-                }
-                expert_registry_->fail_request(transfer.operation_id);
-                supply_telemetry_.record_transfer_event(
-                    transfer.operation_id,
-                    transfer.global_expert_id,
-                    "h2d",
-                    transfer.h2d_source_slot,
-                    transfer.h2d_destination_slot,
-                    "failed",
-                    "h2d_failure");
-                (void)hipEventDestroy(transfer.h2d_event);
-                registry_transfers_.erase(registry_transfers_.begin() + static_cast<std::ptrdiff_t>(index));
-                continue;
-            }
-
-            expert_registry_->complete_request(transfer.operation_id);
-            const auto ready_at = std::chrono::steady_clock::now();
-            const auto h2d_ns = transfer.h2d_enqueued_at.time_since_epoch().count() == 0
-                ? uint64_t{0}
-                : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    ready_at - transfer.h2d_enqueued_at).count());
-            const auto gpu_wait_ns = transfer.gpu_wait_started_at.time_since_epoch().count() == 0
-                ? uint64_t{0}
-                : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    ready_at - transfer.gpu_wait_started_at).count());
-            supply_telemetry_.record_timing(
-                transfer.phase,
-                transfer.source_tier,
-                transfer.nvme_read_service_ns,
-                transfer.nvme_completion_wait_ns,
-                h2d_ns,
-                gpu_wait_ns,
-                transfer.staging_wait_ns,
-                transfer.staging_reuse_wait_ns);
-            supply_telemetry_.record_transfer_event(
-                transfer.operation_id,
-                transfer.global_expert_id,
-                "h2d",
-                transfer.h2d_source_slot,
-                transfer.h2d_destination_slot,
-                "complete");
-            (void)hipEventDestroy(transfer.h2d_event);
-            registry_transfers_.erase(registry_transfers_.begin() + static_cast<std::ptrdiff_t>(index));
-        }
+        expert_supply_.reap_registry_transfers();
     }
 
     void record_supply_request(const ExpertRequestReservation& request) {
-        const bool physical_transfer = request.kind != ExpertRequestKind::HOT_HIT &&
-                                       request.kind != ExpertRequestKind::PENDING;
-        const uint64_t logical_bytes = request.source_tier == ExpertTier::HOT_VRAM
-            ? 0
-            : expert_payload_bytes();
-        supply_telemetry_.record_request(
-            supply_telemetry_.current_phase(),
-            request.source_tier,
-            logical_bytes,
-            physical_transfer ? expert_payload_bytes() : 0,
-            request.source_tier == ExpertTier::COLD_NVME && physical_transfer
-                ? expert_payload_bytes() : 0,
-            request.source_tier == ExpertTier::WARM_HOST && physical_transfer
-                ? expert_payload_bytes() : 0,
-            request.source_tier == ExpertTier::COLD_NVME && physical_transfer
-                ? expert_payload_bytes() : 0
-        );
+        expert_supply_.record_supply_request(request);
     }
 
     void observe_supply_occupancy(ExpertTier source_tier) {
-        const uint64_t warm_pinned_bytes = host_pool_
-            ? static_cast<uint64_t>(host_pool_->pinned_slot_count()) * host_pool_->payload_bytes()
-            : 0;
-        const uint64_t warm_unpinned_bytes = host_pool_
-            ? static_cast<uint64_t>(host_pool_->unpinned_slot_count()) * host_pool_->payload_bytes()
-            : 0;
-        supply_telemetry_.observe_occupancy(
-            expert_registry_->published_hot_slots(),
-            expert_registry_->published_warm_slots(),
-            expert_registry_->pending_transfer_count(),
-            expert_registry_->pending_demotion_count,
-            warm_pinned_bytes,
-            warm_unpinned_bytes,
-            source_tier
-        );
+        expert_supply_.observe_supply_occupancy(source_tier);
     }
 
     void read_experts_direct_blocking(
@@ -1894,8 +1195,7 @@ private:
         }
     }
 
-    float* d_cos_cache_{nullptr};
-    float* d_sin_cache_{nullptr};
+    V4ModelResources model_resources_;
 };
 
 } // namespace aeon::core
