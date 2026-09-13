@@ -10,6 +10,7 @@
 #include "architecture/deepseek_v4/core/memory_budget.hpp"
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
+#include "architecture/deepseek_v4/core/v4_attention_trace.hpp"
 #include "architecture/deepseek_v4/core/v4_model_resources.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
 #include "infrastructure/core/routing_counter.hpp"
@@ -157,6 +158,29 @@ public:
 
     const ExpertTimingPhase& expert_timing(RoutingPhase phase) const {
         return expert_timing_[static_cast<size_t>(phase)];
+    }
+
+    void enable_attention_trace(uint32_t layer_id, size_t max_records) {
+        if (layers.empty() || layer_id >= layers.size()) {
+            throw std::out_of_range("V4Pipeline::enable_attention_trace: invalid layer");
+        }
+        if (max_records == 0) {
+            throw std::invalid_argument("V4Pipeline::enable_attention_trace: record limit must be positive");
+        }
+        attention_trace_layer_ = layer_id;
+        attention_trace_limit_ = max_records;
+        attention_trace_records_.clear();
+        attention_trace_records_.reserve(max_records);
+        attention_trace_enabled_ = true;
+    }
+
+    void disable_attention_trace() noexcept {
+        attention_trace_enabled_ = false;
+        attention_trace_records_.clear();
+    }
+
+    const std::vector<V4AttentionTraceRecord>& attention_trace() const noexcept {
+        return attention_trace_records_;
     }
 
     uint32_t context_capacity() const {
@@ -532,6 +556,9 @@ public:
                 }
             }
 
+            V4AttentionTraceRecord* attention_trace = begin_attention_trace(
+                layer, pos, scratch, HEAD_DIM, TOTAL_Q);
+
             // -----------------------------------------------------------------
             // D. RoPE & KV Cache Persistence
             // -----------------------------------------------------------------
@@ -575,6 +602,24 @@ public:
                 compute_stream
             ));
             layer.record_position(pos);
+
+            if (attention_trace != nullptr) {
+                queue_trace_copy(attention_trace->rotated_query, scratch.d_q, TOTAL_Q);
+                queue_trace_copy(attention_trace->rotated_local_key, scratch.d_kv_norm_act, HEAD_DIM);
+                queue_trace_copy(
+                    attention_trace->local_key_cache,
+                    layer.d_local_key_cache,
+                    static_cast<size_t>(layer.state_layout().local_capacity) * HEAD_DIM);
+                queue_trace_copy(
+                    attention_trace->local_value_cache,
+                    layer.d_local_value_cache,
+                    static_cast<size_t>(layer.state_layout().local_capacity) * HEAD_DIM);
+                queue_trace_copy(
+                    attention_trace->local_positions,
+                    layer.d_local_positions,
+                    layer.state_layout().local_capacity);
+                attention_trace->local_valid_count = layer.local_valid_count_;
+            }
 
             if (uses_compressed_rope) {
                 const int ratio = layer.spec().compression_ratio;
@@ -674,6 +719,68 @@ public:
                     }
                     select_indexer_topk(layer);
                 }
+
+                if (attention_trace != nullptr) {
+                    queue_trace_copy(
+                        attention_trace->compressor_partial_kv,
+                        layer.d_compressor_partial_kv,
+                        layer.state_layout().compressor_partial_vector_bytes() / sizeof(float));
+                    queue_trace_copy(
+                        attention_trace->compressor_partial_score,
+                        layer.d_compressor_partial_score,
+                        layer.state_layout().compressor_partial_vector_bytes() / sizeof(float));
+                    queue_trace_copy(
+                        attention_trace->compressor_partial_positions,
+                        layer.d_compressor_partial_positions,
+                        layer.state_layout().compressor_partial_capacity);
+                    queue_trace_copy(
+                        attention_trace->compressed_key_cache,
+                        layer.d_compressed_key_cache,
+                        static_cast<size_t>(layer.state_layout().compressed_capacity) * HEAD_DIM);
+                    queue_trace_copy(
+                        attention_trace->compressed_value_cache,
+                        layer.d_compressed_value_cache,
+                        static_cast<size_t>(layer.state_layout().compressed_capacity) * HEAD_DIM);
+                    queue_trace_copy(
+                        attention_trace->compressed_positions,
+                        layer.d_compressed_positions,
+                        layer.state_layout().compressed_capacity);
+                    attention_trace->compressor_partial_count = layer.compressor_partial_count_;
+                    attention_trace->compressed_entry_count = layer.compressed_entry_count_;
+                    attention_trace->indexer_candidate_count = layer.indexer_candidate_count_;
+
+                    if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+                        queue_trace_copy(
+                            attention_trace->indexer_partial_kv,
+                            layer.d_indexer_partial_kv,
+                            layer.state_layout().indexer_partial_vector_bytes() / sizeof(float));
+                        queue_trace_copy(
+                            attention_trace->indexer_partial_score,
+                            layer.d_indexer_partial_score,
+                            layer.state_layout().indexer_partial_vector_bytes() / sizeof(float));
+                        queue_trace_copy(
+                            attention_trace->indexer_partial_positions,
+                            layer.d_indexer_partial_positions,
+                            layer.state_layout().indexer_partial_capacity);
+                        queue_trace_copy(
+                            attention_trace->indexer_key_cache,
+                            layer.d_indexer_key_cache,
+                            static_cast<size_t>(layer.state_layout().compressed_capacity) *
+                                layer.state_layout().index_head_dim);
+                        queue_trace_copy(
+                            attention_trace->indexer_positions,
+                            layer.d_indexer_positions,
+                            layer.state_layout().compressed_capacity);
+                        queue_trace_copy(
+                            attention_trace->indexer_scores,
+                            layer.d_indexer_scores,
+                            layer.indexer_candidate_count_);
+                        queue_trace_copy(
+                            attention_trace->indexer_topk_indices,
+                            layer.d_indexer_topk_indices,
+                            layer.state_layout().index_topk);
+                    }
+                }
             }
 
             // -----------------------------------------------------------------
@@ -707,6 +814,10 @@ public:
                 );
             }
 
+            if (attention_trace != nullptr) {
+                queue_trace_copy(attention_trace->attention_output, scratch.d_attn_out, TOTAL_Q);
+            }
+
             // Inverse RoPE on attention output
             hipLaunchKernelGGL(
                 kernel::v4_inverse_rope_at_pos_wave32_kernel,
@@ -714,6 +825,10 @@ public:
                 scratch.d_attn_out, layer_cos_cache, layer_sin_cache, pos,
                 NUM_HEADS, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2
             );
+
+            if (attention_trace != nullptr) {
+                queue_trace_copy(attention_trace->inverse_rope_output, scratch.d_attn_out, TOTAL_Q);
+            }
 
             // Grouped W_o_a: 8 groups x [1024, 4096] -> [8192]
             hipLaunchKernelGGL(
@@ -728,6 +843,10 @@ public:
                 dim3(H, 1), dim3(32), 0, compute_stream,
                 scratch.d_z_lora, layer.d_wo_b, scratch.d_attn_proj, TOT_LORA
             );
+
+            if (attention_trace != nullptr) {
+                queue_trace_copy(attention_trace->grouped_output, scratch.d_attn_proj, H);
+            }
 
             // -----------------------------------------------------------------
             // F. HC Attention Post Expansion: res_mid = comb_a * res_in + post_a * attn_proj
@@ -1171,6 +1290,53 @@ public:
     }
 
 private:
+    template<typename T>
+    void queue_trace_copy(std::vector<T>& destination, const T* source, size_t count) {
+        destination.resize(count);
+        if (count == 0) return;
+        CHECK_HIP(hipMemcpyAsync(
+            destination.data(), source, count * sizeof(T), hipMemcpyDeviceToHost, compute_stream));
+    }
+
+    V4AttentionTraceRecord* begin_attention_trace(
+        V4Layer& layer,
+        uint32_t position,
+        PipelineScratchBuffers& layer_scratch,
+        int head_dim,
+        int total_query
+    ) {
+        if (!attention_trace_enabled_ || layer.layer_id != static_cast<int>(attention_trace_layer_) ||
+            attention_trace_records_.size() >= attention_trace_limit_) {
+            return nullptr;
+        }
+
+        attention_trace_records_.emplace_back();
+        auto& trace = attention_trace_records_.back();
+        trace.position = position;
+        trace.attention_kind = layer.spec().attention_kind;
+        queue_trace_copy(trace.query, layer_scratch.d_q, total_query);
+        queue_trace_copy(trace.local_key, layer_scratch.d_kv_norm_act, head_dim);
+        queue_trace_copy(trace.local_value, layer_scratch.d_kv_norm_act, head_dim);
+
+        if (layer.spec().attention_kind == V4AttentionKind::Sliding) return &trace;
+
+        const int coefficient = layer.spec().compression_ratio == 4 ? 2 : 1;
+        const size_t compressor_width = static_cast<size_t>(coefficient * head_dim);
+        queue_trace_copy(trace.compressor_kv, layer_scratch.d_compressor_kv, compressor_width);
+        queue_trace_copy(trace.compressor_score, layer_scratch.d_compressor_score, compressor_width);
+        if (layer.spec().attention_kind != V4AttentionKind::CSA) return &trace;
+
+        const size_t indexer_query_width = static_cast<size_t>(
+            kernel::DSV4_INDEX_N_HEADS * kernel::DSV4_INDEX_HEAD_DIM);
+        const size_t indexer_width = static_cast<size_t>(
+            coefficient * kernel::DSV4_INDEX_HEAD_DIM);
+        queue_trace_copy(trace.indexer_query, layer_scratch.d_indexer_query, indexer_query_width);
+        queue_trace_copy(trace.indexer_weights, layer_scratch.d_indexer_weights, kernel::DSV4_INDEX_N_HEADS);
+        queue_trace_copy(trace.indexer_compressor_kv, layer_scratch.d_indexer_compressor_kv, indexer_width);
+        queue_trace_copy(trace.indexer_compressor_score, layer_scratch.d_indexer_compressor_score, indexer_width);
+        return &trace;
+    }
+
     void select_indexer_topk(V4Layer& layer) {
         const size_t candidate_count = layer.indexer_candidate_count_;
         if (candidate_count == 0) return;
@@ -1189,16 +1355,19 @@ private:
         for (size_t index = 0; index < candidate_count; ++index) {
             order[index] = static_cast<int32_t>(index);
         }
-        std::stable_sort(order.begin(), order.end(), [&scores](int32_t left, int32_t right) {
-            const float left_score = scores[static_cast<size_t>(left)];
-            const float right_score = scores[static_cast<size_t>(right)];
-            if (left_score != right_score) return left_score > right_score;
-            return left < right;
-        });
-
         const size_t topk = std::min(candidate_count, static_cast<size_t>(layer.state_layout().index_topk));
         std::vector<int32_t> selected(static_cast<size_t>(layer.state_layout().index_topk), -1);
-        std::copy_n(order.begin(), topk, selected.begin());
+        if (candidate_count <= static_cast<size_t>(layer.state_layout().index_topk)) {
+            std::copy(order.begin(), order.end(), selected.begin());
+        } else {
+            std::stable_sort(order.begin(), order.end(), [&scores](int32_t left, int32_t right) {
+                const float left_score = scores[static_cast<size_t>(left)];
+                const float right_score = scores[static_cast<size_t>(right)];
+                if (left_score != right_score) return left_score > right_score;
+                return left < right;
+            });
+            std::copy_n(order.begin(), topk, selected.begin());
+        }
         CHECK_HIP(hipMemcpyAsync(
             layer.d_indexer_topk_indices,
             selected.data(),
@@ -1370,6 +1539,10 @@ private:
     }
 
     V4ModelResources model_resources_;
+    bool attention_trace_enabled_{false};
+    uint32_t attention_trace_layer_{0};
+    size_t attention_trace_limit_{0};
+    std::vector<V4AttentionTraceRecord> attention_trace_records_;
 };
 
 } // namespace aeon::core

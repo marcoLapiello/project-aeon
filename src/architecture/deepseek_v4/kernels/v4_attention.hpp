@@ -56,14 +56,26 @@ struct RopeTable {
         for (uint32_t k = 0; k < half_rope; ++k) {
             float freq = 1.0f / std::pow(theta, (2.0f * k) / (float)rope_dim);
             if (factor > 1.0f) {
-                // YaRN frequency correction
-                float low = std::floor(orig_max_pos / (2.0f * M_PI * std::pow(theta, (2.0f * (half_rope - 1)) / (float)rope_dim)));
-                float high = std::ceil(orig_max_pos / (2.0f * M_PI * std::pow(theta, 0.0f)));
-                float w = 0.0f;
-                if (k < low) w = 0.0f;
-                else if (k > high) w = 1.0f;
-                else w = (k - low) / (high - low + 1e-5f);
-                freq = (1.0f - w) * (freq / factor) + w * freq;
+                // YaRN interpolates between the original and scaled
+                // frequencies across the beta-derived correction range.
+                constexpr float pi = 3.14159265358979323846f;
+                const auto correction_dim = [this, theta, orig_max_pos](float rotations) {
+                    return static_cast<float>(rope_dim) *
+                        std::log(static_cast<float>(orig_max_pos) / (rotations * 2.0f * pi)) /
+                        (2.0f * std::log(theta));
+                };
+                const float low = std::max(
+                    0.0f, std::floor(correction_dim(beta_fast)));
+                const float high = std::min(
+                    static_cast<float>(half_rope - 1),
+                    std::ceil(correction_dim(beta_slow)));
+                if (low >= high) {
+                    freq = static_cast<float>(k) < low ? freq : freq / factor;
+                } else {
+                    const float w = std::clamp(
+                        (static_cast<float>(k) - low) / (high - low), 0.0f, 1.0f);
+                    freq = (1.0f - w) * freq + w * (freq / factor);
+                }
             }
 
             for (uint32_t pos = 0; pos < max_seq_len; ++pos) {

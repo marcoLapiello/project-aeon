@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
 **Date:** 2026-09-13  
-**Status:** Open; Stages 0-3 complete; Stage 4 serial dispatch slice implemented; HIP/oracle parity next
+**Status:** Open; Stages 0-4 serial semantics complete; Stage 5 prefill equivalence next
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -768,7 +768,7 @@ Acceptance criteria:
 
 ### Stage 4 implementation record (2026-09-13)
 
-The first serial production dispatch slice is implemented in
+The serial production dispatch slice is implemented in
 `V4Pipeline::step()`. Sliding layers retain the existing ring attention branch;
 CSA layers now run their compressor and Lightning Indexer projections, write
 APE-adjusted partial rows, materialize overlapping ratio-4 entries at causal
@@ -786,28 +786,43 @@ and use a bounded shared score buffer for the 128-token local ring plus the
 while the semantic path is being proven; this is intentionally not a
 performance implementation.
 
+The production trace boundary is implemented in
+`src/architecture/deepseek_v4/core/v4_attention_trace.hpp` and
+`V4Pipeline::enable_attention_trace()`. It is disabled by default and captures
+projection inputs, rotated query/local cache state, compressor partial rows,
+compressed entries, indexer state and scores, deterministic top-k indices,
+attention output before and after inverse RoPE, and grouped output projection.
+`tests/test_v4_stage4_trace.cpp` replays the captured layer inputs through the
+independent CPU oracle and checks layers 0, 2, and 3 through position 131,
+including local ring reuse, the ratio-4 boundaries, the first ratio-128
+boundary, post-position-128 state, CSA top-k, and grouped output projection.
+
+Two semantic discrepancies exposed by this trace were fixed before the gate
+was accepted: production YaRN now uses the configured beta-derived correction
+range, and short-context CSA selection retains all valid candidates in
+ascending index order when the candidate count is below `index_topk`.
+
 The reproducible Stage 4 validation commands are:
 
 ```text
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure -R '^(test_v4_attention|test_v4_attention_oracle|test_v4_real_attention_oracle|test_v4_model_contract|test_v4_layer_state|test_v4_layer_state_device|test_v4_class_attention_device|test_v4_stage4_dispatch|test_dynamic_expert_pool|test_hot_warm_cold_pipeline)$'
+ctest --test-dir build --output-on-failure -R '^(test_v4_attention|test_v4_attention_oracle|test_v4_real_attention_oracle|test_v4_model_contract|test_v4_layer_state|test_v4_layer_state_device|test_v4_class_attention_device|test_v4_stage4_dispatch|test_v4_stage4_trace|test_dynamic_expert_pool|test_hot_warm_cold_pipeline)$'
 ```
 
-On the Radeon RX 7900 XTX (`gfx1100`), the full build and all ten focused tests
-passed. The primitive test covers C4 and C128 boundary materialization,
-indexer scoring, and mixed attention. The model-backed dispatch test runs 132
-real 43-layer steps in a context-132 configuration, verifies layer 2 reaches
-33 C4 compressed/indexer entries through position 131, verifies layer 3 creates
-its first C128 entry at position 127, and confirms the sliding layers retain a
-128-position ring. The model-backed boundary test completes in approximately
-32.8 seconds. Existing oracle and Hot/Warm/Cold regressions also pass.
+On the Radeon RX 7900 XTX (`gfx1100`), the full build and the eleven focused
+tests passed; the nine attention/state/contract/trace targets completed in
+192.73 seconds, including the model-backed trace target in 147.71 seconds.
+The trace tolerances were fixed before the run at `0.02` for FP16 attention and
+cache values, `0.002` for float32 compressor/indexer partial state, `0.1` for
+float32 indexer scores, and `0.02` for grouped output projection. All captured
+layer traces passed, and the existing oracle, class-device, dispatch, and
+Hot/Warm/Cold regressions remained green.
 
-This record does not close Stage 4. HIP-versus-CPU-oracle tensor traces,
-post-position-128 production HCA/C4 behavior, full prefill equivalence, and
-trusted-reference parity remain open. The next correctness slice is to expose
-production traces for layers 0, 2, and 3 and compare query, cache insertion,
-compressor state, compressed entries, indexer selection, attention output,
-inverse RoPE, and grouped projection against the completed oracle.
+This closes the Stage 4 serial decode and HIP-versus-CPU-oracle trace gate. It
+does not close true prefill/chunk equivalence, complete 43-layer trusted-
+reference parity, or the routing-placement unlock. Stage 5 is next: prove that
+serialized, aligned, and unaligned prefill chunking preserves the same state
+and next-token outputs before optimizing batched execution.
 
 ### Stage 5: Implement stateful and true prefill
 

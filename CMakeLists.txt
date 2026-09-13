@@ -204,6 +204,14 @@ target_link_libraries(test_v4_stage4_dispatch PRIVATE amdhip64)
 add_test(NAME test_v4_stage4_dispatch COMMAND test_v4_stage4_dispatch)
 set_tests_properties(test_v4_stage4_dispatch PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Stage 4 model-backed validation: HIP attention traces versus the CPU oracle
+add_executable(test_v4_stage4_trace tests/test_v4_stage4_trace.cpp)
+target_link_libraries(test_v4_stage4_trace PRIVATE amdhip64)
+add_test(NAME test_v4_stage4_trace COMMAND test_v4_stage4_trace)
+set_tests_properties(test_v4_stage4_trace PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 300)
+
 # Stage 0 evidence: validated model contract and complete dense tensor inventory
 add_executable(aeon_model_contract tools/aeon_model_contract.cpp)
 target_link_libraries(aeon_model_contract PRIVATE amdhip64)
