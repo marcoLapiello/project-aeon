@@ -1,0 +1,901 @@
+# DeepSeek-V4 Flash Model Correctness Execution Plan
+
+**Date:** 2026-09-13  
+**Status:** Open; current priority  
+**Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
+**Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
+
+## 1. Executive decision
+
+The current runtime is a stable DeepSeek-V4-shaped prototype, not yet a faithful
+implementation of the selected checkpoint. The decisive gap is not a missing
+benchmark or a final API comparison: the production path executes a 128-token
+sliding-window approximation for every layer, while the checkpoint declares a
+layer-specific sliding/compressed/indexed attention schedule.
+
+This plan is the canonical implementation sequence for closing that gap. It
+supersedes the correctness portions of the historical Phase 1 checklist while
+preserving the useful storage, expert-format, mHC, routing, and native text
+work already completed.
+
+The plan has four governing rules:
+
+1. Recover the checkpoint contract before adding kernels or performance work.
+2. Implement a deterministic CPU reference/oracle for cache and attention state
+   before relying on HIP output.
+3. Make the runtime reject unsupported architecture contracts rather than
+   silently running all layers as sliding-window attention.
+4. Do not use routing profiles, placement results, or end-to-end throughput as
+   model evidence until the final correctness gates in this document pass.
+
+The first completion target is the **base causal decoder**: exact next-token
+logits and greedy generation for the 43 decoder layers. MTP, DSpark auxiliary
+heads, prefix caching, and serving optimizations are separate follow-up work;
+the runtime must not claim those features merely because their tensors exist.
+
+## 2. Definition of done
+
+The base-decoder correctness gate is closed only when all of the following are
+true:
+
+- The selected model configuration is parsed into an explicit, validated V4
+  execution specification.
+- Layers 0-42 are classified from `compress_ratios`, with no implicit fallback:
+  - layers 0-1: sliding-window;
+  - layers 2, 4, ..., 42: ratio-4 CSA with Lightning Indexer;
+  - layers 3, 5, ..., 41: ratio-128 HCA;
+  - entries 43-45: recognized as auxiliary schedule entries and not used as
+    base decoder layers.
+- Every required compressor, indexer, attention, normalization, HC, router,
+  shared-expert, and output tensor is present with the expected dtype and
+  shape before device execution begins.
+- A CPU float32 oracle reproduces the reference layer semantics for sliding,
+  C4A/CSA, and C128A/HCA attention, including cache state and causal boundary
+  behavior.
+- One-shot prefill, arbitrarily chunked prefill, and serialized token append
+  produce equivalent cache state and next-token outputs.
+- HIP implementations match the CPU oracle at the declared FP16/FP32
+  tolerances for layer 0, layer 2, and layer 3 representative traces.
+- The independent INT4 decoder and the complete routed expert path have passed
+  a real-tensor parity check; local GPU-versus-local-mirror tests alone do not
+  count.
+- A full 43-layer run on identical formatted token IDs agrees with a trusted
+  compatible reference at the agreed intermediate and output checkpoints.
+- The native text path records the exact prompt IDs, generated IDs, logits/top-k
+  evidence where available, and stop reason. Existing generated text is not
+  treated as proof without this evidence.
+- The routing profiler remains locked until the correctness evidence is stored
+  and the routing plan is updated to reference it.
+
+Performance is explicitly not part of this gate. The first correct path may be
+serialized, conservative, and slower than the current approximation.
+
+## 3. Frozen checkpoint contract
+
+The authoritative package is:
+
+```text
+models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon/
+```
+
+The selected configuration declares:
+
+| Contract | Value |
+| --- | ---: |
+| Base decoder layers | 43 |
+| Hidden size | 4096 |
+| Vocabulary | 129280 |
+| Query heads | 64 |
+| KV heads | 1 |
+| Head dimension | 512 |
+| NoPE dimension | 448 |
+| RoPE dimension | 64 |
+| Query low-rank dimension | 1024 |
+| Output low-rank dimension | 1024 |
+| Output groups | 8 |
+| Sliding window | 128 |
+| Routed experts | 256 |
+| Shared experts | 1 |
+| Routed experts per token | 6 |
+| Hash-routed layers | 0-2 |
+| HC streams | 4 |
+| HC Sinkhorn iterations | 20 |
+| RMS/HC epsilon | `1e-6` |
+| SwiGLU limit | 10.0 |
+| Routed scaling factor | 1.5 |
+| Indexer heads | 64 |
+| Indexer head dimension | 128 |
+| Indexer top-k | 512 |
+| Maximum position embeddings | 1048576 |
+| Original position limit | 65536 |
+| Main RoPE theta | 10000 |
+| Compressed RoPE theta | 160000 |
+| YaRN factor | 16 |
+| YaRN beta fast/slow | 32 / 1 |
+| MTP layers declared | 1 |
+
+### 3.1 Layer schedule
+
+The selected `compress_ratios` array has 46 entries. Only the first 43 entries
+belong to the base decoder:
+
+```text
+layer 0-1:       0, 0
+layer 2-42:      4, 128, 4, 128, ..., 4, 128, 4
+entries 43-45:  0, 0, 0   (auxiliary schedule entries)
+```
+
+The exact array must be parsed and validated from the package rather than
+reconstructed from this summary. A mismatch in schedule length, layer value,
+or layer-class mapping is a startup error.
+
+### 3.2 Shared attention preparation
+
+The base attention path has the following logical dataflow. The existing
+tensor names and layouts may be retained where they are proven equivalent, but
+the implementation must be compared against the reference path:
+
+```text
+four HC residual streams
+    -> attention HC pre-mix and Sinkhorn
+    -> attention RMSNorm
+    -> q low-rank projection, q RMSNorm, q expansion
+    -> per-head unit RMSNorm on Q
+    -> shared 512-wide KV projection and KV RMSNorm
+    -> layer-specific cache insertion and attention
+    -> inverse RoPE on attention output
+    -> grouped W_o_a, then W_o_b
+    -> HC attention post-expansion
+    -> FFN HC pre-mix and RMSNorm
+    -> shared expert plus six routed experts
+    -> HC FFN post-expansion
+```
+
+The reference implementation fuses some projections, while Aeon currently
+binds tensors such as `attn.wq_a`, `attn.wq_b`, and `attn.wkv` separately. This
+is acceptable only after intermediate tensors are shown equivalent.
+
+### 3.3 Sliding-window attention
+
+Sliding layers use a causal local window of at most 128 positions, including
+the current position. The local cache must retain absolute positions even if
+the physical storage is a ring. The attention sink, query/key RoPE treatment,
+and output inverse-RoPE must follow the selected reference implementation.
+
+The current `d_kv_cache: [max_seq_len, 512]` allocation is not an adequate
+model-wide cache contract. It can remain as an initial implementation detail
+for a sliding layer only if its reset, position, and window semantics are
+explicitly tested.
+
+### 3.4 Ratio-4 CSA and Lightning Indexer
+
+Every even layer from 2 through 42 is a ratio-4 compressed sparse attention
+layer. It has both local sliding state and long-range compressed/indexed state.
+
+The reference flow is:
+
+```text
+hidden state
+    -> ratio-4 compressor KV and score projections
+    -> persistent compressor partial state plus APE[position % 4]
+    -> overlapping compressed entry at a completed boundary
+    -> compressed KV normalization and compressed RoPE
+
+hidden/query state
+    -> indexer query projection [64, 128]
+    -> indexer weights projection [64]
+    -> indexer score against compressed indexer keys
+    -> causal top-512 compressed-entry selection
+    -> sparse attention over local plus selected long-range entries
+```
+
+The local reference compressor uses `coff = 2` for ratio 4. At a completed
+position it gathers the two overlapping four-token regions, so the compressor
+state spans eight token states. It adds the learned APE row selected by
+`position % 4` to the score state before the boundary reduction. The exact
+causal boundary and warm-up behavior must come from the reference code and the
+oracle tests, not from a simplified non-overlapping four-token average.
+
+The indexer is a separate scoring path. It is not ordinary full attention
+followed by truncation. Top-k ordering and tie behavior must be deterministic;
+when the valid candidate count is below 512, every valid candidate is selected
+and the remaining output slots are marked invalid.
+
+### 3.5 Ratio-128 HCA
+
+Every odd layer from 3 through 41 is a ratio-128 heavily compressed attention
+layer. It has local sliding state and a non-overlapping compressed state:
+
+```text
+128 token states -> one completed compressed entry
+```
+
+An incomplete 128-token region must not become visible as a completed causal
+entry unless the reference implementation explicitly says so. There is no
+CSA Lightning Indexer on this branch. The compressor state must survive chunk
+boundaries and decode steps.
+
+### 3.6 RoPE and compressed RoPE
+
+RoPE is interleaved/GPT-J style and applies to the trailing 64 channels of the
+512-wide head. The layer class controls the table:
+
+- sliding layers use main `rope_theta = 10000` and no long-context YaRN
+  scaling (`factor = 1` for this branch);
+- ratio-4 and ratio-128 compressed layers use
+  `compress_rope_theta = 160000` and the configured YaRN parameters;
+- compressed entries use the reference compressed position convention;
+- inverse RoPE on attention output uses the same layer-class position table.
+
+The current single table initialized with `factor = 1.0` is not sufficient.
+Separate main/compressed tables or an equivalent class-aware table provider are
+required.
+
+### 3.7 HC, MoE, quantization, and output
+
+The current HC and routing paths have useful silicon tests, but the tests must
+be connected to real checkpoint-layer parity before they count toward the full
+gate:
+
+- mHC operates on four streams with 20 Sinkhorn iterations;
+- each MoE layer combines one shared expert and six routed experts;
+- layers 0-2 use checkpoint-provided `tid2eid` hash routing;
+- later layers use the configured sqrt-softplus score and bias correction;
+- routed experts use the selected artifact's symmetric group-32 INT4 contract:
+  low-nibble-first packed words and `(nibble - 8) * FP16 scale`;
+- W1/W3 are `[2048, 4096]`, W2 is `[4096, 2048]`, and expert execution is
+  `activation @ weight.T`;
+- the current expert artifact remains version-2 swizzled and must not be
+  replaced or guessed as FP4 merely because the config labels it `fp4`;
+- the final base path is HC head reduction, final RMSNorm, untied `head.weight`
+  projection, and greedy argmax over 129280 logits.
+
+The checkpoint also contains `mtp.*` and DSpark-related metadata. Those are
+not part of the first base-decoder gate. They must either be implemented in a
+later milestone or explicitly reported as unsupported rather than silently
+implying full release feature coverage.
+
+## 4. Current implementation and evidence boundary
+
+| Area | Current source | Confirmed state | Consequence |
+| --- | --- | --- | --- |
+| Configuration | `src/architecture/deepseek_v4/core/config.hpp` | Parses scalar defaults but not the compression schedule, indexer fields, compressed theta, nested YaRN data, or auxiliary metadata | The runtime cannot derive the real layer classes from the checkpoint. |
+| Layer state | `src/architecture/deepseek_v4/core/v4_layer.hpp` | Owns one full-resolution `[max_seq_len, 512]` cache per layer | No compressor, compressed pool, indexer cache, boundary state, or ring metadata exists. |
+| Pipeline dispatch | `src/architecture/deepseek_v4/core/v4_pipeline.hpp` | Calls `v4_cached_sliding_window_attn_wave32_kernel` for every layer | Layers 2-41 execute the wrong attention mechanism. |
+| Dense binding | `src/architecture/deepseek_v4/core/v4_dense_weight_binding.hpp` | Binds current attention/HC/router/shared-expert tensors only | Compressor and indexer tensors are present in the artifact but unused. Missing tensors fail open by becoming null pointers. |
+| RoPE | `src/architecture/deepseek_v4/core/v4_model_resources.hpp` | One theta-10000 table with factor 1.0 | Compressed-layer RoPE and configured YaRN are not executed. |
+| Prefill | `V4Pipeline::generate` in `v4_pipeline.hpp` | Calls single-token `step()` once per prompt token | No true batched prefill or proven chunk-equivalent compressor state exists. |
+| Attention tests | `tests/test_v4_attention.cpp` | Synthetic SWA, RoPE round trip, grouped projection, and local CPU mirror | Does not test C4A, C128A, real checkpoint state, or layer schedule. |
+| HC/router tests | `tests/test_hc_sinkhorn.cpp`, `tests/test_moe_router.cpp` | GPU versus hand-written CPU mirrors | Does not prove checkpoint/reference graph parity. |
+| Expert tests | `tests/test_w4a16_swizzled_gemv.cpp` and fused expert tests | GPU versus local INT4 decoder | Does not by itself prove source checkpoint semantics or full-layer parity. |
+| Final output | `v4_pipeline.hpp` and `v4_attention.hpp` | Base HC head, final norm, untied LM head, and argmax are wired | MTP is absent; output is only meaningful after preceding layers are correct. |
+
+The native text result and current routing profiles remain plumbing evidence.
+They must not be presented as proof of selected-checkpoint correctness.
+
+## 5. Reference sources and evidence discipline
+
+### 5.1 In-repository references
+
+- [DeepSeek-V4 Flash versus Aeon comparison](../../analysis/current/DEEPSEEK_V4_FLASH_AEON_COMPARISON.md)
+  is the current diagnosis and records the selected 0731 schedule correction.
+- [DeepSeek-V4 architecture notes](../../analysis/current/deepseek_v4_flash_architecture.md)
+  records the model geometry, cache categories, and causal requirements.
+- [VLLM RDNA3 and DeepSeek-V4 reference analysis](../../analysis/current/VLLM_RDNA3_DEEPSEEK_V4_REFERENCE_ANALYSIS.md)
+  maps the external reference attention, compressor, indexer, prefill, and
+  hardware paths to Aeon ownership boundaries.
+- [Native text-in/text-out plan](TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md)
+  owns formatter/tokenizer parity and the external behavioral gate.
+- [Routing profile plan](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) owns the
+  profiler contract and must remain correctness-gated.
+- [Codebase map](../../status/CODEBASE_MAP.md) identifies production files,
+  validation targets, and non-production diagnostics.
+- [Performance ledger](../../status/PERFORMANCE_LEDGER.md) is the only place
+  for authoritative silicon measurements.
+
+Primary local implementation surfaces:
+
+- `src/architecture/deepseek_v4/core/config.hpp`
+- `src/architecture/deepseek_v4/core/v4_layer.hpp`
+- `src/architecture/deepseek_v4/core/v4_dense_weight_binding.hpp`
+- `src/architecture/deepseek_v4/core/v4_model_resources.hpp`
+- `src/architecture/deepseek_v4/core/v4_pipeline.hpp`
+- `src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp`
+- `src/architecture/deepseek_v4/kernels/v4_attention.hpp`
+- `src/architecture/deepseek_v4/kernels/hc_sinkhorn.hpp`
+- `src/architecture/deepseek_v4/kernels/moe_router.hpp`
+- `src/architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp`
+- `src/infrastructure/core/aeon_loader.hpp`
+- `scripts/convert_safetensors_to_aeon.py`
+
+### 5.2 External reference checkouts
+
+The following are source references only. They must not become Aeon runtime
+dependencies. The inspected vLLM checkout was at revision `94848ed` during the
+reference review; record a new revision if it changes before implementation.
+
+```text
+/home/marcolap/aeon-references/vllm/vllm/models/deepseek_v4/attention.py
+/home/marcolap/aeon-references/vllm/vllm/models/deepseek_v4/compressor.py
+/home/marcolap/aeon-references/vllm/vllm/models/deepseek_v4/common/rope.py
+/home/marcolap/aeon-references/vllm/vllm/models/deepseek_v4/common/ops/save_partial_states.py
+/home/marcolap/aeon-references/vllm/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+/home/marcolap/aeon-references/vllm/vllm/v1/attention/backends/mla/indexer.py
+/home/marcolap/aeon-references/vllm/vllm/models/deepseek_v4/amd/model.py
+/home/marcolap/aeon-references/vllm/vllm/models/deepseek_v4/amd/rocm.py
+```
+
+The vLLM V4 graph is primarily an FP8/MXFP4-oriented model path. Reuse its
+attention, cache, compressor, indexer, and boundary semantics; do not reuse its
+weight-format assumptions as a substitute for Aeon's validated symmetric INT4
+artifact.
+
+The selected model source snapshot and formatter are under:
+
+```text
+models/DeepSeek-V4-Flash-0731-INT4-W4A16/
+  models--yiminyuan--DeepSeek-V4-Flash-0731-INT4-W4A16/
+    snapshots/64700592cadaf205fe0c13202061ff4b45afbfd0/
+      encoding/encoding_dsv4.py
+      encoding/test_encoding_dsv4.py
+      encoding/README.md
+      README.md
+```
+
+Use the source snapshot, checked-in config, tensor metadata, and vLLM source
+as a triangulated reference. If they disagree, stop and record the discrepancy
+before writing a kernel.
+
+## 6. Step-by-step execution sequence
+
+### Stage 0: Freeze evidence and create the contract boundary
+
+**Objective:** Make the selected checkpoint and current approximation explicit
+before changing execution.
+
+Tasks:
+
+1. Record the Aeon commit, artifact manifest identity, model config hash,
+   source snapshot revision, tokenizer hash, and external reference revision in
+   the correctness test metadata.
+2. Enumerate every dense tensor in `model_dense.aeon` with name, dtype, byte
+   size, and shape. Produce a machine-readable inventory for the selected
+   checkpoint; do not rely only on a hand-maintained list.
+3. Identify the exact checkpoint names and shapes for:
+   - ratio-4 compressor KV/score projections, APE, and normalization;
+   - ratio-128 compressor KV/score projections, APE, and normalization;
+   - ratio-4 indexer query projection, indexer weight projection, and indexer
+     compressor tensors;
+   - `mtp.*` and DSpark tensors;
+   - all current attention, HC, router, shared-expert, norm, embedding, and LM
+     head tensors.
+4. Extend `DeepSeekV4Config` with the fields needed to describe the execution
+   contract, including `compress_ratios`, `index_head_dim`, `index_n_heads`,
+   `index_topk`, `compress_rope_theta`, `o_groups`, MTP metadata, and the
+   relevant YaRN fields. Parse nested objects and arrays structurally; do not
+   add more fragile scalar substring searches for architecture-defining data.
+5. Add an explicit layer descriptor, for example `Sliding`, `CSA`, or `HCA`,
+   derived from the validated schedule. Keep this descriptor in the V4
+   architecture layer, not in the architecture-neutral expert supply code.
+6. Add startup validation for schedule length, supported ratios, model
+   dimensions, indexer dimensions, RoPE settings, tensor presence, tensor
+   dtype, and tensor shape.
+
+Acceptance criteria:
+
+- A config test reads the checked-in package and asserts the complete schedule,
+  not only scalar dimensions.
+- Mutating `compress_ratios`, `index_topk`, `compress_rope_theta`, or a required
+  tensor entry causes a clear startup/test failure.
+- A valid package never reaches `V4Pipeline::step()` with a required compressor
+  or indexer pointer null.
+- The runtime prints or exposes the resolved layer class for at least layers 0,
+  2, 3, 41, and 42.
+- No change is made to Hot/Warm/Cold ownership or expert artifact bytes.
+
+Suggested validation surfaces:
+
+```text
+tests/test_config_parser.cpp
+tests/test_v4_model_contract.cpp       (new)
+src/architecture/deepseek_v4/core/config.hpp
+src/architecture/deepseek_v4/core/v4_model_spec.hpp  (new or equivalent)
+src/architecture/deepseek_v4/core/v4_dense_weight_binding.hpp
+```
+
+### Stage 1: Close the independent weight and dense-operation gate
+
+**Objective:** Ensure that attention work is not debugging a hidden weight or
+quantization mismatch.
+
+Tasks:
+
+1. Keep the current version-2 swizzled artifact and loader unchanged as the
+   storage baseline.
+2. Implement or retain a separate reference decoder for real W1/W2/W3 tensors
+   using the source contract:
+   - packed `uint32` words;
+   - eight low-nibble-first values per word;
+   - symmetric value `(nibble - 8)`;
+   - FP16 scale per group of 32 input values;
+   - row-major `[out, in]` weights and `activation @ weight.T`.
+3. Select real experts from early, middle, and late layers. Compare all three
+   projections and the complete routed FFN output against the native swizzled
+   path for fixed FP16 activations.
+4. Compare dense projections required by the attention trace: attention norm,
+   `wq_a`, q norm, `wq_b`, `wkv`, KV norm, grouped `wo_a`, `wo_b`, HC tables,
+   router, shared expert, final norm, and LM head.
+5. Keep reference decoding independent from the current GPU test helper. A
+   test that copies the same dequantization loop into CPU code is not sufficient
+   evidence by itself.
+
+Acceptance criteria:
+
+- Real W1/W2/W3 output vectors agree with the independent reference before they
+  are mixed into a transformer state.
+- Dense projection outputs agree for fixed activation fixtures within the
+  declared FP16/FP32 tolerance; all threshold choices are recorded in the test
+  metadata.
+- The full expert payload remains bit-identical through source, `.aeon`, host
+  staging, and VRAM views.
+- Any quantization discrepancy blocks later attention work and is recorded as a
+  separate failure, rather than being absorbed by a relaxed full-model test.
+
+Relevant existing tests:
+
+- `tests/test_w4a16_swizzle.cpp`
+- `tests/test_w4a16_swizzled_gemv.cpp`
+- `tests/test_w4a16_swizzled_dual_gemv.cpp`
+- `tests/test_aeon_moe_fused_w13.cpp`
+- `tests/test_aeon_moe_fused_w2.cpp`
+- `tests/test_aeon_loader.cpp`
+- `tests/test_aeon_swizzled_loader.cpp`
+
+### Stage 2: Build the CPU attention and cache oracle
+
+**Objective:** Define exact state transitions before porting them to HIP.
+
+Implement a deterministic float32 reference module under the V4 architecture
+or test-reference boundary. It must expose state, not only final output, so a
+failure can identify a compressor, cache, indexer, or attention mismatch.
+
+The oracle must own or expose:
+
+- layer class and compression ratio;
+- absolute sequence position;
+- local 128-token K/V state and valid-position metadata;
+- ratio-4 compressor partial state, score state, APE state, and compressed KV
+  entries;
+- ratio-128 compressor partial state and compressed KV entries;
+- ratio-4 indexer key state, query state, candidate count, top-k indices, and
+  indexer weights;
+- RoPE table identity and position mapping;
+- attention sink and causal masks;
+- the output of each attention branch before inverse RoPE and output projection.
+
+Implement the reference control flow from the external source:
+
+1. Insert the current token's local KV state with its absolute position.
+2. For a compressed layer, produce KV and score states from the hidden state.
+3. Add the APE row selected by `position % compress_ratio` to score state.
+4. Materialize a compressed entry only at the correct completed boundary.
+5. For C4A, use the overlapping two-window/8-token boundary semantics.
+6. For C128A, use the non-overlapping 128-token semantics.
+7. Build the C4A indexer query and candidate scores independently from normal
+   attention.
+8. Select at most 512 causal compressed entries with deterministic ordering.
+9. Execute local, C4A, or C128A attention according to the layer descriptor.
+10. Return both the attention output and the updated state snapshot.
+
+Required oracle tests:
+
+- Positions 0, 1, 3, 4, 7, 8, 127, 128, 129, and 131.
+- Prompt lengths immediately below, at, and above 4 and 128 boundaries.
+- Chunk splits at aligned and unaligned positions, including `[1, 3, 4, 7,
+  16, 127, 128]`.
+- Short context where C4A has fewer than 512 valid candidates.
+- Context with more than 512 valid C4A candidates and deterministic ties.
+- Reset followed by a second generation must not observe stale state.
+
+Acceptance criteria:
+
+- One-shot, chunked, and serialized append produce identical float32 state
+  snapshots and next-token outputs within the oracle tolerance.
+- Incomplete C4/C128 windows are not visible early.
+- Absolute positions remain correct after local ring-slot reuse.
+- C4A top-k indices match the independent reference selection, including short
+  context and tie cases.
+- The oracle can dump a compact trace for layers 0, 2, and 3 without loading
+  the complete model into GPU memory.
+
+Suggested files:
+
+```text
+src/architecture/deepseek_v4/reference/v4_attention_oracle.hpp
+src/architecture/deepseek_v4/reference/v4_attention_oracle.cpp
+tests/test_v4_attention_oracle.cpp
+tests/test_v4_prefill_state.cpp
+```
+
+If the repository keeps the first reference implementation header-only, keep it
+isolated from production HIP kernels and document the boundary.
+
+### Stage 3: Add class-aware layer ownership and strict tensor binding
+
+**Objective:** Make cache and weight ownership match the checkpoint schedule.
+
+Tasks:
+
+1. Extend `V4Layer` with an immutable `V4LayerSpec` containing layer ID,
+   attention class, compression ratio, and required dimensions.
+2. Replace the single implicit cache contract with explicit state ownership:
+   - sliding layer: local cache and absolute-position metadata;
+   - C4A layer: local cache, ratio-4 compressor state, compressed KV state,
+     indexer state, valid counts, and top-k workspace;
+   - C128A layer: local cache, ratio-128 compressor state, compressed KV state,
+     and valid counts.
+3. Add reset/clear methods that reset all state for a new generation. Do not
+   clear only the old `d_kv_cache`.
+4. Extend `V4DenseWeightBinding` with exact compressor/indexer bindings for
+   the selected checkpoint. Store the required tensor shapes next to the
+   binding contract or validate them during upload.
+5. Change optional `upload_tensor()` behavior for architecture-defining tensors:
+   missing required tensors must throw a named error. Optional MTP/DSpark
+   tensors may remain absent only when the selected execution mode explicitly
+   disables them.
+6. Extend `V4ModelResources` with class-aware main and compressed RoPE tables.
+   The table builder must receive `rope_theta`, `compress_rope_theta`, YaRN
+   factor, beta values, original context, and the interleaved layout.
+7. Extend scratch ownership for C4A/C128A state and indexer top-k metadata. Do
+   not hide large persistent state in transient per-token scratch buffers.
+
+Acceptance criteria:
+
+- Initialization reports the expected class counts: 3 sliding layers, 20 C4A
+  layers, and 20 C128A layers.
+- A real model initializes every required layer tensor without null pointers or
+  shape reinterpretation.
+- `reset_generation_state()` clears local, compressed, and indexer state and
+  reproduces the first run exactly.
+- Main and compressed RoPE tables differ where the checkpoint requires them;
+  positions 0 and 65536 are covered by a deterministic unit test.
+- The memory report accounts for the new state categories instead of treating
+  the old full-resolution cache as the model contract.
+
+### Stage 4: Implement correct serial decode semantics first
+
+**Objective:** Replace the all-layer sliding fallback with a correct, simple
+single-token execution path before attempting throughput-oriented prefill.
+
+Tasks:
+
+1. Preserve `V4Pipeline::step(token_id, pos, phase)` as the first integration
+   surface, but dispatch each layer through its `V4LayerSpec`.
+2. Keep the current SWA path as the layer-0/1/42 branch only, after comparing
+   its K/V insertion, sink handling, RoPE, and inverse-RoPE order with the
+   oracle.
+3. Add the C128A branch for layers 3, 5, ..., 41. Verify that a compressed
+   entry is created only when its causal region completes.
+4. Add the C4A branch for layers 2, 4, ..., 42. Verify local plus selected
+   compressed attention and the Lightning Indexer in separate trace points.
+5. Keep top-k selection in a simple deterministic implementation first. A
+   slower host or one-block device selection is acceptable while semantics are
+   being proven.
+6. Compare each branch after every major operation: query, KV insertion,
+   compressor state, compressed entry, indexer scores/indices, attention output,
+   inverse-RoPE output, and grouped output projection.
+
+Acceptance criteria:
+
+- Layer 0, layer 2, and layer 3 each pass the oracle trace on real checkpoint
+  tensors for positions before and after their first compression boundary.
+- A token beyond position 128 changes C4A/HCA state and output according to the
+  compressed branch, while a sliding layer retains only its local causal
+  window.
+- No layer 2-41 execution reaches the old all-layer SWA kernel by accident.
+- The existing native generation API still returns a token and preserves its
+  public behavior shape, but its output is now labeled as the corrected path
+  only after this stage passes.
+
+### Stage 5: Implement stateful and true prefill
+
+**Objective:** Make prompt processing mathematically equivalent regardless of
+how the prompt is chunked, then add a batched path without changing semantics.
+
+Tasks:
+
+1. Add an explicit prefill API that accepts a token span and absolute starting
+   position. It may initially use a conservative serialized implementation,
+   but it must update all layer states through the same state machine.
+2. Add a batched/chunked prefill path for multiple prompt tokens. Keep the
+   current `step()` API as the decode and reference fallback path.
+3. Ensure compressor state crosses chunks. A chunk boundary must never reset a
+   partial C4A or C128A window.
+4. Ensure router token IDs, phase labels, and expert requests retain the
+   original absolute positions during prefill.
+5. Compare the next-token logits after:
+   - one-shot prefill;
+   - chunks of 1 token;
+   - aligned chunks of 4 and 128 tokens;
+   - unaligned chunks such as 3, 7, and 127 tokens.
+6. Only after semantic equivalence passes, optimize prefill GEMM and expert
+   batching. Do not let padded `M=16` scratch allocation be mistaken for true
+   batched execution.
+
+Acceptance criteria:
+
+- All prefill chunkings produce the same per-layer state snapshot and next-token
+  logits within the fixed tolerance.
+- The first generated token is identical whether it follows one-shot or
+  serialized prefill.
+- A reset between prompts removes all previous local, compressed, indexer, and
+  routing state.
+- The batched path has a traceable fallback to the serialized oracle path for
+  unsupported shapes; no silent semantic substitution is allowed.
+
+### Stage 6: Port the validated branches to HIP on silicon
+
+**Objective:** Implement the smallest correct Wave32 kernels and compare them
+against the CPU oracle before tuning them.
+
+Port in this order:
+
+1. Class-aware RoPE table lookup and per-position q/KV preparation.
+2. Local sliding cache insertion and attention, including separate K/V inputs
+   if required by the reference trace.
+3. C128 compressor state update, boundary reduction, normalization, RoPE, and
+   compressed cache insertion.
+4. C4 compressor state update with overlap and APE state.
+5. Indexer query projection, compressed-key scoring, causal top-k selection, and
+   selected-entry attention.
+6. Class-aware output projection and HC integration.
+
+Implementation constraints:
+
+- Keep a CPU-oracle path available behind a test/debug option until the full
+  model gate closes.
+- Use float32 accumulation where the reference requires it; convert to FP16
+  only at an explicit storage boundary.
+- Do not optimize top-k, cache paging, compression quantization, or prefetch
+  overlap in the same change as the first semantic port.
+- Preserve Wave32 launch assumptions and validate synchronization around shared
+  state and cache writes.
+- Treat indexer/compressed cache quantization as a later optimization. The first
+  semantic HIP path may use FP16/FP32 state if memory permits the test fixture.
+
+Acceptance criteria:
+
+- `test_v4_attention` is split or extended so SWA, C4A, and C128A each compare
+  HIP output against the oracle rather than only against a local kernel mirror.
+- Device traces match host traces for cache valid counts, compressed entries,
+  indexer top-k indices, attention outputs, and output projections.
+- Boundary tests run on the target gfx1100 device and pass after repeated
+  launches, not only once after process startup.
+- HIP errors, invalid positions, invalid top-k indices, and missing cache state
+  fail explicitly during correctness tests.
+
+### Stage 7: Complete layer and full-model parity
+
+**Objective:** Prove that corrected attention composes with the existing mHC,
+MoE, quantized experts, final head, and text contract.
+
+Build a trace harness that can compare the same token IDs and positions at
+stable boundaries. At minimum capture:
+
+```text
+embedding
+HC attention pre-mix
+attention normalized input
+Q and KV projections
+local cache insertion
+compressor state and compressed entries
+indexer scores and selected indices
+attention output
+grouped output projections
+HC attention post state
+FFN normalized input
+router logits, expert IDs, and weights
+shared/routed expert output
+HC FFN post state
+final head input
+logits and greedy argmax
+```
+
+Required comparison order:
+
+1. One layer-0 SWA trace.
+2. One layer-2 C4A trace.
+3. One layer-3 C128A trace.
+4. A complete 3-layer prefix containing layers 0-2.
+5. The complete 43-layer base decoder on a short deterministic token-ID
+   sequence.
+6. Longer positions crossing 128 and compressed boundaries.
+
+The trusted reference may be a one-layer or selected-layer harness built from
+the checked-in source/reference implementation when the full checkpoint cannot
+fit in the local reference runtime. A text-only external API comparison is
+useful but cannot replace intermediate tensor or logit evidence.
+
+Acceptance criteria:
+
+- CPU oracle and independent reference agree on the selected layer traces.
+- HIP and CPU oracle agree within the fixed dtype tolerance. Thresholds are
+  declared before the run and are not changed per failing layer.
+- For identical model revision, token IDs, and greedy settings, the full-model
+  logits/top-k outputs agree at the recorded checkpoints. Exact token IDs are
+  required when both paths use the same quantized artifact and deterministic
+  arithmetic; otherwise any divergence is explained and recorded.
+- The three most informative failure classes are distinguishable: attention
+  state, weight/dequantization, and output/routing composition.
+- Existing Hot/Warm/Cold tests still pass, demonstrating that the corrected
+  attention state did not invalidate expert residency ownership.
+
+### Stage 8: Text contract and external behavioral gate
+
+**Objective:** Confirm that the corrected base model is being exercised with the
+right prompt format and stopping behavior.
+
+Follow [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md):
+
+1. Use the native DSV4 formatter and tokenizer artifact, not an assumed ChatML
+   format.
+2. Record exact formatted prompt IDs, mode, tokenizer/formatter hashes, model
+   revision, generated IDs, decoded text, and stop reason.
+3. Compare identical formatted IDs with a trusted compatible reference. Use
+   deterministic greedy settings where possible.
+4. Prefer logits/top-k/token IDs over prose-only comparison. An external API
+   match is behavioral evidence, not activation or routing parity.
+5. Include a long answer, arithmetic/exact-format tasks, multi-turn context,
+   and a case that crosses a local/compressed attention boundary.
+
+Acceptance criteria:
+
+- Formatter/tokenizer parity is exact for the existing fixtures.
+- The corrected native path reaches EOS or the declared context/generation
+  limit without feeding EOS back into the model.
+- Any divergence from the trusted reference is classified as prompt contract,
+  weight/quantization, attention state, numerical tolerance, or provider/model
+  revision rather than recorded only as a different sentence.
+- The external gate is recorded with provider/model revision and request
+  parameters. It does not unlock profiling on prose similarity alone.
+
+### Stage 9: Unlock dependent work and handle deferred features
+
+After Stages 0-8 pass:
+
+1. Update `ROUTING_PROFILE_AND_PLACEMENT_STUDY.md` to mark the correctness
+   evidence and exact text contract used by the profile corpus.
+2. Re-run a small routing instrumentation smoke test, then discard or label
+   all pre-correction profiles as invalid for placement decisions.
+3. Build separate profile and held-out corpora using the verified formatter.
+4. Resume Phase 2 cold-tier and placement measurements only after the corrected
+   model is the measured model.
+5. Create a separate MTP execution plan for `num_nextn_predict_layers = 1`,
+   `mtp.*`, and DSpark metadata. Do not fold speculative execution into the
+   base correctness patch.
+6. Add prefix caching only after the cache object can serialize and restore
+   local state, compressor boundaries, compressed entries, indexer metadata,
+   and absolute positions as one transaction.
+
+Acceptance criteria:
+
+- `profile_routing` metadata identifies the correctness plan/gate, model
+  revision, tokenizer/formatter hash, layer schedule, and corrected runtime.
+- No placement conclusion uses a pre-correction trace.
+- MTP and prefix-cache support are either implemented and tested in their own
+  records or explicitly reported as unavailable.
+
+## 7. Test and validation matrix
+
+### CPU-only or host-reference tests
+
+- `test_config_parser`: scalar values, nested YaRN values, and complete array
+  schedule.
+- `test_v4_model_contract`: layer classification, required tensor inventory,
+  and rejection of incompatible schedules.
+- `test_v4_attention_oracle`: SWA/C4A/C128A state transitions and top-k.
+- `test_v4_prefill_state`: one-shot/chunked/serialized equivalence.
+- independent real-tensor dequantization and dense projection tests.
+
+### HIP component tests
+
+Retain and run the existing regression surfaces while extending them with the
+new oracle comparisons:
+
+```text
+test_v4_attention
+test_hc_sinkhorn
+test_moe_router
+test_swiglu_clamp
+test_w4a16_swizzle
+test_w4a16_swizzled_gemv
+test_w4a16_swizzled_dual_gemv
+test_aeon_moe_fused_w13
+test_aeon_moe_fused_w2
+```
+
+### Model-backed tests
+
+Add or extend focused targets for:
+
+```text
+test_v4_layer_parity
+test_v4_full_model_correctness
+test_v4_generation_correctness
+```
+
+Each model-backed test must state context size, artifact identity, model
+revision, residency policy, token IDs, generation settings, and whether it is
+checking a CPU oracle, HIP trace, or external reference.
+
+### Suggested local commands
+
+```bash
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure -R 'test_(config_parser|v4_attention|hc_sinkhorn|moe_router|w4a16|aeon_moe)'
+ctest --test-dir build --output-on-failure -R 'test_(v4_|hot_warm_cold_pipeline|text_generation)'
+```
+
+Run model-backed HIP tests on the intended gfx1100 device. Record any unavailable
+external reference separately; an unavailable reference blocks the final claim
+of full correctness but does not block CPU-oracle and component work.
+
+## 8. Artifacts and reporting required at each gate
+
+Every completed stage must leave compact, reproducible evidence:
+
+- config and tensor inventory hashes;
+- reference checkout revision;
+- test command and hardware identity;
+- token IDs and absolute positions;
+- layer class and compression ratio;
+- cache valid counts and boundary decisions;
+- top-k indexer selections where applicable;
+- max absolute error, RMS error, and exact token/top-k agreement;
+- whether weights were CPU reference, native HIP, or external reference;
+- failure classification and next action when a gate fails.
+
+Update [PERFORMANCE_LEDGER.md](../../status/PERFORMANCE_LEDGER.md) only for
+meaningful silicon measurements. Correctness traces belong in the focused test
+artifacts or a dedicated correctness output directory, not in benchmark prose.
+
+## 9. Non-goals and stop conditions
+
+This plan does not authorize:
+
+- changing the version-2 swizzled expert format;
+- replacing symmetric INT4 with an inferred FP4/MXFP4 decoder;
+- adding Python, PyTorch, vLLM, or an external service as a runtime dependency;
+- optimizing storage, expert placement, or multi-GPU scheduling before the base
+  model gate;
+- replacing CSA/HCA with full attention or a larger sliding window as a claimed
+  correctness workaround;
+- treating a readable generated answer as proof of model parity;
+- adding universal model abstractions before the V4 state machine is proven.
+
+Stop and resolve the discrepancy when:
+
+- the checkpoint tensor names/shapes do not match the assumed compressor or
+  indexer contract;
+- vLLM/source/config disagree on a boundary or position convention;
+- a required tensor is absent from the `.aeon` dense inventory;
+- CPU oracle and independent reference disagree before HIP is involved;
+- top-k selection differs even when attention output happens to look plausible;
+- prefill chunking changes a compressed state or next-token result;
+- a performance change makes correctness failures disappear without identifying
+  the semantic cause.
+
+## 10. Relationship to existing plans
+
+- [PHASE_2_EXECUTION_PLAN.md](PHASE_2_EXECUTION_PLAN.md) remains paused for
+  cold-tier, layout, host-pressure, and latency-hiding work.
+- [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md)
+  remains the owner of tokenizer, formatter, EOS, and external behavioral
+  comparison work.
+- [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)
+  remains locked until this plan's final gate passes.
+- [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](BACKEND_GENERALIZATION_EXECUTION_PLAN.md)
+  remains the owner of artifact/backend boundaries. This plan consumes the
+  current swizzled backend; it does not generalize the V4 graph.
+- [DOCUMENTATION_STATUS.md](../../status/DOCUMENTATION_STATUS.md) and
+  `AGENTS.md` must be updated when this plan changes state.

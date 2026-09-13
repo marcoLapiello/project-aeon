@@ -1,6 +1,6 @@
 # Project Aeon Documentation Status
 
-Status audited on 2026-09-12 against the current source tree.
+Status audited on 2026-09-13 against the current source tree.
 
 This file is the navigation point for project state. Detailed benchmark numbers belong in [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md); design rationale belongs in the reference and vision documents; this file and [AGENTS.md](../../AGENTS.md) should stay concise.
 
@@ -21,6 +21,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 | [WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) | Complete | Persistent Warm ownership, asynchronous refill, transfer safety, corrected demotion accounting, source-tier telemetry, and five-run silicon A/B are complete; configured capacity is eager while preload publication is content-lazy; see the [closure report](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md). |
 | [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md) | Paused | Paused single-GPU cold-tier, storage-layout, and memory-pressure work. Spikes 0-2 are complete; Spike 3 has a bounded implementation but open acceptance gates. |
 | [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](../execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) | Open | Native text path is implemented; external behavioral comparison and longer-context attention correctness remain open. |
+| [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) | Open; current priority | Restores the selected 0731 base-decoder contract: config-driven layer schedule, CSA/HCA/indexer state, compressed RoPE, prefill continuity, and trusted-reference parity. |
 | [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) | Open; evidence gated | Routing observer and durable profiler are implemented; representative profile/held-out data and placement evaluation remain gated by model correctness. |
 | [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) | Open; foundation implemented | Descriptor-driven native artifacts, opaque expert supply, manifest sidecar, backend capability selection, V4 dense binding, and source ownership boundaries are implemented; explicit factory, semantic dispatch, and second-backend gates remain open. |
 | [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Living record | Authoritative silicon results, regressions, and milestone measurements. |
@@ -51,7 +52,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 
 ## Open work
 
-1. **Correctness:** compare identical formatted IDs and outputs against a trusted compatible reference; implement and validate compressed/indexed attention for longer-context layers 2-42.
+1. **Correctness:** execute [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md): validate the checkpoint contract, implement layer-specific SWA/CSA/HCA state and compressed RoPE, prove prefill continuity, then compare identical formatted IDs and outputs against a trusted compatible reference.
 2. **Cold tier:** characterize cold-cache and steady-state behavior, improve physical `.aeon` placement/extent layout, reduce host-memory pressure, and decide whether further scheduling or CPU fallback work is justified by measurements.
 3. **Swizzled full-model performance:** characterize representative 43-layer version-2 generation under controlled Hot/Warm conditions, collect useful rocprof counters, and tune occupancy/register pressure beyond the isolated kernel measurements.
 4. **Placement study:** collect profile and held-out corpora with the verified text contract, then compare measured placement against dynamic LRU. Do not use the existing pilot for placement decisions.

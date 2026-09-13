@@ -16,6 +16,7 @@ Use [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) for th
 Current execution records:
 - [Phase 2 Execution Plan](plans-and-docs/execution/active/PHASE_2_EXECUTION_PLAN.md): paused single-GPU Hot/Warm/Cold runtime and remaining cold-tier work.
 - [Native Text-In/Text-Out Plan](plans-and-docs/execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md): native frontend status and correctness gates.
+- [Model Correctness Execution Plan](plans-and-docs/execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md): config-driven SWA/CSA/HCA/indexer recovery, compressed RoPE, prefill state, and trusted-reference parity gates.
 - [Routing Profile Study](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md): profiler contract and placement-study gates.
 - [Backend Generalization Execution Plan](plans-and-docs/execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md): descriptor-driven artifact and expert-supply boundary; manifest and second-backend gates.
 - [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md): authoritative silicon measurements.
@@ -40,7 +41,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 ---
 
 ## 3. Progress Tracking & State of Execution
-*Status: 2026-09-12. Keep this summary current; put detailed measurements and historical execution notes in the linked documents.*
+*Status: 2026-09-13. Keep this summary current; put detailed measurements and historical execution notes in the linked documents.*
 
 ### Completed milestones
 - [x] Phase 0-2 foundations: single-GPU runtime gates; lossless Safetensors-to-`.aeon` conversion with sector-aligned indexing and bit-exact verification; dynamic Hot/Warm/Cold storage, direct `io_uring`, asynchronous SDMA staging, residency management, and 43-layer regression coverage.
@@ -51,7 +52,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [x] Warm-tier repair and supply telemetry: persistent Warm ownership, event-ordered refill, lazy/eager preload modes, transactional transfer cleanup, pinned fallback handling, source-tier JSONL telemetry, and controlled silicon A/B validation are recorded in [the closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
 
 ### Current priority
-- [ ] **Model correctness:** implement and validate the missing CSA/HCA attention, compressed Prefill state, configured RoPE/YaRN behavior, and trusted-reference parity before using routing data for placement decisions.
+- [ ] **Model correctness:** execute [the model correctness plan](plans-and-docs/execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md): recover the checkpoint-driven SWA/CSA/HCA/indexer graph, compressed prefill state, configured RoPE/YaRN behavior, and trusted-reference parity before using routing data for placement decisions.
 
 ### Paused work
 - [ ] **Phase 2 continuation:** broad cold-tier, storage-layout, placement, and latency-hiding work remains paused while model correctness and the 35 GiB host-pressure tradeoff are characterized. The existing Phase 2 document remains the historical execution record for completed spikes and open gates.
