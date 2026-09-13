@@ -11,8 +11,35 @@
 #include <iostream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace aeon::core {
+
+struct V4LayerStateSnapshot {
+    uint32_t local_valid_count{0};
+    uint32_t compressor_partial_count{0};
+    uint32_t compressed_entry_count{0};
+    uint32_t indexer_candidate_count{0};
+
+    std::vector<uint8_t> local_key_cache;
+    std::vector<uint8_t> local_value_cache;
+    std::vector<uint8_t> local_positions;
+    std::vector<uint8_t> compressed_key_cache;
+    std::vector<uint8_t> compressed_value_cache;
+    std::vector<uint8_t> compressed_positions;
+    std::vector<uint8_t> compressor_partial_kv;
+    std::vector<uint8_t> compressor_partial_score;
+    std::vector<uint8_t> compressor_partial_positions;
+    std::vector<uint8_t> indexer_key_cache;
+    std::vector<uint8_t> indexer_positions;
+    std::vector<uint8_t> indexer_partial_kv;
+    std::vector<uint8_t> indexer_partial_score;
+    std::vector<uint8_t> indexer_partial_positions;
+    std::vector<uint8_t> indexer_query;
+    std::vector<uint8_t> indexer_weights;
+    std::vector<uint8_t> indexer_scores;
+    std::vector<uint8_t> indexer_topk_indices;
+};
 
 // Device Context and Weights for One Complete Transformer Block
 class V4Layer : public V4DenseWeightBinding {
@@ -120,6 +147,67 @@ public:
         return state_layout_.local_capacity;
     }
 
+    V4LayerStateSnapshot snapshot_state() const {
+        V4LayerStateSnapshot snapshot;
+        const size_t indexer_key_bytes = state_layout_.uses_indexer()
+            ? state_layout_.indexer_key_bytes() : 0;
+        const size_t indexer_metadata_bytes = state_layout_.uses_indexer()
+            ? state_layout_.indexer_metadata_bytes() : 0;
+        const size_t indexer_partial_vector_bytes = state_layout_.uses_indexer()
+            ? state_layout_.indexer_partial_vector_bytes() : 0;
+        const size_t indexer_partial_metadata_bytes = state_layout_.uses_indexer()
+            ? state_layout_.indexer_partial_metadata_bytes() : 0;
+        const size_t indexer_query_bytes = state_layout_.uses_indexer()
+            ? state_layout_.indexer_query_bytes() : 0;
+        const size_t indexer_weights_bytes = state_layout_.uses_indexer()
+            ? state_layout_.indexer_weights_bytes() : 0;
+        const size_t indexer_scores_bytes = state_layout_.uses_indexer()
+            ? state_layout_.indexer_scores_bytes() : 0;
+        const size_t indexer_topk_bytes = state_layout_.uses_indexer()
+            ? state_layout_.indexer_topk_bytes() : 0;
+        snapshot.local_valid_count = local_valid_count_;
+        snapshot.compressor_partial_count = compressor_partial_count_;
+        snapshot.compressed_entry_count = compressed_entry_count_;
+        snapshot.indexer_candidate_count = indexer_candidate_count_;
+        snapshot.local_key_cache = copy_state_bytes(
+            d_local_key_cache, state_layout_.local_vector_bytes());
+        snapshot.local_value_cache = copy_state_bytes(
+            d_local_value_cache, state_layout_.local_vector_bytes());
+        snapshot.local_positions = copy_state_bytes(
+            d_local_positions, state_layout_.local_metadata_bytes());
+        snapshot.compressed_key_cache = copy_state_bytes(
+            d_compressed_key_cache, state_layout_.compressed_vector_bytes());
+        snapshot.compressed_value_cache = copy_state_bytes(
+            d_compressed_value_cache, state_layout_.compressed_vector_bytes());
+        snapshot.compressed_positions = copy_state_bytes(
+            d_compressed_positions, state_layout_.compressed_metadata_bytes());
+        snapshot.compressor_partial_kv = copy_state_bytes(
+            d_compressor_partial_kv, state_layout_.compressor_partial_vector_bytes());
+        snapshot.compressor_partial_score = copy_state_bytes(
+            d_compressor_partial_score, state_layout_.compressor_partial_vector_bytes());
+        snapshot.compressor_partial_positions = copy_state_bytes(
+            d_compressor_partial_positions, state_layout_.compressor_partial_metadata_bytes());
+        snapshot.indexer_key_cache = copy_state_bytes(
+            d_indexer_key_cache, indexer_key_bytes);
+        snapshot.indexer_positions = copy_state_bytes(
+            d_indexer_positions, indexer_metadata_bytes);
+        snapshot.indexer_partial_kv = copy_state_bytes(
+            d_indexer_partial_kv, indexer_partial_vector_bytes);
+        snapshot.indexer_partial_score = copy_state_bytes(
+            d_indexer_partial_score, indexer_partial_vector_bytes);
+        snapshot.indexer_partial_positions = copy_state_bytes(
+            d_indexer_partial_positions, indexer_partial_metadata_bytes);
+        snapshot.indexer_query = copy_state_bytes(
+            d_indexer_query, indexer_query_bytes);
+        snapshot.indexer_weights = copy_state_bytes(
+            d_indexer_weights, indexer_weights_bytes);
+        snapshot.indexer_scores = copy_state_bytes(
+            d_indexer_scores, indexer_scores_bytes);
+        snapshot.indexer_topk_indices = copy_state_bytes(
+            d_indexer_topk_indices, indexer_topk_bytes);
+        return snapshot;
+    }
+
     void record_position(uint64_t position) {
         if (position >= max_seq_len_) {
             throw std::out_of_range("V4Layer: position exceeds configured context capacity");
@@ -171,6 +259,17 @@ public:
 private:
     V4LayerSpec model_spec_{};
     V4LayerStateLayout state_layout_{};
+
+    template<typename T>
+    static std::vector<uint8_t> copy_state_bytes(const T* pointer, size_t bytes) {
+        if (bytes == 0) return {};
+        if (pointer == nullptr) {
+            throw std::runtime_error("V4Layer: state snapshot encountered a null device buffer");
+        }
+        std::vector<uint8_t> host(bytes);
+        CHECK_HIP(hipMemcpy(host.data(), pointer, bytes, hipMemcpyDeviceToHost));
+        return host;
+    }
 
     template<typename T>
     static void allocate_state_buffer(T*& pointer, size_t bytes) {

@@ -212,6 +212,14 @@ set_tests_properties(test_v4_stage4_trace PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 300)
 
+# Stage 5 model-backed validation: serialized and chunked prefill state equivalence
+add_executable(test_v4_prefill_state tests/test_v4_prefill_state.cpp)
+target_link_libraries(test_v4_prefill_state PRIVATE amdhip64)
+add_test(NAME test_v4_prefill_state COMMAND test_v4_prefill_state)
+set_tests_properties(test_v4_prefill_state PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 900)
+
 # Stage 0 evidence: validated model contract and complete dense tensor inventory
 add_executable(aeon_model_contract tools/aeon_model_contract.cpp)
 target_link_libraries(aeon_model_contract PRIVATE amdhip64)

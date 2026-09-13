@@ -38,6 +38,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -54,6 +55,22 @@
 #endif
 
 namespace aeon::core {
+
+struct V4PipelineStateSnapshot {
+    uint32_t current_seq_len{0};
+    std::vector<V4LayerStateSnapshot> layers;
+};
+
+enum class V4PrefillExecutionPath : uint8_t {
+    Batched,
+    SerializedFallback,
+};
+
+struct V4PrefillResult {
+    uint32_t next_token{0};
+    size_t token_count{0};
+    V4PrefillExecutionPath execution_path{V4PrefillExecutionPath::SerializedFallback};
+};
 
 // Complete DeepSeek-V4 Autoregressive Multi-Layer Pipeline Engine
 class V4Pipeline {
@@ -95,6 +112,7 @@ public:
     std::vector<hipEvent_t> routed_section_stop_events_;
     std::vector<hipEvent_t> expert_compute_start_events_;
     std::vector<hipEvent_t> expert_compute_stop_events_;
+    bool deterministic_expert_accumulation_{false};
 
     V4Pipeline() = default;
 
@@ -183,6 +201,17 @@ public:
         return attention_trace_records_;
     }
 
+    V4PipelineStateSnapshot snapshot_generation_state() const {
+        if (compute_stream) CHECK_HIP(hipStreamSynchronize(compute_stream));
+        V4PipelineStateSnapshot snapshot;
+        snapshot.current_seq_len = current_seq_len_;
+        snapshot.layers.reserve(layers.size());
+        for (const auto& layer : layers) {
+            snapshot.layers.push_back(layer->snapshot_state());
+        }
+        return snapshot;
+    }
+
     uint32_t context_capacity() const {
         return layers.empty() ? 0 : layers.front()->max_seq_len_;
     }
@@ -197,6 +226,7 @@ public:
         std::cout << "================================================================================" << std::endl;
 
         current_seq_len_ = 0;
+        deterministic_expert_accumulation_ = runtime_cfg.deterministic_expert_accumulation;
         // 1. Initialize streams
         initialize_streams();
 
@@ -1050,15 +1080,41 @@ public:
                 scratch.d_swizzled_moe_accum_f32,
                 H,
                 6, INTER_DIM, H, 10.0f, compute_stream);
-            kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
-                scratch.d_swizzled_expert_hidden,
-                fused_w2,
-                scratch.d_topk_weights,
-                scratch.d_moe_accum,
-                scratch.d_swizzled_moe_accum_f32,
-                scratch.d_moe_accum,
+            CHECK_HIP(hipMemsetAsync(
                 scratch.d_swizzled_counters,
-                6, H, INTER_DIM, compute_stream);
+                0,
+                64 * sizeof(int32_t),
+                compute_stream));
+            if (deterministic_expert_accumulation_) {
+                for (int expert = 0; expert < 6; ++expert) {
+                    kernel::dispatch_aeon_w4a16_swizzled_gemv<8, 8, 4, 16>(
+                        scratch.d_swizzled_expert_hidden + static_cast<size_t>(expert) * INTER_DIM,
+                        reinterpret_cast<const uint32_t*>(fused_w2.w2[expert]),
+                        fused_w2.s2[expert],
+                        scratch.d_expert_down,
+                        H,
+                        INTER_DIM,
+                        compute_stream);
+                    hipLaunchKernelGGL(
+                        kernel::v4_pipeline_accumulate_expert_kernel,
+                        dim3((H + 255) / 256), dim3(256), 0, compute_stream,
+                        scratch.d_moe_accum,
+                        scratch.d_expert_down,
+                        h_topk_weights[expert],
+                        H
+                    );
+                }
+            } else {
+                kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
+                    scratch.d_swizzled_expert_hidden,
+                    fused_w2,
+                    scratch.d_topk_weights,
+                    scratch.d_moe_accum,
+                    scratch.d_swizzled_moe_accum_f32,
+                    scratch.d_moe_accum,
+                    scratch.d_swizzled_counters,
+                    6, H, INTER_DIM, compute_stream);
+            }
 
             if (expert_timing_enabled_) {
                 const size_t event_index = static_cast<size_t>(l);
@@ -1161,6 +1217,49 @@ public:
         }
     }
 
+    uint32_t prefill(std::span<const uint32_t> token_ids, uint32_t start_position = 0) {
+        validate_prefill_span(token_ids, start_position);
+
+        uint32_t next_token = 0;
+        for (size_t index = 0; index < token_ids.size(); ++index) {
+            next_token = step(
+                token_ids[index],
+                start_position + static_cast<uint32_t>(index),
+                RoutingPhase::Prefill);
+        }
+        return next_token;
+    }
+
+    V4PrefillResult prefill_batched(
+        std::span<const uint32_t> token_ids,
+        uint32_t start_position = 0,
+        size_t requested_batch_size = 16,
+        bool allow_serialized_fallback = true
+    ) {
+        validate_prefill_span(token_ids, start_position);
+        if (requested_batch_size == 0) {
+            throw std::invalid_argument(
+                "V4Pipeline::prefill_batched: requested batch size must be greater than zero");
+        }
+        if (!allow_serialized_fallback) {
+            throw std::runtime_error(
+                "V4Pipeline::prefill_batched: true batched execution is not available for the current V4 state path");
+        }
+
+        uint32_t next_token = 0;
+        for (size_t offset = 0; offset < token_ids.size(); offset += requested_batch_size) {
+            const size_t count = std::min(requested_batch_size, token_ids.size() - offset);
+            next_token = prefill(
+                token_ids.subspan(offset, count),
+                start_position + static_cast<uint32_t>(offset));
+        }
+        return V4PrefillResult{
+            next_token,
+            token_ids.size(),
+            V4PrefillExecutionPath::SerializedFallback
+        };
+    }
+
     // Prefill Prompt and Generate Next Tokens
     std::vector<uint32_t> generate(
         const std::vector<uint32_t>& prompt,
@@ -1175,10 +1274,7 @@ public:
 
         // Prefill Phase
         auto t_prefill_start = std::chrono::high_resolution_clock::now();
-        uint32_t next_tok = 0;
-        for (size_t i = 0; i < prompt.size(); ++i) {
-            next_tok = step(prompt[i], static_cast<uint32_t>(i), RoutingPhase::Prefill);
-        }
+        uint32_t next_tok = prefill(std::span<const uint32_t>(prompt), 0);
         auto t_prefill_end = std::chrono::high_resolution_clock::now();
 
         double ttft_ms = std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
@@ -1290,6 +1386,23 @@ public:
     }
 
 private:
+    void validate_prefill_span(
+        std::span<const uint32_t> token_ids,
+        uint32_t start_position
+    ) const {
+        if (token_ids.empty()) {
+            throw std::invalid_argument("V4Pipeline::prefill: token span must not be empty");
+        }
+        if (start_position != current_seq_len_) {
+            throw std::invalid_argument(
+                "V4Pipeline::prefill: start position must continue the current generation state");
+        }
+        const uint64_t end_position = static_cast<uint64_t>(start_position) + token_ids.size();
+        if (end_position > context_capacity()) {
+            throw std::out_of_range("V4Pipeline::prefill: token span exceeds configured context capacity");
+        }
+    }
+
     template<typename T>
     void queue_trace_copy(std::vector<T>& destination, const T* source, size_t count) {
         destination.resize(count);

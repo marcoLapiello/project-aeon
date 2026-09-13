@@ -39,6 +39,10 @@ struct AeonRuntimeConfig {
     // Diagnostic A/B control. The production default keeps asynchronous refill enabled.
     bool enable_warm_refill{true};
 
+    // Correctness-mode control for deterministic routed-expert accumulation.
+    // The production default retains the fused atomic accumulation path.
+    bool deterministic_expert_accumulation{false};
+
     // Hardware target device index
     int device_id{0};
 

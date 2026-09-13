@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
 **Date:** 2026-09-13  
-**Status:** Open; Stages 0-4 serial semantics complete; Stage 5 prefill equivalence next
+**Status:** Open; Stages 0-4 serial semantics complete; Stage 5 serialized/chunk equivalence subgate complete; true batched prefill next
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -859,6 +859,62 @@ Acceptance criteria:
   routing state.
 - The batched path has a traceable fallback to the serialized oracle path for
   unsupported shapes; no silent semantic substitution is allowed.
+
+### Stage 5 serialized/chunk-equivalence implementation record (2026-09-13)
+
+The first Stage 5 subgate is complete. `V4Pipeline::prefill()` now accepts a
+token span and absolute starting position, rejects gaps and context overflow,
+and advances the same state machine used by `step()`. `generate()` uses this
+API for prompt processing. `snapshot_generation_state()` exposes local,
+compressor, compressed, indexer, and top-k state so chunk boundaries can be
+checked directly rather than inferred from the final token alone.
+
+`tests/test_v4_prefill_state.cpp` validates a 132-token real-model prompt
+through position 131 with repeated one-shot replay, serialized one-token
+append, aligned 4-token and 128-token chunks, and boundary splits at
+`[1, 3, 4, 7, 16, 127, 128, 132]`. It compares metadata exactly, FP16 state
+at `0.02`, FP32 state at `0.002` (indexer scores at `0.1`), logits at `0.02`,
+and greedy token IDs exactly. Reset clears all persistent attention state and a
+nonzero starting position is rejected.
+
+The model-backed test uses the proven 35 GiB Warm profile by default on the
+64 GiB host and accepts a GiB command-line argument; `0` remains the explicit
+cold-only control. The selected package initialized with 675 Hot slots, 2,642
+Warm slots, and 7,691 Cold slots on the RX 7900 XTX. This is a test resource
+policy, not an attention-semantic requirement: the earlier `warm_host_bytes =
+0` setting forced every non-Hot expert through the SSD path and made repeated
+equivalence runs unnecessarily slow.
+
+The fused six-expert W2 path uses floating-point `atomicAdd`, which is not
+replay-stable enough for exact chunk-equivalence evidence. The test therefore
+enables the new opt-in deterministic routed-expert accumulation mode, which
+uses the existing single-expert W2 GEMV and sequential accumulation kernels;
+the production default remains the fused path. A per-launch W2 completion
+counter reset is also issued on the compute stream for both modes.
+
+Validation on Radeon RX 7900 XTX (`gfx1100`):
+
+```text
+cmake --build build --parallel
+./build/bin/test_v4_prefill_state
+ctest --test-dir build --output-on-failure -R '^(test_aeon_moe_fused_w2|test_v4_prefill_state|test_v4_stage4_dispatch|test_v4_stage4_trace|test_dynamic_expert_pool|test_hot_warm_cold_pipeline|test_text_generation)$'
+```
+
+The Stage 5 test and all affected regressions passed. This closes the
+serialized, aligned, and unaligned state-equivalence subgate and the explicit
+serialized-fallback contract; a true multi-token prefill kernel remains open.
+For the complete five-schedule correctness run, the explicit cold-only control
+took `283.49 s` and the 35 GiB Warm profile took `205.55 s` on the same device,
+a `27.5%` reduction. This is a resource-policy measurement for test runtime,
+not a model-throughput result.
+
+The public `prefill_batched()` contract now makes that boundary explicit. It
+accepts a requested batch size, reports whether execution used a true batched
+path or `SerializedFallback`, and can reject fallback when a caller requires a
+real batch. The current V4 state machine reports `SerializedFallback` for all
+multi-token requests; the request is still checked for contiguous positions,
+context capacity, and state equivalence. The padded `M=16` scratch allocation
+is therefore no longer evidence of a hidden batched implementation.
 
 ### Stage 6: Port the validated branches to HIP on silicon
 
