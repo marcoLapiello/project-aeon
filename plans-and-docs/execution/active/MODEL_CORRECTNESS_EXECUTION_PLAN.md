@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
 **Date:** 2026-09-13  
-**Status:** Open; Stage 0 complete; Stage 1 next
+**Status:** Open; Stage 0 complete; Stage 1 weight/dense gate complete; Stage 2 next
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -433,6 +433,60 @@ the following frozen identities:
 
 The MTP tensors are inventoried but remain outside the base-decoder execution
 contract. No DSpark tensors are present in the selected dense artifact.
+
+### Stage 1 implementation record (2026-09-13)
+
+The independent weight and dense-operation gate is complete for the selected
+Aeon package. The new host reference boundary in
+`src/architecture/deepseek_v4/reference/v4_int4_reference.hpp` decodes the
+serialized version-2 expert layout from logical row/group coordinates, including
+the swizzled nibble permutation, symmetric group-32 values, and FP16 scales. It
+does not call the production swizzle or GEMV helpers.
+
+The model-backed tests are:
+
+```text
+tests/test_v4_real_expert_parity.cpp
+tests/test_v4_real_dense_parity.cpp
+```
+
+The expert test samples expert IDs `0, 1, 7, 31, 127, 255` from layers 0, 21,
+and 42. It compares independent CPU W1/W2/W3 vectors, clamped SwiGLU, and a
+six-expert weighted routed FFN against the native swizzled Wave32 path using
+fixed FP16 activations. The dense test covers layers 0, 2, and 3, including
+attention projections, grouped `wo_a`, `wo_b`, RMSNorms, shared experts, the
+router, both HC projection/Sinkhorn paths, the final RMSNorm, and all 129,280
+LM-head rows.
+
+The declared test tolerances are fixed rather than selected per layer:
+
+| Comparison | Tolerance |
+| --- | ---: |
+| Expert/dense FP16 projection | `0.005 + 0.001 * max(1, abs(reference))` |
+| Routed FFN/SwiGLU | `0.01 + 0.002 * max(1, abs(reference))` |
+| HC and RMSNorm outputs | `0.002 + 0.001 * max(1, abs(reference))` |
+
+On the Radeon RX 7900 XTX (`gfx1100`), both tests passed. Maximum observed
+errors were approximately `2.24e-4` for sampled expert projections,
+`5.55e-6` for weighted routed FFN output, `4.87e-4` for dense RMSNorm, and
+`1.94e-3` for the full LM head. The source converter's existing
+`verify_swizzled_expert_payload()` remains the source-to-artifact bit-exact
+conversion check; the new test additionally exercises artifact-to-host and
+artifact-to-VRAM views through the native kernels.
+
+Evidence identities for this run:
+
+| Evidence | Value |
+| --- | --- |
+| Aeon baseline commit | `ab908040289d146f809cbaee5434b10a6ad527e8` |
+| Model config SHA-256 | `3911161a028fa2818b22ffff82dc2dad212aafeff32a66698ef7d154dea9d6a1` |
+| Model manifest SHA-256 | `717bc27a36329524a9e716da9aecfc2d942c482e32e2b3fe23345b58b78144fe4` |
+| Source snapshot | `64700592cadaf205fe0c13202061ff4b45afbfd0` |
+| vLLM reference | `94848eda600a07c28675f5753a11b2c212c146ed` |
+
+This closes the weight/dequantization and dense-operation gate only. It does
+not establish layer-semantic correctness, compressed cache behavior, prefill
+equivalence, or full-model parity. Stage 2 remains the next workstream.
 
 ### Stage 1: Close the independent weight and dense-operation gate
 

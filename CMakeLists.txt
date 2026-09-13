@@ -132,6 +132,18 @@ target_link_libraries(test_aeon_moe_fused_w2 PRIVATE amdhip64)
 add_test(NAME test_aeon_moe_fused_w2 COMMAND test_aeon_moe_fused_w2)
 set_tests_properties(test_aeon_moe_fused_w2 PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Stage 1 model-backed validation: independent real INT4 expert parity
+add_executable(test_v4_real_expert_parity tests/test_v4_real_expert_parity.cpp)
+target_link_libraries(test_v4_real_expert_parity PRIVATE amdhip64)
+add_test(NAME test_v4_real_expert_parity COMMAND test_v4_real_expert_parity)
+set_tests_properties(test_v4_real_expert_parity PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Stage 1 model-backed validation: independent real dense projection parity
+add_executable(test_v4_real_dense_parity tests/test_v4_real_dense_parity.cpp)
+target_link_libraries(test_v4_real_dense_parity PRIVATE amdhip64)
+add_test(NAME test_v4_real_dense_parity COMMAND test_v4_real_dense_parity)
+set_tests_properties(test_v4_real_dense_parity PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Benchmark: six separate routed W1/W3/SwiGLU paths versus one fused dispatch
 add_executable(bench_aeon_moe_fused_w13 tests/bench_aeon_moe_fused_w13.cpp)
 target_link_libraries(bench_aeon_moe_fused_w13 PRIVATE amdhip64)
