@@ -30,7 +30,7 @@ The current split is `src/architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp` 
 kernels, `src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp` for scratch ownership,
 `src/architecture/deepseek_v4/core/v4_layer.hpp` for layer-local structures,
 `src/architecture/deepseek_v4/core/v4_model_resources.hpp` for model-level device resources, and
-`src/architecture/deepseek_v4/core/v4_expert_supply.hpp` for transfer and prefetch coordination.
+`src/infrastructure/core/tiered_expert_supply.hpp` plus its V4 adapter for transfer and prefetch coordination.
 Production residency is handled by `UnifiedVRAMExpertPool`, `HostExpertPool`, and `ExpertRegistry`.
 
 These were separate concerns even though they originally participated in one
@@ -38,40 +38,18 @@ header-only implementation; the current ownership split is described above.
 
 ## Duplication Findings
 
-### Transformer block representation
+### Retired transformer block reference path
 
-There is substantial conceptual overlap between `V4Layer` in
-`src/architecture/deepseek_v4/core/v4_pipeline.hpp` and the following types in
-`src/architecture/deepseek_v4/core/v4_block.hpp`:
-
-- `DeepSeekV4BlockWeights`
-- `DeepSeekV4BlockDeviceContext`
-- `cpu_v4_block_forward`
-
-Both paths describe the same attention and FFN topology, including:
-
-- Hyper-Connections weights.
-- Attention and FFN normalization weights.
-- MLA projections (`wq_a`, `wq_b`, `wkv`, `wo_a`, and `wo_b`).
-- Attention sink values.
-- RoPE resources.
-- Intermediate activation buffers.
-
-This is not currently a direct implementation duplicate. `v4_block.hpp` is a
-CPU/reference-oriented path, while `V4Layer` is part of the production
-token-at-a-time GPU pipeline and also owns KV-cache and expert-tier state.
-However, the model block is represented twice, which creates a maintenance
-risk when tensor names, dimensions, or block behavior change.
-
-Recommended direction: define shared logical block metadata or weight naming
-constants, while keeping separate CPU-reference and GPU-runtime resource
-representations. Do not merge the two execution paths prematurely.
+The former standalone block representation duplicated production V4 weight and
+scratch concepts for a synthetic CPU/reference-oriented validation path. It was
+retired during cleanup because it was not part of the runtime or default test
+suite. The model-correctness milestone should create a new trusted-reference
+harness against the current pipeline rather than revive that representation.
 
 ### Scratch-buffer ownership
 
-`PipelineScratchBuffers` in `v4_pipeline.hpp` and
-`DeepSeekV4BlockDeviceContext` in `v4_block.hpp` independently allocate many
-of the same categories of activation buffers:
+The former standalone block path and `PipelineScratchBuffers` independently
+allocated many of the same categories of activation buffers:
 
 - `d_x_pre` and `d_x_norm`.
 - `d_qa`, `d_qa_norm`, `d_q`, and `d_kv`.
@@ -176,7 +154,6 @@ types:
 - `V4Pipeline::free_all()`.
 - `GlobalVRAMExpertPool::free()`.
 - `HostExpertPool::free()`.
-- `DeepSeekV4BlockDeviceContext::free()`.
 
 `CHECK_HIP` is also defined in both `v4_pipeline.hpp` and
 `vram_expert_pool.hpp`. The production expert-pool classes already have clearer
@@ -202,8 +179,8 @@ The mechanical sequence was completed as follows:
 6. [ ] Revisit a deeper `step()` extraction only if it removes real complexity;
    the current header boundary is not an active correctness blocker.
 7. [x] Keep `generate()` as the public orchestration API.
-8. [ ] Revisit shared shape/metadata contracts with `v4_block.hpp` only when a
-   concrete duplication affects an active change.
+8. [ ] Build a trusted-reference parity harness for the current pipeline as part
+   of the model-correctness milestone.
 
 The extraction preserved public member names where practical because current
 tests inspect `pipeline.layers` and `pipeline.expert_registry_` directly.

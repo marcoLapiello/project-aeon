@@ -105,7 +105,7 @@ The current backend remains validated by:
 - `test_dynamic_expert_pool`: descriptor-driven budget, opaque payload DMA,
   swizzled-view guarding, and end-to-end dynamic pipeline execution;
 - `test_expert_registry_warm_state`: Warm ownership and staging transitions;
-- `test_direct_io`: default 4 KiB sector validation;
+- `test_model_direct_io`: model-backed 4 KiB sector and direct-read validation;
 - `test_hot_warm_cold_pipeline`: full-model silicon Hot/Warm/Cold pipeline smoke;
 - `ctest --test-dir build -R 'test_aeon_(loader|swizzled_loader)'`.
 

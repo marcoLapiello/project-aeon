@@ -68,7 +68,7 @@ Standard file operations (`mmap`, `read`, `fread`) route I/O through the Linux k
    * Pre-register memory buffers using `io_uring_register_buffers()` to eliminate page-pinning overhead on every I/O transaction.
 2. **Strict Storage Sector Alignment in Binary Formats:**
    * `O_DIRECT` requires file offsets, memory addresses, and read lengths to be strictly aligned to physical storage block boundaries (typically 4096 bytes).
-   * The offline layout conversion tool (`prepare_rdna.py`) must inject deterministic padding between tensor headers and expert weights to guarantee 4KB boundary alignment.
+   * The offline layout conversion tool (`convert_safetensors_to_aeon.py`) must inject deterministic padding between tensor headers and expert weights to guarantee 4KB boundary alignment.
 
 ---
 

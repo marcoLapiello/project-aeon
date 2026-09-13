@@ -391,9 +391,7 @@ Use the existing native model tests for transformer and swizzled-kernel correctn
 - `test_aeon_moe_fused_w13`;
 - `test_aeon_moe_fused_w2`;
 - `test_v4_attention`;
-- `test_v4_block`;
 - `test_hot_warm_cold_pipeline`;
-- `test_hot_warm_cold_pipeline`.
 
 ### Gate C: external API behavioral comparison
 

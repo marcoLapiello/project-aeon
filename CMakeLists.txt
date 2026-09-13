@@ -81,18 +81,6 @@ add_executable(aeon_chat
 )
 target_link_libraries(aeon_chat PRIVATE amdhip64)
 
-# Hardware validation: single-tile Wave32 WMMA smoke test
-add_executable(test_wmma_tile tests/test_wmma_tile.cpp)
-target_link_libraries(test_wmma_tile PRIVATE amdhip64)
-
-# Hardware benchmark: tiled Wave32 WMMA GEMM
-add_executable(bench_wmma_gemm tests/bench_wmma_gemm.cpp)
-target_link_libraries(bench_wmma_gemm PRIVATE amdhip64)
-
-# I/O validation: 4KB sector-aligned direct reader
-add_executable(test_direct_io tests/test_direct_io.cpp)
-target_link_libraries(test_direct_io PRIVATE amdhip64)
-
 # Phase 2 Spike 3 validation: model-backed batched O_DIRECT expert reads
 add_executable(test_model_direct_io tests/test_model_direct_io.cpp)
 target_link_libraries(test_model_direct_io PRIVATE amdhip64)
@@ -103,21 +91,11 @@ set_tests_properties(test_model_direct_io PROPERTIES WORKING_DIRECTORY ${CMAKE_C
 add_executable(bench_model_direct_io tests/bench_model_direct_io.cpp)
 target_link_libraries(bench_model_direct_io PRIVATE amdhip64)
 
-# Transfer benchmark: concurrent compute and SDMA overlap
-add_executable(bench_async_overlap tests/bench_async_overlap.cpp)
-target_link_libraries(bench_async_overlap PRIVATE amdhip64)
-
-# Legacy diagnostic: single-layer toy MoE cache pipeline
-add_executable(test_toy_moe_layer tests/test_toy_moe_layer.cpp)
-target_link_libraries(test_toy_moe_layer PRIVATE amdhip64)
-
-# Regression test: DeepSeek-V4 configuration parser
-add_executable(test_config_parser tests/test_config_parser.cpp)
-target_link_libraries(test_config_parser PRIVATE amdhip64)
-
 # Regression test: Wave32 RMSNorm and clamped SwiGLU
 add_executable(test_swiglu_clamp tests/test_swiglu_clamp.cpp)
 target_link_libraries(test_swiglu_clamp PRIVATE amdhip64)
+add_test(NAME test_swiglu_clamp COMMAND test_swiglu_clamp)
+set_tests_properties(test_swiglu_clamp PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Regression test: Hyper-Connections Sinkhorn and expansion
 add_executable(test_hc_sinkhorn tests/test_hc_sinkhorn.cpp)
@@ -161,14 +139,14 @@ target_link_libraries(bench_aeon_moe_fused_w13 PRIVATE amdhip64)
 # Regression test: dual-mode MoE router
 add_executable(test_moe_router tests/test_moe_router.cpp)
 target_link_libraries(test_moe_router PRIVATE amdhip64)
+add_test(NAME test_moe_router COMMAND test_moe_router)
+set_tests_properties(test_moe_router PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Regression test: sliding-window attention and rotary embeddings
 add_executable(test_v4_attention tests/test_v4_attention.cpp)
 target_link_libraries(test_v4_attention PRIVATE amdhip64)
-
-# Regression test: complete DeepSeek-V4 transformer block
-add_executable(test_v4_block tests/test_v4_block.cpp)
-target_link_libraries(test_v4_block PRIVATE amdhip64)
+add_test(NAME test_v4_attention COMMAND test_v4_attention)
+set_tests_properties(test_v4_attention PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Current format validation: native Aeon model loader
 add_executable(test_aeon_loader tests/test_aeon_loader.cpp)

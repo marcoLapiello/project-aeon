@@ -125,7 +125,7 @@ Rather than letting host CPUs sit idle during GPU execution, Aeon implements a b
 
 To ensure day-one utility and prevent ecosystem isolation:
 - **No Proprietary Quantization Format:** Aeon rejects the overhead of developing an isolated quantization format. It adopts standard low-bit modalities widely distributed across the open-source ecosystem (e.g., GGUF, Unsloth dynamic quants).
-- **Offline Structural Reorganization:** Aeon introduces a lightweight preprocessing workflow (`prepare_rdna.py`). This utility inspects standard model distributions, deconstructs monolithic MoE tensors into discrete, individually addressable expert blocks, aligns them to 4KB storage hardware sectors, and reorganizes weight memory layouts to match RDNA3 Wave32 register swizzling.
+- **Offline Structural Reorganization:** Aeon uses a lightweight preprocessing workflow (`convert_safetensors_to_aeon.py`). This utility inspects standard model distributions, deconstructs monolithic MoE tensors into discrete, individually addressable expert blocks, aligns them to 4KB storage hardware sectors, and reorganizes weight memory layouts to match RDNA3 Wave32 register swizzling.
 - **Turnkey Integration:** Users retain access to public model hubs and existing quantization pipelines while benefiting from hardware-specific data ordering at runtime.
 
 ---

@@ -84,7 +84,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: WMMA tile error `0.0`; GEMM `25.6 TFLOP/s` at `870 us` for `2048 x 2048`; NVMe `6.33 GB/s`; overlap `24.9 GB/s` with `0.0%` compute jitter
 - **Correctness / service**: FP16 tile and aligned direct-I/O payload checks passed
 - **Conclusion / next gate**: Hardware and storage primitives are usable as baselines; these numbers are not end-to-end inference measurements
-- **Evidence**: `test_wmma_tile.cpp`, `bench_wmma_gemm.cpp`, `test_direct_io.cpp`, `bench_async_overlap.cpp`
+- **Evidence**: historical Phase 0 primitive probes; the probe sources were retired during the source cleanup.
 
 ### M2: Single-GPU Mathematical Primitives (Phase 1 Spikes 1–5)
 - **Run**: `2026-09-07`; component fixtures
@@ -95,7 +95,7 @@ explicit comparison key and pass the entry gate.
 - **Metrics**: projection `140.34 us` (`1.91 TFLOP/s`); RMSNorm error `<8.4e-4`; Sinkhorn error `<5.96e-8`; router top-6 match `100%`; attention `41.91 us` for 16 tokens (`2.62 us/token`); block `1.80 ms/token`, error `0.0033`
 - **Correctness / service**: all named CPU-reference and assignment checks passed their recorded thresholds
 - **Conclusion / next gate**: Mathematical primitives passed; full-model parity remains a separate gate
-- **Evidence**: `test_w4a16_swizzle.cpp`, `test_w4a16_swizzled_gemv.cpp`, `test_swiglu_clamp.cpp`, `test_hc_sinkhorn.cpp`, `test_moe_router.cpp`, `test_v4_attention.cpp`, `test_v4_block.cpp`
+- **Evidence**: `test_w4a16_swizzle.cpp`, `test_w4a16_swizzled_gemv.cpp`, `test_swiglu_clamp.cpp`, `test_hc_sinkhorn.cpp`, `test_moe_router.cpp`, and `test_v4_attention.cpp`; the former standalone block fixture was retired.
 
 ### M3: Autoregressive Pipeline Baseline (Phase 1 Spike 6)
 - **Run**: `2026-09-07`; commit `5e27dd9`; DeepSeek-V4 INT4-W4A16, Safetensors

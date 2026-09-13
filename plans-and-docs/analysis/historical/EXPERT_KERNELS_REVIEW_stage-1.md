@@ -461,7 +461,7 @@ inline void aeon_moe_ffn_fused(const half* d_x, const MoEExpertPtrs& P,
 | Effective BW | 354 GB/s | 700–800 GB/s (target) |
 | Routed GEMM/token | 11 ms | 4.5–5.5 ms |
 
-I want to be explicit: I cannot run this on your hardware, so the bandwidth figure is a design target derived from the roofline, not a measurement. The correctness path, however, is exactly checkable — `unswizzle_w4a16` round-trips bit-identically, and `test_w4a16_wmma`'s CPU reference should give max error `0` against the new kernels since the dequant math `((n-8)*scale, fp32 accumulate)` is unchanged.
+I want to be explicit: I cannot run this on your hardware, so the bandwidth figure is a design target derived from the roofline, not a measurement. The correctness path, however, is exactly checkable — `unswizzle_w4a16` round-trips bit-identically, and the current swizzled GEMV CPU reference should give max error `0` against the new kernels since the dequant math `((n-8)*scale, fp32 accumulate)` is unchanged.
 
 ## What I Need Back Before Stage 2
 

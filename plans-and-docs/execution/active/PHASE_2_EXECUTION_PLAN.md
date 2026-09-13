@@ -30,7 +30,7 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
 ### Spike 0: Surgical Safetensors-to-`.aeon` Model Repacking & Weight Verification
 *Objective: Unbundle and isolate the dense backbone from the 11,008 routed experts into strictly 4096-byte sector-aligned binary containers, ensuring production-ready layouts and 100% bit-exact numerical parity before cache engine optimization.*
 
-- **Micro-Step 0.1: Surgical Model Splitting & Sector-Aligned Serializer (`scripts/prepare_rdna.py`)**
+- **Micro-Step 0.1: Surgical Model Splitting & Sector-Aligned Serializer (`scripts/convert_safetensors_to_aeon.py`)**
   - Ingest the 34 sharded Safetensors files of `DeepSeek-V4-Flash-0731-INT4-W4A16`.
   - Isolate all dense weights into `model_dense.aeon` (~9.24 GB): Attention projections ($W_q, W_{kv}, W_o$), RMSNorms, Hyper-Connections Sinkhorn tables, Shared Experts, and Router gate weights.
   - Isolate the 11,008 routed experts (43 layers $\times$ 256 experts) into `model_experts_swizzled.aeon` (~135 GB): Each expert FFN ($W_1, W_2, W_3$ packed INT4 + FP16 scales) is written in the version-2 Wave32 swizzled layout as an isolated contiguous block starting at a strictly 4096-byte aligned file offset (`O_DIRECT` compliant).

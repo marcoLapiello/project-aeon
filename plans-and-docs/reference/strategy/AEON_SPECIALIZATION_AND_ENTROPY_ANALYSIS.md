@@ -122,7 +122,7 @@ To avoid technical lock-in while maintaining maximum single-model performance, t
 ### 4.1 Phase 1 Concrete Implementations (Hardcoded for Maximum Speed)
 * RDNA3 WMMA Wave32 GEMM kernels tuned specifically for DeepSeek's FFN hidden dimensions.
 * DeepSeek MLA low-rank key-value decompressor.
-* Pre-swizzled weight converter (`prepare_rdna.py`) tailored to DeepSeek tensor naming and quantization layouts.
+* Pre-swizzled weight converter (`convert_safetensors_to_aeon.py`) tailored to DeepSeek tensor naming and quantization layouts.
 
 ### 4.2 Phase 1 Reusable Subsystems (Agnostic to Model Architecture)
 * Linux `io_uring` direct NVMe streaming runtime with registered memory buffers.

@@ -10,9 +10,10 @@ mean that it is part of the production runtime.
 
 The current integration point is `src/architecture/deepseek_v4/core/v4_pipeline.hpp`. It is header-only and
 owns the V4 execution schedule and generation API. Model-level GPU allocations
-are owned by `v4_model_resources.hpp`; Hot/Warm/Cold transfer state, prefetch,
-direct-I/O materialization, and supply telemetry are owned by
-`v4_expert_supply.hpp`.
+are owned by `v4_model_resources.hpp`; architecture-neutral Hot/Warm/Cold
+transfer state, prefetch, direct-I/O materialization, and supply telemetry are
+owned by `infrastructure/core/tiered_expert_supply.hpp`, with
+`v4_expert_supply.hpp` retaining the V4 request adapter.
 
 The production-facing implementation is:
 
@@ -20,8 +21,8 @@ The production-facing implementation is:
 - `src/platform/rdna3/device.hpp` - RDNA3/HIP device selection and GPU utilities.
 - `src/architecture/deepseek_v4/core/v4_pipeline.hpp` - multi-layer V4 execution schedule and generation orchestration.
 - `src/architecture/deepseek_v4/core/v4_model_resources.hpp` - RoPE caches and model-level resident weights.
-- `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` - Hot/Warm/Cold transfer state, prefetch, and supply telemetry coordination.
-- `src/architecture/deepseek_v4/core/v4_block.hpp` - transformer block composition.
+- `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` - six-expert V4 request adapter and Aeon payload-source mapping.
+- `src/infrastructure/core/tiered_expert_supply.hpp` - architecture-neutral tiered payload movement and transfer lifecycle.
 - `src/infrastructure/core/aeon_loader.hpp` - native `.aeon` dense and expert container access.
 - `src/architecture/deepseek_v4/core/memory_budget.hpp` - V4 VRAM/host feasibility calculations and startup checks.
 - `src/backend/swizzled_w4a16/core/vram_expert_pool.hpp` - current backend's Tier 1 hot expert pool.
@@ -68,7 +69,6 @@ conditions.
 These targets validate pieces that are already part of the engine and should remain
 as regression tests, even though they are not runtime binaries:
 
-- `tests/test_config_parser.cpp`
 - `tests/test_swiglu_clamp.cpp`
 - `tests/test_hc_sinkhorn.cpp`
 - `tests/test_w4a16_swizzle.cpp`
@@ -78,39 +78,31 @@ as regression tests, even though they are not runtime binaries:
 - `tests/test_aeon_moe_fused_w2.cpp`
 - `tests/test_moe_router.cpp`
 - `tests/test_v4_attention.cpp`
-- `tests/test_v4_block.cpp`
 
-These are not noise: they protect the completed Phase 1 implementation and provide
-smaller failure surfaces when the integrated pipeline changes.
+These are registered with CTest and protect current production contracts while
+providing smaller failure surfaces when the integrated pipeline changes.
 
-## Historical and infrastructure spikes
+## Manual diagnostics and benchmarks
 
-These targets validate foundational hardware behavior or an earlier toy model. They
-are useful when changing the relevant subsystem, but they do not need to be treated
-as part of every normal engine run:
+These targets are intentionally outside the default CTest suite because they are
+manual hardware diagnostics or measurements for open performance gates:
 
 - `src/smoke.cpp` / `smoke_check` - compiler and HIP toolchain sanity check.
 - `tools/aeon_info.cpp` / `aeon_info` - hardware and topology inspection.
-- `tests/test_wmma_tile.cpp` and `tests/bench_wmma_gemm.cpp` - Phase 0 WMMA checks.
-- `tests/test_direct_io.cpp` - standalone direct-I/O primitive check.
-- `tests/bench_async_overlap.cpp` - compute/SDMA overlap benchmark.
-- `tests/test_toy_moe_layer.cpp` - earlier toy cache pipeline.
-
-These should remain available as explicit diagnostic targets until the corresponding
-production subsystem is stable. They should eventually be separated from the default
-validation set, rather than deleted casually.
+- `tests/bench_model_direct_io.cpp` - model-backed cold-read request-shape benchmark.
+- `tests/bench_aeon_moe_fused_w13.cpp` - current fused expert-kernel measurement.
+- `tests/bench_full_model.cpp` - full 43-layer generation measurement.
 
 ## Offline scripts
 
 - `scripts/convert_safetensors_to_aeon.py` is the current production model preparation
   tool. It creates `model_manifest.json`, `model_dense.aeon`,
   `model_experts_swizzled.aeon`, and the version-2 swizzled expert index.
-- `scripts/prepare_rdna.py` is an older synthetic formatter for the original toy
-  `AEON` layout. It does not create the current `AEON_DENSE`/`AEON_EXPERTS` format
-  and is retained only for historical diagnostics.
+- `scripts/prepare_dsv4_tokenizer.py` prepares the native tokenizer artifact used by
+  the text path.
 
 ## Cleanup rule
 
-Do not delete a spike merely because it is not on the current runtime path. First
-move it out of the default build or mark it as an explicit diagnostic target, then
-delete it only after its result has been captured in the relevant plan or ledger.
+Code outside the current runtime path must either protect a current contract,
+measure an open gate, or carry unique historical evidence. Otherwise delete it
+and update the map and execution records in the same change.

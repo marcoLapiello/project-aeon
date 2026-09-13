@@ -19,7 +19,7 @@ Following empirical verification of the official Hugging Face repositories (`dee
    - Execution: **Fused INT4 $\to$ FP16 Dequant-GEMM**. Weights are loaded as 4-bit nibbles into LDS/registers, unpacked in registers via fast bit manipulation, and computed using native Wave32 FP16 WMMA (`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`).
 
 3. **Storage & Memory Integration:**
-   - Offline packer (`prepare_rdna.py`) ingests Safetensors shards and outputs 4096-byte sector-aligned `.aeon` files with Wave32 pre-swizzled layouts for zero-copy Linux `io_uring` direct I/O.
+  - Offline packer (`convert_safetensors_to_aeon.py`) ingests Safetensors shards and outputs 4096-byte sector-aligned `.aeon` files with Wave32 pre-swizzled layouts for zero-copy Linux `io_uring` direct I/O.
    - Dynamic Tier 1 (VRAM LRU pool) and Tier 2 (Pinned Host DDR) management.
 
 ---
@@ -33,7 +33,7 @@ Following empirical verification of the official Hugging Face repositories (`dee
   - *Verification:* Bit-accurate match against JSON schema.
 - **Micro-Step 1.2: INT4 Safetensors Header Parser & Stream Slicer**
   - Implement clean, zero-dependency C++20 / Python parser for Safetensors metadata headers.
-  - Upgrade `scripts/prepare_rdna.py` to parse `INT4-W4A16` Safetensors tensors, align discrete experts to 4096-byte boundaries, and generate binary `.aeon` files.
+  - Upgrade the native converter to parse `INT4-W4A16` Safetensors tensors, align discrete experts to 4096-byte boundaries, and generate binary `.aeon` files.
   - *Verification:* Convert a sample layer/shard; verify 4KB offsets and MD5 checksum of dequantized values.
 
 ---
@@ -54,7 +54,7 @@ Following empirical verification of the official Hugging Face repositories (`dee
   - Hand-tune register unpacking from packed INT4 pairs into FP16 half2 vectors.
   - Scale by per-group FP16 scale factors directly inside Wave32 registers.
   - Dispatch to `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`.
-  - *Verification:* `tests/test_w4a16_wmma.cpp` comparing GPU output against unquantized FP16 CPU GEMM within quantization tolerance.
+  - *Verification:* the current swizzled GEMV tests comparing GPU output against unquantized FP16 CPU GEMM within quantization tolerance.
 - **Micro-Step 3.2: Fused Block GEMM Benchmark for DeepSeek Expert Shapes**
   - Benchmark INT4-W4A16 GEMM for DeepSeek-V4 expert dimensions ($M=1\text{ to }16, N=2048, K=4096$).
   - Measure TFLOP/s and latency on the RX 7900 XTX (`gfx1100`).
@@ -69,7 +69,7 @@ Following empirical verification of the official Hugging Face repositories (`dee
 - **Micro-Step 4.3: End-to-End MoE Layer Execution with Tier 1/2 Offloading**
   - Integrate Tier 1 (VRAM LRU cache) and Tier 2 (Host DDR SDMA stream) with real INT4-W4A16 expert weights.
   - Compute active experts and accumulate weighted outputs with the permanent shared expert.
-  - *Verification:* `tests/test_v4_moe_layer.cpp` against Python reference layer pass.
+  - *Verification:* the current fused W1/W3 and W2 tests plus the integrated tiered-pipeline test.
 
 ---
 
@@ -78,7 +78,7 @@ Following empirical verification of the official Hugging Face repositories (`dee
   - Implement decoupled RoPE with YaRN scaling.
   - Implement causal sliding-window attention ($W=128$) targeting Wave32 WMMA.
 - **Micro-Step 5.2: Full Block Forward Pass (HC -> Attn -> HC -> MoE -> Output)**
-  - Assemble complete `DeepSeekV4Block` executing on a single RX 7900 XTX.
+  - Assemble the complete V4 execution path on a single RX 7900 XTX. The former standalone block fixture was retired; trusted reference parity remains an open gate.
   - *Verification:* Golden check against PyTorch forward pass of one complete layer.
 
 ---

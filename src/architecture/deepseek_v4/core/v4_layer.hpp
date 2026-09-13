@@ -8,7 +8,6 @@
 
 #include <cstdint>
 #include <iostream>
-#include <list>
 #include <utility>
 
 namespace aeon::core {
@@ -61,16 +60,6 @@ public:
         // 5. Allocate Persistent KV Cache on Device
         CHECK_HIP(hipMalloc(&d_kv_cache, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
         CHECK_HIP(hipMemset(d_kv_cache, 0, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
-    }
-
-    void init(int id, const AeonModelLoader& loader, uint32_t max_seq = 4096) {
-        init_with_loader(id, loader, max_seq);
-    }
-
-    // Initialize layer with unified expert pool (dense weights + KV cache)
-    template<typename LoaderT>
-    void init_global(int id, const LoaderT& loader, uint32_t max_seq = 4096) {
-        init_with_loader(id, loader, max_seq);
     }
 
     void free() {

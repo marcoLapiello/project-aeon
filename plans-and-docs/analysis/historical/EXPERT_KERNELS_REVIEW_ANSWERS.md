@@ -69,7 +69,7 @@ For the last instrumented full-model runs, the critical path was cold NVMe/direc
 | WMMA API | Yes, RDNA3 WMMA is already used and silicon-validated through `rocwmma::fragment`/`mma_sync` in `w4a16_gemm.hpp` and the WMMA tests. The code does not use `__builtin_amdgcn_wmma_*` directly. The current `M=1` decode path is GEMV; the WMMA kernel remains for `M>1`. |
 | Wave mode | Wave32 is enforced by `-mno-wavefrontsize64`; kernels use 32-thread blocks/wave operations. |
 | Occupancy/LDS data | No rocprof/occupancy report or LDS bank-conflict measurement is committed. |
-| Harness availability | Yes. `test_w4a16_wmma` provides CPU-reference correctness checks, including representative expert shapes and a real-checkpoint check; `bench_wmma_gemm` and `bench_async_overlap` provide timing/overlap harnesses. There is no automated tile/layout autotune sweep yet. |
+| Harness availability | Yes. The current swizzled GEMV and fused W1/W3/W2 tests provide CPU-reference correctness checks, while `bench_aeon_moe_fused_w13` provides the current expert-path measurement. There is no automated tile/layout autotune sweep yet. |
 
 ## 6. Current Interfaces
 
@@ -172,14 +172,13 @@ The runtime sequence in `V4Pipeline::step()` is:
 
 ### Test-only kernel definitions
 
-These files define local validation or benchmark kernels; they are not production pipeline implementations:
+The current component tests define local validation kernels; they are not
+production pipeline implementations. Retired primitive and toy probes are not
+part of the current source tree.
 
-- [tests/test_w4a16_wmma.cpp](../../../tests/test_w4a16_wmma.cpp): `wmma_fused_int4_tile_kernel`.
-- [tests/test_wmma_tile.cpp](../../../tests/test_wmma_tile.cpp): `wmma_single_tile_kernel`.
-- [tests/bench_wmma_gemm.cpp](../../../tests/bench_wmma_gemm.cpp) and [tests/bench_async_overlap.cpp](../../../tests/bench_async_overlap.cpp): benchmark-local FP16 WMMA kernels.
 - [tests/test_swiglu_clamp.cpp](../../../tests/test_swiglu_clamp.cpp): local RMSNorm and SwiGLU kernels.
-- [tests/test_toy_moe_layer.cpp](../../../tests/test_toy_moe_layer.cpp): local toy expert GEMM kernel.
-- [tests/test_v4_moe_layer.cpp](../../../tests/test_v4_moe_layer.cpp): local SwiGLU and expert-accumulation kernels.
+- [tests/test_aeon_moe_fused_w13.cpp](../../../tests/test_aeon_moe_fused_w13.cpp): fused W1/W3 validation kernels.
+- [tests/test_aeon_moe_fused_w2.cpp](../../../tests/test_aeon_moe_fused_w2.cpp): fused W2 accumulation validation kernels.
 
 ## Known Design Caveats
 

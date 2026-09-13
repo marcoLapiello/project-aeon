@@ -27,7 +27,7 @@ This actionable plan breaks down the foundational work into discrete, verifiable
 
 ## Spike 2: Bare-Metal Wave32 WMMA Compute Kernel
 
-### Micro-Step 2.1: Single-Tile WMMA Smoke Test (`tests/test_wmma_tile.cpp`)
+### Micro-Step 2.1: Single-Tile WMMA Smoke Test (retired primitive probe)
 - **Goal:** Verify that the compiler generates native RDNA3 Wave32 WMMA matrix instructions and that arithmetic output matches CPU reference math.
 - **Kernel Implementation:**
   - Execute a single 16x16x16 tile multiplication ($D = A \times B + C$) using `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` (or FP16 input variant).
@@ -35,7 +35,7 @@ This actionable plan breaks down the foundational work into discrete, verifiable
 - **Verification:** Compare device output with a bit-accurate CPU reference calculation; assert absolute difference $\epsilon < 10^{-4}$.
 - **Git Commit:** `test(kernels): add single-tile wave32 wmma hip smoke test with cpu validation`
 
-### Micro-Step 2.2: Tiled Block GEMM Benchmark (`tests/bench_wmma_gemm.cpp`)
+### Micro-Step 2.2: Tiled Block GEMM Benchmark (retired primitive benchmark)
 - **Goal:** Implement a 2D block-tiled GEMM kernel ($M=1024, N=1024, K=1024$) using shared memory (LDS) and WMMA Wave32 instructions.
 - **Metrics Collected:**
   - Execution time (microseconds via `hipEventElapsedTime`).
@@ -57,7 +57,7 @@ This actionable plan breaks down the foundational work into discrete, verifiable
 - **Verification:** Read a synthetic 500 MB file with `O_DIRECT` and verify data integrity with MD5/SHA256 checksum.
 - **Git Commit:** `feat(io): implement 4kb sector-aligned direct io reader using io_uring`
 
-### Micro-Step 3.2: Concurrent Compute & SDMA Transfer Stress Test (`tests/bench_async_overlap.cpp`)
+### Micro-Step 3.2: Concurrent Compute & SDMA Transfer Stress Test (retired primitive benchmark)
 - **Goal:** Validate that background PCIe DMA transfers (`hipMemcpyAsync` on dedicated stream) do NOT serialize or degrade foreground WMMA compute kernel execution.
 - **Implementation:**
   - Stream 1: Continuously launch the WMMA GEMM kernel on GPU 0.
@@ -70,12 +70,12 @@ This actionable plan breaks down the foundational work into discrete, verifiable
 
 ## Spike 4: Sector-Aligned Storage & Single-Layer Toy MoE Pipeline
 
-### Micro-Step 4.1: Offline Model Formatter (`scripts/prepare_rdna.py`)
+### Micro-Step 4.1: Offline Model Formatter (superseded by the native converter)
 - **Goal:** Python tool to pack mock or real MoE weights into Aeon's `.aeon` format with 4096-byte padding and layout aligned for Wave32 register swizzling.
 - **Verification:** Generate synthetic 64-expert weights file and verify all tensor headers and data offsets align to $4096 \times n$.
 - **Git Commit:** `feat(scripts): add offline 4kb-aligned expert weight serialization tool`
 
-### Micro-Step 4.2: Single-Layer Toy MoE Runtime (`tests/test_toy_moe_layer.cpp`)
+### Micro-Step 4.2: Single-Layer Toy MoE Runtime (retired prototype)
 - **Goal:** End-to-end integration of Tier 1 (VRAM LRU pool) and Tier 2 (Pinned Host RAM) with top-K routing.
 - **Workflow:**
   - Simulate a stream of 50 tokens with top-6 routing across 64 experts.

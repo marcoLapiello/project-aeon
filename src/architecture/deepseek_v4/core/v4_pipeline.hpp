@@ -34,7 +34,6 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
-#include <list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -220,7 +219,7 @@ public:
         layers.resize(num_layers_);
         for (uint32_t l = 0; l < num_layers_; ++l) {
             layers[l] = std::make_unique<V4Layer>();
-            layers[l]->init_global(l, aeon_loader, runtime_cfg.context_size);
+            layers[l]->init_with_loader(l, aeon_loader, runtime_cfg.context_size);
         }
         std::cout << "  > Dense weights and KV cache for all " << num_layers_ << " layers uploaded to VRAM." << std::endl;
 
@@ -1054,62 +1053,12 @@ private:
         }
     }
 
-    using PendingRegistryTransfer = V4ExpertSupplyCoordinator::PendingRegistryTransfer;
-
-    PendingRegistryTransfer& ensure_registry_transfer(uint64_t operation_id, uint32_t gid) {
-        return expert_supply_.ensure_registry_transfer(operation_id, gid);
-    }
-
-    PendingRegistryTransfer* find_registry_transfer(uint64_t operation_id) {
-        return expert_supply_.find_registry_transfer(operation_id);
-    }
-
-    const PendingRegistryTransfer* find_registry_transfer(uint64_t operation_id) const {
-        return expert_supply_.find_registry_transfer(operation_id);
-    }
-
-    void schedule_demotion(const ExpertRequestReservation& request) {
-        expert_supply_.schedule_demotion(request);
-    }
-
-    void wait_for_demotion_dependency(uint64_t operation_id, hipStream_t stream) {
-        expert_supply_.wait_for_demotion_dependency(operation_id, stream);
-    }
-
-    void record_h2d_event(
-        uint64_t operation_id,
-        hipStream_t stream,
-        uint32_t staging_idx,
-        bool has_staging,
-        int32_t source_slot,
-        int32_t destination_slot
-    ) {
-        expert_supply_.record_h2d_event(
-            operation_id, stream, staging_idx, has_staging, source_slot, destination_slot);
-    }
-
-    void bind_staging(uint64_t operation_id, uint32_t staging_idx) {
-        expert_supply_.bind_staging(operation_id, staging_idx);
-    }
-
     void mark_gpu_readiness_wait_start(uint64_t operation_id) {
         expert_supply_.mark_gpu_readiness_wait_start(operation_id);
     }
 
-    void mark_registry_request_failed(uint64_t operation_id, const std::string& reason) {
-        expert_supply_.mark_registry_request_failed(operation_id, reason);
-    }
-
     void reap_registry_transfers() {
         expert_supply_.reap_registry_transfers();
-    }
-
-    void record_supply_request(const ExpertRequestReservation& request) {
-        expert_supply_.record_supply_request(request);
-    }
-
-    void observe_supply_occupancy(ExpertTier source_tier) {
-        expert_supply_.observe_supply_occupancy(source_tier);
     }
 
     void read_experts_direct_blocking(

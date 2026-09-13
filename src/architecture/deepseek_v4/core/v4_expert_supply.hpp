@@ -20,7 +20,6 @@ class V4ExpertSupplyCoordinator {
 public:
     static constexpr uint64_t DEFAULT_DEMOTION_QUEUE_CAPACITY =
         TieredExpertSupply::DEFAULT_DEMOTION_QUEUE_CAPACITY;
-    using PendingRegistryTransfer = TieredExpertSupply::PendingTransfer;
 
     struct LayerPrefetchState {
         std::array<int32_t, 6> vram_slots{-1, -1, -1, -1, -1, -1};
@@ -160,60 +159,12 @@ public:
         sync_state(state);
     }
 
-    PendingRegistryTransfer& ensure_registry_transfer(uint64_t operation_id, uint32_t gid) {
-        return supply_.ensure_registry_transfer(operation_id, gid);
-    }
-
-    PendingRegistryTransfer* find_registry_transfer(uint64_t operation_id) {
-        return supply_.find_registry_transfer(operation_id);
-    }
-
-    const PendingRegistryTransfer* find_registry_transfer(uint64_t operation_id) const {
-        return supply_.find_registry_transfer(operation_id);
-    }
-
-    void schedule_demotion(const ExpertRequestReservation& request) {
-        supply_.schedule_demotion(request);
-    }
-
-    void wait_for_demotion_dependency(uint64_t operation_id, hipStream_t stream) {
-        supply_.wait_for_demotion_dependency(operation_id, stream);
-    }
-
-    void record_h2d_event(
-        uint64_t operation_id,
-        hipStream_t stream,
-        uint32_t staging_idx,
-        bool has_staging,
-        int32_t source_slot,
-        int32_t destination_slot
-    ) {
-        supply_.record_h2d_event(
-            operation_id, stream, staging_idx, has_staging, source_slot, destination_slot);
-    }
-
-    void bind_staging(uint64_t operation_id, uint32_t staging_idx) {
-        supply_.bind_staging(operation_id, staging_idx);
-    }
-
-    void mark_gpu_readiness_wait_start(uint64_t operation_id) {
-        supply_.mark_gpu_readiness_wait_start(operation_id);
-    }
-
-    void mark_registry_request_failed(uint64_t operation_id, const std::string& reason) {
-        supply_.mark_registry_request_failed(operation_id, reason);
-    }
-
     void reap_registry_transfers() {
         supply_.reap_registry_transfers();
     }
 
-    void record_supply_request(const ExpertRequestReservation& request) {
-        supply_.record_supply_request(request);
-    }
-
-    void observe_supply_occupancy(ExpertTier source_tier) {
-        supply_.observe_supply_occupancy(source_tier);
+    void mark_gpu_readiness_wait_start(uint64_t operation_id) {
+        supply_.mark_gpu_readiness_wait_start(operation_id);
     }
 
     void clear() noexcept {
