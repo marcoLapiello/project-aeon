@@ -48,20 +48,21 @@ struct V4OracleRopeTable {
         if (factor <= 1.0f) return frequency;
 
         constexpr float pi = 3.14159265358979323846f;
-        const float low = std::floor(
-            static_cast<float>(original_max_position) /
-            (2.0f * pi * std::pow(theta, (2.0f * static_cast<float>(rope_dim / 2 - 1)) /
-                static_cast<float>(rope_dim))));
-        const float high = std::ceil(static_cast<float>(original_max_position) / (2.0f * pi));
-        float weight = 0.0f;
-        if (static_cast<float>(pair) < low) {
-            weight = 0.0f;
-        } else if (static_cast<float>(pair) > high) {
-            weight = 1.0f;
-        } else {
-            weight = (static_cast<float>(pair) - low) / (high - low + 1e-5f);
+        const auto correction_dim = [this](float rotations) {
+            return static_cast<float>(rope_dim) *
+                std::log(static_cast<float>(original_max_position) / (rotations * 2.0f * pi)) /
+                (2.0f * std::log(theta));
+        };
+        const float low = std::max(0.0f, std::floor(correction_dim(beta_fast)));
+        const float high = std::min(
+            static_cast<float>(rope_dim / 2 - 1),
+            std::ceil(correction_dim(beta_slow)));
+        if (low >= high) {
+            return static_cast<float>(pair) < low ? frequency : frequency / factor;
         }
-        return (1.0f - weight) * (frequency / factor) + weight * frequency;
+        const float ramp = std::clamp(
+            (static_cast<float>(pair) - low) / (high - low), 0.0f, 1.0f);
+        return ramp * (frequency / factor) + (1.0f - ramp) * frequency;
     }
 
     void apply(std::vector<float>& values, int32_t heads, int64_t position) const {
@@ -232,11 +233,12 @@ public:
                 ", received " + std::to_string(input.position));
         }
 
+        const auto& attention_rope = is_compressed() ? config_.compressed_rope : config_.main_rope;
         std::vector<float> rotated_query = input.query;
-        config_.main_rope.apply(rotated_query, config_.num_heads, input.position);
+        attention_rope.apply(rotated_query, config_.num_heads, input.position);
 
         std::vector<float> rotated_local_key = input.local_key;
-        config_.main_rope.apply(rotated_local_key, 1, input.position);
+        attention_rope.apply(rotated_local_key, 1, input.position);
         const size_t local_slot = static_cast<size_t>(input.position % config_.sliding_window);
         local_cache_[local_slot].position = input.position;
         local_cache_[local_slot].key = std::move(rotated_local_key);
@@ -333,7 +335,7 @@ public:
         result.selected_compressed_count = result.selected_compressed_positions.size();
         result.attention_output = compute_attention(result, rotated_query);
         result.inverse_rope_output = result.attention_output;
-        config_.main_rope.apply_inverse(result.inverse_rope_output, config_.num_heads, input.position);
+        attention_rope.apply_inverse(result.inverse_rope_output, config_.num_heads, input.position);
 
         last_step_ = result;
         if (input.position == std::numeric_limits<int64_t>::max()) {
@@ -446,10 +448,12 @@ public:
                << " compressed_entries=" << compressed_entries_.size();
         if (is_csa()) {
             output << " indexer_candidates=" << last_step_.indexer_candidate_count << " topk=[";
-            for (size_t index = 0; index < last_step_.topk_indices.size(); ++index) {
+            const size_t trace_count = std::min<size_t>(last_step_.topk_indices.size(), 16);
+            for (size_t index = 0; index < trace_count; ++index) {
                 if (index != 0) output << ',';
                 output << last_step_.topk_indices[index];
             }
+            if (trace_count < last_step_.topk_indices.size()) output << ",...";
             output << ']';
         }
         output << " ropes=" << config_.main_rope.identity << '@' << config_.compressed_rope.identity
@@ -760,23 +764,37 @@ private:
         std::vector<float> output(static_cast<size_t>(config_.num_heads * config_.head_dim), 0.0f);
         for (int32_t head = 0; head < config_.num_heads; ++head) {
             const size_t query_offset = static_cast<size_t>(head * config_.head_dim);
+            std::vector<const std::vector<float>*> attention_keys;
+            std::vector<const std::vector<float>*> attention_values;
+            attention_keys.reserve(local_entries.size() + compressed_entries.size());
+            attention_values.reserve(local_entries.size() + compressed_entries.size());
+            for (const auto* entry : local_entries) {
+                attention_keys.push_back(&entry->key);
+                attention_values.push_back(&entry->value);
+            }
+            for (const auto* entry : compressed_entries) {
+                attention_keys.push_back(&entry->key);
+                attention_values.push_back(&entry->value);
+            }
+
+            std::vector<float> scores;
+            scores.reserve(attention_keys.size());
             float maximum = config_.attention_sink[static_cast<size_t>(head)];
-            for (const auto* entry : local_entries) maximum = std::max(maximum, dot(query, query_offset, entry->key, config_.attention_scale));
-            for (const auto* entry : compressed_entries) maximum = std::max(maximum, dot(query, query_offset, entry->key, config_.attention_scale));
+            for (const auto* key : attention_keys) {
+                const float score = dot(query, query_offset, *key, config_.attention_scale);
+                scores.push_back(score);
+                maximum = std::max(maximum, score);
+            }
 
             float denominator = std::exp(config_.attention_sink[static_cast<size_t>(head)] - maximum);
-            for (const auto* entry : local_entries) denominator += std::exp(dot(query, query_offset, entry->key, config_.attention_scale) - maximum);
-            for (const auto* entry : compressed_entries) denominator += std::exp(dot(query, query_offset, entry->key, config_.attention_scale) - maximum);
+            for (const float score : scores) denominator += std::exp(score - maximum);
             const float inverse_denominator = 1.0f / std::max(denominator, 1e-30f);
+            for (float& score : scores) score = std::exp(score - maximum) * inverse_denominator;
             for (int32_t dimension = 0; dimension < config_.head_dim; ++dimension) {
                 float value = 0.0f;
-                for (const auto* entry : local_entries) {
-                    value += std::exp(dot(query, query_offset, entry->key, config_.attention_scale) - maximum) *
-                        entry->value[static_cast<size_t>(dimension)] * inverse_denominator;
-                }
-                for (const auto* entry : compressed_entries) {
-                    value += std::exp(dot(query, query_offset, entry->key, config_.attention_scale) - maximum) *
-                        entry->value[static_cast<size_t>(dimension)] * inverse_denominator;
+                for (size_t entry_index = 0; entry_index < attention_values.size(); ++entry_index) {
+                    value += scores[entry_index] *
+                        (*attention_values[entry_index])[static_cast<size_t>(dimension)];
                 }
                 output[query_offset + static_cast<size_t>(dimension)] = value;
             }

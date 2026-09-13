@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
 **Date:** 2026-09-13  
-**Status:** Open; Stage 0 complete; Stage 1 weight/dense gate complete; Stage 2 CPU oracle in progress
+**Status:** Open; Stage 0 complete; Stage 1 weight/dense gate complete; Stage 2 CPU attention/cache oracle complete; Stage 3 next
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -486,7 +486,8 @@ Evidence identities for this run:
 
 This closes the weight/dequantization and dense-operation gate only. It does
 not establish layer-semantic correctness, compressed cache behavior, prefill
-equivalence, or full-model parity. Stage 2 remains the next workstream.
+equivalence, or full-model parity. Stage 2 was the next workstream at the time
+of this record; its completed CPU-oracle gate is recorded below.
 
 ### Stage 1: Close the independent weight and dense-operation gate
 
@@ -627,15 +628,25 @@ The reproducible validation commands are:
 
 ```text
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure -R '^(test_v4_attention_oracle|test_v4_attention|test_v4_model_contract)$'
+ctest --test-dir build --output-on-failure -R '^(test_v4_attention_oracle|test_v4_real_attention_oracle|test_v4_attention|test_v4_model_contract)$'
 ```
 
-On the current build, the full repository build and all three selected tests
-passed. The oracle test covers positions through 131, the real 512/513 C4
-candidate boundary, local ring-slot reuse, reset, aligned and unaligned chunk
-splits, and serialized state continuation. This record does not close Stage 2:
-real checkpoint-layer traces, production prefill ownership, HIP-versus-oracle
-parity, and trusted-reference parity remain open for the next slices.
+On the current build, the full repository build and all four selected tests
+passed. The synthetic oracle covers positions through 131, the real 512/513
+C4 candidate boundary, local ring-slot reuse, reset, aligned and unaligned
+chunk splits, and serialized state continuation. The model-backed oracle loads
+the selected `.aeon` dense artifact and exercises real layer 0 Sliding, layer
+2 C4A, and layer 3 C128A projections through positions 0-131, including
+independent compressed-entry reconstruction, class-aware RoPE divergence at
+position 65536, chunk equivalence, and serialized continuation. Its CTest
+timeout is 120 seconds; the current run completes in approximately 11 seconds.
+
+This closes the Stage 2 CPU attention/cache oracle gate. Stage 3 remains next:
+production layer-state ownership, strict persistent cache initialization,
+class-aware device resources, and memory accounting must now be implemented
+against this oracle. HIP-versus-oracle parity, true production prefill, and
+trusted-reference parity remain later gates and are not implied by this Stage 2
+completion.
 
 ### Stage 3: Add class-aware layer ownership and strict tensor binding
 
