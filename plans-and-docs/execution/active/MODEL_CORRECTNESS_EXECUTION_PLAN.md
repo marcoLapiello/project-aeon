@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
 **Date:** 2026-09-13  
-**Status:** Open; Stages 0-2 complete; Stage 3 layer ownership/resources complete; Stage 4 next
+**Status:** Open; Stages 0-3 complete; Stage 4 serial dispatch slice implemented; HIP/oracle parity next
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -765,6 +765,49 @@ Acceptance criteria:
 - The existing native generation API still returns a token and preserves its
   public behavior shape, but its output is now labeled as the corrected path
   only after this stage passes.
+
+### Stage 4 implementation record (2026-09-13)
+
+The first serial production dispatch slice is implemented in
+`V4Pipeline::step()`. Sliding layers retain the existing ring attention branch;
+CSA layers now run their compressor and Lightning Indexer projections, write
+APE-adjusted partial rows, materialize overlapping ratio-4 entries at causal
+boundaries, perform stable host-side top-k ordering, and attend over local plus
+selected compressed entries. HCA layers run the same persistent compressor
+state path with non-overlapping ratio-128 materialization and attend over all
+completed compressed entries. Local values are copied before class-specific
+RoPE so the cache keeps separate key and value semantics.
+
+The conservative HIP primitives are in
+`src/architecture/deepseek_v4/kernels/v4_attention.hpp`; they keep compressor
+state in float32, normalize and rotate completed entries before FP16 storage,
+and use a bounded shared score buffer for the 128-token local ring plus the
+512-entry CSA selection. Top-k scores are read back for deterministic ordering
+while the semantic path is being proven; this is intentionally not a
+performance implementation.
+
+The reproducible Stage 4 validation commands are:
+
+```text
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure -R '^(test_v4_attention|test_v4_attention_oracle|test_v4_real_attention_oracle|test_v4_model_contract|test_v4_layer_state|test_v4_layer_state_device|test_v4_class_attention_device|test_v4_stage4_dispatch|test_dynamic_expert_pool|test_hot_warm_cold_pipeline)$'
+```
+
+On the Radeon RX 7900 XTX (`gfx1100`), the full build and all ten focused tests
+passed. The primitive test covers C4 and C128 boundary materialization,
+indexer scoring, and mixed attention. The model-backed dispatch test runs 132
+real 43-layer steps in a context-132 configuration, verifies layer 2 reaches
+33 C4 compressed/indexer entries through position 131, verifies layer 3 creates
+its first C128 entry at position 127, and confirms the sliding layers retain a
+128-position ring. The model-backed boundary test completes in approximately
+32.8 seconds. Existing oracle and Hot/Warm/Cold regressions also pass.
+
+This record does not close Stage 4. HIP-versus-CPU-oracle tensor traces,
+post-position-128 production HCA/C4 behavior, full prefill equivalence, and
+trusted-reference parity remain open. The next correctness slice is to expose
+production traces for layers 0, 2, and 3 and compare query, cache insertion,
+compressor state, compressed entries, indexer selection, attention output,
+inverse RoPE, and grouped projection against the completed oracle.
 
 ### Stage 5: Implement stateful and true prefill
 

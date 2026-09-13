@@ -379,6 +379,7 @@ public:
         constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
         constexpr int NUM_HEADS = kernel::DSV4_NUM_HEADS;
         constexpr int TOTAL_Q = NUM_HEADS * HEAD_DIM;
+        constexpr int INDEXER_Q = kernel::DSV4_INDEX_N_HEADS * kernel::DSV4_INDEX_HEAD_DIM;
         constexpr int O_LORA = kernel::DSV4_O_LORA_RANK;
         constexpr int O_GROUPS = kernel::DSV4_O_GROUPS;
         constexpr int TOT_LORA = kernel::DSV4_TOTAL_O_LORA_DIM;
@@ -490,9 +491,60 @@ public:
                 scratch.d_kv, layer.d_kv_norm, scratch.d_kv_norm_act, HEAD_DIM, 1e-6f
             );
 
+            if (uses_compressed_rope) {
+                const int ratio = layer.spec().compression_ratio;
+                const int coefficient = ratio == 4 ? 2 : 1;
+                const int compressor_width = coefficient * HEAD_DIM;
+                hipLaunchKernelGGL(
+                    kernel::v4_gemv_fp16_kernel,
+                    dim3(compressor_width, 1), dim3(32), 0, compute_stream,
+                    scratch.d_x_norm, layer.d_compressor_wkv, scratch.d_compressor_kv, H
+                );
+                hipLaunchKernelGGL(
+                    kernel::v4_gemv_fp16_kernel,
+                    dim3(compressor_width, 1), dim3(32), 0, compute_stream,
+                    scratch.d_x_norm, layer.d_compressor_wgate, scratch.d_compressor_score, H
+                );
+
+                if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+                    hipLaunchKernelGGL(
+                        kernel::v4_gemv_fp16_kernel,
+                        dim3(INDEXER_Q, 1), dim3(32), 0, compute_stream,
+                        scratch.d_qa_norm, layer.d_indexer_wq_b, scratch.d_indexer_query, Q_LORA
+                    );
+                    hipLaunchKernelGGL(
+                        kernel::v4_gemv_fp16_kernel,
+                        dim3(kernel::DSV4_INDEX_N_HEADS, 1), dim3(32), 0, compute_stream,
+                        scratch.d_x_norm, layer.d_indexer_weights_proj, scratch.d_indexer_weights, H
+                    );
+                    hipLaunchKernelGGL(
+                        kernel::v4_gemv_fp16_kernel,
+                        dim3(coefficient * kernel::DSV4_INDEX_HEAD_DIM, 1), dim3(32), 0, compute_stream,
+                        scratch.d_x_norm, layer.d_indexer_compressor_wkv,
+                        scratch.d_indexer_compressor_kv, H
+                    );
+                    hipLaunchKernelGGL(
+                        kernel::v4_gemv_fp16_kernel,
+                        dim3(coefficient * kernel::DSV4_INDEX_HEAD_DIM, 1), dim3(32), 0, compute_stream,
+                        scratch.d_x_norm, layer.d_indexer_compressor_wgate,
+                        scratch.d_indexer_compressor_score, H
+                    );
+                }
+            }
+
             // -----------------------------------------------------------------
             // D. RoPE & KV Cache Persistence
             // -----------------------------------------------------------------
+            const uint32_t local_slot = pos % layer.local_cache_capacity();
+            const size_t local_offset = static_cast<size_t>(local_slot) * HEAD_DIM;
+            CHECK_HIP(hipMemcpyAsync(
+                layer.d_local_value_cache + local_offset,
+                scratch.d_kv_norm_act,
+                HEAD_DIM * sizeof(half),
+                hipMemcpyDeviceToDevice,
+                compute_stream
+            ));
+
             hipLaunchKernelGGL(
                 kernel::v4_forward_rope_at_pos_wave32_kernel,
                 dim3(NUM_HEADS), dim3(32), 0, compute_stream,
@@ -507,17 +559,8 @@ public:
                 1, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2
             );
 
-            const uint32_t local_slot = pos % layer.local_cache_capacity();
-            const size_t local_offset = static_cast<size_t>(local_slot) * HEAD_DIM;
             CHECK_HIP(hipMemcpyAsync(
                 layer.d_local_key_cache + local_offset,
-                scratch.d_kv_norm_act,
-                HEAD_DIM * sizeof(half),
-                hipMemcpyDeviceToDevice,
-                compute_stream
-            ));
-            CHECK_HIP(hipMemcpyAsync(
-                layer.d_local_value_cache + local_offset,
                 scratch.d_kv_norm_act,
                 HEAD_DIM * sizeof(half),
                 hipMemcpyDeviceToDevice,
@@ -533,16 +576,136 @@ public:
             ));
             layer.record_position(pos);
 
+            if (uses_compressed_rope) {
+                const int ratio = layer.spec().compression_ratio;
+                const int coefficient = ratio == 4 ? 2 : 1;
+                const int compressor_width = coefficient * HEAD_DIM;
+                const int partial_capacity = static_cast<int>(layer.state_layout().compressor_partial_capacity);
+                hipLaunchKernelGGL(
+                    kernel::v4_save_compressor_state_kernel,
+                    dim3(1), dim3(256), 0, compute_stream,
+                    scratch.d_compressor_kv, scratch.d_compressor_score,
+                    layer.d_compressor_partial_kv, layer.d_compressor_partial_score,
+                    layer.d_compressor_partial_positions, layer.d_compressor_ape,
+                    absolute_position, ratio, partial_capacity, compressor_width
+                );
+
+                if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+                    hipLaunchKernelGGL(
+                        kernel::v4_forward_rope_at_pos_wave32_kernel,
+                        dim3(kernel::DSV4_INDEX_N_HEADS), dim3(32), 0, compute_stream,
+                        scratch.d_indexer_query, layer_cos_cache, layer_sin_cache, pos,
+                        kernel::DSV4_INDEX_N_HEADS, kernel::DSV4_INDEX_HEAD_DIM,
+                        kernel::DSV4_INDEX_HEAD_DIM - kernel::DSV4_ROPE_DIM,
+                        kernel::DSV4_ROPE_DIM / 2
+                    );
+                    CHECK_HIP(hipMemcpyAsync(
+                        layer.d_indexer_query,
+                        scratch.d_indexer_query,
+                        INDEXER_Q * sizeof(half),
+                        hipMemcpyDeviceToDevice,
+                        compute_stream
+                    ));
+                    kernel::v4_half_to_float_n_kernel<<<1, 128, 0, compute_stream>>>(
+                        scratch.d_indexer_weights, layer.d_indexer_weights,
+                        kernel::DSV4_INDEX_N_HEADS
+                    );
+
+                    hipLaunchKernelGGL(
+                        kernel::v4_save_compressor_state_kernel,
+                        dim3(1), dim3(256), 0, compute_stream,
+                        scratch.d_indexer_compressor_kv, scratch.d_indexer_compressor_score,
+                        layer.d_indexer_partial_kv, layer.d_indexer_partial_score,
+                        layer.d_indexer_partial_positions, layer.d_indexer_compressor_ape,
+                        absolute_position, ratio, partial_capacity,
+                        coefficient * kernel::DSV4_INDEX_HEAD_DIM
+                    );
+                }
+
+                if ((pos + 1u) % static_cast<uint32_t>(ratio) == 0) {
+                    const int compressed_index = static_cast<int>(
+                        (pos + 1u) / static_cast<uint32_t>(ratio) - 1u);
+                    hipLaunchKernelGGL(
+                        kernel::v4_materialize_compressed_entry_kernel,
+                        dim3(1), dim3(512), 0, compute_stream,
+                        layer.d_compressor_partial_kv, layer.d_compressor_partial_score,
+                        layer.d_compressor_partial_positions, layer.d_compressor_norm,
+                        layer.d_compressed_key_cache, layer.d_compressed_value_cache,
+                        layer.d_compressed_positions,
+                        model_resources_.d_compressed_cos_cache,
+                        model_resources_.d_compressed_sin_cache,
+                        absolute_position, ratio, partial_capacity, HEAD_DIM,
+                        compressor_width, compressed_index,
+                        kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM, 1e-6f
+                    );
+
+                    if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+                        hipLaunchKernelGGL(
+                            kernel::v4_materialize_compressed_entry_kernel,
+                            dim3(1), dim3(512), 0, compute_stream,
+                            layer.d_indexer_partial_kv, layer.d_indexer_partial_score,
+                            layer.d_indexer_partial_positions, layer.d_indexer_compressor_norm,
+                            layer.d_indexer_key_cache, layer.d_indexer_key_cache,
+                            layer.d_indexer_positions,
+                            model_resources_.d_compressed_cos_cache,
+                            model_resources_.d_compressed_sin_cache,
+                            absolute_position, ratio,
+                            static_cast<int>(layer.state_layout().indexer_partial_capacity),
+                            kernel::DSV4_INDEX_HEAD_DIM,
+                            coefficient * kernel::DSV4_INDEX_HEAD_DIM,
+                            compressed_index,
+                            kernel::DSV4_INDEX_HEAD_DIM - kernel::DSV4_ROPE_DIM,
+                            kernel::DSV4_ROPE_DIM, 1e-6f
+                        );
+                    }
+                }
+
+                if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+                    if (layer.indexer_candidate_count_ != 0) {
+                        hipLaunchKernelGGL(
+                            kernel::v4_indexer_scores_kernel,
+                            dim3((layer.indexer_candidate_count_ + 255u) / 256u), dim3(256), 0, compute_stream,
+                            layer.d_indexer_query, layer.d_indexer_weights, layer.d_indexer_key_cache,
+                            layer.d_indexer_scores, static_cast<int>(layer.indexer_candidate_count_),
+                            kernel::DSV4_INDEX_N_HEADS, kernel::DSV4_INDEX_HEAD_DIM,
+                            1.0f / std::sqrt(static_cast<float>(kernel::DSV4_INDEX_HEAD_DIM)),
+                            1.0f / std::sqrt(static_cast<float>(kernel::DSV4_INDEX_N_HEADS))
+                        );
+                    }
+                    select_indexer_topk(layer);
+                }
+            }
+
             // -----------------------------------------------------------------
-            // E. Autoregressive Sliding-Window Attention over Cached States
+            // E. Class-specific serial attention over cached states
             // -----------------------------------------------------------------
-            hipLaunchKernelGGL(
-                kernel::v4_cached_sliding_window_attn_wave32_kernel,
-                dim3(NUM_HEADS), dim3(32), 0, compute_stream,
-                scratch.d_q, layer.d_local_key_cache, layer.d_local_value_cache,
-                layer.d_local_positions, layer.d_attn_sink, scratch.d_attn_out,
-                pos, static_cast<int>(layer.local_cache_capacity()), kernel::DSV4_ATTN_SCALE
-            );
+            if (layer.spec().attention_kind == V4AttentionKind::Sliding) {
+                hipLaunchKernelGGL(
+                    kernel::v4_cached_sliding_window_attn_wave32_kernel,
+                    dim3(NUM_HEADS), dim3(32), 0, compute_stream,
+                    scratch.d_q, layer.d_local_key_cache, layer.d_local_value_cache,
+                    layer.d_local_positions, layer.d_attn_sink, scratch.d_attn_out,
+                    pos, static_cast<int>(layer.local_cache_capacity()), kernel::DSV4_ATTN_SCALE
+                );
+            } else {
+                const bool uses_indexer = layer.spec().attention_kind == V4AttentionKind::CSA;
+                const int compressed_count = static_cast<int>(layer.compressed_entry_count_);
+                const int topk_count = uses_indexer
+                    ? std::min<int>(compressed_count, static_cast<int>(layer.state_layout().index_topk))
+                    : 0;
+                hipLaunchKernelGGL(
+                    kernel::v4_cached_compressed_attention_wave32_kernel,
+                    dim3(NUM_HEADS), dim3(32), 0, compute_stream,
+                    scratch.d_q, layer.d_local_key_cache, layer.d_local_value_cache,
+                    layer.d_local_positions, layer.d_attn_sink,
+                    layer.d_compressed_key_cache, layer.d_compressed_value_cache,
+                    layer.d_compressed_positions,
+                    uses_indexer ? layer.d_indexer_topk_indices : nullptr,
+                    scratch.d_attn_out, absolute_position,
+                    static_cast<int>(layer.local_cache_capacity()), compressed_count,
+                    topk_count, uses_indexer, kernel::DSV4_ATTN_SCALE
+                );
+            }
 
             // Inverse RoPE on attention output
             hipLaunchKernelGGL(
@@ -1008,6 +1171,44 @@ public:
     }
 
 private:
+    void select_indexer_topk(V4Layer& layer) {
+        const size_t candidate_count = layer.indexer_candidate_count_;
+        if (candidate_count == 0) return;
+
+        std::vector<float> scores(candidate_count);
+        CHECK_HIP(hipMemcpyAsync(
+            scores.data(),
+            layer.d_indexer_scores,
+            candidate_count * sizeof(float),
+            hipMemcpyDeviceToHost,
+            compute_stream
+        ));
+        CHECK_HIP(hipStreamSynchronize(compute_stream));
+
+        std::vector<int32_t> order(candidate_count);
+        for (size_t index = 0; index < candidate_count; ++index) {
+            order[index] = static_cast<int32_t>(index);
+        }
+        std::stable_sort(order.begin(), order.end(), [&scores](int32_t left, int32_t right) {
+            const float left_score = scores[static_cast<size_t>(left)];
+            const float right_score = scores[static_cast<size_t>(right)];
+            if (left_score != right_score) return left_score > right_score;
+            return left < right;
+        });
+
+        const size_t topk = std::min(candidate_count, static_cast<size_t>(layer.state_layout().index_topk));
+        std::vector<int32_t> selected(static_cast<size_t>(layer.state_layout().index_topk), -1);
+        std::copy_n(order.begin(), topk, selected.begin());
+        CHECK_HIP(hipMemcpyAsync(
+            layer.d_indexer_topk_indices,
+            selected.data(),
+            selected.size() * sizeof(int32_t),
+            hipMemcpyHostToDevice,
+            compute_stream
+        ));
+        CHECK_HIP(hipStreamSynchronize(compute_stream));
+    }
+
     void validate_supported_model_config(const DeepSeekV4Config& model_cfg) const {
         V4ModelSpec::validate_config(model_cfg);
     }

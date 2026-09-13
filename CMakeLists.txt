@@ -192,6 +192,18 @@ target_link_libraries(test_v4_layer_state_device PRIVATE amdhip64)
 add_test(NAME test_v4_layer_state_device COMMAND test_v4_layer_state_device)
 set_tests_properties(test_v4_layer_state_device PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Stage 4 silicon validation: serial compressor, indexer, and mixed attention primitives
+add_executable(test_v4_class_attention_device tests/test_v4_class_attention_device.cpp)
+target_link_libraries(test_v4_class_attention_device PRIVATE amdhip64)
+add_test(NAME test_v4_class_attention_device COMMAND test_v4_class_attention_device)
+set_tests_properties(test_v4_class_attention_device PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Stage 4 model-backed validation: serial C4A/C128A boundary dispatch
+add_executable(test_v4_stage4_dispatch tests/test_v4_stage4_dispatch.cpp)
+target_link_libraries(test_v4_stage4_dispatch PRIVATE amdhip64)
+add_test(NAME test_v4_stage4_dispatch COMMAND test_v4_stage4_dispatch)
+set_tests_properties(test_v4_stage4_dispatch PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Stage 0 evidence: validated model contract and complete dense tensor inventory
 add_executable(aeon_model_contract tools/aeon_model_contract.cpp)
 target_link_libraries(aeon_model_contract PRIVATE amdhip64)

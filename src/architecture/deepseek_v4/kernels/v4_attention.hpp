@@ -24,6 +24,10 @@ constexpr uint32_t DSV4_HEADS_PER_GROUP = DSV4_NUM_HEADS / DSV4_O_GROUPS; // 8
 constexpr uint32_t DSV4_GROUP_HEADS_DIM = DSV4_HEADS_PER_GROUP * DSV4_HEAD_DIM; // 4096
 constexpr uint32_t DSV4_TOTAL_O_LORA_DIM = DSV4_O_GROUPS * DSV4_O_LORA_RANK; // 8192
 constexpr uint32_t DSV4_SLIDING_WINDOW = 128;
+constexpr uint32_t DSV4_INDEX_N_HEADS = 64;
+constexpr uint32_t DSV4_INDEX_HEAD_DIM = 128;
+constexpr uint32_t DSV4_INDEX_TOPK = 512;
+constexpr uint32_t DSV4_MAX_ATTENTION_KEYS = DSV4_SLIDING_WINDOW + DSV4_INDEX_TOPK;
 constexpr float DSV4_ROPE_THETA = 10000.0f;
 constexpr float DSV4_ATTN_SCALE = 0.04419417382415922f; // 1.0f / sqrtf(512.0f)
 
@@ -633,7 +637,264 @@ __global__ void __launch_bounds__(32) v4_cached_sliding_window_attn_wave32_kerne
     }
 }
 
-// 10. Hyper-Connections Head Reduction Kernel
+// 10. Save one compressor or indexer partial row with its APE-adjusted score.
+// The state is a position-addressed ring. The following materialization kernel
+// runs on the same stream, so no device-side barrier is required between them.
+__global__ void v4_save_compressor_state_kernel(
+    const __half* __restrict__ kv,
+    const __half* __restrict__ score,
+    float* __restrict__ partial_kv,
+    float* __restrict__ partial_score,
+    int64_t* __restrict__ partial_positions,
+    const float* __restrict__ ape,
+    int64_t position,
+    int ratio,
+    int partial_capacity,
+    int width
+) {
+    const int slot = static_cast<int>(position % partial_capacity);
+    if (threadIdx.x == 0) {
+        partial_positions[slot] = position;
+    }
+
+    const size_t row_offset = static_cast<size_t>(slot) * static_cast<size_t>(width);
+    const size_t ape_offset = static_cast<size_t>(position % ratio) * static_cast<size_t>(width);
+    for (int dimension = threadIdx.x; dimension < width; dimension += blockDim.x) {
+        partial_kv[row_offset + static_cast<size_t>(dimension)] = __half2float(kv[dimension]);
+        partial_score[row_offset + static_cast<size_t>(dimension)] =
+            __half2float(score[dimension]) + ape[ape_offset + static_cast<size_t>(dimension)];
+    }
+}
+
+// 11. Materialize a completed C4/C128 compressed entry. The reduction is
+// intentionally simple and float32: each output dimension independently
+// softmaxes the compressor scores over the causal window, then block 0
+// performs the small RMS reduction before the normalized row is stored.
+__global__ void v4_materialize_compressed_entry_kernel(
+    const float* __restrict__ partial_kv,
+    const float* __restrict__ partial_score,
+    const int64_t* __restrict__ partial_positions,
+    const __half* __restrict__ norm,
+    __half* __restrict__ compressed_key,
+    __half* __restrict__ compressed_value,
+    int64_t* __restrict__ compressed_positions,
+    const float* __restrict__ cos_cache,
+    const float* __restrict__ sin_cache,
+    int64_t boundary_position,
+    int ratio,
+    int partial_capacity,
+    int head_dim,
+    int width,
+    int compressed_index,
+    int nope_dim,
+    int rope_dim,
+    float rms_eps
+) {
+    __shared__ float raw[DSV4_HEAD_DIM];
+    __shared__ float inverse_rms;
+
+    const int dimension = threadIdx.x;
+    const int coefficient = width / head_dim;
+    const int window = coefficient * ratio;
+    const int64_t rope_position = (boundary_position / ratio) * ratio;
+
+    if (dimension < head_dim) {
+        float maximum = -3.402823466e+38F;
+        bool has_value = false;
+        for (int offset = 0; offset < window; ++offset) {
+            const int64_t source_position = boundary_position - window + 1 + offset;
+            if (source_position < 0) continue;
+            const int slot = static_cast<int>(source_position % partial_capacity);
+            if (partial_positions[slot] != source_position) continue;
+            const int segment = offset / ratio;
+            maximum = fmaxf(
+                maximum,
+                partial_score[static_cast<size_t>(slot) * static_cast<size_t>(width) +
+                              static_cast<size_t>(segment * head_dim + dimension)]);
+            has_value = true;
+        }
+
+        float compressed = 0.0f;
+        if (has_value) {
+            float denominator = 0.0f;
+            for (int offset = 0; offset < window; ++offset) {
+                const int64_t source_position = boundary_position - window + 1 + offset;
+                if (source_position < 0) continue;
+                const int slot = static_cast<int>(source_position % partial_capacity);
+                if (partial_positions[slot] != source_position) continue;
+                const int segment = offset / ratio;
+                const float score = partial_score[
+                    static_cast<size_t>(slot) * static_cast<size_t>(width) +
+                    static_cast<size_t>(segment * head_dim + dimension)];
+                denominator += expf(score - maximum);
+            }
+            if (denominator > 0.0f) {
+                for (int offset = 0; offset < window; ++offset) {
+                    const int64_t source_position = boundary_position - window + 1 + offset;
+                    if (source_position < 0) continue;
+                    const int slot = static_cast<int>(source_position % partial_capacity);
+                    if (partial_positions[slot] != source_position) continue;
+                    const int segment = offset / ratio;
+                    const size_t source_offset =
+                        static_cast<size_t>(slot) * static_cast<size_t>(width) +
+                        static_cast<size_t>(segment * head_dim + dimension);
+                    const float score = partial_score[source_offset];
+                    compressed += expf(score - maximum) / denominator * partial_kv[source_offset];
+                }
+            }
+        }
+        raw[dimension] = compressed;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float sum_sq = 0.0f;
+        for (int index = 0; index < head_dim; ++index) sum_sq += raw[index] * raw[index];
+        inverse_rms = rsqrtf(sum_sq / static_cast<float>(head_dim) + rms_eps);
+        compressed_positions[compressed_index] = boundary_position;
+    }
+    __syncthreads();
+
+    if (dimension < head_dim) {
+        float value = raw[dimension] * inverse_rms * __half2float(norm[dimension]);
+        if (dimension >= nope_dim && dimension < nope_dim + rope_dim) {
+            const int pair = (dimension - nope_dim) / 2;
+            const float cosine = cos_cache[rope_position * (rope_dim / 2) + pair];
+            const float sine = sin_cache[rope_position * (rope_dim / 2) + pair];
+            const float partner = raw[dimension + ((dimension - nope_dim) % 2 == 0 ? 1 : -1)] *
+                                  inverse_rms * __half2float(norm[dimension + ((dimension - nope_dim) % 2 == 0 ? 1 : -1)]);
+            value = ((dimension - nope_dim) % 2 == 0)
+                ? value * cosine - partner * sine
+                : value * cosine + partner * sine;
+        }
+        const size_t output_offset = static_cast<size_t>(compressed_index) * static_cast<size_t>(head_dim) +
+                                     static_cast<size_t>(dimension);
+        compressed_key[output_offset] = __float2half(value);
+        compressed_value[output_offset] = __float2half(value);
+    }
+}
+
+// 12. Float32 Lightning Indexer score path. One thread owns one compressed
+// candidate; the host performs the final stable top-k ordering so ties remain
+// deterministic while the semantic path is being proven.
+__global__ void v4_indexer_scores_kernel(
+    const __half* __restrict__ query,
+    const float* __restrict__ weights,
+    const __half* __restrict__ key_cache,
+    float* __restrict__ scores,
+    int candidate_count,
+    int num_heads,
+    int head_dim,
+    float softmax_scale,
+    float head_scale
+) {
+    const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate >= candidate_count) return;
+
+    float score = 0.0f;
+    const __half* key = key_cache + static_cast<size_t>(candidate) * static_cast<size_t>(head_dim);
+    for (int head = 0; head < num_heads; ++head) {
+        float dot = 0.0f;
+        const size_t head_offset = static_cast<size_t>(head) * static_cast<size_t>(head_dim);
+        for (int dimension = 0; dimension < head_dim; ++dimension) {
+            dot += __half2float(query[head_offset + static_cast<size_t>(dimension)]) *
+                   __half2float(key[static_cast<size_t>(dimension)]);
+        }
+        score += dot * weights[head] * softmax_scale * head_scale;
+    }
+    scores[candidate] = score;
+}
+
+// 13. Serial local-plus-compressed attention for C4A and C128A. The bounded
+// shared score array covers the 128-token local ring plus a 512-entry top-k.
+__global__ void __launch_bounds__(32) v4_cached_compressed_attention_wave32_kernel(
+    const __half* __restrict__ q,
+    const __half* __restrict__ local_key_cache,
+    const __half* __restrict__ local_value_cache,
+    const int64_t* __restrict__ local_positions,
+    const float* __restrict__ attn_sink,
+    const __half* __restrict__ compressed_key_cache,
+    const __half* __restrict__ compressed_value_cache,
+    const int64_t* __restrict__ compressed_positions,
+    const int32_t* __restrict__ topk_indices,
+    __half* __restrict__ out,
+    int64_t current_position,
+    int local_capacity,
+    int compressed_count,
+    int topk_count,
+    bool uses_indexer,
+    float scale
+) {
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x;
+    __shared__ float scores[DSV4_MAX_ATTENTION_KEYS];
+
+    const int local_start = max(0, static_cast<int>(current_position) - local_capacity + 1);
+    const __half* query = q + static_cast<size_t>(head) * DSV4_HEAD_DIM;
+    const int compressed_slots = uses_indexer ? topk_count : compressed_count;
+
+    for (int slot = 0; slot < local_capacity; ++slot) {
+        const int64_t key_position = local_positions[slot];
+        const bool valid = key_position >= local_start && key_position <= current_position;
+        float dot = 0.0f;
+        if (valid) {
+            const __half* key = local_key_cache + static_cast<size_t>(slot) * DSV4_HEAD_DIM;
+            for (int dimension = lane; dimension < static_cast<int>(DSV4_HEAD_DIM); dimension += 32) {
+                dot += __half2float(query[dimension]) * __half2float(key[dimension]);
+            }
+            for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_xor(dot, offset, 32);
+        }
+        if (lane == 0) scores[slot] = valid ? dot * scale : -3.402823466e+38F;
+    }
+
+    for (int index = 0; index < compressed_slots; ++index) {
+        const int compressed_index = uses_indexer ? topk_indices[index] : index;
+        bool valid = compressed_index >= 0 && compressed_index < compressed_count;
+        if (valid) valid = compressed_positions[compressed_index] <= current_position;
+        float dot = 0.0f;
+        if (valid) {
+            const __half* key = compressed_key_cache + static_cast<size_t>(compressed_index) * DSV4_HEAD_DIM;
+            for (int dimension = lane; dimension < static_cast<int>(DSV4_HEAD_DIM); dimension += 32) {
+                dot += __half2float(query[dimension]) * __half2float(key[dimension]);
+            }
+            for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_xor(dot, offset, 32);
+        }
+        if (lane == 0) scores[local_capacity + index] = valid ? dot * scale : -3.402823466e+38F;
+    }
+    __syncthreads();
+
+    const int total_keys = local_capacity + compressed_slots;
+    float maximum = attn_sink[head];
+    for (int index = 0; index < total_keys; ++index) maximum = fmaxf(maximum, scores[index]);
+    float denominator = expf(attn_sink[head] - maximum);
+    for (int index = 0; index < total_keys; ++index) {
+        scores[index] = expf(scores[index] - maximum);
+        denominator += scores[index];
+    }
+    const float inverse_denominator = 1.0f / fmaxf(denominator, 1e-30f);
+    __syncthreads();
+
+    __half* output = out + static_cast<size_t>(head) * DSV4_HEAD_DIM;
+    for (int dimension = lane; dimension < static_cast<int>(DSV4_HEAD_DIM); dimension += 32) {
+        float value = 0.0f;
+        for (int slot = 0; slot < local_capacity; ++slot) {
+            if (scores[slot] == 0.0f) continue;
+            value += scores[slot] * inverse_denominator *
+                     __half2float(local_value_cache[static_cast<size_t>(slot) * DSV4_HEAD_DIM + dimension]);
+        }
+        for (int index = 0; index < compressed_slots; ++index) {
+            const int compressed_index = uses_indexer ? topk_indices[index] : index;
+            if (compressed_index < 0 || compressed_index >= compressed_count) continue;
+            if (scores[local_capacity + index] == 0.0f) continue;
+            value += scores[local_capacity + index] * inverse_denominator *
+                     __half2float(compressed_value_cache[
+                         static_cast<size_t>(compressed_index) * DSV4_HEAD_DIM + dimension]);
+        }
+        output[dimension] = __float2half(value);
+    }
+}
+
+// 14. Hyper-Connections Head Reduction Kernel
 __global__ void __launch_bounds__(32) hc_head_wave32_kernel(
     const float* __restrict__ residual_in, // [4, 4096] = 16384 floats
     const float* __restrict__ hc_head_fn,  // [4, 16384] floats

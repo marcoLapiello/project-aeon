@@ -56,7 +56,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [x] Stage 3 model correctness layer ownership: class-aware local/compressed/indexer device state, complete generation reset, main/compressed RoPE resources, bounded attention scratch, absolute-position ring reuse, and state-aware memory accounting are implemented and validated on gfx1100.
 
 ### Current priority
-- [ ] **Model correctness:** continue [the model correctness plan](plans-and-docs/execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) at Stage 4: dispatch serial decode through the class-specific state machine and compare the production traces against the completed CPU oracle before using routing data for placement decisions.
+- [ ] **Model correctness:** continue [the model correctness plan](plans-and-docs/execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) after the Stage 4 serial dispatch slice: compare production traces against the completed CPU oracle, then prove post-position-128 behavior before using routing data for placement decisions.
 
 ### Paused work
 - [ ] **Phase 2 continuation:** broad cold-tier, storage-layout, placement, and latency-hiding work remains paused while model correctness and the 35 GiB host-pressure tradeoff are characterized. The existing Phase 2 document remains the historical execution record for completed spikes and open gates.
