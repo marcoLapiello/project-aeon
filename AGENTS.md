@@ -54,7 +54,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [x] Stage 1 model correctness weight/dense gate: independent version-2 INT4 expert decoding, real early/middle/late routed-expert parity, representative dense/HC/RMSNorm/router parity, and full LM-head comparison pass on gfx1100 under fixed tolerances. The checkpoint-specific attention state machine remains open.
 
 ### Current priority
-- [ ] **Model correctness:** continue [the model correctness plan](plans-and-docs/execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) at Stage 2: build the CPU SWA/CSA/HCA attention and cache oracle, then recover the checkpoint-driven state machine and trusted-reference parity before using routing data for placement decisions.
+- [ ] **Model correctness:** continue [the model correctness plan](plans-and-docs/execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) at Stage 2: the initial CPU SWA/CSA/HCA attention and cache oracle is in place; next recover the checkpoint-driven state machine and trusted-reference parity before using routing data for placement decisions.
 
 ### Paused work
 - [ ] **Phase 2 continuation:** broad cold-tier, storage-layout, placement, and latency-hiding work remains paused while model correctness and the 35 GiB host-pressure tradeoff are characterized. The existing Phase 2 document remains the historical execution record for completed spikes and open gates.

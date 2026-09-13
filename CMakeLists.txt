@@ -160,6 +160,12 @@ target_link_libraries(test_v4_attention PRIVATE amdhip64)
 add_test(NAME test_v4_attention COMMAND test_v4_attention)
 set_tests_properties(test_v4_attention PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Stage 2 host oracle: sliding, ratio-4 CSA, ratio-128 HCA, and state transitions
+add_executable(test_v4_attention_oracle tests/test_v4_attention_oracle.cpp)
+target_link_libraries(test_v4_attention_oracle PRIVATE amdhip64)
+add_test(NAME test_v4_attention_oracle COMMAND test_v4_attention_oracle)
+set_tests_properties(test_v4_attention_oracle PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Model-backed validation: selected DeepSeek-V4 schedule and dense tensor contract
 add_executable(test_v4_model_contract tests/test_v4_model_contract.cpp)
 target_link_libraries(test_v4_model_contract PRIVATE amdhip64)

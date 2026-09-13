@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
 **Date:** 2026-09-13  
-**Status:** Open; Stage 0 complete; Stage 1 weight/dense gate complete; Stage 2 next
+**Status:** Open; Stage 0 complete; Stage 1 weight/dense gate complete; Stage 2 CPU oracle in progress
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -604,6 +604,38 @@ tests/test_v4_prefill_state.cpp
 
 If the repository keeps the first reference implementation header-only, keep it
 isolated from production HIP kernels and document the boundary.
+
+### Stage 2 implementation record (2026-09-13)
+
+The initial CPU oracle boundary is implemented in
+`src/architecture/deepseek_v4/reference/v4_attention_oracle.hpp` with focused
+coverage in `tests/test_v4_attention_oracle.cpp`. It is host-only and accepts
+caller-supplied float32 query, local K/V, compressor, and indexer projection
+fixtures; it does not depend on the production HIP kernels or the complete
+model artifact.
+
+The oracle now exposes and serializes the absolute position, 128-slot local
+K/V ring with absolute positions, C4 overlapping and C128 non-overlapping
+partial compressor rows, score plus APE state, normalized compressed entries,
+class-specific RoPE identities and positions, C4 indexer query/weight/key
+state, candidate counts, deterministic top-k indices, attention sink, and
+attention output before inverse RoPE. C4 short-context selection retains all
+valid candidates in ascending index order; larger candidate sets use
+descending score with ascending index tie-breaking.
+
+The reproducible validation commands are:
+
+```text
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure -R '^(test_v4_attention_oracle|test_v4_attention|test_v4_model_contract)$'
+```
+
+On the current build, the full repository build and all three selected tests
+passed. The oracle test covers positions through 131, the real 512/513 C4
+candidate boundary, local ring-slot reuse, reset, aligned and unaligned chunk
+splits, and serialized state continuation. This record does not close Stage 2:
+real checkpoint-layer traces, production prefill ownership, HIP-versus-oracle
+parity, and trusted-reference parity remain open for the next slices.
 
 ### Stage 3: Add class-aware layer ownership and strict tensor binding
 
