@@ -53,15 +53,16 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 - [x] Stage 0 model correctness boundary: structured DeepSeek-V4 config parsing, explicit 43-layer Sliding/CSA/HCA classification, shape-aware 1,271-tensor dense inventory, strict required-tensor validation, class-specific compressor/indexer binding, and reproducible contract metadata are implemented and validated against the selected package.
 - [x] Stage 1 model correctness weight/dense gate: independent version-2 INT4 expert decoding, real early/middle/late routed-expert parity, representative dense/HC/RMSNorm/router parity, and full LM-head comparison pass on gfx1100 under fixed tolerances. The checkpoint-specific attention state machine remains open.
 - [x] Stage 2 model correctness CPU oracle: deterministic Sliding/C4A/C128A cache transitions, real layer 0/2/3 dense traces through position 131, compressed-entry and indexer boundary checks, class-aware RoPE, chunk/serialization equivalence, and deterministic C4 top-k selection.
+- [x] Stage 3 model correctness layer ownership: class-aware local/compressed/indexer device state, complete generation reset, main/compressed RoPE resources, bounded attention scratch, absolute-position ring reuse, and state-aware memory accounting are implemented and validated on gfx1100.
 
 ### Current priority
-- [ ] **Model correctness:** continue [the model correctness plan](plans-and-docs/execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) at Stage 3: add production layer-specific cache/indexer ownership and class-aware resources against the completed CPU oracle before porting to HIP or using routing data for placement decisions.
+- [ ] **Model correctness:** continue [the model correctness plan](plans-and-docs/execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) at Stage 4: dispatch serial decode through the class-specific state machine and compare the production traces against the completed CPU oracle before using routing data for placement decisions.
 
 ### Paused work
 - [ ] **Phase 2 continuation:** broad cold-tier, storage-layout, placement, and latency-hiding work remains paused while model correctness and the 35 GiB host-pressure tradeoff are characterized. The existing Phase 2 document remains the historical execution record for completed spikes and open gates.
 
 ### Open gates
-- [ ] **Model correctness:** port the validated layer-specific state machine to production ownership and HIP, then compare identical formatted inputs and outputs with a trusted compatible reference before using traces for placement.
+- [ ] **Model correctness:** port the validated layer-specific state machine to HIP, then compare identical formatted inputs and outputs with a trusted compatible reference before using traces for placement.
 - [ ] **Cold-tier performance:** characterize cold-cache and steady-state behavior, reduce host-memory pressure, improve physical `.aeon` placement, and test whether the exposed just-in-time miss path needs a new scheduling or CPU-fallback design. The model-backed `>= 6.0 GB/s` target remains open.
 - [ ] **Swizzled full-model performance:** validate representative 43-layer generation with the version-2 artifact under controlled Hot/Warm conditions, collect useful rocprof performance counters, and tune occupancy/register pressure beyond the isolated six-expert benchmarks. A residency invariant violation would produce invalid/stale results or a device memory fault rather than trigger an automatic fallback.
 - [ ] **Routing placement study:** collect representative profile and held-out corpora with the verified text contract, then evaluate frequency-informed placement against dynamic LRU.

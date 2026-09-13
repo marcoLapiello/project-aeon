@@ -1,5 +1,6 @@
 #pragma once
 
+#include "architecture/deepseek_v4/core/config.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
 
@@ -16,6 +17,7 @@ namespace aeon::core {
 class V4ModelResources {
 public:
     kernel::RopeTable rope_table;
+    kernel::RopeTable compressed_rope_table;
 
     const half* host_embed_table{nullptr};
     float* d_hc_head_fn{nullptr};
@@ -25,6 +27,8 @@ public:
     half* d_final_norm{nullptr};
     float* d_cos_cache{nullptr};
     float* d_sin_cache{nullptr};
+    float* d_compressed_cos_cache{nullptr};
+    float* d_compressed_sin_cache{nullptr};
 
     V4ModelResources() = default;
 
@@ -48,20 +52,30 @@ public:
     }
 
     void initialize(const AeonModelLoader& loader, uint32_t max_seq_len) {
+        initialize(loader, max_seq_len, DeepSeekV4Config{});
+    }
+
+    void initialize(
+        const AeonModelLoader& loader,
+        uint32_t max_seq_len,
+        const DeepSeekV4Config& config
+    ) {
         free();
 
-        rope_table.init(max_seq_len, kernel::DSV4_ROPE_THETA, 1.0f);
-        const size_t rope_bytes = rope_table.max_seq_len * rope_table.half_rope * sizeof(float);
-        check_hip(hipMalloc(&d_cos_cache, rope_bytes), "hipMalloc(cosine cache)");
-        check_hip(hipMalloc(&d_sin_cache, rope_bytes), "hipMalloc(sine cache)");
-        check_hip(
-            hipMemcpy(d_cos_cache, rope_table.cos_cache.data(), rope_bytes, hipMemcpyHostToDevice),
-            "hipMemcpy(cosine cache)"
-        );
-        check_hip(
-            hipMemcpy(d_sin_cache, rope_table.sin_cache.data(), rope_bytes, hipMemcpyHostToDevice),
-            "hipMemcpy(sine cache)"
-        );
+        rope_table.init(max_seq_len, config.rope_theta, 1.0f);
+        compressed_rope_table.init(
+            max_seq_len,
+            config.compress_rope_theta,
+            config.rope_scaling.factor,
+            config.rope_scaling.beta_fast,
+            config.rope_scaling.beta_slow,
+            static_cast<uint32_t>(config.rope_scaling.original_max_position_embeddings));
+        allocate_rope_cache(rope_table, &d_cos_cache, &d_sin_cache, "main");
+        allocate_rope_cache(
+            compressed_rope_table,
+            &d_compressed_cos_cache,
+            &d_compressed_sin_cache,
+            "compressed");
 
         host_embed_table = loader.get_data_ptr<half>("embed.weight");
 
@@ -102,6 +116,8 @@ public:
     void free() noexcept {
         if (d_cos_cache) { (void)hipFree(d_cos_cache); d_cos_cache = nullptr; }
         if (d_sin_cache) { (void)hipFree(d_sin_cache); d_sin_cache = nullptr; }
+        if (d_compressed_cos_cache) { (void)hipFree(d_compressed_cos_cache); d_compressed_cos_cache = nullptr; }
+        if (d_compressed_sin_cache) { (void)hipFree(d_compressed_sin_cache); d_compressed_sin_cache = nullptr; }
         if (d_lm_head) { (void)hipFree(d_lm_head); d_lm_head = nullptr; }
         if (d_hc_head_fn) { (void)hipFree(d_hc_head_fn); d_hc_head_fn = nullptr; }
         if (d_hc_head_base) { (void)hipFree(d_hc_head_base); d_hc_head_base = nullptr; }
@@ -111,6 +127,27 @@ public:
     }
 
 private:
+    static void allocate_rope_cache(
+        const kernel::RopeTable& table,
+        float** cosine_cache,
+        float** sine_cache,
+        const char* identity
+    ) {
+        const size_t bytes = static_cast<size_t>(table.max_seq_len) * table.half_rope * sizeof(float);
+        check_hip(
+            hipMalloc(cosine_cache, bytes),
+            (std::string("hipMalloc(") + identity + " cosine cache)").c_str());
+        check_hip(
+            hipMalloc(sine_cache, bytes),
+            (std::string("hipMalloc(") + identity + " sine cache)").c_str());
+        check_hip(
+            hipMemcpy(*cosine_cache, table.cos_cache.data(), bytes, hipMemcpyHostToDevice),
+            (std::string("hipMemcpy(") + identity + " cosine cache)").c_str());
+        check_hip(
+            hipMemcpy(*sine_cache, table.sin_cache.data(), bytes, hipMemcpyHostToDevice),
+            (std::string("hipMemcpy(") + identity + " sine cache)").c_str());
+    }
+
     static void check_hip(hipError_t error, const char* operation) {
         if (error != hipSuccess) {
             throw std::runtime_error(
@@ -120,6 +157,7 @@ private:
 
     void move_from(V4ModelResources&& other) noexcept {
         rope_table = std::move(other.rope_table);
+        compressed_rope_table = std::move(other.compressed_rope_table);
         host_embed_table = other.host_embed_table;
         d_hc_head_fn = other.d_hc_head_fn;
         d_hc_head_base = other.d_hc_head_base;
@@ -128,6 +166,8 @@ private:
         d_final_norm = other.d_final_norm;
         d_cos_cache = other.d_cos_cache;
         d_sin_cache = other.d_sin_cache;
+        d_compressed_cos_cache = other.d_compressed_cos_cache;
+        d_compressed_sin_cache = other.d_compressed_sin_cache;
 
         other.host_embed_table = nullptr;
         other.d_hc_head_fn = nullptr;
@@ -137,6 +177,8 @@ private:
         other.d_final_norm = nullptr;
         other.d_cos_cache = nullptr;
         other.d_sin_cache = nullptr;
+        other.d_compressed_cos_cache = nullptr;
+        other.d_compressed_sin_cache = nullptr;
     }
 };
 

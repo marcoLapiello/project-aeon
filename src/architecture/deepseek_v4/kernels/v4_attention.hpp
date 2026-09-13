@@ -557,74 +557,77 @@ __global__ void __launch_bounds__(32) v4_inverse_rope_at_pos_wave32_kernel(
 
 // 9. Autoregressive Sliding-Window Attention with persistent KV Cache
 __global__ void __launch_bounds__(32) v4_cached_sliding_window_attn_wave32_kernel(
-    const __half* __restrict__ q,         // [64, 512]
-    const __half* __restrict__ kv_cache,  // [max_seq_len, 512]
-    const float*  __restrict__ attn_sink, // [64]
-    __half*       __restrict__ out,       // [64, 512]
-    int current_pos,                      // sequence index (0, 1, 2, ...)
-    int window_size,                      // 128
-    float scale                           // 1.0f / sqrt(512)
+    const __half* __restrict__ q,          // [64, 512]
+    const __half* __restrict__ key_cache,  // [window_size, 512]
+    const __half* __restrict__ value_cache,// [window_size, 512]
+    const int64_t* __restrict__ positions, // [window_size]
+    const float*  __restrict__ attn_sink,  // [64]
+    __half*       __restrict__ out,        // [64, 512]
+    int current_pos,                       // sequence index (0, 1, 2, ...)
+    int window_size,                       // 128
+    float scale                            // 1.0f / sqrt(512)
 ) {
     int head = blockIdx.x;                // 0..63
     int lane = threadIdx.x;               // 0..31
 
     __shared__ float lds_scores[DSV4_SLIDING_WINDOW];
 
-    int j_start = max(0, current_pos - window_size + 1);
-    int num_keys = current_pos - j_start + 1;
-
+    const int j_start = max(0, current_pos - window_size + 1);
     const __half* q_ptr = q + head * DSV4_HEAD_DIM;
 
-    // Phase 1: Dot products with cached keys
-    for (int step = 0; step < num_keys; ++step) {
-        int j = j_start + step;
-        const __half* k_ptr = kv_cache + j * DSV4_HEAD_DIM;
+    // Phase 1: Dot products with valid cached ring slots.
+    for (int slot = 0; slot < window_size; ++slot) {
+        const int64_t key_position = positions[slot];
+        const bool valid = key_position >= static_cast<int64_t>(j_start) &&
+                           key_position <= static_cast<int64_t>(current_pos);
+        const __half* k_ptr = key_cache + slot * DSV4_HEAD_DIM;
 
         float dot = 0.0f;
-        #pragma unroll 4
-        for (int d = lane * 16; d < (lane + 1) * 16; ++d) {
-            dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d]);
-        }
+        if (valid) {
+            #pragma unroll 4
+            for (int d = lane * 16; d < (lane + 1) * 16; ++d) {
+                dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d]);
+            }
 
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            dot += __shfl_xor(dot, offset, 32);
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                dot += __shfl_xor(dot, offset, 32);
+            }
         }
 
         if (lane == 0) {
-            lds_scores[step] = dot * scale;
+            lds_scores[slot] = valid ? dot * scale : -INFINITY;
         }
     }
     __syncthreads();
 
-    // Phase 2: Softmax with attention sink
+    // Phase 2: Softmax with attention sink.
     float max_score = attn_sink[head];
-    for (int step = 0; step < num_keys; ++step) {
-        max_score = fmaxf(max_score, lds_scores[step]);
+    for (int slot = 0; slot < window_size; ++slot) {
+        max_score = fmaxf(max_score, lds_scores[slot]);
     }
 
     float sink_weight = expf(attn_sink[head] - max_score);
     float sum_exp = sink_weight;
 
-    for (int step = 0; step < num_keys; ++step) {
-        float p = expf(lds_scores[step] - max_score);
-        lds_scores[step] = p;
+    for (int slot = 0; slot < window_size; ++slot) {
+        float p = expf(lds_scores[slot] - max_score);
+        lds_scores[slot] = p;
         sum_exp += p;
     }
 
     float inv_sum = 1.0f / fmaxf(sum_exp, 1e-30f);
     __syncthreads();
 
-    // Phase 3: Weighted sum of Value vectors (V = K)
+    // Phase 3: Weighted sum of value vectors.
     __half* out_ptr = out + head * DSV4_HEAD_DIM;
 
     #pragma unroll 4
     for (int d = lane * 16; d < (lane + 1) * 16; ++d) {
         float acc = 0.0f;
-        for (int step = 0; step < num_keys; ++step) {
-            int j = j_start + step;
-            float weight = lds_scores[step] * inv_sum;
-            acc += weight * __half2float(kv_cache[j * DSV4_HEAD_DIM + d]);
+        for (int slot = 0; slot < window_size; ++slot) {
+            const float weight = lds_scores[slot] * inv_sum;
+            acc += weight * __half2float(value_cache[slot * DSV4_HEAD_DIM + d]);
         }
         out_ptr[d] = __float2half(acc);
     }

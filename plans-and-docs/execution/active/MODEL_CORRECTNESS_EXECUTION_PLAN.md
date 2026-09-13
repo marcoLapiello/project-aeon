@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
 **Date:** 2026-09-13  
-**Status:** Open; Stage 0 complete; Stage 1 weight/dense gate complete; Stage 2 CPU attention/cache oracle complete; Stage 3 next
+**Status:** Open; Stages 0-2 complete; Stage 3 layer ownership/resources complete; Stage 4 next
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -407,7 +407,7 @@ src/architecture/deepseek_v4/core/v4_dense_weight_binding.hpp
 
 Stage 0 is complete for the selected Aeon package. The runtime now parses the
 configuration through a structured JSON value tree, resolves the 43 base layers
-to 3 Sliding, 20 CSA, and 20 HCA descriptors, retains dense directory shapes,
+to 2 Sliding, 21 CSA, and 20 HCA descriptors, retains dense directory shapes,
 and rejects missing, mismatched, or incorrectly shaped required tensors before
 device layer initialization. The class-specific compressor and CSA indexer
 weights are bound fail-closed from the resolved descriptor.
@@ -679,7 +679,7 @@ Tasks:
 
 Acceptance criteria:
 
-- Initialization reports the expected class counts: 3 sliding layers, 20 C4A
+- Initialization reports the expected class counts: 2 sliding layers, 21 C4A
   layers, and 20 C128A layers.
 - A real model initializes every required layer tensor without null pointers or
   shape reinterpretation.
@@ -690,6 +690,47 @@ Acceptance criteria:
 - The memory report accounts for the new state categories instead of treating
   the old full-resolution cache as the model contract.
 
+### Stage 3 implementation record (2026-09-13)
+
+The production layer-ownership slice is complete. `V4Layer` now keeps its
+resolved layer descriptor private after initialization and owns an explicit
+128-slot local key/value ring with absolute-position metadata. CSA and HCA
+layers additionally own their class-specific compressor partial rows,
+compressed key/value entries, and valid-count metadata; CSA layers also own
+indexer keys, partial rows, query/weight/score state, candidate positions, and
+deterministic top-k workspace. The legacy `d_kv_cache` name remains only as a
+non-owning alias to the local key cache; the current sliding path uses the ring
+and its absolute-position metadata.
+
+`V4ModelResources` now builds and uploads separate main and compressed RoPE
+tables from the parsed theta and YaRN settings. The pipeline scratch object
+owns bounded per-token compressor/indexer projections and top-k metadata, while
+large persistent state remains in each layer. The sliding kernel now filters
+ring slots by absolute position, and `reset_generation_state()` clears local,
+compressed, compressor, indexer, position, and top-k state together. The memory
+budget reports local K/V, compressed K/V, compressor, indexer, metadata, RoPE,
+and total attention-state categories using the same layout used for allocation.
+
+The focused validation targets are:
+
+```text
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure -R '^(test_v4_attention|test_v4_attention_oracle|test_v4_real_attention_oracle|test_v4_model_contract|test_v4_layer_state|test_v4_layer_state_device|test_dynamic_expert_pool|test_hot_warm_cold_pipeline)$'
+```
+
+On the Radeon RX 7900 XTX (`gfx1100`), the full build and all eight focused
+tests passed. The model-backed real-oracle test completed in approximately
+10.4 seconds, the context-256 43-layer pipeline initialization and one-token
+smoke completed in approximately 8.5 seconds, and the device state test
+verified ring-slot reuse at positions 0 and 128 plus reset sentinels. The
+resolved schedule is 2 Sliding, 21 CSA, and 20 HCA; the earlier 3/20/20 text
+was an acceptance-text error, not a checkpoint change.
+
+This closes Stage 3 layer-state ownership, resource allocation, reset, and
+memory-accounting work. It does not establish C4A/HCA production dispatch,
+HIP-versus-oracle parity, true batched prefill, or trusted-reference parity.
+Stage 4 is next: serial dispatch through the class-specific state machine.
+
 ### Stage 4: Implement correct serial decode semantics first
 
 **Objective:** Replace the all-layer sliding fallback with a correct, simple
@@ -699,7 +740,7 @@ Tasks:
 
 1. Preserve `V4Pipeline::step(token_id, pos, phase)` as the first integration
    surface, but dispatch each layer through its `V4LayerSpec`.
-2. Keep the current SWA path as the layer-0/1/42 branch only, after comparing
+2. Keep the current SWA path as the layer-0/1 branch only, after comparing
    its K/V insertion, sink handling, RoPE, and inverse-RoPE order with the
    oracle.
 3. Add the C128A branch for layers 3, 5, ..., 41. Verify that a compressed

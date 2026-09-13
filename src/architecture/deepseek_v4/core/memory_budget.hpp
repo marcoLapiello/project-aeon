@@ -1,6 +1,7 @@
 #pragma once
 
 #include "architecture/deepseek_v4/core/config.hpp"
+#include "architecture/deepseek_v4/core/v4_layer_state.hpp"
 #include "infrastructure/core/expert_format.hpp"
 
 #include <hip/hip_runtime.h>
@@ -56,6 +57,13 @@ struct MemoryBudgetReport {
     // VRAM allocations
     size_t vram_dense_bytes{0};
     size_t vram_kv_bytes{0};
+    size_t vram_local_kv_bytes{0};
+    size_t vram_compressed_kv_bytes{0};
+    size_t vram_compressor_state_bytes{0};
+    size_t vram_indexer_state_bytes{0};
+    size_t vram_attention_metadata_bytes{0};
+    size_t vram_attention_state_bytes{0};
+    size_t vram_rope_bytes{0};
     size_t vram_scratch_bytes{0};
     size_t vram_headroom_bytes{VRAM_HEADROOM_SAFETY_BYTES};
     size_t vram_min_active_bytes{0};
@@ -97,7 +105,13 @@ struct MemoryBudgetReport {
             << "--------------------------------------------------------------------------------\n"
             << "  VRAM Allocation Breakdown:\n"
             << "    - Dense Model Weights  : " << (double)vram_dense_bytes / (1024 * 1024 * 1024) << " GB\n"
-            << "    - KV Cache Buffer      : " << (double)vram_kv_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Local K/V state      : " << (double)vram_local_kv_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Compressed K/V state : " << (double)vram_compressed_kv_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Compressor state     : " << (double)vram_compressor_state_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Indexer state        : " << (double)vram_indexer_state_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Attention metadata   : " << (double)vram_attention_metadata_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - RoPE tables          : " << (double)vram_rope_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Attention state total: " << (double)vram_attention_state_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Compute Scratch      : " << (double)vram_scratch_bytes / (1024 * 1024) << " MB\n"
             << "    - Safety Headroom      : " << (double)vram_headroom_bytes / (1024 * 1024) << " MB (Fixed OS/GTT buffer)\n"
             << "    - Active Experts Min   : " << (double)vram_min_active_bytes / (1024 * 1024) << " MB\n"
@@ -121,6 +135,44 @@ struct MemoryBudgetReport {
 
 class MemoryBudgetEngine {
 public:
+    struct AttentionStateMemory {
+        size_t local_kv_bytes{0};
+        size_t compressed_kv_bytes{0};
+        size_t compressor_state_bytes{0};
+        size_t indexer_state_bytes{0};
+        size_t metadata_bytes{0};
+        size_t layer_state_bytes{0};
+        size_t rope_bytes{0};
+
+        size_t total_bytes() const {
+            return layer_state_bytes + rope_bytes;
+        }
+    };
+
+    static AttentionStateMemory attention_state_memory(
+        const DeepSeekV4Config& model_cfg,
+        uint32_t context_size
+    ) {
+        if (context_size == 0) {
+            throw std::invalid_argument("MemoryBudgetEngine: attention context cannot be 0");
+        }
+        const auto layer_specs = V4ModelSpec::resolve_layers(model_cfg);
+        AttentionStateMemory memory;
+        for (const auto& layer_spec : layer_specs) {
+            const auto layout = V4LayerStateLayout::from_spec(layer_spec, context_size);
+            memory.local_kv_bytes += layout.local_cache_bytes();
+            memory.compressed_kv_bytes += layout.compressed_cache_bytes();
+            memory.compressor_state_bytes += layout.compressor_state_bytes();
+            memory.indexer_state_bytes += layout.indexer_cache_bytes() + layout.indexer_workspace_bytes();
+            memory.metadata_bytes += layout.local_metadata_bytes() + layout.compressed_metadata_bytes();
+            memory.layer_state_bytes += layout.total_device_bytes();
+        }
+
+        const size_t rope_half = static_cast<size_t>(model_cfg.qk_rope_head_dim / 2);
+        memory.rope_bytes = static_cast<size_t>(context_size) * rope_half * sizeof(float) * 4;
+        return memory;
+    }
+
     static MemoryBudgetReport evaluate(
         const AeonRuntimeConfig& runtime_cfg,
         const DeepSeekV4Config& model_cfg,
@@ -187,14 +239,24 @@ public:
             return report;
         }
 
-        // 4. Calculate exact VRAM requirements
-        // KV Cache for DeepSeek-V4 MLA: layers * context_size * kv_dim * sizeof(half)
-        // kv_dim is head_dim (512) for num_key_value_heads (1)
+        AttentionStateMemory attention_memory;
+        try {
+            attention_memory = attention_state_memory(model_cfg, runtime_cfg.context_size);
+        } catch (const std::exception& error) {
+            report.rejection_reason = error.what();
+            return report;
+        }
+
+        // 4. Calculate exact VRAM requirements from the resolved layer classes.
         report.vram_dense_bytes   = dense_weights_bytes;
-        report.vram_kv_bytes      = static_cast<size_t>(model_cfg.num_hidden_layers) *
-                                    runtime_cfg.context_size *
-                                    model_cfg.head_dim *
-                                    sizeof(uint16_t);
+        report.vram_local_kv_bytes = attention_memory.local_kv_bytes;
+        report.vram_compressed_kv_bytes = attention_memory.compressed_kv_bytes;
+        report.vram_compressor_state_bytes = attention_memory.compressor_state_bytes;
+        report.vram_indexer_state_bytes = attention_memory.indexer_state_bytes;
+        report.vram_attention_metadata_bytes = attention_memory.metadata_bytes;
+        report.vram_attention_state_bytes = attention_memory.layer_state_bytes;
+        report.vram_rope_bytes = attention_memory.rope_bytes;
+        report.vram_kv_bytes = attention_memory.total_bytes();
         report.vram_scratch_bytes = PIPELINE_SCRATCH_BYTES;
         report.vram_headroom_bytes = VRAM_HEADROOM_SAFETY_BYTES;
 
@@ -211,16 +273,22 @@ public:
                                       report.vram_headroom_bytes +
                                       report.vram_min_active_bytes;
 
-        // Calculate max viable context size for this GPU
-        size_t non_kv_required = report.vram_dense_bytes + report.vram_scratch_bytes +
-                                 report.vram_headroom_bytes + report.vram_min_active_bytes;
-        if (total_vram > non_kv_required) {
-            size_t max_kv_bytes = total_vram - non_kv_required;
-            size_t bytes_per_token = static_cast<size_t>(model_cfg.num_hidden_layers) *
-                                     model_cfg.head_dim * sizeof(uint16_t);
-            report.max_viable_context_size = static_cast<uint32_t>(max_kv_bytes / bytes_per_token);
-        } else {
-            report.max_viable_context_size = 0;
+        // Calculate max viable context size for this GPU using the same layout.
+        const size_t non_attention_required = report.vram_dense_bytes + report.vram_scratch_bytes +
+                                               report.vram_headroom_bytes + report.vram_min_active_bytes;
+        if (total_vram > non_attention_required) {
+            size_t low = 0;
+            size_t high = static_cast<size_t>(model_cfg.max_position_embeddings);
+            while (low < high) {
+                const size_t midpoint = low + (high - low + 1) / 2;
+                const auto candidate = attention_state_memory(model_cfg, static_cast<uint32_t>(midpoint));
+                if (non_attention_required + candidate.total_bytes() <= total_vram) {
+                    low = midpoint;
+                } else {
+                    high = midpoint - 1;
+                }
+            }
+            report.max_viable_context_size = static_cast<uint32_t>(low);
         }
 
         // 6. Hard Feasibility Gate Evaluation

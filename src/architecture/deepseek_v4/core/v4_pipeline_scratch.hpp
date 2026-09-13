@@ -49,6 +49,14 @@ struct PipelineScratchBuffers {
     half*  d_q{nullptr};           // [16, 64, 512]
     half*  d_kv{nullptr};          // [16, 512]
     half*  d_kv_norm_act{nullptr}; // [16, 512]
+    half*  d_compressor_kv{nullptr}; // [16, 1024]
+    half*  d_compressor_score{nullptr}; // [16, 1024]
+    half*  d_indexer_query{nullptr}; // [16, 8192]
+    half*  d_indexer_weights{nullptr}; // [16, 64]
+    half*  d_indexer_compressor_kv{nullptr}; // [16, 256]
+    half*  d_indexer_compressor_score{nullptr}; // [16, 256]
+    int32_t* d_indexer_topk_indices{nullptr}; // [16, 512]
+    int32_t* d_indexer_candidate_count{nullptr}; // [16]
     half*  d_attn_out{nullptr};    // [16, 64, 512]
     half*  d_z_lora{nullptr};      // [16, 8192]
     half*  d_attn_proj{nullptr};   // [16, 4096]
@@ -139,6 +147,14 @@ struct PipelineScratchBuffers {
         CHECK_HIP(hipMalloc(&d_q, M * 64 * 512 * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_kv, M * 512 * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_kv_norm_act, M * 512 * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_compressor_kv, M * 1024 * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_compressor_score, M * 1024 * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_indexer_query, M * 8192 * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_indexer_weights, M * 64 * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_indexer_compressor_kv, M * 256 * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_indexer_compressor_score, M * 256 * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_indexer_topk_indices, M * 512 * sizeof(int32_t)));
+        CHECK_HIP(hipMalloc(&d_indexer_candidate_count, M * sizeof(int32_t)));
         CHECK_HIP(hipMalloc(&d_attn_out, M * 64 * 512 * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_z_lora, M * 8192 * sizeof(half)));
         CHECK_HIP(hipMalloc(&d_attn_proj, M * H * sizeof(half)));
@@ -204,6 +220,14 @@ struct PipelineScratchBuffers {
         if (d_q) { (void)hipFree(d_q); d_q = nullptr; }
         if (d_kv) { (void)hipFree(d_kv); d_kv = nullptr; }
         if (d_kv_norm_act) { (void)hipFree(d_kv_norm_act); d_kv_norm_act = nullptr; }
+        if (d_compressor_kv) { (void)hipFree(d_compressor_kv); d_compressor_kv = nullptr; }
+        if (d_compressor_score) { (void)hipFree(d_compressor_score); d_compressor_score = nullptr; }
+        if (d_indexer_query) { (void)hipFree(d_indexer_query); d_indexer_query = nullptr; }
+        if (d_indexer_weights) { (void)hipFree(d_indexer_weights); d_indexer_weights = nullptr; }
+        if (d_indexer_compressor_kv) { (void)hipFree(d_indexer_compressor_kv); d_indexer_compressor_kv = nullptr; }
+        if (d_indexer_compressor_score) { (void)hipFree(d_indexer_compressor_score); d_indexer_compressor_score = nullptr; }
+        if (d_indexer_topk_indices) { (void)hipFree(d_indexer_topk_indices); d_indexer_topk_indices = nullptr; }
+        if (d_indexer_candidate_count) { (void)hipFree(d_indexer_candidate_count); d_indexer_candidate_count = nullptr; }
         if (d_attn_out) { (void)hipFree(d_attn_out); d_attn_out = nullptr; }
         if (d_z_lora) { (void)hipFree(d_z_lora); d_z_lora = nullptr; }
         if (d_attn_proj) { (void)hipFree(d_attn_proj); d_attn_proj = nullptr; }
@@ -264,6 +288,14 @@ private:
         d_q = o.d_q; o.d_q = nullptr;
         d_kv = o.d_kv; o.d_kv = nullptr;
         d_kv_norm_act = o.d_kv_norm_act; o.d_kv_norm_act = nullptr;
+        d_compressor_kv = o.d_compressor_kv; o.d_compressor_kv = nullptr;
+        d_compressor_score = o.d_compressor_score; o.d_compressor_score = nullptr;
+        d_indexer_query = o.d_indexer_query; o.d_indexer_query = nullptr;
+        d_indexer_weights = o.d_indexer_weights; o.d_indexer_weights = nullptr;
+        d_indexer_compressor_kv = o.d_indexer_compressor_kv; o.d_indexer_compressor_kv = nullptr;
+        d_indexer_compressor_score = o.d_indexer_compressor_score; o.d_indexer_compressor_score = nullptr;
+        d_indexer_topk_indices = o.d_indexer_topk_indices; o.d_indexer_topk_indices = nullptr;
+        d_indexer_candidate_count = o.d_indexer_candidate_count; o.d_indexer_candidate_count = nullptr;
         d_attn_out = o.d_attn_out; o.d_attn_out = nullptr;
         d_z_lora = o.d_z_lora; o.d_z_lora = nullptr;
         d_attn_proj = o.d_attn_proj; o.d_attn_proj = nullptr;

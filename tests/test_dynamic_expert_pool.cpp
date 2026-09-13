@@ -30,9 +30,9 @@ int main() {
     // -------------------------------------------------------------------------
     // Test 1: Hard Feasibility Gate with Over-Budget Context Length
     // -------------------------------------------------------------------------
-    std::cout << "\n[Test 1] Testing Hard Feasibility Gate with Excessive Context Size (262,144 tokens)..." << std::endl;
+    std::cout << "\n[Test 1] Testing Hard Feasibility Gate with Excessive Context Size (1,048,576 tokens)..." << std::endl;
     aeon::core::AeonRuntimeConfig overbudget_cfg;
-    overbudget_cfg.context_size = 262144; // MLA KV would require ~11.27 GB, exceeding remaining 24GB VRAM
+    overbudget_cfg.context_size = 1048576;
     overbudget_cfg.warm_host_bytes = 0;   // Warm disabled
 
     auto overbudget_report = aeon::core::MemoryBudgetEngine::evaluate(

@@ -227,7 +227,7 @@ public:
 
         // 4. Initialize model-level device resources.
         std::cout << "[Pipeline] Initializing RoPE tables and model-level weights..." << std::endl;
-        model_resources_.initialize(aeon_loader, runtime_cfg.context_size);
+        model_resources_.initialize(aeon_loader, runtime_cfg.context_size, model_cfg);
 
         // 6. Allocate Intermediate GPU Scratch Buffers
         std::cout << "[Pipeline] Allocating intermediate GPU scratch buffers..." << std::endl;
@@ -364,6 +364,9 @@ public:
     // Run Single Autoregressive Step for token_id at sequence position `pos`
     // Returns next token ID via greedy argmax
     uint32_t step(uint32_t token_id, uint32_t pos, RoutingPhase phase = RoutingPhase::Decode) {
+        if (layers.empty() || pos >= context_capacity()) {
+            throw std::out_of_range("V4Pipeline::step: position exceeds configured context capacity");
+        }
         supply_telemetry_.set_phase(phase);
         reap_registry_transfers();
 
@@ -401,6 +404,13 @@ public:
         // 2. Execute Consecutive Transformer Layers
         for (uint32_t l = 0; l < num_layers_; ++l) {
             auto& layer = *layers[l];
+            const bool uses_compressed_rope = layer.spec().attention_kind != V4AttentionKind::Sliding;
+            const float* layer_cos_cache = uses_compressed_rope
+                ? model_resources_.d_compressed_cos_cache
+                : model_resources_.d_cos_cache;
+            const float* layer_sin_cache = uses_compressed_rope
+                ? model_resources_.d_compressed_sin_cache
+                : model_resources_.d_sin_cache;
 
             // -----------------------------------------------------------------
             // A. Hyper-Connections Attention Pre-Mix & Sinkhorn
@@ -486,25 +496,42 @@ public:
             hipLaunchKernelGGL(
                 kernel::v4_forward_rope_at_pos_wave32_kernel,
                 dim3(NUM_HEADS), dim3(32), 0, compute_stream,
-                scratch.d_q, model_resources_.d_cos_cache, model_resources_.d_sin_cache, pos,
+                scratch.d_q, layer_cos_cache, layer_sin_cache, pos,
                 NUM_HEADS, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2
             );
 
             hipLaunchKernelGGL(
                 kernel::v4_forward_rope_at_pos_wave32_kernel,
                 dim3(1), dim3(32), 0, compute_stream,
-                scratch.d_kv_norm_act, model_resources_.d_cos_cache, model_resources_.d_sin_cache, pos,
+                scratch.d_kv_norm_act, layer_cos_cache, layer_sin_cache, pos,
                 1, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2
             );
 
-            // Insert new KV vector into layer's persistent KV Cache at `pos`
+            const uint32_t local_slot = pos % layer.local_cache_capacity();
+            const size_t local_offset = static_cast<size_t>(local_slot) * HEAD_DIM;
             CHECK_HIP(hipMemcpyAsync(
-                layer.d_kv_cache + pos * HEAD_DIM,
+                layer.d_local_key_cache + local_offset,
                 scratch.d_kv_norm_act,
                 HEAD_DIM * sizeof(half),
                 hipMemcpyDeviceToDevice,
                 compute_stream
             ));
+            CHECK_HIP(hipMemcpyAsync(
+                layer.d_local_value_cache + local_offset,
+                scratch.d_kv_norm_act,
+                HEAD_DIM * sizeof(half),
+                hipMemcpyDeviceToDevice,
+                compute_stream
+            ));
+            const int64_t absolute_position = static_cast<int64_t>(pos);
+            CHECK_HIP(hipMemcpyAsync(
+                layer.d_local_positions + local_slot,
+                &absolute_position,
+                sizeof(absolute_position),
+                hipMemcpyHostToDevice,
+                compute_stream
+            ));
+            layer.record_position(pos);
 
             // -----------------------------------------------------------------
             // E. Autoregressive Sliding-Window Attention over Cached States
@@ -512,15 +539,16 @@ public:
             hipLaunchKernelGGL(
                 kernel::v4_cached_sliding_window_attn_wave32_kernel,
                 dim3(NUM_HEADS), dim3(32), 0, compute_stream,
-                scratch.d_q, layer.d_kv_cache, layer.d_attn_sink, scratch.d_attn_out,
-                pos, kernel::DSV4_SLIDING_WINDOW, kernel::DSV4_ATTN_SCALE
+                scratch.d_q, layer.d_local_key_cache, layer.d_local_value_cache,
+                layer.d_local_positions, layer.d_attn_sink, scratch.d_attn_out,
+                pos, static_cast<int>(layer.local_cache_capacity()), kernel::DSV4_ATTN_SCALE
             );
 
             // Inverse RoPE on attention output
             hipLaunchKernelGGL(
                 kernel::v4_inverse_rope_at_pos_wave32_kernel,
                 dim3(NUM_HEADS), dim3(32), 0, compute_stream,
-                scratch.d_attn_out, model_resources_.d_cos_cache, model_resources_.d_sin_cache, pos,
+                scratch.d_attn_out, layer_cos_cache, layer_sin_cache, pos,
                 NUM_HEADS, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2
             );
 
@@ -847,7 +875,7 @@ public:
     void reset_generation_state() {
         current_seq_len_ = 0;
         for (auto& l : layers) {
-            CHECK_HIP(hipMemset(l->d_kv_cache, 0, l->max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
+            l->reset_generation_state();
         }
     }
 

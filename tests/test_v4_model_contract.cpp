@@ -80,6 +80,6 @@ int main() {
 
     std::cout << "V4 model contract passed: " << layers.size()
               << " layers, " << inventory.size() << " dense tensors,"
-              << " classes [3 Sliding, 20 CSA, 20 HCA]" << std::endl;
+              << " classes [2 Sliding, 21 CSA, 20 HCA]" << std::endl;
     return 0;
 }

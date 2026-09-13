@@ -180,6 +180,18 @@ target_link_libraries(test_v4_model_contract PRIVATE amdhip64)
 add_test(NAME test_v4_model_contract COMMAND test_v4_model_contract)
 set_tests_properties(test_v4_model_contract PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Stage 3 host-side validation: class-aware persistent attention state sizing
+add_executable(test_v4_layer_state tests/test_v4_layer_state.cpp)
+target_link_libraries(test_v4_layer_state PRIVATE amdhip64)
+add_test(NAME test_v4_layer_state COMMAND test_v4_layer_state)
+set_tests_properties(test_v4_layer_state PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Stage 3 silicon validation: persistent class-aware state allocation and reset
+add_executable(test_v4_layer_state_device tests/test_v4_layer_state_device.cpp)
+target_link_libraries(test_v4_layer_state_device PRIVATE amdhip64)
+add_test(NAME test_v4_layer_state_device COMMAND test_v4_layer_state_device)
+set_tests_properties(test_v4_layer_state_device PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Stage 0 evidence: validated model contract and complete dense tensor inventory
 add_executable(aeon_model_contract tools/aeon_model_contract.cpp)
 target_link_libraries(aeon_model_contract PRIVATE amdhip64)

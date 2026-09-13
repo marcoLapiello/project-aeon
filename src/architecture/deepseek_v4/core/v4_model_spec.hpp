@@ -30,6 +30,11 @@ struct V4LayerSpec {
     uint32_t layer_id{0};
     V4AttentionKind attention_kind{V4AttentionKind::Sliding};
     int32_t compression_ratio{0};
+    int32_t head_dim{512};
+    int32_t sliding_window{128};
+    int32_t index_n_heads{64};
+    int32_t index_head_dim{128};
+    int32_t index_topk{512};
 
     bool uses_indexer() const noexcept {
         return attention_kind == V4AttentionKind::CSA;
@@ -150,6 +155,11 @@ public:
             V4LayerSpec spec;
             spec.layer_id = static_cast<uint32_t>(layer);
             spec.compression_ratio = ratio;
+            spec.head_dim = config.head_dim;
+            spec.sliding_window = config.sliding_window;
+            spec.index_n_heads = config.index_n_heads;
+            spec.index_head_dim = config.index_head_dim;
+            spec.index_topk = config.index_topk;
             spec.attention_kind = ratio == 0
                 ? V4AttentionKind::Sliding
                 : (ratio == 4 ? V4AttentionKind::CSA : V4AttentionKind::HCA);
