@@ -1,5 +1,6 @@
 #pragma once
 
+#include "architecture/deepseek_v4/core/v4_model_spec.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
 
 #include <hip/hip_fp16.h>
@@ -33,6 +34,18 @@ public:
     float* d_attn_sink{nullptr};
     half* d_wo_a{nullptr};
     half* d_wo_b{nullptr};
+
+    float* d_compressor_ape{nullptr};
+    half* d_compressor_norm{nullptr};
+    half* d_compressor_wgate{nullptr};
+    half* d_compressor_wkv{nullptr};
+
+    float* d_indexer_compressor_ape{nullptr};
+    half* d_indexer_compressor_norm{nullptr};
+    half* d_indexer_compressor_wgate{nullptr};
+    half* d_indexer_compressor_wkv{nullptr};
+    half* d_indexer_weights_proj{nullptr};
+    half* d_indexer_wq_b{nullptr};
 
     float* d_hc_attn_fn{nullptr};
     float* d_hc_attn_base{nullptr};
@@ -74,8 +87,10 @@ public:
     }
 
     template<typename LoaderT>
-    void bind_dense_weights(int layer_id, bool is_hash_layer, const LoaderT& loader) {
+    void bind_dense_weights(const V4LayerSpec& layer_spec, const LoaderT& loader) {
         free_dense_weights();
+        const int layer_id = static_cast<int>(layer_spec.layer_id);
+        const bool is_hash_layer = layer_spec.layer_id < 3;
         const std::string prefix = "layers." + std::to_string(layer_id) + ".";
 
         upload_tensor(loader, prefix + "attn_norm.weight", &d_attn_norm);
@@ -87,6 +102,22 @@ public:
         upload_tensor(loader, prefix + "attn.attn_sink", &d_attn_sink);
         upload_tensor(loader, prefix + "attn.wo_a.weight", &d_wo_a);
         upload_tensor(loader, prefix + "attn.wo_b.weight", &d_wo_b);
+
+        if (layer_spec.attention_kind == V4AttentionKind::CSA ||
+            layer_spec.attention_kind == V4AttentionKind::HCA) {
+            upload_tensor(loader, prefix + "attn.compressor.ape", &d_compressor_ape);
+            upload_tensor(loader, prefix + "attn.compressor.norm.weight", &d_compressor_norm);
+            upload_tensor(loader, prefix + "attn.compressor.wgate.weight", &d_compressor_wgate);
+            upload_tensor(loader, prefix + "attn.compressor.wkv.weight", &d_compressor_wkv);
+        }
+        if (layer_spec.attention_kind == V4AttentionKind::CSA) {
+            upload_tensor(loader, prefix + "attn.indexer.compressor.ape", &d_indexer_compressor_ape);
+            upload_tensor(loader, prefix + "attn.indexer.compressor.norm.weight", &d_indexer_compressor_norm);
+            upload_tensor(loader, prefix + "attn.indexer.compressor.wgate.weight", &d_indexer_compressor_wgate);
+            upload_tensor(loader, prefix + "attn.indexer.compressor.wkv.weight", &d_indexer_compressor_wkv);
+            upload_tensor(loader, prefix + "attn.indexer.weights_proj.weight", &d_indexer_weights_proj);
+            upload_tensor(loader, prefix + "attn.indexer.wq_b.weight", &d_indexer_wq_b);
+        }
 
         upload_tensor(loader, prefix + "hc_attn_fn", &d_hc_attn_fn);
         upload_tensor(loader, prefix + "hc_attn_base", &d_hc_attn_base);
@@ -124,6 +155,17 @@ public:
         if (d_attn_sink) { (void)hipFree(d_attn_sink); d_attn_sink = nullptr; }
         if (d_wo_a) { (void)hipFree(d_wo_a); d_wo_a = nullptr; }
         if (d_wo_b) { (void)hipFree(d_wo_b); d_wo_b = nullptr; }
+
+        if (d_compressor_ape) { (void)hipFree(d_compressor_ape); d_compressor_ape = nullptr; }
+        if (d_compressor_norm) { (void)hipFree(d_compressor_norm); d_compressor_norm = nullptr; }
+        if (d_compressor_wgate) { (void)hipFree(d_compressor_wgate); d_compressor_wgate = nullptr; }
+        if (d_compressor_wkv) { (void)hipFree(d_compressor_wkv); d_compressor_wkv = nullptr; }
+        if (d_indexer_compressor_ape) { (void)hipFree(d_indexer_compressor_ape); d_indexer_compressor_ape = nullptr; }
+        if (d_indexer_compressor_norm) { (void)hipFree(d_indexer_compressor_norm); d_indexer_compressor_norm = nullptr; }
+        if (d_indexer_compressor_wgate) { (void)hipFree(d_indexer_compressor_wgate); d_indexer_compressor_wgate = nullptr; }
+        if (d_indexer_compressor_wkv) { (void)hipFree(d_indexer_compressor_wkv); d_indexer_compressor_wkv = nullptr; }
+        if (d_indexer_weights_proj) { (void)hipFree(d_indexer_weights_proj); d_indexer_weights_proj = nullptr; }
+        if (d_indexer_wq_b) { (void)hipFree(d_indexer_wq_b); d_indexer_wq_b = nullptr; }
         if (d_hc_attn_fn) { (void)hipFree(d_hc_attn_fn); d_hc_attn_fn = nullptr; }
         if (d_hc_attn_base) { (void)hipFree(d_hc_attn_base); d_hc_attn_base = nullptr; }
         if (d_hc_attn_scale) { (void)hipFree(d_hc_attn_scale); d_hc_attn_scale = nullptr; }
@@ -147,8 +189,7 @@ private:
     template<typename LoaderT, typename T>
     void upload_tensor(const LoaderT& loader, const std::string& name, T** device_ptr) {
         if (!loader.has_tensor(name)) {
-            *device_ptr = nullptr;
-            return;
+            throw std::runtime_error("V4DenseWeightBinding: missing required tensor " + name);
         }
         const auto& tensor = loader.get_tensor(name);
         CHECK_HIP(hipMalloc(reinterpret_cast<void**>(device_ptr), tensor.byte_size));
@@ -165,6 +206,17 @@ private:
         d_attn_sink = other.d_attn_sink; other.d_attn_sink = nullptr;
         d_wo_a = other.d_wo_a; other.d_wo_a = nullptr;
         d_wo_b = other.d_wo_b; other.d_wo_b = nullptr;
+
+        d_compressor_ape = other.d_compressor_ape; other.d_compressor_ape = nullptr;
+        d_compressor_norm = other.d_compressor_norm; other.d_compressor_norm = nullptr;
+        d_compressor_wgate = other.d_compressor_wgate; other.d_compressor_wgate = nullptr;
+        d_compressor_wkv = other.d_compressor_wkv; other.d_compressor_wkv = nullptr;
+        d_indexer_compressor_ape = other.d_indexer_compressor_ape; other.d_indexer_compressor_ape = nullptr;
+        d_indexer_compressor_norm = other.d_indexer_compressor_norm; other.d_indexer_compressor_norm = nullptr;
+        d_indexer_compressor_wgate = other.d_indexer_compressor_wgate; other.d_indexer_compressor_wgate = nullptr;
+        d_indexer_compressor_wkv = other.d_indexer_compressor_wkv; other.d_indexer_compressor_wkv = nullptr;
+        d_indexer_weights_proj = other.d_indexer_weights_proj; other.d_indexer_weights_proj = nullptr;
+        d_indexer_wq_b = other.d_indexer_wq_b; other.d_indexer_wq_b = nullptr;
 
         d_hc_attn_fn = other.d_hc_attn_fn; other.d_hc_attn_fn = nullptr;
         d_hc_attn_base = other.d_hc_attn_base; other.d_hc_attn_base = nullptr;

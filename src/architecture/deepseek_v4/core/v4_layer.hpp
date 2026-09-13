@@ -17,6 +17,7 @@ class V4Layer : public V4DenseWeightBinding {
 public:
     int layer_id{0};
     bool is_hash_layer{true};
+    V4LayerSpec model_spec{};
 
     // Persistent Sliding-Window KV Cache on Device: [max_seq_len, 512]
     half*  d_kv_cache{nullptr};
@@ -51,11 +52,12 @@ public:
     }
 
     template<typename LoaderT>
-    void init_with_loader(int id, const LoaderT& loader, uint32_t max_seq = 4096) {
-        layer_id = id;
-        is_hash_layer = (id < 3);
+    void init_with_loader(const V4LayerSpec& spec, const LoaderT& loader, uint32_t max_seq = 4096) {
+        model_spec = spec;
+        layer_id = static_cast<int>(spec.layer_id);
+        is_hash_layer = (spec.layer_id < 3);
         max_seq_len_ = max_seq;
-        bind_dense_weights(layer_id, is_hash_layer, loader);
+        bind_dense_weights(model_spec, loader);
 
         // 5. Allocate Persistent KV Cache on Device
         CHECK_HIP(hipMalloc(&d_kv_cache, max_seq_len_ * kernel::DSV4_HEAD_DIM * sizeof(half)));
@@ -71,6 +73,7 @@ private:
     void move_from(V4Layer&& o) noexcept {
         layer_id = o.layer_id;
         is_hash_layer = o.is_hash_layer;
+        model_spec = o.model_spec;
         d_kv_cache = o.d_kv_cache; o.d_kv_cache = nullptr;
         max_seq_len_ = o.max_seq_len_;
 

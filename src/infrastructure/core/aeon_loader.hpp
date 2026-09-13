@@ -1,6 +1,7 @@
 #pragma once
 
 #include "infrastructure/core/aeon_artifact.hpp"
+#include "infrastructure/core/json.hpp"
 #include "infrastructure/core/loaded_tensor.hpp"
 #include "infrastructure/core/model_manifest.hpp"
 
@@ -11,8 +12,10 @@
 
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -84,6 +87,20 @@ public:
 
     size_t dense_file_size() const noexcept {
         return dense_file_size_;
+    }
+
+    const std::string& model_dir() const noexcept {
+        return model_dir_;
+    }
+
+    std::vector<std::pair<std::string, LoadedTensor>> dense_tensor_inventory() const {
+        std::vector<std::pair<std::string, LoadedTensor>> inventory;
+        inventory.reserve(dense_tensors_.size());
+        for (const auto& entry : dense_tensors_) inventory.push_back(entry);
+        std::sort(inventory.begin(), inventory.end(), [](const auto& left, const auto& right) {
+            return left.first < right.first;
+        });
+        return inventory;
     }
 
 private:
@@ -226,9 +243,10 @@ private:
                 std::to_string(expected_version));
         }
 
-        uint64_t dir_len = *reinterpret_cast<const uint64_t*>(dense_mmap_base_ + 20);
+        const uint32_t tensor_count = *reinterpret_cast<const uint32_t*>(dense_mmap_base_ + 16);
+        const uint64_t dir_len = *reinterpret_cast<const uint64_t*>(dense_mmap_base_ + 20);
 
-        if (28 + dir_len > dense_file_size_) {
+        if (dir_len > dense_file_size_ - 28) {
             throw std::runtime_error("AeonModelLoader: Directory length exceeds file size!");
         }
 
@@ -237,11 +255,19 @@ private:
         // Calculate 4KB sector aligned data payload start
         size_t pre_data_len = 28 + dir_len;
         size_t pad_bytes = (AEON_SECTOR_SIZE - (pre_data_len % AEON_SECTOR_SIZE)) % AEON_SECTOR_SIZE;
-        size_t data_start = pre_data_len + pad_bytes;
+        const size_t data_start = pre_data_len + pad_bytes;
+        if (data_start > dense_file_size_) {
+            throw std::runtime_error("AeonModelLoader: Dense payload starts beyond file size");
+        }
 
-        // Fast minimal JSON parser for tensor directory array of objects
-        // Directory schema: [ { "name": str, "offset": int, "size": int, "dtype": str, "shape": [...] }, ... ]
-        parse_dense_directory(dir_json, dense_mmap_base_ + data_start);
+        const size_t parsed_tensor_count = parse_dense_directory(
+            dir_json,
+            dense_mmap_base_ + data_start,
+            dense_file_size_ - data_start);
+        if (parsed_tensor_count != tensor_count) {
+            throw std::runtime_error(
+                "AeonModelLoader: Dense directory count does not match its header");
+        }
         std::cout << "[AeonModelLoader] Loaded dense container: " << dense_tensors_.size()
                   << " tensors (data starts at 0x" << std::hex << data_start << std::dec << ")." << std::endl;
     }
@@ -371,52 +397,42 @@ private:
                   << (experts_file_size_ / (1024 * 1024 * 1024)) << " GB mmaped)." << std::endl;
     }
 
-    void parse_dense_directory(const std::string& dir_json, const uint8_t* payload_base) {
-        // Fast streaming parser for the known directory format:
-        // [ { "name": "...", "offset": 123, "size": 456, "dtype": "...", "shape": [...] }, ... ]
-        size_t pos = 0;
-        while (pos < dir_json.size()) {
-            size_t name_tag = dir_json.find("\"name\":", pos);
-            if (name_tag == std::string::npos) break;
-
-            size_t name_start = dir_json.find('"', name_tag + 7);
-            if (name_start == std::string::npos) break;
-            size_t name_end = dir_json.find('"', name_start + 1);
-            if (name_end == std::string::npos) break;
-            std::string name = dir_json.substr(name_start + 1, name_end - name_start - 1);
-
-            size_t off_tag = dir_json.find("\"offset\":", name_end);
-            if (off_tag == std::string::npos) break;
-            size_t off_start = dir_json.find_first_of("0123456789", off_tag + 9);
-            size_t off_end = dir_json.find_first_not_of("0123456789", off_start);
-            int64_t offset = std::stoll(dir_json.substr(off_start, off_end - off_start));
-
-            size_t sz_tag = dir_json.find("\"size\":", off_end);
-            if (sz_tag == std::string::npos) break;
-            size_t sz_start = dir_json.find_first_of("0123456789", sz_tag + 7);
-            size_t sz_end = dir_json.find_first_not_of("0123456789", sz_start);
-            int64_t size = std::stoll(dir_json.substr(sz_start, sz_end - sz_start));
-
-            size_t dt_tag = dir_json.find("\"dtype\":", sz_end);
-            std::string dtype = "unknown";
-            size_t next_scan = sz_end;
-            if (dt_tag != std::string::npos && dt_tag < dir_json.find("\"name\":", sz_end)) {
-                size_t dt_s = dir_json.find('"', dt_tag + 8);
-                size_t dt_e = dir_json.find('"', dt_s + 1);
-                if (dt_s != std::string::npos && dt_e != std::string::npos) {
-                    dtype = dir_json.substr(dt_s + 1, dt_e - dt_s - 1);
-                    next_scan = dt_e;
-                }
+    size_t parse_dense_directory(
+        const std::string& dir_json,
+        const uint8_t* payload_base,
+        size_t payload_size
+    ) {
+        const JsonValue directory = JsonValue::parse(dir_json);
+        const auto& entries = directory.as_array();
+        for (const auto& entry : entries) {
+            const std::string& name = entry.at("name").as_string();
+            const int64_t offset_value = entry.at("offset").as_int64();
+            const int64_t size_value = entry.at("size").as_int64();
+            if (offset_value < 0 || size_value < 0) {
+                throw std::runtime_error("AeonModelLoader: Dense directory contains a negative range");
+            }
+            const auto offset = static_cast<uint64_t>(offset_value);
+            const auto size = static_cast<uint64_t>(size_value);
+            if (offset > payload_size || size > payload_size - offset ||
+                offset > std::numeric_limits<size_t>::max() ||
+                size > std::numeric_limits<size_t>::max()) {
+                throw std::runtime_error("AeonModelLoader: Dense tensor range exceeds payload");
             }
 
-            LoadedTensor lt;
-            lt.data = payload_base + offset;
-            lt.byte_size = size;
-            lt.dtype = dtype;
-
-            dense_tensors_[name] = lt;
-            pos = next_scan;
+            LoadedTensor tensor;
+            tensor.data = payload_base + static_cast<size_t>(offset);
+            tensor.byte_size = static_cast<int64_t>(size);
+            tensor.dtype = entry.at("dtype").as_string();
+            for (const auto& dimension : entry.at("shape").as_array()) {
+                const int64_t value = dimension.as_int64();
+                if (value < 0) throw std::runtime_error("AeonModelLoader: Dense tensor shape is negative");
+                tensor.shape.push_back(value);
+            }
+            if (!dense_tensors_.emplace(name, std::move(tensor)).second) {
+                throw std::runtime_error("AeonModelLoader: Duplicate dense tensor: " + name);
+            }
         }
+        return entries.size();
     }
 
     std::string model_dir_;

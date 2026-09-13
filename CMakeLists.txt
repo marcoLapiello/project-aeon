@@ -148,6 +148,16 @@ target_link_libraries(test_v4_attention PRIVATE amdhip64)
 add_test(NAME test_v4_attention COMMAND test_v4_attention)
 set_tests_properties(test_v4_attention PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Model-backed validation: selected DeepSeek-V4 schedule and dense tensor contract
+add_executable(test_v4_model_contract tests/test_v4_model_contract.cpp)
+target_link_libraries(test_v4_model_contract PRIVATE amdhip64)
+add_test(NAME test_v4_model_contract COMMAND test_v4_model_contract)
+set_tests_properties(test_v4_model_contract PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Stage 0 evidence: validated model contract and complete dense tensor inventory
+add_executable(aeon_model_contract tools/aeon_model_contract.cpp)
+target_link_libraries(aeon_model_contract PRIVATE amdhip64)
+
 # Current format validation: native Aeon model loader
 add_executable(test_aeon_loader tests/test_aeon_loader.cpp)
 target_link_libraries(test_aeon_loader PRIVATE amdhip64)

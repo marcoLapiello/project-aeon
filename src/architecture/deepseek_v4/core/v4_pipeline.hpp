@@ -8,6 +8,7 @@
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "architecture/deepseek_v4/core/memory_budget.hpp"
+#include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_model_resources.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
@@ -73,6 +74,7 @@ public:
 
     uint32_t num_layers_{0};
     uint32_t current_seq_len_{0};
+    std::vector<V4LayerSpec> layer_specs_;
 
     // Unified VRAM expert pool, warm host pool, and expert registry.
     std::unique_ptr<UnifiedVRAMExpertPool> unified_vram_pool_;
@@ -194,7 +196,24 @@ public:
             throw std::runtime_error("V4Pipeline: model configuration must declare at least one layer");
         }
         validate_supported_model_config(model_cfg);
+        layer_specs_ = V4ModelSpec::resolve_layers(model_cfg);
+        V4ModelContract::validate(model_cfg, aeon_loader);
         num_layers_ = static_cast<uint32_t>(model_cfg.num_hidden_layers);
+
+        std::array<uint32_t, 3> attention_kind_counts{};
+        for (const auto& layer_spec : layer_specs_) {
+            ++attention_kind_counts[static_cast<size_t>(layer_spec.attention_kind)];
+        }
+        std::cout << "[Pipeline] Layer contract: "
+                  << attention_kind_counts[static_cast<size_t>(V4AttentionKind::Sliding)] << " Sliding, "
+                  << attention_kind_counts[static_cast<size_t>(V4AttentionKind::CSA)] << " CSA, "
+                  << attention_kind_counts[static_cast<size_t>(V4AttentionKind::HCA)] << " HCA" << std::endl;
+        for (const uint32_t layer_id : {0u, 2u, 3u, 41u, 42u}) {
+            const auto& layer_spec = layer_specs_.at(layer_id);
+            std::cout << "  > Layer " << layer_id << ": "
+                      << v4_attention_kind_name(layer_spec.attention_kind)
+                      << " (ratio=" << layer_spec.compression_ratio << ')' << std::endl;
+        }
 
         // 3. Evaluate Memory Budget & Feasibility Gate
         const size_t dense_bytes = aeon_loader.dense_file_size();
@@ -219,7 +238,7 @@ public:
         layers.resize(num_layers_);
         for (uint32_t l = 0; l < num_layers_; ++l) {
             layers[l] = std::make_unique<V4Layer>();
-            layers[l]->init_with_loader(l, aeon_loader, runtime_cfg.context_size);
+            layers[l]->init_with_loader(layer_specs_.at(l), aeon_loader, runtime_cfg.context_size);
         }
         std::cout << "  > Dense weights and KV cache for all " << num_layers_ << " layers uploaded to VRAM." << std::endl;
 
@@ -962,30 +981,7 @@ public:
 
 private:
     void validate_supported_model_config(const DeepSeekV4Config& model_cfg) const {
-        const bool supported =
-            model_cfg.vocab_size == 129280 &&
-            model_cfg.hidden_size == kernel::DSV4_HIDDEN_SIZE &&
-            model_cfg.moe_intermediate_size == 2048 &&
-            model_cfg.num_attention_heads == kernel::DSV4_NUM_HEADS &&
-            model_cfg.num_key_value_heads == 1 &&
-            model_cfg.head_dim == kernel::DSV4_HEAD_DIM &&
-            model_cfg.q_lora_rank == kernel::DSV4_Q_LORA_RANK &&
-            model_cfg.o_lora_rank == kernel::DSV4_O_LORA_RANK &&
-            model_cfg.qk_rope_head_dim == kernel::DSV4_ROPE_DIM &&
-            model_cfg.sliding_window == kernel::DSV4_SLIDING_WINDOW &&
-            model_cfg.n_routed_experts == 256 &&
-            model_cfg.n_shared_experts == 1 &&
-            model_cfg.num_experts_per_tok == 6 &&
-            model_cfg.num_hash_layers == 3 &&
-            std::fabs(model_cfg.routed_scaling_factor - 1.5f) < 1e-6f &&
-            std::fabs(model_cfg.swiglu_limit - 10.0f) < 1e-6f &&
-            model_cfg.hc_mult == 4 &&
-            model_cfg.hc_sinkhorn_iters == 20 &&
-            std::fabs(model_cfg.hc_eps - 1e-6f) < 1e-12f;
-        if (!supported) {
-            throw std::runtime_error(
-                "V4Pipeline: model configuration is incompatible with the current DeepSeek-V4 kernel contract");
-        }
+        V4ModelSpec::validate_config(model_cfg);
     }
 
     size_t expert_payload_bytes() const noexcept {

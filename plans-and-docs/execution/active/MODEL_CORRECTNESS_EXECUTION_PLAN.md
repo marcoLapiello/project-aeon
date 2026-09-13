@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
 **Date:** 2026-09-13  
-**Status:** Open; current priority  
+**Status:** Open; Stage 0 complete; Stage 1 next
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -402,6 +402,37 @@ src/architecture/deepseek_v4/core/config.hpp
 src/architecture/deepseek_v4/core/v4_model_spec.hpp  (new or equivalent)
 src/architecture/deepseek_v4/core/v4_dense_weight_binding.hpp
 ```
+
+### Stage 0 implementation record (2026-09-13)
+
+Stage 0 is complete for the selected Aeon package. The runtime now parses the
+configuration through a structured JSON value tree, resolves the 43 base layers
+to 3 Sliding, 20 CSA, and 20 HCA descriptors, retains dense directory shapes,
+and rejects missing, mismatched, or incorrectly shaped required tensors before
+device layer initialization. The class-specific compressor and CSA indexer
+weights are bound fail-closed from the resolved descriptor.
+
+The reproducible evidence command is:
+
+```text
+scripts/record_v4_stage0_metadata.sh \
+  models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon \
+  build/correctness/stage0_model_contract.json
+```
+
+The recorded package contains 1,271 dense tensors, 43 resolved base layers, and
+the following frozen identities:
+
+| Evidence | Value |
+| --- | --- |
+| Aeon commit | `6b4a20ffc424a73a3627608f4dbec20625d9e0fb` |
+| Source snapshot | `64700592cadaf205fe0c13202061ff4b45afbfd0` |
+| vLLM reference | `94848eda600a07c28675f5753a11b2c212c146ed` |
+| MTP tensor count | 72 |
+| DSpark tensor count | 0 |
+
+The MTP tensors are inventoried but remain outside the base-decoder execution
+contract. No DSpark tensors are present in the selected dense artifact.
 
 ### Stage 1: Close the independent weight and dense-operation gate
 

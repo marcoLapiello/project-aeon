@@ -1,14 +1,23 @@
 #pragma once
 
+#include "infrastructure/core/json.hpp"
+
+#include <cmath>
 #include <cstdint>
-#include <string>
 #include <vector>
-#include <fstream>
-#include <sstream>
+#include <string>
 #include <stdexcept>
-#include <iostream>
+#include <unordered_set>
 
 namespace aeon::core {
+
+struct RopeScalingConfig {
+    std::string type{"yarn"};
+    float factor{1.0f};
+    float beta_fast{32.0f};
+    float beta_slow{1.0f};
+    int32_t original_max_position_embeddings{65536};
+};
 
 struct QuantConfig {
     std::string quant_method{"compressed-tensors"};
@@ -35,8 +44,13 @@ struct DeepSeekV4Config {
     int32_t o_lora_rank{1024};
     int32_t qk_rope_head_dim{64};
     int32_t sliding_window{128};
+    int32_t index_head_dim{128};
+    int32_t index_n_heads{64};
+    int32_t index_topk{512};
+    int32_t o_groups{8};
+    float compress_rope_theta{160000.0f};
+    std::vector<int32_t> compress_ratios;
 
-    // MoE configuration
     int32_t n_routed_experts{256};
     int32_t n_shared_experts{1};
     int32_t num_experts_per_tok{6};
@@ -60,111 +74,154 @@ struct DeepSeekV4Config {
     int32_t rope_factor{16};
     float rope_beta_fast{32.0f};
     float rope_beta_slow{1.0f};
+    RopeScalingConfig rope_scaling;
 
-    // Quantization configuration
+    std::string expert_dtype{"fp4"};
+    int32_t num_nextn_predict_layers{1};
+    int32_t dspark_block_size{5};
+    int32_t dspark_noise_token_id{128799};
+    std::vector<int32_t> dspark_target_layer_ids;
+    int32_t dspark_markov_rank{256};
+
     QuantConfig quant;
+    std::unordered_set<std::string> present_fields;
+
+    bool has_field(const std::string& path) const {
+        return present_fields.find(path) != present_fields.end();
+    }
 
     static DeepSeekV4Config load_from_json(const std::string& json_path) {
-        std::ifstream file(json_path);
-        if (!file.is_open()) {
-            throw std::runtime_error("DeepSeekV4Config: Failed to open config file: " + json_path);
+        const JsonValue document = JsonValue::parse_file(json_path);
+        if (!document.is_object()) {
+            throw std::runtime_error("DeepSeekV4Config: root value must be an object");
         }
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        std::string text = buffer.str();
-
         DeepSeekV4Config cfg;
 
-        auto extract_int = [&](const std::string& key, int32_t default_val) -> int32_t {
-            std::string pattern = "\"" + key + "\"";
-            size_t pos = text.find(pattern);
-            if (pos == std::string::npos) return default_val;
-            size_t colon = text.find(':', pos);
-            if (colon == std::string::npos) return default_val;
-            size_t start = text.find_first_of("-0123456789", colon);
-            if (start == std::string::npos) return default_val;
-            size_t end = text.find_first_not_of("-0123456789", start);
-            return std::stoi(text.substr(start, end - start));
+        auto field = [&](const JsonValue& object, const std::string& key, const std::string& path) -> const JsonValue* {
+            const JsonValue* value = object.find(key);
+            if (value != nullptr) cfg.present_fields.insert(path);
+            return value;
         };
-
-        auto extract_float = [&](const std::string& key, float default_val) -> float {
-            std::string pattern = "\"" + key + "\"";
-            size_t pos = text.find(pattern);
-            if (pos == std::string::npos) return default_val;
-            size_t colon = text.find(':', pos);
-            if (colon == std::string::npos) return default_val;
-            size_t start = text.find_first_of("-0123456789.", colon);
-            if (start == std::string::npos) return default_val;
-            size_t end = text.find_first_not_of("-0123456789.eE", start);
-            return std::stof(text.substr(start, end - start));
-        };
-
-        auto extract_string = [&](const std::string& key, const std::string& default_val) -> std::string {
-            std::string pattern = "\"" + key + "\"";
-            size_t pos = text.find(pattern);
-            if (pos == std::string::npos) return default_val;
-            size_t colon = text.find(':', pos);
-            if (colon == std::string::npos) return default_val;
-            size_t start = text.find('"', colon);
-            if (start == std::string::npos) return default_val;
-            size_t end = text.find('"', start + 1);
-            if (end == std::string::npos) return default_val;
-            return text.substr(start + 1, end - start - 1);
-        };
-
-        auto extract_bool = [&](const std::string& key, bool default_val) -> bool {
-            std::string pattern = "\"" + key + "\"";
-            size_t pos = text.find(pattern);
-            if (pos == std::string::npos) return default_val;
-            size_t colon = text.find(':', pos);
-            if (colon == std::string::npos) return default_val;
-            size_t true_pos = text.find("true", colon);
-            size_t false_pos = text.find("false", colon);
-            if (true_pos != std::string::npos && (false_pos == std::string::npos || true_pos < false_pos)) {
-                return true;
+        auto read_int = [&](const JsonValue& object, const std::string& key, int32_t fallback, const std::string& path) {
+            const JsonValue* value = field(object, key, path);
+            if (value == nullptr) return fallback;
+            const int64_t parsed = value->as_int64();
+            if (parsed < std::numeric_limits<int32_t>::min() || parsed > std::numeric_limits<int32_t>::max()) {
+                throw std::runtime_error("DeepSeekV4Config: integer field out of range: " + path);
             }
-            if (false_pos != std::string::npos) {
-                return false;
-            }
-            return default_val;
+            return static_cast<int32_t>(parsed);
+        };
+        auto read_float = [&](const JsonValue& object, const std::string& key, float fallback, const std::string& path) {
+            const JsonValue* value = field(object, key, path);
+            return value == nullptr ? fallback : static_cast<float>(value->as_number());
+        };
+        auto read_string = [&](const JsonValue& object, const std::string& key, const std::string& fallback, const std::string& path) {
+            const JsonValue* value = field(object, key, path);
+            return value == nullptr ? fallback : value->as_string();
+        };
+        auto read_bool = [&](const JsonValue& object, const std::string& key, bool fallback, const std::string& path) {
+            const JsonValue* value = field(object, key, path);
+            return value == nullptr ? fallback : value->as_bool();
         };
 
-        cfg.vocab_size = extract_int("vocab_size", cfg.vocab_size);
-        cfg.hidden_size = extract_int("hidden_size", cfg.hidden_size);
-        cfg.moe_intermediate_size = extract_int("moe_intermediate_size", cfg.moe_intermediate_size);
-        cfg.num_hidden_layers = extract_int("num_hidden_layers", cfg.num_hidden_layers);
-        cfg.num_attention_heads = extract_int("num_attention_heads", cfg.num_attention_heads);
-        cfg.num_key_value_heads = extract_int("num_key_value_heads", cfg.num_key_value_heads);
-        cfg.head_dim = extract_int("head_dim", cfg.head_dim);
-        cfg.q_lora_rank = extract_int("q_lora_rank", cfg.q_lora_rank);
-        cfg.o_lora_rank = extract_int("o_lora_rank", cfg.o_lora_rank);
-        cfg.qk_rope_head_dim = extract_int("qk_rope_head_dim", cfg.qk_rope_head_dim);
-        cfg.sliding_window = extract_int("sliding_window", cfg.sliding_window);
+        cfg.model_type = read_string(document, "model_type", cfg.model_type, "model_type");
+        if (const JsonValue* value = field(document, "architectures", "architectures")) {
+            cfg.architectures.clear();
+            for (const auto& architecture : value->as_array()) cfg.architectures.push_back(architecture.as_string());
+        }
+        cfg.vocab_size = read_int(document, "vocab_size", cfg.vocab_size, "vocab_size");
+        cfg.hidden_size = read_int(document, "hidden_size", cfg.hidden_size, "hidden_size");
+        cfg.moe_intermediate_size = read_int(document, "moe_intermediate_size", cfg.moe_intermediate_size, "moe_intermediate_size");
+        cfg.num_hidden_layers = read_int(document, "num_hidden_layers", cfg.num_hidden_layers, "num_hidden_layers");
+        cfg.num_attention_heads = read_int(document, "num_attention_heads", cfg.num_attention_heads, "num_attention_heads");
+        cfg.num_key_value_heads = read_int(document, "num_key_value_heads", cfg.num_key_value_heads, "num_key_value_heads");
+        cfg.head_dim = read_int(document, "head_dim", cfg.head_dim, "head_dim");
+        cfg.q_lora_rank = read_int(document, "q_lora_rank", cfg.q_lora_rank, "q_lora_rank");
+        cfg.o_lora_rank = read_int(document, "o_lora_rank", cfg.o_lora_rank, "o_lora_rank");
+        cfg.qk_rope_head_dim = read_int(document, "qk_rope_head_dim", cfg.qk_rope_head_dim, "qk_rope_head_dim");
+        cfg.sliding_window = read_int(document, "sliding_window", cfg.sliding_window, "sliding_window");
+        cfg.index_head_dim = read_int(document, "index_head_dim", cfg.index_head_dim, "index_head_dim");
+        cfg.index_n_heads = read_int(document, "index_n_heads", cfg.index_n_heads, "index_n_heads");
+        cfg.index_topk = read_int(document, "index_topk", cfg.index_topk, "index_topk");
+        cfg.o_groups = read_int(document, "o_groups", cfg.o_groups, "o_groups");
+        cfg.compress_rope_theta = read_float(document, "compress_rope_theta", cfg.compress_rope_theta, "compress_rope_theta");
 
-        cfg.n_routed_experts = extract_int("n_routed_experts", cfg.n_routed_experts);
-        cfg.n_shared_experts = extract_int("n_shared_experts", cfg.n_shared_experts);
-        cfg.num_experts_per_tok = extract_int("num_experts_per_tok", cfg.num_experts_per_tok);
-        cfg.num_hash_layers = extract_int("num_hash_layers", cfg.num_hash_layers);
-        cfg.routed_scaling_factor = extract_float("routed_scaling_factor", cfg.routed_scaling_factor);
-        cfg.scoring_func = extract_string("scoring_func", cfg.scoring_func);
-        cfg.topk_method = extract_string("topk_method", cfg.topk_method);
-        cfg.norm_topk_prob = extract_bool("norm_topk_prob", cfg.norm_topk_prob);
-        cfg.swiglu_limit = extract_float("swiglu_limit", cfg.swiglu_limit);
+        if (const JsonValue* value = field(document, "compress_ratios", "compress_ratios")) {
+            cfg.compress_ratios.clear();
+            for (const auto& ratio : value->as_array()) {
+                const int64_t parsed = ratio.as_int64();
+                if (parsed < 0 || parsed > std::numeric_limits<int32_t>::max()) {
+                    throw std::runtime_error("DeepSeekV4Config: compression ratio out of range");
+                }
+                cfg.compress_ratios.push_back(static_cast<int32_t>(parsed));
+            }
+        }
 
-        cfg.hc_mult = extract_int("hc_mult", cfg.hc_mult);
-        cfg.hc_sinkhorn_iters = extract_int("hc_sinkhorn_iters", cfg.hc_sinkhorn_iters);
-        cfg.hc_eps = extract_float("hc_eps", cfg.hc_eps);
+        cfg.n_routed_experts = read_int(document, "n_routed_experts", cfg.n_routed_experts, "n_routed_experts");
+        cfg.n_shared_experts = read_int(document, "n_shared_experts", cfg.n_shared_experts, "n_shared_experts");
+        cfg.num_experts_per_tok = read_int(document, "num_experts_per_tok", cfg.num_experts_per_tok, "num_experts_per_tok");
+        cfg.num_hash_layers = read_int(document, "num_hash_layers", cfg.num_hash_layers, "num_hash_layers");
+        cfg.routed_scaling_factor = read_float(document, "routed_scaling_factor", cfg.routed_scaling_factor, "routed_scaling_factor");
+        cfg.scoring_func = read_string(document, "scoring_func", cfg.scoring_func, "scoring_func");
+        cfg.topk_method = read_string(document, "topk_method", cfg.topk_method, "topk_method");
+        cfg.norm_topk_prob = read_bool(document, "norm_topk_prob", cfg.norm_topk_prob, "norm_topk_prob");
+        cfg.swiglu_limit = read_float(document, "swiglu_limit", cfg.swiglu_limit, "swiglu_limit");
 
-        cfg.rms_norm_eps = extract_float("rms_norm_eps", cfg.rms_norm_eps);
-        cfg.max_position_embeddings = extract_int("max_position_embeddings", cfg.max_position_embeddings);
-        cfg.rope_theta = extract_float("rope_theta", cfg.rope_theta);
+        cfg.hc_mult = read_int(document, "hc_mult", cfg.hc_mult, "hc_mult");
+        cfg.hc_sinkhorn_iters = read_int(document, "hc_sinkhorn_iters", cfg.hc_sinkhorn_iters, "hc_sinkhorn_iters");
+        cfg.hc_eps = read_float(document, "hc_eps", cfg.hc_eps, "hc_eps");
 
-        // Quantization config extraction
-        cfg.quant.quant_method = extract_string("quant_method", cfg.quant.quant_method);
-        cfg.quant.format = extract_string("format", cfg.quant.format);
-        cfg.quant.num_bits = extract_int("num_bits", cfg.quant.num_bits);
-        cfg.quant.group_size = extract_int("group_size", cfg.quant.group_size);
-        cfg.quant.symmetric = extract_bool("symmetric", cfg.quant.symmetric);
+        cfg.rms_norm_eps = read_float(document, "rms_norm_eps", cfg.rms_norm_eps, "rms_norm_eps");
+        cfg.max_position_embeddings = read_int(document, "max_position_embeddings", cfg.max_position_embeddings, "max_position_embeddings");
+        cfg.rope_theta = read_float(document, "rope_theta", cfg.rope_theta, "rope_theta");
+        cfg.expert_dtype = read_string(document, "expert_dtype", cfg.expert_dtype, "expert_dtype");
+        cfg.num_nextn_predict_layers = read_int(document, "num_nextn_predict_layers", cfg.num_nextn_predict_layers, "num_nextn_predict_layers");
+        cfg.dspark_block_size = read_int(document, "dspark_block_size", cfg.dspark_block_size, "dspark_block_size");
+        cfg.dspark_noise_token_id = read_int(document, "dspark_noise_token_id", cfg.dspark_noise_token_id, "dspark_noise_token_id");
+        cfg.dspark_markov_rank = read_int(document, "dspark_markov_rank", cfg.dspark_markov_rank, "dspark_markov_rank");
+        if (const JsonValue* value = field(document, "dspark_target_layer_ids", "dspark_target_layer_ids")) {
+            cfg.dspark_target_layer_ids.clear();
+            for (const auto& layer_id : value->as_array()) {
+                const int64_t parsed = layer_id.as_int64();
+                if (parsed < 0 || parsed > std::numeric_limits<int32_t>::max()) {
+                    throw std::runtime_error("DeepSeekV4Config: DSpark layer ID out of range");
+                }
+                cfg.dspark_target_layer_ids.push_back(static_cast<int32_t>(parsed));
+            }
+        }
+
+        if (const JsonValue* value = field(document, "rope_scaling", "rope_scaling")) {
+            const JsonValue& rope_scaling = *value;
+            cfg.rope_scaling.type = read_string(rope_scaling, "type", cfg.rope_scaling.type, "rope_scaling.type");
+            cfg.rope_scaling.factor = read_float(rope_scaling, "factor", cfg.rope_scaling.factor, "rope_scaling.factor");
+            cfg.rope_scaling.beta_fast = read_float(rope_scaling, "beta_fast", cfg.rope_scaling.beta_fast, "rope_scaling.beta_fast");
+            cfg.rope_scaling.beta_slow = read_float(rope_scaling, "beta_slow", cfg.rope_scaling.beta_slow, "rope_scaling.beta_slow");
+            cfg.rope_scaling.original_max_position_embeddings = read_int(
+                rope_scaling,
+                "original_max_position_embeddings",
+                cfg.rope_scaling.original_max_position_embeddings,
+                "rope_scaling.original_max_position_embeddings");
+            cfg.rope_factor = static_cast<int32_t>(cfg.rope_scaling.factor);
+            cfg.rope_beta_fast = cfg.rope_scaling.beta_fast;
+            cfg.rope_beta_slow = cfg.rope_scaling.beta_slow;
+            cfg.original_max_position_embeddings = cfg.rope_scaling.original_max_position_embeddings;
+        }
+
+        if (const JsonValue* value = field(document, "quantization_config", "quantization_config")) {
+            const JsonValue& quantization = *value;
+            cfg.quant.quant_method = read_string(quantization, "quant_method", cfg.quant.quant_method, "quantization_config.quant_method");
+            if (const JsonValue* groups = field(quantization, "config_groups", "quantization_config.config_groups")) {
+                const JsonValue& group_zero = groups->at("group_0");
+                cfg.quant.format = read_string(group_zero, "format", cfg.quant.format, "quantization_config.config_groups.group_0.format");
+                if (const JsonValue* weights = field(group_zero, "weights", "quantization_config.config_groups.group_0.weights")) {
+                    cfg.quant.num_bits = read_int(*weights, "num_bits", cfg.quant.num_bits, "quantization_config.config_groups.group_0.weights.num_bits");
+                    cfg.quant.type = read_string(*weights, "type", cfg.quant.type, "quantization_config.config_groups.group_0.weights.type");
+                    cfg.quant.symmetric = read_bool(*weights, "symmetric", cfg.quant.symmetric, "quantization_config.config_groups.group_0.weights.symmetric");
+                    cfg.quant.strategy = read_string(*weights, "strategy", cfg.quant.strategy, "quantization_config.config_groups.group_0.weights.strategy");
+                    cfg.quant.group_size = read_int(*weights, "group_size", cfg.quant.group_size, "quantization_config.config_groups.group_0.weights.group_size");
+                }
+            }
+        }
 
         return cfg;
     }
