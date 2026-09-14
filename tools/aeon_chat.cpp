@@ -29,6 +29,7 @@ struct Options {
     bool thinking_mode{false};
     bool until_eos{false};
     bool diagnostic{false};
+    bool deterministic_expert_accumulation{false};
 };
 
 void print_usage(const char* executable) {
@@ -47,6 +48,7 @@ void print_usage(const char* executable) {
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill for A/B control\n"
         << "  --supply-telemetry <path> Write phase/source supply telemetry JSONL\n"
         << "  --run-id <id>            Supply telemetry run identifier\n"
+        << "  --deterministic-experts  Use replay-stable routed-expert accumulation\n"
         << "  --diagnostic             Print rendered prompt, IDs, and timings\n"
         << "  --help                   Show this help\n";
 }
@@ -111,6 +113,8 @@ Options parse_options(int argc, char** argv) {
                 argc, argv, index, "--supply-telemetry");
         } else if (argument == "--run-id") {
             options.supply_telemetry_run_id = require_value(argc, argv, index, "--run-id");
+        } else if (argument == "--deterministic-experts") {
+            options.deterministic_expert_accumulation = true;
         } else if (argument == "--diagnostic") {
             options.diagnostic = true;
         } else {
@@ -164,6 +168,7 @@ int main(int argc, char** argv) {
         runtime_config.warm_host_bytes = options.warm_gib * 1024ULL * 1024ULL * 1024ULL;
         runtime_config.preload_warm_host = options.preload_warm_host;
         runtime_config.enable_warm_refill = options.enable_warm_refill;
+        runtime_config.deterministic_expert_accumulation = options.deterministic_expert_accumulation;
 
         aeon::core::V4Pipeline pipeline;
         pipeline.initialize(options.model_dir, runtime_config);

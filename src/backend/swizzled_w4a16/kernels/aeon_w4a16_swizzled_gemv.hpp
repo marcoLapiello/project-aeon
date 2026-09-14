@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace aeon::kernel {
 
@@ -181,8 +182,10 @@ inline void dispatch_aeon_w4a16_swizzled_gemv(
     hipStream_t stream = 0
 ) {
     static_assert(RPW * LPR == 32, "RPW and LPR must describe one Wave32");
-    if (K != ITERS * LPR * 32 || N % RPW != 0) {
-        return;
+    const int expected_k = ITERS * LPR * 32;
+    if (N <= 0 || K != expected_k || N % RPW != 0) {
+        throw std::invalid_argument(
+            "dispatch_aeon_w4a16_swizzled_gemv: incompatible N/K shape");
     }
 
     constexpr int threads_per_block = WAVES * 32;
@@ -208,8 +211,10 @@ inline void dispatch_aeon_w4a16_swizzled_gemv(
                                 hipStream_t stream = 0
                             ) {
                                 static_assert(RPW * LPR == 32, "RPW and LPR must describe one Wave32");
-                                if (K != ITERS * LPR * 32 || N % RPW != 0) {
-                                    return;
+                                const int expected_k = ITERS * LPR * 32;
+                                if (N <= 0 || K != expected_k || N % RPW != 0) {
+                                    throw std::invalid_argument(
+                                        "dispatch_aeon_w4a16_swizzled_dual_gemv: incompatible N/K shape");
                                 }
 
                                 constexpr int threads_per_block = WAVES * 32;

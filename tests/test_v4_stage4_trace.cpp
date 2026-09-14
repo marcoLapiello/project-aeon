@@ -1,6 +1,7 @@
 #include "architecture/deepseek_v4/core/config.hpp"
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_pipeline.hpp"
+#include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "architecture/deepseek_v4/reference/v4_attention_oracle.hpp"
 #include "architecture/deepseek_v4/reference/v4_int4_reference.hpp"
 #include "platform/rdna3/device.hpp"
@@ -37,7 +38,7 @@ constexpr uint32_t kTraceTokens = 132;
 constexpr float kAttentionTolerance = 2.0e-2f;
 constexpr float kStateTolerance = 2.0e-3f;
 constexpr float kIndexerScoreTolerance = 1.0e-1f;
-constexpr float kGroupedProjectionTolerance = 2.0e-2f;
+constexpr float kFp16RelativeTolerance = 2.0e-3f;
 
 const LoadedTensor& require_tensor(
     const AeonModelLoader& loader,
@@ -97,6 +98,14 @@ std::vector<float> half_to_float(std::span<const half> values) {
     return result;
 }
 
+std::vector<uint16_t> half_to_bits(std::span<const half> values) {
+    std::vector<uint16_t> bits(values.size());
+    for (size_t index = 0; index < values.size(); ++index) {
+        std::memcpy(&bits[index], &values[index], sizeof(uint16_t));
+    }
+    return bits;
+}
+
 float max_abs_difference(std::span<const half> actual, std::span<const float> expected) {
     if (actual.size() != expected.size()) {
         throw std::runtime_error("Stage 4 trace vector size mismatch");
@@ -117,6 +126,12 @@ float max_abs_difference(std::span<const float> actual, std::span<const float> e
         maximum = std::max(maximum, std::abs(actual[index] - expected[index]));
     }
     return maximum;
+}
+
+float fp16_tensor_tolerance(std::span<const float> expected) {
+    float scale = 1.0f;
+    for (const float value : expected) scale = std::max(scale, std::abs(value));
+    return kAttentionTolerance + kFp16RelativeTolerance * scale;
 }
 
 void require_close(
@@ -234,12 +249,12 @@ void compare_local_state(
             max_abs_difference(
                 std::span<const half>(trace.local_key_cache.data() + offset, expected_entry.key.size()),
                 expected_entry.key),
-            kAttentionTolerance, "local key", trace.position, layer_id);
+            fp16_tensor_tolerance(expected_entry.key), "local key", trace.position, layer_id);
         require_close(
             max_abs_difference(
                 std::span<const half>(trace.local_value_cache.data() + offset, expected_entry.value.size()),
                 expected_entry.value),
-            kAttentionTolerance, "local value", trace.position, layer_id);
+            fp16_tensor_tolerance(expected_entry.value), "local value", trace.position, layer_id);
     }
 }
 
@@ -288,12 +303,12 @@ void compare_compressed_state(
             max_abs_difference(
                 std::span<const half>(trace.compressed_key_cache.data() + offset, expected_entry.key.size()),
                 expected_entry.key),
-            kAttentionTolerance, "compressed key", trace.position, layer_id);
+            fp16_tensor_tolerance(expected_entry.key), "compressed key", trace.position, layer_id);
         require_close(
             max_abs_difference(
                 std::span<const half>(trace.compressed_value_cache.data() + offset, expected_entry.value.size()),
                 expected_entry.value),
-            kAttentionTolerance, "compressed value", trace.position, layer_id);
+            fp16_tensor_tolerance(expected_entry.value), "compressed value", trace.position, layer_id);
     }
 
     for (size_t index = 0; index < expected.indexer_entries.size(); ++index) {
@@ -307,7 +322,7 @@ void compare_compressed_state(
             max_abs_difference(
                 std::span<const half>(trace.indexer_key_cache.data() + offset, expected_entry.key.size()),
                 expected_entry.key),
-            kAttentionTolerance, "indexer key", trace.position, layer_id);
+            fp16_tensor_tolerance(expected_entry.key), "indexer key", trace.position, layer_id);
     }
 }
 
@@ -351,29 +366,491 @@ void compare_grouped_projection(
         max_abs_difference(
             trace.grouped_output,
             half_to_float(expected)),
-        kGroupedProjectionTolerance, "grouped output", trace.position, layer_spec.layer_id);
+        fp16_tensor_tolerance(half_to_float(expected)),
+        "grouped output", trace.position, layer_spec.layer_id);
+}
+
+void compare_layer_zero_attention_input(
+    const AeonModelLoader& loader,
+    const DeepSeekV4Config& model_config,
+    const V4AttentionTraceRecord& trace
+) {
+    if (trace.position != 0 || trace.attention_normalized_input.empty()) return;
+
+    constexpr int kHcStreams = 4;
+    constexpr int kHiddenSize = 4096;
+    const auto& embedding = require_tensor(
+        loader, "embed.weight",
+        {model_config.vocab_size, kHiddenSize}, "F16");
+    const auto& hc_fn = require_tensor(
+        loader, "layers.0.hc_attn_fn",
+        {kHcStreams * (2 + kHcStreams), kHcStreams * kHiddenSize}, "F32");
+    const auto& hc_base = require_tensor(
+        loader, "layers.0.hc_attn_base",
+        {kHcStreams * (2 + kHcStreams)}, "F32");
+    const auto& hc_scale = require_tensor(
+        loader, "layers.0.hc_attn_scale", {3}, "F32");
+    const auto& attention_norm = require_tensor(
+        loader, "layers.0.attn_norm.weight", {kHiddenSize}, "F16");
+
+    std::vector<float> residual(kHcStreams * kHiddenSize);
+    for (int stream = 0; stream < kHcStreams; ++stream) {
+        for (int hidden = 0; hidden < kHiddenSize; ++hidden) {
+            const size_t embedding_index =
+                static_cast<size_t>(trace.token_id) * kHiddenSize + static_cast<size_t>(hidden);
+            residual[static_cast<size_t>(stream) * kHiddenSize + hidden] =
+                load_half_value(embedding, embedding_index);
+        }
+    }
+
+    std::vector<float> expected_mixes(kHcStreams * (2 + kHcStreams));
+    if (trace.token_id >= static_cast<uint32_t>(model_config.vocab_size)) {
+        throw std::runtime_error("Stage 4 trace token ID exceeds model vocabulary");
+    }
+    const float* fn_values = reinterpret_cast<const float*>(hc_fn.data);
+    const float* base_values = reinterpret_cast<const float*>(hc_base.data);
+    const float* scale_values = reinterpret_cast<const float*>(hc_scale.data);
+    float squared_residual = 0.0f;
+    for (float value : residual) squared_residual += value * value;
+    const float residual_inverse_rms = 1.0f / std::sqrt(
+        squared_residual / static_cast<float>(residual.size()) + 1e-6f);
+    for (size_t mix = 0; mix < expected_mixes.size(); ++mix) {
+        float dot = 0.0f;
+        for (size_t index = 0; index < residual.size(); ++index) {
+            dot += residual[index] * fn_values[mix * residual.size() + index];
+        }
+        expected_mixes[mix] = dot * residual_inverse_rms;
+    }
+    std::vector<float> expected_pre_mix(kHcStreams);
+    for (int stream = 0; stream < kHcStreams; ++stream) {
+        expected_pre_mix[static_cast<size_t>(stream)] = 1.0f / (1.0f + std::exp(-(
+            expected_mixes[static_cast<size_t>(stream)] * scale_values[0] +
+            base_values[stream]))) + 1e-6f;
+    }
+
+    float squared_sum = 0.0f;
+    std::vector<float> expected(kHiddenSize);
+    std::vector<float> expected_precombined(kHiddenSize);
+    for (int hidden = 0; hidden < kHiddenSize; ++hidden) {
+        float value = 0.0f;
+        for (int stream = 0; stream < kHcStreams; ++stream) {
+            value += expected_pre_mix[static_cast<size_t>(stream)] *
+                residual[static_cast<size_t>(stream) * kHiddenSize + hidden];
+        }
+        expected_precombined[static_cast<size_t>(hidden)] = __half2float(__float2half(value));
+        squared_sum += expected_precombined[static_cast<size_t>(hidden)] *
+            expected_precombined[static_cast<size_t>(hidden)];
+    }
+    const float inverse_rms = 1.0f / std::sqrt(
+        squared_sum / static_cast<float>(kHiddenSize) + 1e-6f);
+    for (int hidden = 0; hidden < kHiddenSize; ++hidden) {
+        expected[hidden] = expected_precombined[static_cast<size_t>(hidden)] *
+            inverse_rms * load_half_value(
+            attention_norm, static_cast<size_t>(hidden));
+    }
+
+    require_close(
+        max_abs_difference(trace.attention_hc_mixes, expected_mixes),
+        kStateTolerance,
+        "layer 0 HC mixes",
+        trace.position,
+        0);
+    require_close(
+        max_abs_difference(trace.attention_hc_pre_mix, expected_pre_mix),
+        kStateTolerance,
+        "layer 0 HC pre mix",
+        trace.position,
+        0);
+    require_close(
+        max_abs_difference(trace.attention_precombined_input, expected_precombined),
+        fp16_tensor_tolerance(expected_precombined),
+        "layer 0 HC precombined input",
+        trace.position,
+        0);
+    require_close(
+        max_abs_difference(trace.attention_normalized_input, expected),
+        fp16_tensor_tolerance(expected),
+        "layer 0 HC attention input",
+        trace.position,
+        0);
+}
+
+void compare_layer_attention_input_from_trace(
+    const AeonModelLoader& loader,
+    const V4LayerSpec& layer_spec,
+    const V4AttentionTraceRecord& trace
+) {
+    if (trace.position != 0 || trace.block_residual_input.empty()) return;
+
+    constexpr int kHcStreams = 4;
+    constexpr int kHiddenSize = 4096;
+    const std::string prefix = "layers." + std::to_string(layer_spec.layer_id) + ".";
+    const auto& hc_fn = require_tensor(
+        loader, prefix + "hc_attn_fn",
+        {kHcStreams * (2 + kHcStreams), kHcStreams * kHiddenSize}, "F32");
+    const auto& hc_base = require_tensor(
+        loader, prefix + "hc_attn_base",
+        {kHcStreams * (2 + kHcStreams)}, "F32");
+    const auto& hc_scale = require_tensor(
+        loader, prefix + "hc_attn_scale", {3}, "F32");
+    const auto& attention_norm = require_tensor(
+        loader, prefix + "attn_norm.weight", {kHiddenSize}, "F16");
+
+    const std::vector<float>& residual = trace.block_residual_input;
+    const float* fn_values = reinterpret_cast<const float*>(hc_fn.data);
+    const float* base_values = reinterpret_cast<const float*>(hc_base.data);
+    const float* scale_values = reinterpret_cast<const float*>(hc_scale.data);
+    std::vector<float> expected_mixes(kHcStreams * (2 + kHcStreams));
+    float squared_residual = 0.0f;
+    for (float value : residual) squared_residual += value * value;
+    const float residual_inverse_rms = 1.0f / std::sqrt(
+        squared_residual / static_cast<float>(residual.size()) + 1e-6f);
+    for (size_t mix = 0; mix < expected_mixes.size(); ++mix) {
+        float dot = 0.0f;
+        for (size_t index = 0; index < residual.size(); ++index) {
+            dot += residual[index] * fn_values[mix * residual.size() + index];
+        }
+        expected_mixes[mix] = dot * residual_inverse_rms;
+    }
+
+    std::vector<float> expected_pre_mix(kHcStreams);
+    for (int stream = 0; stream < kHcStreams; ++stream) {
+        expected_pre_mix[static_cast<size_t>(stream)] = 1.0f / (1.0f + std::exp(-(
+            expected_mixes[static_cast<size_t>(stream)] * scale_values[0] +
+            base_values[stream]))) + 1e-6f;
+    }
+
+    std::vector<float> expected_precombined(kHiddenSize);
+    for (int hidden = 0; hidden < kHiddenSize; ++hidden) {
+        float value = 0.0f;
+        for (int stream = 0; stream < kHcStreams; ++stream) {
+            value += trace.attention_hc_pre_mix[static_cast<size_t>(stream)] *
+                residual[static_cast<size_t>(stream) * kHiddenSize + hidden];
+        }
+        expected_precombined[hidden] = __half2float(__float2half(value));
+    }
+    float squared_sum = 0.0f;
+    for (float value : expected_precombined) squared_sum += value * value;
+    const float inverse_rms = 1.0f / std::sqrt(
+        squared_sum / static_cast<float>(kHiddenSize) + 1e-6f);
+    std::vector<float> expected_norm(kHiddenSize);
+    for (int hidden = 0; hidden < kHiddenSize; ++hidden) {
+        expected_norm[hidden] = expected_precombined[hidden] * inverse_rms *
+            load_half_value(attention_norm, static_cast<size_t>(hidden));
+    }
+
+    const float expected_pre_mix_error = [&]() {
+        float maximum = 0.0f;
+        for (int stream = 0; stream < kHcStreams; ++stream) {
+            const float expected_pre_mix = 1.0f / (1.0f + std::exp(-(
+                expected_mixes[stream] * scale_values[0] + base_values[stream]))) + 1e-6f;
+            maximum = std::max(
+                maximum,
+                std::abs(trace.attention_hc_pre_mix[static_cast<size_t>(stream)] -
+                         expected_pre_mix));
+        }
+        return maximum;
+    }();
+    if (max_abs_difference(trace.attention_precombined_input, expected_precombined) >
+            kAttentionTolerance) {
+        std::vector<float> production_precombined(kHiddenSize);
+        for (int hidden = 0; hidden < kHiddenSize; ++hidden) {
+            float value = 0.0f;
+            for (int stream = 0; stream < kHcStreams; ++stream) {
+                value += trace.attention_hc_pre_mix[static_cast<size_t>(stream)] *
+                    residual[static_cast<size_t>(stream) * kHiddenSize + hidden];
+            }
+            production_precombined[static_cast<size_t>(hidden)] =
+                __half2float(__float2half(value));
+        }
+        std::cerr << "HC diagnostic layer " << layer_spec.layer_id
+                  << " position " << trace.position
+                  << " mix_error=" << max_abs_difference(
+                      trace.attention_hc_mixes, expected_mixes)
+                  << " pre_mix_error=" << expected_pre_mix_error
+                  << " precombined_with_production_pre_mix_error="
+                  << max_abs_difference(
+                      trace.attention_precombined_input, production_precombined)
+                  << std::endl;
+        for (int stream = 0; stream < kHcStreams; ++stream) {
+            const float expected_pre_mix = 1.0f / (1.0f + std::exp(-(
+                expected_mixes[stream] * scale_values[0] + base_values[stream]))) + 1e-6f;
+            std::cerr << "  stream " << stream
+                      << " production_pre=" << trace.attention_hc_pre_mix[static_cast<size_t>(stream)]
+                      << " expected_pre=" << expected_pre_mix << std::endl;
+        }
+        size_t maximum_index = 0;
+        float maximum_error = 0.0f;
+        for (size_t index = 0; index < production_precombined.size(); ++index) {
+            const float error = std::abs(
+                __half2float(trace.attention_precombined_input[index]) -
+                production_precombined[index]);
+            if (error > maximum_error) {
+                maximum_error = error;
+                maximum_index = index;
+            }
+        }
+        std::cerr << "  max_precombined_index=" << maximum_index
+                  << " actual=" << __half2float(trace.attention_precombined_input[maximum_index])
+                  << " expected=" << production_precombined[maximum_index] << std::endl;
+        for (int stream = 0; stream < kHcStreams; ++stream) {
+            std::cerr << "  residual[" << stream << "]="
+                      << residual[static_cast<size_t>(stream) * kHiddenSize + maximum_index]
+                      << std::endl;
+        }
+    }
+
+    require_close(
+        max_abs_difference(trace.attention_hc_mixes, expected_mixes),
+        kStateTolerance,
+        "HC attention mixes",
+        trace.position,
+        layer_spec.layer_id);
+    require_close(
+        max_abs_difference(trace.attention_hc_pre_mix, expected_pre_mix),
+        kStateTolerance,
+        "HC attention pre mix",
+        trace.position,
+        layer_spec.layer_id);
+    require_close(
+        max_abs_difference(trace.attention_precombined_input, expected_precombined),
+        fp16_tensor_tolerance(expected_precombined),
+        "HC attention precombined input",
+        trace.position,
+        layer_spec.layer_id);
+    require_close(
+        max_abs_difference(trace.attention_normalized_input, expected_norm),
+        fp16_tensor_tolerance(expected_norm),
+        "HC attention normalized input",
+        trace.position,
+        layer_spec.layer_id);
+}
+
+void compare_layer_post_attention(
+    const AeonModelLoader& loader,
+    const DeepSeekV4Config& model_config,
+    const V4LayerSpec& layer_spec,
+    const V4AttentionTraceRecord& trace
+) {
+    if (trace.position != 0 || trace.attention_post_residual.empty()) return;
+
+    constexpr int kHcStreams = 4;
+    constexpr int kHiddenSize = 4096;
+    const std::string prefix = "layers." + std::to_string(layer_spec.layer_id) + ".";
+    const auto& ffn_fn = require_tensor(
+        loader, prefix + "hc_ffn_fn",
+        {kHcStreams * (2 + kHcStreams), kHcStreams * kHiddenSize}, "F32");
+    const auto& ffn_base = require_tensor(
+        loader, prefix + "hc_ffn_base",
+        {kHcStreams * (2 + kHcStreams)}, "F32");
+    const auto& ffn_scale = require_tensor(
+        loader, prefix + "hc_ffn_scale", {3}, "F32");
+    const auto& ffn_norm = require_tensor(
+        loader, prefix + "ffn_norm.weight", {kHiddenSize}, "F16");
+
+    std::vector<float> residual(trace.block_residual_input.size());
+    for (size_t index = 0; index < residual.size(); ++index) {
+        residual[index] = __half2float(__float2half(trace.block_residual_input[index]));
+    }
+
+    std::vector<float> attention_output = half_to_float(trace.grouped_output);
+    std::vector<float> expected_residual(kHcStreams * kHiddenSize);
+    aeon::kernel::cpu_hc_post(
+        attention_output.data(),
+        residual.data(),
+        trace.attention_hc_post_mix.data(),
+        trace.attention_hc_comb_mix.data(),
+        expected_residual.data(),
+        kHiddenSize,
+        kHcStreams);
+    std::vector<float> expected_residual_half(expected_residual.size());
+    for (size_t index = 0; index < expected_residual.size(); ++index) {
+        expected_residual_half[index] = __half2float(__float2half(expected_residual[index]));
+    }
+    require_close(
+        max_abs_difference(trace.attention_post_residual, expected_residual_half),
+        fp16_tensor_tolerance(expected_residual_half),
+        "HC attention post residual",
+        trace.position,
+        layer_spec.layer_id);
+
+    const std::vector<float> actual_residual = half_to_float(trace.attention_post_residual);
+    std::vector<float> expected_ffn_input(kHiddenSize);
+    std::vector<float> unused_post_mix(kHcStreams);
+    std::vector<float> unused_comb_mix(kHcStreams * kHcStreams);
+    aeon::kernel::cpu_sinkhorn_and_mix(
+        actual_residual.data(),
+        reinterpret_cast<const float*>(ffn_fn.data),
+        reinterpret_cast<const float*>(ffn_base.data),
+        reinterpret_cast<const float*>(ffn_scale.data),
+        expected_ffn_input.data(),
+        unused_post_mix.data(),
+        unused_comb_mix.data(),
+        kHiddenSize,
+        kHcStreams,
+        1e-6f,
+        1e-6f,
+        1e-6f,
+        2.0f,
+        20);
+    std::vector<float> expected_ffn_input_half(kHiddenSize);
+    for (size_t index = 0; index < expected_ffn_input_half.size(); ++index) {
+        expected_ffn_input_half[index] = __half2float(__float2half(expected_ffn_input[index]));
+    }
+    require_close(
+        max_abs_difference(trace.ffn_precombined_input, expected_ffn_input_half),
+        fp16_tensor_tolerance(expected_ffn_input_half),
+        "HC FFN input",
+        trace.position,
+        layer_spec.layer_id);
+
+    float squared_sum = 0.0f;
+    for (float value : expected_ffn_input_half) squared_sum += value * value;
+    const float inverse_rms = 1.0f / std::sqrt(
+        squared_sum / static_cast<float>(kHiddenSize) + 1e-6f);
+    std::vector<float> expected_ffn_norm(kHiddenSize);
+    for (int hidden = 0; hidden < kHiddenSize; ++hidden) {
+        expected_ffn_norm[hidden] = expected_ffn_input_half[hidden] * inverse_rms *
+            load_half_value(ffn_norm, static_cast<size_t>(hidden));
+    }
+    require_close(
+        max_abs_difference(trace.ffn_normalized_input, expected_ffn_norm),
+        fp16_tensor_tolerance(expected_ffn_norm),
+        "FFN normalized input",
+        trace.position,
+        layer_spec.layer_id);
+}
+
+void compare_layer_moe(
+    const AeonModelLoader& loader,
+    const V4LayerSpec& layer_spec,
+    const V4AttentionTraceRecord& trace
+) {
+    if (trace.position != 0 || trace.moe_output.empty()) return;
+
+    constexpr int kHiddenSize = 4096;
+    constexpr int kIntermediateSize = 2048;
+    constexpr int kRouterExperts = 256;
+    const std::string prefix = "layers." + std::to_string(layer_spec.layer_id) + ".";
+    const std::vector<uint16_t> input_bits = half_to_bits(trace.ffn_normalized_input);
+    const std::vector<float> input_values = half_to_float(trace.ffn_normalized_input);
+
+    const auto& router = require_tensor(
+        loader, prefix + "ffn.gate.weight", {kRouterExperts, kHiddenSize}, "F16");
+    std::vector<float> expected_router(kRouterExperts);
+    aeon::reference::decode_fp16_gemv(
+        router.data, input_bits.data(), kRouterExperts, kHiddenSize, expected_router.data());
+    require_close(
+        max_abs_difference(trace.router_logits, expected_router),
+        0.1f,
+        "router logits",
+        trace.position,
+        layer_spec.layer_id);
+
+    const auto& shared_w1 = require_tensor(
+        loader, prefix + "ffn.shared_experts.w1.weight",
+        {kIntermediateSize, kHiddenSize}, "F16");
+    const auto& shared_w3 = require_tensor(
+        loader, prefix + "ffn.shared_experts.w3.weight",
+        {kIntermediateSize, kHiddenSize}, "F16");
+    const auto& shared_w2 = require_tensor(
+        loader, prefix + "ffn.shared_experts.w2.weight",
+        {kHiddenSize, kIntermediateSize}, "F16");
+    std::vector<float> shared_gate(kIntermediateSize);
+    std::vector<float> shared_up(kIntermediateSize);
+    aeon::reference::decode_fp16_gemv(
+        shared_w1.data, input_bits.data(), kIntermediateSize, kHiddenSize, shared_gate.data());
+    aeon::reference::decode_fp16_gemv(
+        shared_w3.data, input_bits.data(), kIntermediateSize, kHiddenSize, shared_up.data());
+    std::vector<uint16_t> shared_hidden_bits(kIntermediateSize);
+    for (int index = 0; index < kIntermediateSize; ++index) {
+        const float gate = std::min(shared_gate[index], 10.0f);
+        const float up = std::min(std::max(shared_up[index], -10.0f), 10.0f);
+        const half hidden = __float2half((gate / (1.0f + std::exp(-gate))) * up);
+        std::memcpy(&shared_hidden_bits[index], &hidden, sizeof(uint16_t));
+    }
+    std::vector<float> expected_shared(kHiddenSize);
+    aeon::reference::decode_fp16_gemv(
+        shared_w2.data, shared_hidden_bits.data(), kHiddenSize, kIntermediateSize,
+        expected_shared.data());
+    require_close(
+        max_abs_difference(trace.shared_expert_output, expected_shared),
+        fp16_tensor_tolerance(expected_shared),
+        "shared expert output",
+        trace.position,
+        layer_spec.layer_id);
+
+    std::vector<float> expected_moe = expected_shared;
+    for (size_t expert_index = 0; expert_index < trace.routed_expert_indices.size(); ++expert_index) {
+        const uint8_t* payload = loader.get_expert_data(
+            static_cast<uint32_t>(layer_spec.layer_id),
+            static_cast<uint32_t>(trace.routed_expert_indices[expert_index]));
+        std::vector<float> expert_output(kHiddenSize);
+        aeon::reference::decode_routed_ffn(
+            payload, input_values.data(), expert_output.data(), 10.0f);
+        for (int hidden = 0; hidden < kHiddenSize; ++hidden) {
+            expected_moe[hidden] += trace.routed_expert_weights[expert_index] * expert_output[hidden];
+        }
+    }
+    require_close(
+        max_abs_difference(trace.moe_output, expected_moe),
+        fp16_tensor_tolerance(expected_moe),
+        "combined MoE output",
+        trace.position,
+        layer_spec.layer_id);
+
+    const std::vector<float> residual_mid = half_to_float(trace.attention_post_residual);
+    const std::vector<float> actual_moe = half_to_float(trace.moe_output);
+    std::vector<float> expected_residual(residual_mid.size());
+    aeon::kernel::cpu_hc_post(
+        actual_moe.data(),
+        residual_mid.data(),
+        trace.ffn_hc_post_mix.data(),
+        trace.ffn_hc_comb_mix.data(),
+        expected_residual.data(),
+        kHiddenSize,
+        4);
+    std::vector<float> expected_residual_half(expected_residual.size());
+    for (size_t index = 0; index < expected_residual.size(); ++index) {
+        expected_residual_half[index] = __half2float(__float2half(expected_residual[index]));
+    }
+    require_close(
+        max_abs_difference(trace.post_ffn_residual, expected_residual_half),
+        fp16_tensor_tolerance(expected_residual_half),
+        "HC FFN post residual",
+        trace.position,
+        layer_spec.layer_id);
 }
 
 void compare_layer_trace(
     const AeonModelLoader& loader,
     const DeepSeekV4Config& model_config,
     const V4LayerSpec& layer_spec,
-    const std::vector<V4AttentionTraceRecord>& traces
+    const std::vector<V4AttentionTraceRecord>& traces,
+    size_t expected_trace_tokens = kTraceTokens
 ) {
-    if (traces.size() != kTraceTokens) {
+    if (traces.size() != expected_trace_tokens) {
         throw std::runtime_error("Stage 4 trace did not capture all requested positions");
     }
     const V4OracleConfig oracle_config = make_oracle_config(model_config, layer_spec, loader);
     V4AttentionOracle oracle(oracle_config);
-    const auto& first_layout = traces.front();
 
-    for (const auto& trace : traces) {
-        if (trace.position != static_cast<uint32_t>(&trace - traces.data())) {
+    for (size_t trace_index = 0; trace_index < traces.size(); ++trace_index) {
+        const auto& trace = traces[trace_index];
+        if (trace.position != trace_index) {
             throw std::runtime_error("Stage 4 trace positions are not contiguous");
         }
         const V4OracleTokenInput input = make_oracle_input(trace);
         const auto result = oracle.append(input);
         const auto state = oracle.snapshot();
+
+        if (layer_spec.layer_id == 0) {
+            compare_layer_zero_attention_input(loader, model_config, trace);
+        } else {
+            compare_layer_attention_input_from_trace(loader, layer_spec, trace);
+        }
+        compare_layer_post_attention(loader, model_config, layer_spec, trace);
+        compare_layer_moe(loader, layer_spec, trace);
 
         if (trace.local_valid_count != result.local_valid_count ||
             trace.compressed_entry_count != result.compressed_entry_count ||
@@ -384,13 +861,16 @@ void compare_layer_trace(
 
         require_close(
             max_abs_difference(trace.rotated_query, result.rotated_query),
-            kAttentionTolerance, "rotated query", trace.position, layer_spec.layer_id);
+            fp16_tensor_tolerance(result.rotated_query),
+            "rotated query", trace.position, layer_spec.layer_id);
         require_close(
             max_abs_difference(trace.attention_output, result.attention_output),
-            kAttentionTolerance, "attention output", trace.position, layer_spec.layer_id);
+            fp16_tensor_tolerance(result.attention_output),
+            "attention output", trace.position, layer_spec.layer_id);
         require_close(
             max_abs_difference(trace.inverse_rope_output, result.inverse_rope_output),
-            kAttentionTolerance, "inverse RoPE output", trace.position, layer_spec.layer_id);
+            fp16_tensor_tolerance(result.inverse_rope_output),
+            "inverse RoPE output", trace.position, layer_spec.layer_id);
 
         compare_local_state(trace, state, layer_spec.layer_id);
         if (layer_spec.attention_kind != V4AttentionKind::Sliding) {
@@ -432,20 +912,143 @@ void compare_layer_trace(
             }
         }
 
-        if (trace.position == kTraceTokens - 1) {
+        if (trace.position == expected_trace_tokens - 1) {
             compare_grouped_projection(loader, layer_spec, trace);
         }
     }
 
-    (void)first_layout;
     std::cout << "[PASS] Stage 4 HIP/oracle trace layer " << layer_spec.layer_id << " "
               << aeon::core::v4_attention_kind_name(layer_spec.attention_kind)
-              << " through position " << (kTraceTokens - 1) << std::endl;
+              << " through position " << (expected_trace_tokens - 1) << std::endl;
+}
+
+void compare_all_layer_boundary_state(const V4LayerSpec& layer_spec,
+                                      const V4AttentionTraceRecord& trace) {
+    constexpr uint32_t kLocalCapacity = 128;
+    constexpr uint32_t kIndexerTopK = 512;
+    const uint32_t position = trace.position;
+    const uint32_t expected_local_count = std::min(position + 1u, kLocalCapacity);
+    if (trace.local_valid_count != expected_local_count) {
+        throw std::runtime_error(
+            "All-layer boundary local count mismatch at layer " +
+            std::to_string(layer_spec.layer_id) + ", position " +
+            std::to_string(position));
+    }
+    if (trace.local_positions.size() != kLocalCapacity) {
+        throw std::runtime_error("All-layer boundary local cache capacity mismatch");
+    }
+    for (uint32_t slot = 0; slot < kLocalCapacity; ++slot) {
+        int64_t expected_position = -1;
+        if (slot <= position || position >= kLocalCapacity) {
+            const uint32_t distance = (position % kLocalCapacity + kLocalCapacity - slot) %
+                kLocalCapacity;
+            if (distance <= position) {
+                expected_position = static_cast<int64_t>(position - distance);
+            }
+        }
+        if (trace.local_positions[slot] != expected_position) {
+            throw std::runtime_error(
+                "All-layer boundary local ring mismatch at layer " +
+                std::to_string(layer_spec.layer_id) + ", position " +
+                std::to_string(position) + ", slot " + std::to_string(slot));
+        }
+    }
+
+    const uint32_t ratio = static_cast<uint32_t>(layer_spec.compression_ratio);
+    const uint32_t expected_compressed_count = layer_spec.attention_kind == V4AttentionKind::Sliding
+        ? 0u
+        : (position + 1u) / ratio;
+    if (trace.compressed_entry_count != expected_compressed_count) {
+        throw std::runtime_error(
+            "All-layer boundary compressed count mismatch at layer " +
+            std::to_string(layer_spec.layer_id) + ", position " +
+            std::to_string(position));
+    }
+    for (uint32_t index = 0; index < expected_compressed_count; ++index) {
+        const int64_t expected_boundary = static_cast<int64_t>((index + 1u) * ratio - 1u);
+        if (trace.compressed_positions[index] != expected_boundary) {
+            throw std::runtime_error(
+                "All-layer boundary compressed position mismatch at layer " +
+                std::to_string(layer_spec.layer_id) + ", position " +
+                std::to_string(position));
+        }
+    }
+
+    if (layer_spec.attention_kind == V4AttentionKind::CSA) {
+        if (trace.indexer_candidate_count != expected_compressed_count ||
+            trace.indexer_topk_indices.size() != kIndexerTopK) {
+            throw std::runtime_error(
+                "All-layer boundary CSA candidate contract mismatch at layer " +
+                std::to_string(layer_spec.layer_id) + ", position " +
+                std::to_string(position));
+        }
+        for (uint32_t index = 0; index < kIndexerTopK; ++index) {
+            const int32_t expected_index = index < expected_compressed_count
+                ? static_cast<int32_t>(index)
+                : -1;
+            if (trace.indexer_topk_indices[index] != expected_index) {
+                throw std::runtime_error(
+                    "All-layer boundary CSA top-k mismatch at layer " +
+                    std::to_string(layer_spec.layer_id) + ", position " +
+                    std::to_string(position));
+            }
+        }
+    } else if (trace.indexer_candidate_count != 0) {
+        throw std::runtime_error(
+            "All-layer boundary non-CSA indexer state is non-empty at layer " +
+            std::to_string(layer_spec.layer_id) + ", position " +
+            std::to_string(position));
+    }
+
+    const auto require_finite = [](std::span<const half> values, const char* label,
+                                   uint32_t layer_id, uint32_t position) {
+        for (const half value : values) {
+            if (!std::isfinite(__half2float(value))) {
+                throw std::runtime_error(
+                    std::string("All-layer boundary ") + label +
+                    " contains a non-finite value at layer " + std::to_string(layer_id) +
+                    ", position " + std::to_string(position));
+            }
+        }
+    };
+    require_finite(trace.attention_output, "attention output", layer_spec.layer_id, position);
+    require_finite(trace.inverse_rope_output, "inverse RoPE output", layer_spec.layer_id, position);
+}
+
+void compare_full_block_residual_continuity(
+    const std::vector<V4AttentionTraceRecord>& traces
+) {
+    for (size_t index = 1; index < traces.size(); ++index) {
+        const auto& previous = traces[index - 1];
+        const auto& current = traces[index];
+        if (current.layer_id != previous.layer_id + 1 ||
+            current.position != previous.position) {
+            throw std::runtime_error("Full-block trace layers are not contiguous");
+        }
+        if (previous.post_ffn_residual.size() != current.block_residual_input.size()) {
+            throw std::runtime_error(
+                "Full-block residual continuity vector size mismatch between layers " +
+                std::to_string(previous.layer_id) + " and " +
+                std::to_string(current.layer_id));
+        }
+        std::vector<float> expected_input(previous.post_ffn_residual.size());
+        for (size_t element = 0; element < expected_input.size(); ++element) {
+            expected_input[element] = __half2float(previous.post_ffn_residual[element]);
+        }
+        require_close(
+            max_abs_difference(
+                std::span<const float>(current.block_residual_input),
+                std::span<const float>(expected_input)),
+            fp16_tensor_tolerance(expected_input),
+            "full-block residual continuity",
+            current.position,
+            current.layer_id);
+    }
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     aeon::core::select_compute_device(true);
 
     const std::string model_dir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
@@ -455,10 +1058,126 @@ int main() {
     aeon::core::AeonRuntimeConfig runtime_config;
     runtime_config.context_size = kTraceTokens;
     runtime_config.warm_host_bytes = 0;
+    runtime_config.deterministic_expert_accumulation = true;
 
     aeon::core::V4Pipeline pipeline;
     pipeline.initialize(model_dir, runtime_config);
     aeon::core::RoutingPhase phase = aeon::core::RoutingPhase::Prefill;
+
+    if (argc > 1) {
+        const std::string mode = argv[1];
+        std::vector<uint32_t> prelude_layers;
+        const bool no_trace_prelude = mode == "no-trace-layer0-layer2-layer3";
+        const bool synchronize_device = mode == "device-sync-layer0-layer2-layer3";
+        const bool compare_all_layers = argc > 2 && std::string(argv[2]) == "compare-all";
+        if (mode == "real-only") {
+            const std::vector<uint32_t> real_prompt_ids = {
+                0u, 128803u, 3085u, 344u, 223u, 20u, 223u, 13u, 223u, 20u,
+                33u, 9361u, 418u, 1438u, 270u, 1167u, 16u, 128804u, 128822u};
+            std::vector<uint32_t> real_prompt_positions;
+            real_prompt_positions.reserve(real_prompt_ids.size());
+            for (uint32_t position = 0; position < real_prompt_ids.size(); ++position) {
+                real_prompt_positions.push_back(position);
+            }
+            pipeline.enable_attention_trace_all_layers(real_prompt_positions);
+            pipeline.reset_generation_state();
+            for (uint32_t position = 0; position < real_prompt_ids.size(); ++position) {
+                const uint32_t next_token = pipeline.step(
+                    real_prompt_ids[position], position, phase);
+                assert(next_token < 129280u);
+            }
+            const auto& real_traces = pipeline.attention_trace();
+            for (const auto& layer_spec : layer_specs) {
+                std::vector<V4AttentionTraceRecord> layer_traces;
+                layer_traces.reserve(real_prompt_ids.size());
+                for (const auto& trace : real_traces) {
+                    if (trace.layer_id == layer_spec.layer_id) layer_traces.push_back(trace);
+                }
+                compare_layer_trace(
+                    pipeline.aeon_loader,
+                    model_config,
+                    layer_spec,
+                    layer_traces,
+                    real_prompt_ids.size());
+            }
+            std::cout << "[PASS] Stage 4 real-prompt isolation" << std::endl;
+            return 0;
+        }
+        if (mode == "layer0") {
+            prelude_layers = {0u};
+        } else if (mode == "layer2") {
+            prelude_layers = {2u};
+        } else if (mode == "layer3") {
+            prelude_layers = {3u};
+        } else if (mode == "layer0-layer2") {
+            prelude_layers = {0u, 2u};
+        } else if (mode == "layer0-layer3") {
+            prelude_layers = {0u, 3u};
+        } else if (mode == "layer2-layer3") {
+            prelude_layers = {2u, 3u};
+        } else if (mode == "layer0-layer2-layer3") {
+            prelude_layers = {0u, 2u, 3u};
+        } else if (synchronize_device) {
+            prelude_layers = {0u, 2u, 3u};
+        } else if (!no_trace_prelude && mode != "fresh") {
+            throw std::invalid_argument("Unknown Stage 4 isolation mode: " + mode);
+        }
+
+        for (const uint32_t layer_id : prelude_layers) {
+            if (no_trace_prelude) pipeline.disable_attention_trace();
+            else pipeline.enable_attention_trace(layer_id, kTraceTokens);
+            pipeline.reset_generation_state();
+            for (uint32_t position = 0; position < kTraceTokens; ++position) {
+                const uint32_t next_token = pipeline.step(1u + position, position, phase);
+                assert(next_token < 129280u);
+                if (synchronize_device && hipDeviceSynchronize() != hipSuccess) {
+                    throw std::runtime_error("Stage 4 isolation device synchronization failed");
+                }
+            }
+            if (argc > 2 &&
+                (std::string(argv[2]) == "compare" || compare_all_layers)) {
+                compare_layer_trace(
+                    pipeline.aeon_loader,
+                    model_config,
+                    layer_specs.at(layer_id),
+                    pipeline.attention_trace());
+            }
+        }
+
+        pipeline.enable_attention_trace_all_layers(0);
+        pipeline.reset_generation_state();
+        const uint32_t first_token = pipeline.step(1u, 0u, phase);
+        assert(first_token < 129280u);
+        if (synchronize_device && hipDeviceSynchronize() != hipSuccess) {
+            throw std::runtime_error("Stage 4 isolation device synchronization failed");
+        }
+        const auto& isolation_traces = pipeline.attention_trace();
+        const auto layer_zero = std::find_if(
+            isolation_traces.begin(), isolation_traces.end(),
+            [](const V4AttentionTraceRecord& trace) { return trace.layer_id == 0; });
+        if (layer_zero == isolation_traces.end()) {
+            throw std::runtime_error("Stage 4 isolation did not capture layer 0");
+        }
+        compare_layer_zero_attention_input(
+            pipeline.aeon_loader, model_config, *layer_zero);
+        if (compare_all_layers) {
+            for (const auto& trace : isolation_traces) {
+                const auto& layer_spec = layer_specs.at(trace.layer_id);
+                if (trace.layer_id == 0) {
+                    compare_layer_zero_attention_input(
+                        pipeline.aeon_loader, model_config, trace);
+                } else {
+                    compare_layer_attention_input_from_trace(
+                        pipeline.aeon_loader, layer_spec, trace);
+                }
+                compare_layer_post_attention(
+                    pipeline.aeon_loader, model_config, layer_spec, trace);
+                compare_layer_moe(pipeline.aeon_loader, layer_spec, trace);
+            }
+        }
+        std::cout << "[PASS] Stage 4 reset isolation mode " << mode << std::endl;
+        return 0;
+    }
 
     for (const uint32_t layer_id : {0u, 2u, 3u}) {
         pipeline.enable_attention_trace(layer_id, kTraceTokens);
@@ -474,7 +1193,104 @@ int main() {
             pipeline.attention_trace());
     }
 
+    pipeline.enable_attention_trace_all_layers(0);
+    pipeline.reset_generation_state();
+    const uint32_t first_token = pipeline.step(1u, 0u, phase);
+    assert(first_token < 129280u);
+    const auto& all_layer_traces = pipeline.attention_trace();
+    if (all_layer_traces.size() != layer_specs.size()) {
+        throw std::runtime_error(
+            "All-layer block trace captured " + std::to_string(all_layer_traces.size()) +
+            " records for " + std::to_string(layer_specs.size()) + " layers");
+    }
+    for (const auto& trace : all_layer_traces) {
+        const auto& layer_spec = layer_specs.at(trace.layer_id);
+        if (trace.position != 0 || trace.attention_kind != layer_spec.attention_kind) {
+            throw std::runtime_error(
+                "All-layer block trace contract mismatch at layer " +
+                std::to_string(trace.layer_id));
+        }
+        if (trace.block_residual_input.empty() || trace.ffn_normalized_input.empty() ||
+            trace.router_logits.empty() || trace.shared_expert_output.empty() ||
+            trace.moe_output.empty() || trace.post_ffn_residual.empty()) {
+            throw std::runtime_error(
+                "All-layer block trace missing a full-block checkpoint at layer " +
+                std::to_string(trace.layer_id));
+        }
+        if (trace.layer_id == 0) {
+            compare_layer_zero_attention_input(pipeline.aeon_loader, model_config, trace);
+        } else {
+            compare_layer_attention_input_from_trace(
+                pipeline.aeon_loader, layer_spec, trace);
+        }
+        compare_layer_post_attention(
+            pipeline.aeon_loader, model_config, layer_spec, trace);
+        compare_layer_moe(pipeline.aeon_loader, layer_spec, trace);
+    }
+    compare_full_block_residual_continuity(all_layer_traces);
+
+    const std::vector<uint32_t> boundary_positions = {
+        0u, 3u, 4u, 7u, 8u, 123u, 124u, 126u, 127u, 128u, 131u};
+    pipeline.enable_attention_trace_all_layers(boundary_positions);
+    pipeline.reset_generation_state();
+    for (uint32_t position = 0; position < kTraceTokens; ++position) {
+        const uint32_t next_token = pipeline.step(1u + position, position, phase);
+        assert(next_token < 129280u);
+    }
+    const auto& boundary_traces = pipeline.attention_trace();
+    if (boundary_traces.size() != layer_specs.size() * boundary_positions.size()) {
+        throw std::runtime_error(
+            "All-layer boundary trace captured " + std::to_string(boundary_traces.size()) +
+            " records instead of " +
+            std::to_string(layer_specs.size() * boundary_positions.size()));
+    }
+    size_t boundary_index = 0;
+    for (const uint32_t position : boundary_positions) {
+        for (const auto& layer_spec : layer_specs) {
+            const auto& trace = boundary_traces[boundary_index++];
+            if (trace.layer_id != layer_spec.layer_id || trace.position != position ||
+                trace.attention_kind != layer_spec.attention_kind) {
+                throw std::runtime_error("All-layer boundary trace ordering mismatch");
+            }
+            compare_all_layer_boundary_state(layer_spec, trace);
+        }
+    }
+
+    const std::vector<uint32_t> real_prompt_ids = {
+        0u, 128803u, 3085u, 344u, 223u, 20u, 223u, 13u, 223u, 20u,
+        33u, 9361u, 418u, 1438u, 270u, 1167u, 16u, 128804u, 128822u};
+    std::vector<uint32_t> real_prompt_positions;
+    real_prompt_positions.reserve(real_prompt_ids.size());
+    for (uint32_t position = 0; position < real_prompt_ids.size(); ++position) {
+        real_prompt_positions.push_back(position);
+    }
+    pipeline.enable_attention_trace_all_layers(real_prompt_positions);
+    pipeline.reset_generation_state();
+    for (uint32_t position = 0; position < real_prompt_ids.size(); ++position) {
+        const uint32_t next_token = pipeline.step(real_prompt_ids[position], position, phase);
+        assert(next_token < 129280u);
+    }
+    const auto& real_prompt_traces = pipeline.attention_trace();
+    if (real_prompt_traces.size() != layer_specs.size() * real_prompt_ids.size()) {
+        throw std::runtime_error("Real prompt all-layer trace count mismatch");
+    }
+    for (const auto& layer_spec : layer_specs) {
+        std::vector<V4AttentionTraceRecord> layer_traces;
+        layer_traces.reserve(real_prompt_ids.size());
+        for (const auto& trace : real_prompt_traces) {
+            if (trace.layer_id == layer_spec.layer_id) layer_traces.push_back(trace);
+        }
+        compare_layer_trace(
+            pipeline.aeon_loader,
+            model_config,
+            layer_spec,
+            layer_traces,
+            real_prompt_ids.size());
+    }
+
     std::cout << "V4 Stage 4 HIP/oracle traces passed: layers 0/2/3, cache state, "
-              << "C4/C128 entries, indexer top-k, attention outputs, and grouped projection" << std::endl;
+              << "C4/C128 entries, indexer top-k, attention outputs, grouped projection, "
+              << "all 43 full-block compositions, all-layer attention boundaries, "
+              << "and the real formatted prompt" << std::endl;
     return 0;
 }

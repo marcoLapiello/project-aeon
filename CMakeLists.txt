@@ -72,6 +72,10 @@ if(NOT AEON_GIT_COMMIT)
 endif()
 target_compile_definitions(profile_routing PRIVATE AEON_GIT_COMMIT=\"${AEON_GIT_COMMIT}\")
 
+# Opt-in full-model GPU evidence recorder; this is intentionally not a default CTest.
+add_executable(record_v4_gpu_evidence tools/record_v4_gpu_evidence.cpp)
+target_link_libraries(record_v4_gpu_evidence PRIVATE amdhip64)
+
 # Native text-in/text-out CLI for the verified DSV4 formatter and pipeline
 add_executable(aeon_chat
     tools/aeon_chat.cpp

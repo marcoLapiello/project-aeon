@@ -10,6 +10,8 @@
 namespace aeon::core {
 
 struct V4AttentionTraceRecord {
+    uint32_t layer_id{0};
+    uint32_t token_id{0};
     uint32_t position{0};
     V4AttentionKind attention_kind{V4AttentionKind::Sliding};
     uint32_t local_valid_count{0};
@@ -18,6 +20,16 @@ struct V4AttentionTraceRecord {
     uint32_t indexer_candidate_count{0};
 
     // Projection inputs before class-specific RoPE and cache mutation.
+    std::vector<float> block_residual_input;
+    std::vector<float> attention_hc_mixes;
+    std::vector<float> attention_hc_pre_mix;
+    std::vector<float> attention_hc_post_mix;
+    std::vector<float> attention_hc_comb_mix;
+    std::vector<half> attention_precombined_input;
+    std::vector<half> attention_post_residual;
+    std::vector<half> ffn_precombined_input;
+    std::vector<float> ffn_hc_post_mix;
+    std::vector<float> ffn_hc_comb_mix;
     std::vector<half> query;
     std::vector<half> local_key;
     std::vector<half> local_value;
@@ -34,6 +46,16 @@ struct V4AttentionTraceRecord {
     std::vector<half> attention_output;
     std::vector<half> inverse_rope_output;
     std::vector<half> grouped_output;
+
+    // Full transformer-block checkpoints around HC, FFN, and routed experts.
+    std::vector<half> attention_normalized_input;
+    std::vector<half> ffn_normalized_input;
+    std::vector<float> router_logits;
+    std::vector<int32_t> routed_expert_indices;
+    std::vector<float> routed_expert_weights;
+    std::vector<half> shared_expert_output;
+    std::vector<half> moe_output;
+    std::vector<half> post_ffn_residual;
 
     std::vector<half> local_key_cache;
     std::vector<half> local_value_cache;

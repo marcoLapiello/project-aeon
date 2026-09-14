@@ -124,6 +124,7 @@ __global__ void __launch_bounds__(64) moe_router_kernel(
     __shared__ float s_choice[256];
     __shared__ int s_topk_idx[6];
     __shared__ float s_topk_val[6];
+    __shared__ float s_sum;
 
     // Compute sqrtsoftplus scores in parallel: 256 / 64 = 4 items per thread
     #pragma unroll
@@ -169,19 +170,16 @@ __global__ void __launch_bounds__(64) moe_router_kernel(
     }
     __syncthreads();
 
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int k = 0; k < top_k; ++k) sum += s_topk_val[k];
+        s_sum = sum;
+    }
+    __syncthreads();
+
     if (tid < top_k) {
         float val = s_topk_val[tid];
         out_indices[tid] = s_topk_idx[tid];
-
-        // Thread 0 computes sum for normalization
-        __shared__ float s_sum;
-        if (tid == 0) {
-            float sum = 0.0f;
-            for (int k = 0; k < top_k; ++k) sum += s_topk_val[k];
-            s_sum = sum;
-        }
-        __syncthreads();
-
         if (renormalize) {
             val = val / (s_sum + 1e-20f);
         }

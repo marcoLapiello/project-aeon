@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
 **Date:** 2026-09-14
-**Status:** Open; Stages 0-4 serial semantics complete; Stage 5 serialized/chunk equivalence and hybrid batched-prefill subgates complete; fully batched stateful execution and trusted-reference parity remain open
+**Status:** Open; Stages 0-6 serial correctness complete; Stage 5 serialized/chunk equivalence and hybrid batched-prefill subgates complete; Stage 7 trusted-reference parity is active but its independent reference-runtime lane is pending; fully batched stateful optimization remains separate
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -809,20 +809,15 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure -R '^(test_v4_attention|test_v4_attention_oracle|test_v4_real_attention_oracle|test_v4_model_contract|test_v4_layer_state|test_v4_layer_state_device|test_v4_class_attention_device|test_v4_stage4_dispatch|test_v4_stage4_trace|test_dynamic_expert_pool|test_hot_warm_cold_pipeline)$'
 ```
 
-On the Radeon RX 7900 XTX (`gfx1100`), the full build and the eleven focused
-tests passed; the nine attention/state/contract/trace targets completed in
-192.73 seconds, including the model-backed trace target in 147.71 seconds.
-The trace tolerances were fixed before the run at `0.02` for FP16 attention and
-cache values, `0.002` for float32 compressor/indexer partial state, `0.1` for
-float32 indexer scores, and `0.02` for grouped output projection. All captured
-layer traces passed, and the existing oracle, class-device, dispatch, and
-Hot/Warm/Cold regressions remained green.
-
-This closes the Stage 4 serial decode and HIP-versus-CPU-oracle trace gate. It
-does not close true prefill/chunk equivalence, complete 43-layer trusted-
-reference parity, or the routing-placement unlock. Stage 5 is next: prove that
-serialized, aligned, and unaligned prefill chunking preserves the same state
-and next-token outputs before optimizing batched execution.
+The earlier Stage 4 pass record is superseded by the bounded rerun documented
+in `AEON_V4_REVIEW_AND_FIX_REPORT.md`. The focused component and oracle tests
+still pass, but `test_v4_stage4_trace` now fails after the dedicated layer 0,
+layer 2, and layer 3 runs during the subsequent all-layer position-0 check:
+layer 0 HC mixes differ by `88.590942` with a `0.002` tolerance. A fresh
+one-token all-layer diagnostic passes, so the serial trace gate is open again
+until repeated-reset corruption is isolated. Stage 4 must not be described as
+closed, and the Stage 5 equivalence results remain metamorphic evidence rather
+than trusted-reference model correctness.
 
 ### Stage 5: Implement stateful and hybrid prefill
 
@@ -964,6 +959,52 @@ batch-wide expert acquisition/grouping, and larger single-launch capacities
 remain future optimization work. Trusted-reference parity remains the next
 correctness gate.
 
+### Full-model validation execution policy (2026-09-14)
+
+The complete 43-layer checkpoint must not be run through the float32 CPU oracle.
+That oracle remains intentionally narrow: selected layer 0/2/3 traces,
+compressor/indexer boundary transitions, dense-operation fixtures, and state
+serialization. It is a semantic diagnostic, not a second implementation of
+the full 170 GiB decoder.
+
+Complete-model evidence is collected on the target accelerator through the
+opt-in [`record_v4_gpu_evidence`](../../../tools/record_v4_gpu_evidence.cpp)
+tool. It runs the existing HIP pipeline with deterministic routed-expert
+accumulation and records the exact input IDs, model/runtime policy, GPU
+identity, prefill execution path, greedy token IDs, top-k logits, half-logit
+FNV-1a checksums, and timing. `--include-logits` additionally writes the full
+129,280-element logit vectors for selected-reference comparison. The tool is
+not a correctness claim by itself and is deliberately not registered as a
+default CTest because model initialization and expert residency are expensive.
+
+The trusted-reference gate therefore has two execution lanes:
+
+1. Compare selected layer/state checkpoints against the host oracle and an
+  independent reference implementation on a short deterministic fixture.
+2. Run the complete decoder on an accelerator and compare final logits/top-k
+  and greedy IDs using the same token IDs, model revision, and runtime
+  contract. If an independent accelerator-backed reference is unavailable,
+  the full-model trusted-reference gate remains open; a CPU fallback must not
+  be substituted merely to produce a result.
+
+  The first recorder run completed on the Radeon RX 7900 XTX (`gfx1100`) with
+  the 35 GiB Warm policy and the exact input IDs `[1, 101, 2054, 300]`. The
+  prefill used the reported `Batched` path, produced greedy token `982`, and
+  took `1618.20 ms`; the continuation decode produced token `875` in
+  `341.57 ms`. All 129,280 logits were finite. The JSON artifact was written to
+  `build/correctness/v4_gpu_evidence.json`. These numbers are a workflow smoke
+  result, not a performance-ledger entry or an independent parity result.
+
+  The local `ds4` checkout is a candidate for the independent accelerator lane:
+  revision `6289c516273979173abbc062209a81dd3706b804` contains a native ROCm
+  DeepSeek-V4 implementation and a Safetensors-to-GGUF converter. It is not a
+  drop-in reader for the Aeon artifact: its runtime consumes project-generated
+  GGUF, defaults to `gfx1151`, and no compatible GGUF is currently present in
+  the workspace. Before using it for parity, convert the same 0731 source
+  snapshot with a pinned DS4 template, build for `gfx1100`, verify tensor names,
+  shapes, and quantization against the selected source, and record that artifact
+  identity beside the Aeon evidence.
+
 ### Stage 6: Port the validated branches to HIP on silicon
 
 **Objective:** Implement the smallest correct Wave32 kernels and compare them
@@ -1005,10 +1046,92 @@ Acceptance criteria:
 - HIP errors, invalid positions, invalid top-k indices, and missing cache state
   fail explicitly during correctness tests.
 
+### Stage 6 implementation record (2026-09-14)
+
+Stage 6 is complete for the serial correctness path. The class-aware main and
+compressed RoPE resources, local SWA branch, C4A compressor/indexer branch,
+C128A compressor branch, deterministic top-k path, grouped output projection,
+and HC integration are implemented in the production HIP pipeline. The
+Stage 4 device trace already exercised these branches on `gfx1100` against the
+independent CPU oracle for layers 0, 2, and 3 through position 131, including
+cache metadata, compressor boundaries, compressed entries, indexer selection,
+attention outputs, and grouped projection.
+
+This closes the Stage 6 acceptance boundary for semantic serial execution. It
+does not claim a fully batched stateful graph, batch-wide compressed attention,
+or batch-wide routed-expert execution; those remain performance work. The
+active correctness gate is now Stage 7: complete-model parity against an
+independent accelerator-backed reference.
+
 ### Stage 7: Complete layer and full-model parity
 
 **Objective:** Prove that corrected attention composes with the existing mHC,
 MoE, quantized experts, final head, and text contract.
+
+**Status:** Active. Selected-layer HIP/oracle parity is complete; the complete
+43-layer trusted-reference comparison and its evidence artifact remain open.
+
+**Boundary clarification (2026-09-14):** Stage 7 does not add another Aeon
+production engine and does not change the `.aeon` runtime contract. Aeon remains
+the only production path and continues to consume the native `.aeon` artifact.
+An external implementation such as vLLM or DS4 is used only as an offline
+reference process to emit comparison values; it is not linked, vendored, or
+required by Aeon at runtime. The reference may read the original source
+Safetensors because that is its input contract, while Aeon continues to be
+tested against the resulting values from its `.aeon` artifact.
+
+**Current blocker:** the Aeon-side GPU evidence recorder is available, but the
+workspace currently has only the vLLM/DS4 source references, not an executable
+independent reference environment for this checkpoint. vLLM's Python runtime
+dependencies are absent, and DS4 requires a separately generated GGUF with a
+different quantization/input contract. This is an evidence-environment gap,
+not a missing Aeon Stage 5 or Stage 6 implementation.
+
+**Minimum package to close Stage 7:**
+
+1. A pinned external reference revision and a runnable source-checkpoint
+  configuration, preferably on an accelerator rather than through a complete
+  CPU decode.
+2. Identical formatted token IDs, absolute positions, greedy settings, source
+  checkpoint identity, and base-decoder-only mode on both paths.
+3. Aeon GPU captures for the selected layer-0/2/3 checkpoints and final logits;
+  the existing attention trace covers the attention state, while
+  `record_v4_gpu_evidence` covers the complete-model final output.
+4. Reference values at those selected checkpoints plus the final logits/top-k,
+  followed by one comparison report recording max error, token agreement, and
+  any quantization or numerical differences.
+
+Until item 1 exists, Stage 7 is correctly marked active but blocked at the
+external-reference lane. No second production engine is required to unblock it.
+
+### Stage 7 native end-to-end smoke record (2026-09-14)
+
+Before waiting on an external reference, the native `.aeon` text path was run
+on the Radeon RX 7900 XTX with the verified DSV4 formatter and tokenizer, a
+35 GiB Warm policy, and the prompt `What is 2 + 2? Answer with just the
+number.` The model initialized all 43 layers, completed prefill and decode,
+and passed through EOS-aware detokenization, but the behavioral gate failed:
+
+- Default fused routed-expert accumulation produced generated IDs `[1]` and an
+  empty response because EOS ranked first.
+- Replay-stable deterministic accumulation produced `[1999, 344, 270, 20, 1]`,
+  decoded as `What is the2`, which is not a coherent answer.
+- Explicit Thinking mode with deterministic accumulation again produced
+  `[1]` and an empty response.
+
+The exact formatted prompt IDs were recorded in the diagnostic output. A
+deterministic replay of those IDs through `record_v4_gpu_evidence` reproduced
+the non-EOS top token, separating the fused atomic W2 instability from the
+remaining full-block semantic failure. The formatter and EOS IDs match the
+source encoding contract; this is therefore a failing model-composition smoke,
+not a text-wrapper failure.
+
+The post-layer trace boundary is now implemented for the full block. Use the
+all-layer position-0 capture and the representative long traces to identify
+the first layer-specific attention/output discrepancy before attempting the
+complete trusted-reference comparison.
+Do not unlock routing placement or claim coherent generation until this smoke
+passes with a non-empty, task-correct response.
 
 Build a trace harness that can compare the same token IDs and positions at
 stable boundaries. At minimum capture:
@@ -1046,6 +1169,30 @@ The trusted reference may be a one-layer or selected-layer harness built from
 the checked-in source/reference implementation when the full checkpoint cannot
 fit in the local reference runtime. A text-only external API comparison is
 useful but cannot replace intermediate tensor or logit evidence.
+
+### Stage 7 full-block trace implementation record (2026-09-14)
+
+The production trace now supports a compact all-layer position-0 capture in a
+single GPU pass. `test_v4_stage4_trace` validates every layer 0-42 against
+independent host calculations for the real layer-specific tensors at these
+boundaries: HC attention input, FFN normalized input, router logits, shared
+expert output, combined routed MoE output, and HC FFN post residual. The same
+test continues to validate the long cache/compressor/indexer attention traces
+through position 131 for representative layers 0, 2, and 3.
+
+This closes the selected full-block composition subgate across all 43 layers;
+it does not prove all-layer compressed-attention boundary semantics or produce
+a coherent text answer. The native text smoke remains failing, so the next
+repair target is the first layer-specific attention/output discrepancy outside
+the representative long traces, not another generic HC or MoE test.
+
+The canonical user-facing path is explicit: `generate_until_stop()` processes
+prompt and decode tokens through `prefill()`/`step()`. `prefill_batched()` is an
+opt-in hybrid path used for semantic comparison and future performance work;
+it is not called by native text generation. On the exact 19-token formatted
+arithmetic prompt, serialized and hybrid prefill produced identical final and
+continuation half-logit checksums and greedy IDs, so there is no evidence of
+state overlap or double processing between the two paths.
 
 Acceptance criteria:
 

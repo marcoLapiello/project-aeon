@@ -39,6 +39,10 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 | [EXPERT_KERNELS_REVIEW.md](../analysis/current/EXPERT_KERNELS_REVIEW.md) | Current review | Records the pending kernel-geometry, quant-layout, bottleneck, and interface questions for the next kernel investigation. |
 | [EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md](../analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) | Historical implementation report | Compares the external Stage 1 proposal with the implemented version-2 path and records the measured GPU-side effects that led to the v2-only promotion. |
 
+## Reference dossiers
+
+- [AEON_NATIVE_PRODUCTION_INFERENCE_DOSSIER.md](../reference/AEON_NATIVE_PRODUCTION_INFERENCE_DOSSIER.md) is a neutral, source-grounded package for external review of the native `aeon_chat` inference path, selected model contract, native artifact format, and production source closure. It intentionally excludes diagnosis, measurements, tests, and inferred gaps.
+
 ## Completed execution records
 
 - [PHASE_0_EXECUTION_PLAN.md](../execution/completed/PHASE_0_EXECUTION_PLAN.md) is complete for the build, hardware, I/O, overlap, and toy-cache foundations.

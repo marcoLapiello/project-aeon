@@ -186,15 +186,53 @@ public:
         if (max_records == 0) {
             throw std::invalid_argument("V4Pipeline::enable_attention_trace: record limit must be positive");
         }
+        synchronize_generation_boundary();
         attention_trace_layer_ = layer_id;
+        attention_trace_all_layers_ = false;
+        attention_trace_position_.reset();
+        attention_trace_positions_.clear();
         attention_trace_limit_ = max_records;
         attention_trace_records_.clear();
         attention_trace_records_.reserve(max_records);
         attention_trace_enabled_ = true;
     }
 
+    void enable_attention_trace_all_layers(uint32_t position) {
+        enable_attention_trace_all_layers(std::span<const uint32_t>(&position, 1));
+    }
+
+    void enable_attention_trace_all_layers(std::span<const uint32_t> positions) {
+        if (layers.empty() || positions.empty()) {
+            throw std::invalid_argument(
+                "V4Pipeline::enable_attention_trace_all_layers: positions must not be empty");
+        }
+        if (!std::is_sorted(positions.begin(), positions.end()) ||
+            std::adjacent_find(positions.begin(), positions.end()) != positions.end()) {
+            throw std::invalid_argument(
+                "V4Pipeline::enable_attention_trace_all_layers: positions must be sorted and unique");
+        }
+        for (const uint32_t position : positions) {
+            if (position >= context_capacity()) {
+                throw std::out_of_range(
+                    "V4Pipeline::enable_attention_trace_all_layers: invalid position");
+            }
+        }
+        synchronize_generation_boundary();
+        attention_trace_layer_ = 0;
+        attention_trace_all_layers_ = true;
+        attention_trace_position_.reset();
+        attention_trace_positions_.assign(positions.begin(), positions.end());
+        attention_trace_limit_ = layers.size() * attention_trace_positions_.size();
+        attention_trace_records_.clear();
+        attention_trace_records_.reserve(attention_trace_limit_);
+        attention_trace_enabled_ = true;
+    }
+
     void disable_attention_trace() noexcept {
         attention_trace_enabled_ = false;
+        attention_trace_all_layers_ = false;
+        attention_trace_position_.reset();
+        attention_trace_positions_.clear();
         attention_trace_records_.clear();
     }
 
@@ -589,20 +627,25 @@ public:
             }
 
             V4AttentionTraceRecord* attention_trace = begin_attention_trace(
-                layer, pos, scratch, HEAD_DIM, TOTAL_Q);
+                layer, token_id, pos, scratch, HEAD_DIM, TOTAL_Q);
+            if (attention_trace != nullptr) {
+                queue_trace_copy(attention_trace->block_residual_input, scratch.d_res_in, HC_DIM);
+                queue_trace_copy(attention_trace->attention_hc_mixes, scratch.d_mixes_a, HC_MULT3);
+                queue_trace_copy(attention_trace->attention_hc_pre_mix, scratch.d_pre_a, HC);
+                queue_trace_copy(attention_trace->attention_hc_post_mix, scratch.d_post_a, HC);
+                queue_trace_copy(attention_trace->attention_hc_comb_mix, scratch.d_comb_a, HC * HC);
+                queue_trace_copy(attention_trace->attention_precombined_input, scratch.d_x_pre, H);
+                queue_trace_copy(
+                    attention_trace->attention_normalized_input,
+                    scratch.d_x_norm,
+                    H);
+            }
 
             // -----------------------------------------------------------------
             // D. RoPE & KV Cache Persistence
             // -----------------------------------------------------------------
             const uint32_t local_slot = pos % layer.local_cache_capacity();
             const size_t local_offset = static_cast<size_t>(local_slot) * HEAD_DIM;
-            CHECK_HIP(hipMemcpyAsync(
-                layer.d_local_value_cache + local_offset,
-                scratch.d_kv_norm_act,
-                HEAD_DIM * sizeof(half),
-                hipMemcpyDeviceToDevice,
-                compute_stream
-            ));
 
             hipLaunchKernelGGL(
                 kernel::v4_forward_rope_at_pos_wave32_kernel,
@@ -618,6 +661,13 @@ public:
                 1, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2
             );
 
+            CHECK_HIP(hipMemcpyAsync(
+                layer.d_local_value_cache + local_offset,
+                scratch.d_kv_norm_act,
+                HEAD_DIM * sizeof(half),
+                hipMemcpyDeviceToDevice,
+                compute_stream
+            ));
             CHECK_HIP(hipMemcpyAsync(
                 layer.d_local_key_cache + local_offset,
                 scratch.d_kv_norm_act,
@@ -890,6 +940,12 @@ public:
                 dim3((H + 255) / 256, 1), dim3(256), 0, compute_stream,
                 scratch.d_attn_proj, scratch.d_res_in_half, scratch.d_post_a, scratch.d_comb_a, scratch.d_res_mid_half, H
             );
+            if (attention_trace != nullptr) {
+                queue_trace_copy(
+                    attention_trace->attention_post_residual,
+                    scratch.d_res_mid_half,
+                    HC_DIM);
+            }
 
             kernel::v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, compute_stream>>>(scratch.d_res_mid_half, scratch.d_res_mid, HC_DIM);
 
@@ -910,12 +966,22 @@ public:
                 scratch.d_pre_f, scratch.d_post_f, scratch.d_comb_f,
                 1e-6f, 1e-6f, 2.0f, 20
             );
+            if (attention_trace != nullptr) {
+                queue_trace_copy(attention_trace->ffn_hc_post_mix, scratch.d_post_f, HC);
+                queue_trace_copy(attention_trace->ffn_hc_comb_mix, scratch.d_comb_f, HC * HC);
+            }
 
             hipLaunchKernelGGL(
                 kernel::hc_pre_combine_kernel,
                 dim3((H / 4 + 255) / 256), dim3(256), 0, compute_stream,
                 scratch.d_res_mid, scratch.d_pre_f, scratch.d_ffn_pre, H, HC
             );
+            if (attention_trace != nullptr) {
+                queue_trace_copy(
+                    attention_trace->ffn_precombined_input,
+                    scratch.d_ffn_pre,
+                    H);
+            }
 
             // FFN RMSNorm
             hipLaunchKernelGGL(
@@ -923,6 +989,12 @@ public:
                 dim3(1), dim3(32), 0, compute_stream,
                 scratch.d_ffn_pre, layer.d_ffn_norm, scratch.d_ffn_norm_act, H, 1e-6f
             );
+            if (attention_trace != nullptr) {
+                queue_trace_copy(
+                    attention_trace->ffn_normalized_input,
+                    scratch.d_ffn_norm_act,
+                    H);
+            }
 
             // Replicate row 0 to M_PAD rows of d_ffn_norm_act for WMMA compatibility
             for (int r = 1; r < M_PAD; ++r) {
@@ -960,6 +1032,17 @@ public:
             CHECK_HIP(hipMemcpyAsync(h_topk_weights.data(), scratch.d_topk_weights, 6 * sizeof(float), hipMemcpyDeviceToHost, compute_stream));
             CHECK_HIP(hipMemcpyAsync(h_topk_indices.data(), scratch.d_topk_indices, 6 * sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream));
             CHECK_HIP(hipStreamSynchronize(compute_stream));
+
+            if (attention_trace != nullptr) {
+                queue_trace_copy(
+                    attention_trace->router_logits,
+                    scratch.d_router_logits,
+                    256);
+                attention_trace->routed_expert_indices.assign(
+                    h_topk_indices.begin(), h_topk_indices.end());
+                attention_trace->routed_expert_weights.assign(
+                    h_topk_weights.begin(), h_topk_weights.end());
+            }
 
             for (uint32_t gid : leased_experts) {
                 expert_registry_->release_lease(gid);
@@ -1013,6 +1096,12 @@ public:
                 dim3(H, 1), dim3(32), 0, compute_stream,
                 scratch.d_shared_swiglu, layer.d_shared_w2, scratch.d_moe_accum, INTER_DIM
             );
+            if (attention_trace != nullptr) {
+                queue_trace_copy(
+                    attention_trace->shared_expert_output,
+                    scratch.d_moe_accum,
+                    H);
+            }
 
             // -----------------------------------------------------------------
             // Dual-Stream Asynchronous SDMA Prefetching Pipeline
@@ -1118,6 +1207,13 @@ public:
                     6, H, INTER_DIM, compute_stream);
             }
 
+                    if (attention_trace != nullptr) {
+                    queue_trace_copy(
+                        attention_trace->moe_output,
+                        scratch.d_moe_accum,
+                        H);
+                    }
+
             if (expert_timing_enabled_) {
                 const size_t event_index = static_cast<size_t>(l);
                 CHECK_HIP(hipEventRecord(
@@ -1143,6 +1239,12 @@ public:
                 dim3((H + 255) / 256, 1), dim3(256), 0, compute_stream,
                 scratch.d_moe_accum, scratch.d_res_mid_half, scratch.d_post_f, scratch.d_comb_f, scratch.d_res_out_half, H
             );
+            if (attention_trace != nullptr) {
+                queue_trace_copy(
+                    attention_trace->post_ffn_residual,
+                    scratch.d_res_out_half,
+                    HC_DIM);
+            }
 
             // Copy res_out into res_in for next layer
             CHECK_HIP(hipMemcpyAsync(
@@ -1189,20 +1291,19 @@ public:
             kernel::V4_ARGMAX_BLOCKS,
             scratch.d_argmax_result
         );
-        for (uint32_t staging_idx : releasable_staging_slots) {
-            prefetch_staging_->release_after_gpu_transfer(staging_idx);
-        }
-
         int32_t h_argmax = 0;
         CHECK_HIP(hipMemcpyAsync(&h_argmax, scratch.d_argmax_result, sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream));
         CHECK_HIP(hipStreamSynchronize(compute_stream));
+        for (uint32_t staging_idx : releasable_staging_slots) {
+            prefetch_staging_->release_after_gpu_transfer(staging_idx);
+        }
         for (uint32_t gid : leased_experts) {
             expert_registry_->release_lease(gid);
         }
         if (phase == RoutingPhase::Decode) {
             supply_telemetry_.record_decode_token();
         }
-        reap_registry_transfers();
+        synchronize_auxiliary_streams();
         if (expert_timing_enabled_) {
             collect_expert_timing(phase);
         }
@@ -1213,12 +1314,14 @@ public:
     }
 
     void reset_generation_state() {
+        synchronize_generation_boundary();
         current_seq_len_ = 0;
         for (auto& l : layers) {
             l->reset_generation_state();
         }
     }
 
+    // Canonical correctness path: advances every token through step() in order.
     uint32_t prefill(std::span<const uint32_t> token_ids, uint32_t start_position = 0) {
         validate_prefill_span(token_ids, start_position);
 
@@ -1232,6 +1335,7 @@ public:
         return next_token;
     }
 
+    // Explicit opt-in hybrid path. User-facing text generation remains on prefill().
     V4PrefillResult prefill_batched(
         std::span<const uint32_t> token_ids,
         uint32_t start_position = 0,
@@ -1580,7 +1684,7 @@ private:
                 const size_t local_offset = static_cast<size_t>(local_slot) * HEAD_DIM;
                 CHECK_HIP(hipMemcpyAsync(
                     layer.d_local_value_cache + local_offset,
-                    value,
+                    rotated_value,
                     HEAD_DIM * sizeof(half),
                     hipMemcpyDeviceToDevice,
                     compute_stream));
@@ -2010,24 +2114,34 @@ private:
     void queue_trace_copy(std::vector<T>& destination, const T* source, size_t count) {
         destination.resize(count);
         if (count == 0) return;
-        CHECK_HIP(hipMemcpyAsync(
-            destination.data(), source, count * sizeof(T), hipMemcpyDeviceToHost, compute_stream));
+        CHECK_HIP(hipMemcpy(
+            destination.data(), source, count * sizeof(T), hipMemcpyDeviceToHost));
     }
 
     V4AttentionTraceRecord* begin_attention_trace(
         V4Layer& layer,
+        uint32_t token_id,
         uint32_t position,
         PipelineScratchBuffers& layer_scratch,
         int head_dim,
         int total_query
     ) {
-        if (!attention_trace_enabled_ || layer.layer_id != static_cast<int>(attention_trace_layer_) ||
+        if (!attention_trace_enabled_ ||
+            (!attention_trace_all_layers_ &&
+             layer.layer_id != static_cast<int>(attention_trace_layer_)) ||
+            (attention_trace_position_.has_value() &&
+             position != *attention_trace_position_) ||
+            (!attention_trace_positions_.empty() &&
+             !std::binary_search(
+                 attention_trace_positions_.begin(), attention_trace_positions_.end(), position)) ||
             attention_trace_records_.size() >= attention_trace_limit_) {
             return nullptr;
         }
 
         attention_trace_records_.emplace_back();
         auto& trace = attention_trace_records_.back();
+        trace.layer_id = layer.layer_id;
+        trace.token_id = token_id;
         trace.position = position;
         trace.attention_kind = layer.spec().attention_kind;
         queue_trace_copy(trace.query, layer_scratch.d_q, total_query);
@@ -2171,6 +2285,18 @@ private:
         expert_supply_.reap_registry_transfers();
     }
 
+    void synchronize_generation_boundary() {
+        if (compute_stream) CHECK_HIP(hipStreamSynchronize(compute_stream));
+        synchronize_auxiliary_streams();
+    }
+
+    void synchronize_auxiliary_streams() {
+        if (sdma_stream) CHECK_HIP(hipStreamSynchronize(sdma_stream));
+        if (sdma_cold_stream) CHECK_HIP(hipStreamSynchronize(sdma_cold_stream));
+        if (demotion_stream) CHECK_HIP(hipStreamSynchronize(demotion_stream));
+        reap_registry_transfers();
+    }
+
     void read_experts_direct_blocking(
         const std::vector<std::pair<uint32_t, uint32_t>>& expert_ids,
         const std::vector<uint8_t*>& destinations
@@ -2256,7 +2382,10 @@ private:
 
     V4ModelResources model_resources_;
     bool attention_trace_enabled_{false};
+    bool attention_trace_all_layers_{false};
     uint32_t attention_trace_layer_{0};
+    std::optional<uint32_t> attention_trace_position_;
+    std::vector<uint32_t> attention_trace_positions_;
     size_t attention_trace_limit_{0};
     std::vector<V4AttentionTraceRecord> attention_trace_records_;
 };

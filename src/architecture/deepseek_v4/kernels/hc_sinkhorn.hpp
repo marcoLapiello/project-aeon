@@ -294,13 +294,14 @@ __global__ void __launch_bounds__(256) hc_pre_combine_kernel(
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int idx = tid * 4;
-    if (idx >= hidden_size) return;
+    const bool valid = idx < hidden_size;
 
     __shared__ float s_pre[4];
     if (threadIdx.x < 4) {
         s_pre[threadIdx.x] = pre_mix[threadIdx.x];
     }
     __syncthreads();
+    if (!valid) return;
 
     float p0 = s_pre[0];
     float p1 = s_pre[1];
@@ -340,13 +341,14 @@ __global__ void __launch_bounds__(256) hc_pre_combine_batched_kernel(
     const int token_idx = blockIdx.y;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int idx = tid * 4;
-    if (idx >= hidden_size) return;
+    const bool valid = idx < hidden_size;
 
     __shared__ float s_pre[4];
     if (threadIdx.x < 4) {
         s_pre[threadIdx.x] = pre_mix[static_cast<size_t>(token_idx) * hc_mult + threadIdx.x];
     }
     __syncthreads();
+    if (!valid) return;
 
     const size_t residual_offset = static_cast<size_t>(token_idx) * hc_mult * hidden_size;
     const float* r0 = residual_in + residual_offset;

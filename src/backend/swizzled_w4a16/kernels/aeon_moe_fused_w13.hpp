@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace aeon::kernel {
 
@@ -124,9 +125,11 @@ inline void dispatch_aeon_moe_fused_w13_swiglu(
     hipStream_t stream = 0
 ) {
     static_assert(RPW * LPR == 32, "RPW and LPR must describe one Wave32");
+    const int expected_k = ITERS * LPR * 32;
     if (expert_count <= 0 || expert_count > kAeonSwizzledMaxExperts ||
-        K != ITERS * LPR * 32 || N % RPW != 0) {
-        return;
+        N <= 0 || K != expected_k || N % RPW != 0) {
+        throw std::invalid_argument(
+            "dispatch_aeon_moe_fused_w13_swiglu: incompatible expert or N/K shape");
     }
 
     constexpr int threads_per_block = WAVES * 32;

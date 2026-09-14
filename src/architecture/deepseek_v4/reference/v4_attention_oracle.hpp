@@ -241,8 +241,8 @@ public:
         attention_rope.apply(rotated_local_key, 1, input.position);
         const size_t local_slot = static_cast<size_t>(input.position % config_.sliding_window);
         local_cache_[local_slot].position = input.position;
-        local_cache_[local_slot].key = std::move(rotated_local_key);
-        local_cache_[local_slot].value = input.local_value;
+        local_cache_[local_slot].key = rotated_local_key;
+        local_cache_[local_slot].value = std::move(rotated_local_key);
 
         bool compressed_entry_created = false;
         size_t compressed_entry_index = 0;

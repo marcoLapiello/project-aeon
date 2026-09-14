@@ -51,10 +51,6 @@ public:
         return *this;
     }
 
-    void initialize(const AeonModelLoader& loader, uint32_t max_seq_len) {
-        initialize(loader, max_seq_len, DeepSeekV4Config{});
-    }
-
     void initialize(
         const AeonModelLoader& loader,
         uint32_t max_seq_len,
