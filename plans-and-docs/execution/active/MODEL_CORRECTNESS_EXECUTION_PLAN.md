@@ -1,7 +1,7 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
-**Date:** 2026-09-13  
-**Status:** Open; Stages 0-4 serial semantics complete; Stage 5 serialized/chunk equivalence subgate complete; true batched prefill next
+**Date:** 2026-09-14
+**Status:** Open; Stages 0-4 serial semantics complete; Stage 5 serialized/chunk equivalence and hybrid batched-prefill subgates complete; fully batched stateful execution and trusted-reference parity remain open
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
 **Scope:** Restore mathematically faithful base-decoder execution, then prove it against an independent reference before resuming placement or performance work.
 
@@ -264,7 +264,7 @@ implying full release feature coverage.
 | Pipeline dispatch | `src/architecture/deepseek_v4/core/v4_pipeline.hpp` | Calls `v4_cached_sliding_window_attn_wave32_kernel` for every layer | Layers 2-41 execute the wrong attention mechanism. |
 | Dense binding | `src/architecture/deepseek_v4/core/v4_dense_weight_binding.hpp` | Binds current attention/HC/router/shared-expert tensors only | Compressor and indexer tensors are present in the artifact but unused. Missing tensors fail open by becoming null pointers. |
 | RoPE | `src/architecture/deepseek_v4/core/v4_model_resources.hpp` | One theta-10000 table with factor 1.0 | Compressed-layer RoPE and configured YaRN are not executed. |
-| Prefill | `V4Pipeline::generate` in `v4_pipeline.hpp` | Calls single-token `step()` once per prompt token | No true batched prefill or proven chunk-equivalent compressor state exists. |
+| Prefill | `V4Pipeline::prefill()` and `prefill_batched()` in `v4_pipeline.hpp` | Serial prefill is the reference path; hybrid batch prefill batches dense/HC/FFN/router work but advances cache, compressor, indexer, attention, and routed experts per token | The hybrid path is state-equivalent to serial execution for the validated 132-token case. A batch state plan, per-query visibility masks, batched stateful attention, and batch-wide routed-expert execution remain open. |
 | Attention tests | `tests/test_v4_attention.cpp` | Synthetic SWA, RoPE round trip, grouped projection, and local CPU mirror | Does not test C4A, C128A, real checkpoint state, or layer schedule. |
 | HC/router tests | `tests/test_hc_sinkhorn.cpp`, `tests/test_moe_router.cpp` | GPU versus hand-written CPU mirrors | Does not prove checkpoint/reference graph parity. |
 | Expert tests | `tests/test_w4a16_swizzled_gemv.cpp` and fused expert tests | GPU versus local INT4 decoder | Does not by itself prove source checkpoint semantics or full-layer parity. |
@@ -824,10 +824,12 @@ reference parity, or the routing-placement unlock. Stage 5 is next: prove that
 serialized, aligned, and unaligned prefill chunking preserves the same state
 and next-token outputs before optimizing batched execution.
 
-### Stage 5: Implement stateful and true prefill
+### Stage 5: Implement stateful and hybrid prefill
 
 **Objective:** Make prompt processing mathematically equivalent regardless of
-how the prompt is chunked, then add a batched path without changing semantics.
+how the prompt is chunked, then add a hybrid batched path without changing
+semantics. Fully batched stateful attention and routed-expert execution are
+separate performance work.
 
 Tasks:
 
@@ -902,19 +904,65 @@ ctest --test-dir build --output-on-failure -R '^(test_aeon_moe_fused_w2|test_v4_
 
 The Stage 5 test and all affected regressions passed. This closes the
 serialized, aligned, and unaligned state-equivalence subgate and the explicit
-serialized-fallback contract; a true multi-token prefill kernel remains open.
+serialized-fallback contract.
 For the complete five-schedule correctness run, the explicit cold-only control
 took `283.49 s` and the 35 GiB Warm profile took `205.55 s` on the same device,
 a `27.5%` reduction. This is a resource-policy measurement for test runtime,
 not a model-throughput result.
 
 The public `prefill_batched()` contract now makes that boundary explicit. It
-accepts a requested batch size, reports whether execution used a true batched
-path or `SerializedFallback`, and can reject fallback when a caller requires a
-real batch. The current V4 state machine reports `SerializedFallback` for all
-multi-token requests; the request is still checked for contiguous positions,
-context capacity, and state equivalence. The padded `M=16` scratch allocation
-is therefore no longer evidence of a hidden batched implementation.
+accepts a requested batch size, reports whether execution used the hybrid
+batched path or `SerializedFallback`, and can reject fallback when a caller
+requires a real multi-token entry point. Multi-token requests use a
+fixed-capacity 16-row batch path and split larger requests into contiguous
+chunks; single-token requests or an explicit batch size of one retain the
+serialized fallback. Dense/HC/MLA/FFN projections, shared-expert work, and
+router logits use batch rows, while local cache, compressor, compressed-entry
+materialization, indexer top-k, attention, routed expert supply, routed W1/W3,
+routed W2, and cleanup remain ordered per token. The new path uses the
+existing deterministic per-expert W2 accumulation when that correctness mode
+is enabled; it is a semantic implementation, not a fully parallel batch
+performance claim.
+
+### Stage 5 hybrid batched prefill implementation record (2026-09-14)
+
+The production batch path is implemented in `V4Pipeline::prefill_batched()`
+and `prefill_batched_chunk()`. `PipelineBatchScratchBuffers` owns fixed-capacity
+device rows for embeddings, HC mixes, MLA projections, compressor/indexer
+projections, FFN activations, router results, and shared-expert output. New
+Wave32 batch kernels cover HC projection/pre-combine and clamped SwiGLU. The
+existing batch-indexed GEMV and grouped output kernels are used with explicit
+`grid.y` token rows and Wave32 blocks.
+
+The causal attention state machine still advances each token in order inside a
+chunk. That ordering is required for local ring insertion, C4 overlap,
+C128 boundary materialization, Lightning Indexer candidate selection, and
+absolute-position metadata. Routed expert supply remains correctness-first and
+waits for each token's residency and W2 accumulation before releasing its
+leases; this avoids silently treating the existing six-expert storage path as
+a multi-token expert kernel.
+
+`tests/test_v4_prefill_state.cpp` now requires `V4PrefillExecutionPath::Batched`
+for a 16-token request, verifies that fallback can be disallowed for a
+supported request, and compares the batch result against the serial baseline
+for a 132-token prompt through position 131. The comparison covers exact
+metadata and positions, fixed FP16/FP32 state tolerances, logits, greedy token
+IDs, and the continuation decode step. The request passed on the Radeon RX
+7900 XTX (`gfx1100`) with the 35 GiB Warm profile.
+
+Validation:
+
+```text
+cmake --build build --parallel
+./build/bin/test_v4_prefill_state
+```
+
+This closes the hybrid batched-prefill semantic subgate. It does not close a
+fully batched llama.cpp-style stateful path: batch state planning, per-query
+compressed visibility, batched compressed attention, batched indexer selection,
+batch-wide expert acquisition/grouping, and larger single-launch capacities
+remain future optimization work. Trusted-reference parity remains the next
+correctness gate.
 
 ### Stage 6: Port the validated branches to HIP on silicon
 

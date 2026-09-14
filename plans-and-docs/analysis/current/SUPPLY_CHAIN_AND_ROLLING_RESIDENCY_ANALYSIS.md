@@ -508,7 +508,7 @@ The success criterion is not a target Hot-hit percentage. It is lower exposed su
 
 The current `generate()` path calls single-token `step()` once per prompt token. `RoutingPhase::Prefill` labels the call but does not create a batched Prefill execution shape. The scratch buffers are padded for WMMA compatibility, while the active routed path remains `M=1`.
 
-A future chunked Prefill path should reuse the same supply API, because a prompt chunk will request a larger union of experts and will otherwise pollute the Decode residency. The supply-chain work should therefore expose phase-aware admission and leases now, even if true batched Prefill remains a separate implementation stage.
+A hybrid chunked Prefill path should reuse the same supply API, because a prompt chunk will request a larger union of experts and will otherwise pollute the Decode residency. The supply-chain work should therefore expose phase-aware admission and leases now, even if fully batched stateful Prefill remains a separate implementation stage.
 
 MTP, speculative router execution, and another kernel rewrite are deferred until the supply measurements show that the runtime can keep the GPU supplied.
 

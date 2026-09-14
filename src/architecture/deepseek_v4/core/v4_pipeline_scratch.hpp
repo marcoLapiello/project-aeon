@@ -331,4 +331,179 @@ private:
     }
 };
 
+struct PipelineBatchScratchBuffers {
+    static constexpr int kMaxTokens = 16;
+
+    float* d_res_in{nullptr};
+    float* d_res_mid{nullptr};
+    float* d_res_out{nullptr};
+    half* d_res_in_half{nullptr};
+    half* d_res_mid_half{nullptr};
+    half* d_res_out_half{nullptr};
+
+    float* d_mixes_a{nullptr};
+    float* d_pre_a{nullptr};
+    float* d_post_a{nullptr};
+    float* d_comb_a{nullptr};
+    float* d_mixes_f{nullptr};
+    float* d_pre_f{nullptr};
+    float* d_post_f{nullptr};
+    float* d_comb_f{nullptr};
+
+    half* d_x_pre{nullptr};
+    half* d_x_norm{nullptr};
+    half* d_qa{nullptr};
+    half* d_qa_norm{nullptr};
+    half* d_q{nullptr};
+    half* d_kv{nullptr};
+    half* d_kv_norm_act{nullptr};
+    half* d_kv_rotated{nullptr};
+    half* d_compressor_kv{nullptr};
+    half* d_compressor_score{nullptr};
+    half* d_indexer_query{nullptr};
+    half* d_indexer_weights{nullptr};
+    half* d_indexer_compressor_kv{nullptr};
+    half* d_indexer_compressor_score{nullptr};
+    half* d_attn_out{nullptr};
+    half* d_z_lora{nullptr};
+    half* d_attn_proj{nullptr};
+
+    half* d_ffn_pre{nullptr};
+    half* d_ffn_norm_act{nullptr};
+    half* d_router_logits_half{nullptr};
+    float* d_router_logits{nullptr};
+    float* d_topk_weights{nullptr};
+    int32_t* d_topk_indices{nullptr};
+    int32_t* d_token_ids{nullptr};
+    half* d_shared_gate{nullptr};
+    half* d_shared_up{nullptr};
+    half* d_shared_swiglu{nullptr};
+    half* d_moe_accum{nullptr};
+
+    ~PipelineBatchScratchBuffers() {
+        free();
+    }
+
+    void allocate() {
+        constexpr size_t B = kMaxTokens;
+        constexpr size_t H = 4096;
+        constexpr size_t HC_DIM = 4 * H;
+        constexpr size_t Q_LORA = 1024;
+        constexpr size_t TOTAL_Q = 64 * 512;
+        constexpr size_t COMPRESSOR_WIDTH = 2 * 512;
+        constexpr size_t INDEXER_Q = 64 * 128;
+        constexpr size_t INDEXER_WIDTH = 2 * 128;
+        constexpr size_t O_LORA = 8 * 1024;
+        constexpr size_t INTER_DIM = 2048;
+        constexpr size_t ROUTED_EXPERTS = 6;
+        constexpr size_t ROUTER_EXPERTS = 256;
+
+        allocate_array(d_res_in, B * HC_DIM);
+        allocate_array(d_res_mid, B * HC_DIM);
+        allocate_array(d_res_out, B * HC_DIM);
+        allocate_array(d_res_in_half, B * HC_DIM);
+        allocate_array(d_res_mid_half, B * HC_DIM);
+        allocate_array(d_res_out_half, B * HC_DIM);
+
+        allocate_array(d_mixes_a, B * 24);
+        allocate_array(d_pre_a, B * 4);
+        allocate_array(d_post_a, B * 4);
+        allocate_array(d_comb_a, B * 16);
+        allocate_array(d_mixes_f, B * 24);
+        allocate_array(d_pre_f, B * 4);
+        allocate_array(d_post_f, B * 4);
+        allocate_array(d_comb_f, B * 16);
+
+        allocate_array(d_x_pre, B * H);
+        allocate_array(d_x_norm, B * H);
+        allocate_array(d_qa, B * Q_LORA);
+        allocate_array(d_qa_norm, B * Q_LORA);
+        allocate_array(d_q, B * TOTAL_Q);
+        allocate_array(d_kv, B * 512);
+        allocate_array(d_kv_norm_act, B * 512);
+        allocate_array(d_kv_rotated, B * 512);
+        allocate_array(d_compressor_kv, B * COMPRESSOR_WIDTH);
+        allocate_array(d_compressor_score, B * COMPRESSOR_WIDTH);
+        allocate_array(d_indexer_query, B * INDEXER_Q);
+        allocate_array(d_indexer_weights, B * 64);
+        allocate_array(d_indexer_compressor_kv, B * INDEXER_WIDTH);
+        allocate_array(d_indexer_compressor_score, B * INDEXER_WIDTH);
+        allocate_array(d_attn_out, B * TOTAL_Q);
+        allocate_array(d_z_lora, B * O_LORA);
+        allocate_array(d_attn_proj, B * H);
+
+        allocate_array(d_ffn_pre, B * H);
+        allocate_array(d_ffn_norm_act, B * H);
+        allocate_array(d_router_logits_half, B * ROUTER_EXPERTS);
+        allocate_array(d_router_logits, B * ROUTER_EXPERTS);
+        allocate_array(d_topk_weights, B * ROUTED_EXPERTS);
+        allocate_array(d_topk_indices, B * ROUTED_EXPERTS);
+        allocate_array(d_token_ids, B);
+        allocate_array(d_shared_gate, B * INTER_DIM);
+        allocate_array(d_shared_up, B * INTER_DIM);
+        allocate_array(d_shared_swiglu, B * INTER_DIM);
+        allocate_array(d_moe_accum, B * H);
+    }
+
+    void free() noexcept {
+        free_array(d_res_in);
+        free_array(d_res_mid);
+        free_array(d_res_out);
+        free_array(d_res_in_half);
+        free_array(d_res_mid_half);
+        free_array(d_res_out_half);
+        free_array(d_mixes_a);
+        free_array(d_pre_a);
+        free_array(d_post_a);
+        free_array(d_comb_a);
+        free_array(d_mixes_f);
+        free_array(d_pre_f);
+        free_array(d_post_f);
+        free_array(d_comb_f);
+        free_array(d_x_pre);
+        free_array(d_x_norm);
+        free_array(d_qa);
+        free_array(d_qa_norm);
+        free_array(d_q);
+        free_array(d_kv);
+        free_array(d_kv_norm_act);
+        free_array(d_kv_rotated);
+        free_array(d_compressor_kv);
+        free_array(d_compressor_score);
+        free_array(d_indexer_query);
+        free_array(d_indexer_weights);
+        free_array(d_indexer_compressor_kv);
+        free_array(d_indexer_compressor_score);
+        free_array(d_attn_out);
+        free_array(d_z_lora);
+        free_array(d_attn_proj);
+        free_array(d_ffn_pre);
+        free_array(d_ffn_norm_act);
+        free_array(d_router_logits_half);
+        free_array(d_router_logits);
+        free_array(d_topk_weights);
+        free_array(d_topk_indices);
+        free_array(d_token_ids);
+        free_array(d_shared_gate);
+        free_array(d_shared_up);
+        free_array(d_shared_swiglu);
+        free_array(d_moe_accum);
+    }
+
+private:
+    template<typename T>
+    static void allocate_array(T*& pointer, size_t count) {
+        CHECK_HIP(hipMalloc(&pointer, count * sizeof(T)));
+        CHECK_HIP(hipMemset(pointer, 0, count * sizeof(T)));
+    }
+
+    template<typename T>
+    static void free_array(T*& pointer) noexcept {
+        if (pointer != nullptr) {
+            (void)hipFree(pointer);
+            pointer = nullptr;
+        }
+    }
+};
+
 } // namespace aeon::core

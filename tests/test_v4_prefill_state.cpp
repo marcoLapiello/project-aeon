@@ -177,7 +177,7 @@ PrefillResult run_with_batched_request(
         0,
         requested_batch_size);
     assert(report.token_count == prompt.size());
-    assert(report.execution_path == V4PrefillExecutionPath::SerializedFallback);
+    assert(report.execution_path == V4PrefillExecutionPath::Batched);
     const auto logits = snapshot_logits(pipeline);
     const auto state = pipeline.snapshot_generation_state();
     const uint32_t continuation_token = pipeline.step(
@@ -234,17 +234,14 @@ int main(int argc, char** argv) {
     assert(rejected_gap);
 
     pipeline.reset_generation_state();
-    bool rejected_unsupported_batch = false;
-    try {
-        pipeline.prefill_batched(
-            std::span<const uint32_t>(prompt),
-            0,
-            16,
-            false);
-    } catch (const std::runtime_error&) {
-        rejected_unsupported_batch = true;
-    }
-    assert(rejected_unsupported_batch);
+    const auto required_batch = pipeline.prefill_batched(
+        std::span<const uint32_t>(prompt),
+        0,
+        16,
+        false);
+    assert(required_batch.token_count == prompt.size());
+    assert(required_batch.execution_path == V4PrefillExecutionPath::Batched);
+    pipeline.reset_generation_state();
 
     assert_reset_is_empty(pipeline);
     const auto one_shot = run_with_boundaries(pipeline, prompt, {prompt.size()});
@@ -261,7 +258,7 @@ int main(int argc, char** argv) {
         {"serialized", &serialized},
         {"aligned-four", &aligned_four},
         {"aligned-128", &aligned_128},
-        {"requested-batch-fallback", &requested_batch},
+        {"requested-batch", &requested_batch},
         {"boundary-splits", &boundary_splits},
     };
     for (const auto& [name, result] : comparisons) {

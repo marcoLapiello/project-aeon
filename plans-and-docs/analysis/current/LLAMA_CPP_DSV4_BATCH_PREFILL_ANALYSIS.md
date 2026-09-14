@@ -57,7 +57,7 @@ The comparison used these llama.cpp files:
 
 The corresponding Aeon surfaces are:
 
-- [Stage 5 execution plan](../../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md): serialized/chunk-equivalence gate and the open true-prefill task.
+- [Stage 5 execution plan](../../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md): serialized/chunk-equivalence gate, completed hybrid prefill path, and the open fully batched stateful task.
 - [V4 pipeline](../../../src/architecture/deepseek_v4/core/v4_pipeline.hpp): `step()`, `prefill()`, `prefill_batched()`, `prefill_batched_chunk()`, and `select_indexer_topk()`.
 - [Batch scratch buffers](../../../src/architecture/deepseek_v4/core/v4_pipeline_scratch.hpp): `PipelineBatchScratchBuffers` and token-major temporary storage.
 - [V4 attention kernels](../../../src/architecture/deepseek_v4/kernels/v4_attention.hpp): single-row compressor save, compressed-entry materialization, indexer scoring, and local-plus-compressed attention kernels.
@@ -323,7 +323,9 @@ Aeon's INT4 artifact, HIP kernels, memory ownership, and deterministic
 accumulation remain separate contracts.
 
 The current Stage 5 serialized/chunk-equivalence gate remains valid evidence
-for the fallback path. A `Batched` result should be promoted to evidence for a
-true batch path only after the state plan, per-query masks, batched compressed
-attention, indexer rows, and batch-wide expert execution are traceable and
-validated against the serialized path.
+for the reference path, and the hybrid batch test is valid evidence for the
+batched dense front half plus ordered causal-state path. A `Batched` result
+must not be interpreted as evidence of a fully batched stateful path until the
+state plan, per-query masks, batched compressed attention, indexer rows, and
+batch-wide expert execution are traceable and validated against the serialized
+path.

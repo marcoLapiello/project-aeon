@@ -25,6 +25,24 @@ __global__ void v4_pipeline_swiglu_clamp_kernel(
     }
 }
 
+__global__ void v4_pipeline_swiglu_clamp_batched_kernel(
+    const half* __restrict__ gate,
+    const half* __restrict__ up,
+    half* __restrict__ out,
+    int total_elements,
+    float limit
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < total_elements) {
+        float gate_value = __half2float(gate[index]);
+        float up_value = __half2float(up[index]);
+        gate_value = fminf(gate_value, limit);
+        up_value = fminf(fmaxf(up_value, -limit), limit);
+        out[index] = __float2half(
+            (gate_value / (1.0f + expf(-gate_value))) * up_value);
+    }
+}
+
 // Accumulate weighted expert output into token hidden state
 __global__ void v4_pipeline_accumulate_expert_kernel(
     half* __restrict__ accum_out,

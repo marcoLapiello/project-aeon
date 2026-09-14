@@ -1041,8 +1041,9 @@ The vLLM source map does not close any of these gates:
 4. **Residency:** the vLLM fused MoE kernels assume contiguous device expert
    tensors. Aeon must preserve leases and publication state while supplying
    only the selected experts.
-5. **Prefill:** the vLLM WMMA path is a matrix path; Aeon's current prompt loop
-   is repeated single-token execution and is not evidence of true prefill.
+5. **Prefill:** the vLLM WMMA path is a matrix path; Aeon's default prompt loop
+   remains repeated single-token execution, while the newer hybrid batch entry
+   point is not evidence of fully batched stateful prefill.
 6. **V4 attention:** generic sliding-window or ordinary paged attention is not
    equivalent to the selected ratio-4/ratio-128 sparse MLA schedule.
 7. **KV cache:** FP8-DS-MLA storage is a vLLM format choice, not a hardware
@@ -1088,4 +1089,5 @@ Hot/Warm/Cold supply, leases, I/O, and telemetry: generalized shared layer
 
 The immediate implementation target is an independent CPU GPTQ decoder and a
 GPTQ-preserving group128 artifact. Native RDNA3 M=1 projection correctness
-comes next; fused resident-expert MoE and true prefill follow after that.
+comes next; fused resident-expert MoE and fully batched stateful prefill follow
+after that.

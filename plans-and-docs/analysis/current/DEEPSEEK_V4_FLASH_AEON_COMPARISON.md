@@ -26,8 +26,9 @@ The distinction matters:
   attention kernel for every layer. It does not implement the selected
   checkpoint's ratio-4 CSA compressor/indexer or ratio-128 HCA compressor.
 - The configured YaRN factor and compressed-attention RoPE base are not applied
-  by the current pipeline. True batched prefill, prefix caching, and the MTP
-  component are also absent.
+  by the current pipeline. A hybrid batched-prefill path now exists, while
+  fully batched stateful prefill, prefix caching, and the MTP component remain
+  absent.
 
 Therefore the current effort is not useless, but the present full-model text
 output is not evidence of model correctness. The reusable work is mostly below

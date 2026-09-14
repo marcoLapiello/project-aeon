@@ -84,6 +84,7 @@ public:
     AeonModelLoader aeon_loader;
     std::vector<std::unique_ptr<V4Layer>> layers;
     PipelineScratchBuffers scratch;
+    PipelineBatchScratchBuffers batch_scratch;
 
     hipStream_t compute_stream{0};
     hipStream_t sdma_stream{0};       // Warm Host H2D uploads
@@ -286,6 +287,7 @@ public:
         // 6. Allocate Intermediate GPU Scratch Buffers
         std::cout << "[Pipeline] Allocating intermediate GPU scratch buffers..." << std::endl;
         scratch.allocate();
+        batch_scratch.allocate();
 
         // 7. Initialize Consecutive Transformer Layers in Global Mode (Dense weights + KV Cache)
         std::cout << "[Pipeline] Initializing " << num_layers_ << " Transformer Layers (Dense weights + KV Cache in VRAM)..." << std::endl;
@@ -1241,6 +1243,23 @@ public:
             throw std::invalid_argument(
                 "V4Pipeline::prefill_batched: requested batch size must be greater than zero");
         }
+        if (requested_batch_size > 1 && token_ids.size() > 1) {
+            const size_t batch_size = std::min(
+                requested_batch_size,
+                static_cast<size_t>(PipelineBatchScratchBuffers::kMaxTokens));
+            uint32_t next_token = 0;
+            for (size_t offset = 0; offset < token_ids.size(); offset += batch_size) {
+                const size_t count = std::min(batch_size, token_ids.size() - offset);
+                next_token = prefill_batched_chunk(
+                    token_ids.subspan(offset, count),
+                    start_position + static_cast<uint32_t>(offset));
+            }
+            return V4PrefillResult{
+                next_token,
+                token_ids.size(),
+                V4PrefillExecutionPath::Batched
+            };
+        }
         if (!allow_serialized_fallback) {
             throw std::runtime_error(
                 "V4Pipeline::prefill_batched: true batched execution is not available for the current V4 state path");
@@ -1367,6 +1386,7 @@ public:
         if (demotion_stream) { (void)hipStreamDestroy(demotion_stream); demotion_stream = 0; }
         model_resources_.free();
 
+        batch_scratch.free();
         scratch.free();
         free_expert_timing_events();
         routing_counter_.reset();
@@ -1386,6 +1406,589 @@ public:
     }
 
 private:
+    uint32_t prefill_batched_chunk(
+        std::span<const uint32_t> token_ids,
+        uint32_t start_position
+    ) {
+        if (token_ids.empty() || token_ids.size() > PipelineBatchScratchBuffers::kMaxTokens) {
+            throw std::invalid_argument("V4Pipeline::prefill_batched_chunk: unsupported token count");
+        }
+
+        constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+        constexpr int HC = 4;
+        constexpr int HC_DIM = HC * H;
+        constexpr int HC_MULT3 = HC * (2 + HC);
+        constexpr int Q_LORA = kernel::DSV4_Q_LORA_RANK;
+        constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
+        constexpr int NUM_HEADS = kernel::DSV4_NUM_HEADS;
+        constexpr int TOTAL_Q = NUM_HEADS * HEAD_DIM;
+        constexpr int INDEXER_Q = kernel::DSV4_INDEX_N_HEADS * kernel::DSV4_INDEX_HEAD_DIM;
+        constexpr int O_LORA = kernel::DSV4_O_LORA_RANK;
+        constexpr int O_GROUPS = kernel::DSV4_O_GROUPS;
+        constexpr int TOT_LORA = kernel::DSV4_TOTAL_O_LORA_DIM;
+        constexpr int INTER_DIM = 2048;
+        constexpr int ROUTER_EXPERTS = 256;
+        constexpr int ROUTED_EXPERTS = 6;
+        const int batch_count = static_cast<int>(token_ids.size());
+
+        validate_prefill_span(token_ids, start_position);
+        supply_telemetry_.set_phase(RoutingPhase::Prefill);
+        reap_registry_transfers();
+
+        for (int token = 0; token < batch_count; ++token) {
+            const half* token_embedding = model_resources_.host_embed_table +
+                static_cast<size_t>(token_ids[static_cast<size_t>(token)]) * H;
+            for (int stream = 0; stream < HC; ++stream) {
+                CHECK_HIP(hipMemcpyAsync(
+                    batch_scratch.d_res_in_half +
+                        static_cast<size_t>(token) * HC_DIM + stream * H,
+                    token_embedding,
+                    H * sizeof(half),
+                    hipMemcpyHostToDevice,
+                    compute_stream));
+            }
+            const int32_t token_id = static_cast<int32_t>(token_ids[static_cast<size_t>(token)]);
+            CHECK_HIP(hipMemcpyAsync(
+                batch_scratch.d_token_ids + token,
+                &token_id,
+                sizeof(token_id),
+                hipMemcpyHostToDevice,
+                compute_stream));
+        }
+        kernel::v4_half_to_float_kernel<<<
+            (batch_count * HC_DIM + 255) / 256, 256, 0, compute_stream>>>(
+                batch_scratch.d_res_in_half,
+                batch_scratch.d_res_in,
+                batch_count * HC_DIM);
+
+        for (uint32_t layer_index = 0; layer_index < num_layers_; ++layer_index) {
+            auto& layer = *layers[layer_index];
+            const bool uses_compressed_rope = layer.spec().attention_kind != V4AttentionKind::Sliding;
+            const float* layer_cos_cache = uses_compressed_rope
+                ? model_resources_.d_compressed_cos_cache
+                : model_resources_.d_cos_cache;
+            const float* layer_sin_cache = uses_compressed_rope
+                ? model_resources_.d_compressed_sin_cache
+                : model_resources_.d_sin_cache;
+
+            hipLaunchKernelGGL(
+                kernel::hc_project_batched_kernel,
+                dim3(HC_MULT3, batch_count), dim3(256), 0, compute_stream,
+                batch_scratch.d_res_in, layer.d_hc_attn_fn, batch_scratch.d_mixes_a,
+                H, HC, 1e-6f);
+            hipLaunchKernelGGL(
+                kernel::hc_sinkhorn_normalize_kernel,
+                dim3(batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_mixes_a, layer.d_hc_attn_scale, layer.d_hc_attn_base,
+                batch_scratch.d_pre_a, batch_scratch.d_post_a, batch_scratch.d_comb_a,
+                1e-6f, 1e-6f, 2.0f, 20);
+            hipLaunchKernelGGL(
+                kernel::hc_pre_combine_batched_kernel,
+                dim3((H / 4 + 255) / 256, batch_count), dim3(256), 0, compute_stream,
+                batch_scratch.d_res_in, batch_scratch.d_pre_a, batch_scratch.d_x_pre,
+                H, HC);
+            hipLaunchKernelGGL(
+                kernel::v4_rmsnorm_wave32_kernel,
+                dim3(batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_x_pre, layer.d_attn_norm, batch_scratch.d_x_norm, H, 1e-6f);
+
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_kernel,
+                dim3(Q_LORA, batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_x_norm, layer.d_wq_a, batch_scratch.d_qa, H);
+            hipLaunchKernelGGL(
+                kernel::v4_rmsnorm_wave32_kernel,
+                dim3(batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_qa, layer.d_q_norm, batch_scratch.d_qa_norm, Q_LORA, 1e-6f);
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_kernel,
+                dim3(TOTAL_Q, batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_qa_norm, layer.d_wq_b, batch_scratch.d_q, Q_LORA);
+            hipLaunchKernelGGL(
+                kernel::v4_rmsnorm_unit_wave32_kernel,
+                dim3(batch_count * NUM_HEADS), dim3(32), 0, compute_stream,
+                batch_scratch.d_q, batch_scratch.d_q, HEAD_DIM, 1e-6f);
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_kernel,
+                dim3(HEAD_DIM, batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_x_norm, layer.d_wkv, batch_scratch.d_kv, H);
+            hipLaunchKernelGGL(
+                kernel::v4_rmsnorm_wave32_kernel,
+                dim3(batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_kv, layer.d_kv_norm, batch_scratch.d_kv_norm_act,
+                HEAD_DIM, 1e-6f);
+
+            if (uses_compressed_rope) {
+                const int ratio = layer.spec().compression_ratio;
+                const int coefficient = ratio == 4 ? 2 : 1;
+                const int compressor_width = coefficient * HEAD_DIM;
+                hipLaunchKernelGGL(
+                    kernel::v4_gemv_fp16_kernel,
+                    dim3(compressor_width, batch_count), dim3(32), 0, compute_stream,
+                    batch_scratch.d_x_norm, layer.d_compressor_wkv,
+                    batch_scratch.d_compressor_kv, H);
+                hipLaunchKernelGGL(
+                    kernel::v4_gemv_fp16_kernel,
+                    dim3(compressor_width, batch_count), dim3(32), 0, compute_stream,
+                    batch_scratch.d_x_norm, layer.d_compressor_wgate,
+                    batch_scratch.d_compressor_score, H);
+
+                if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+                    hipLaunchKernelGGL(
+                        kernel::v4_gemv_fp16_kernel,
+                        dim3(INDEXER_Q, batch_count), dim3(32), 0, compute_stream,
+                        batch_scratch.d_qa_norm, layer.d_indexer_wq_b,
+                        batch_scratch.d_indexer_query, Q_LORA);
+                    hipLaunchKernelGGL(
+                        kernel::v4_gemv_fp16_kernel,
+                        dim3(kernel::DSV4_INDEX_N_HEADS, batch_count), dim3(32), 0, compute_stream,
+                        batch_scratch.d_x_norm, layer.d_indexer_weights_proj,
+                        batch_scratch.d_indexer_weights, H);
+                    hipLaunchKernelGGL(
+                        kernel::v4_gemv_fp16_kernel,
+                        dim3(2 * kernel::DSV4_INDEX_HEAD_DIM, batch_count), dim3(32), 0, compute_stream,
+                        batch_scratch.d_x_norm, layer.d_indexer_compressor_wkv,
+                        batch_scratch.d_indexer_compressor_kv, H);
+                    hipLaunchKernelGGL(
+                        kernel::v4_gemv_fp16_kernel,
+                        dim3(2 * kernel::DSV4_INDEX_HEAD_DIM, batch_count), dim3(32), 0, compute_stream,
+                        batch_scratch.d_x_norm, layer.d_indexer_compressor_wgate,
+                        batch_scratch.d_indexer_compressor_score, H);
+                }
+            }
+
+            for (int token = 0; token < batch_count; ++token) {
+                const uint32_t position = start_position + static_cast<uint32_t>(token);
+                half* query = batch_scratch.d_q + static_cast<size_t>(token) * TOTAL_Q;
+                half* value = batch_scratch.d_kv_norm_act + static_cast<size_t>(token) * HEAD_DIM;
+                half* rotated_value = batch_scratch.d_kv_rotated + static_cast<size_t>(token) * HEAD_DIM;
+                CHECK_HIP(hipMemcpyAsync(
+                    rotated_value, value, HEAD_DIM * sizeof(half),
+                    hipMemcpyDeviceToDevice, compute_stream));
+                hipLaunchKernelGGL(
+                    kernel::v4_forward_rope_at_pos_wave32_kernel,
+                    dim3(NUM_HEADS), dim3(32), 0, compute_stream,
+                    query, layer_cos_cache, layer_sin_cache, position,
+                    NUM_HEADS, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2);
+                hipLaunchKernelGGL(
+                    kernel::v4_forward_rope_at_pos_wave32_kernel,
+                    dim3(1), dim3(32), 0, compute_stream,
+                    rotated_value, layer_cos_cache, layer_sin_cache, position,
+                    1, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2);
+
+                const uint32_t local_slot = position % layer.local_cache_capacity();
+                const size_t local_offset = static_cast<size_t>(local_slot) * HEAD_DIM;
+                CHECK_HIP(hipMemcpyAsync(
+                    layer.d_local_value_cache + local_offset,
+                    value,
+                    HEAD_DIM * sizeof(half),
+                    hipMemcpyDeviceToDevice,
+                    compute_stream));
+                CHECK_HIP(hipMemcpyAsync(
+                    layer.d_local_key_cache + local_offset,
+                    rotated_value,
+                    HEAD_DIM * sizeof(half),
+                    hipMemcpyDeviceToDevice,
+                    compute_stream));
+                const int64_t absolute_position = static_cast<int64_t>(position);
+                CHECK_HIP(hipMemcpyAsync(
+                    layer.d_local_positions + local_slot,
+                    &absolute_position,
+                    sizeof(absolute_position),
+                    hipMemcpyHostToDevice,
+                    compute_stream));
+                layer.record_position(position);
+
+                if (uses_compressed_rope) {
+                    const int ratio = layer.spec().compression_ratio;
+                    const int coefficient = ratio == 4 ? 2 : 1;
+                    const int compressor_width = coefficient * HEAD_DIM;
+                    hipLaunchKernelGGL(
+                        kernel::v4_save_compressor_state_kernel,
+                        dim3(1), dim3(256), 0, compute_stream,
+                        batch_scratch.d_compressor_kv +
+                            static_cast<size_t>(token) * compressor_width,
+                        batch_scratch.d_compressor_score +
+                            static_cast<size_t>(token) * compressor_width,
+                        layer.d_compressor_partial_kv, layer.d_compressor_partial_score,
+                        layer.d_compressor_partial_positions, layer.d_compressor_ape,
+                        static_cast<int64_t>(position), ratio,
+                        static_cast<int>(layer.state_layout().compressor_partial_capacity),
+                        compressor_width);
+
+                    if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+                        hipLaunchKernelGGL(
+                            kernel::v4_forward_rope_at_pos_wave32_kernel,
+                            dim3(kernel::DSV4_INDEX_N_HEADS), dim3(32), 0, compute_stream,
+                            batch_scratch.d_indexer_query +
+                                static_cast<size_t>(token) * INDEXER_Q,
+                            layer_cos_cache, layer_sin_cache, position,
+                            kernel::DSV4_INDEX_N_HEADS, kernel::DSV4_INDEX_HEAD_DIM,
+                            kernel::DSV4_INDEX_HEAD_DIM - kernel::DSV4_ROPE_DIM,
+                            kernel::DSV4_ROPE_DIM / 2);
+                        CHECK_HIP(hipMemcpyAsync(
+                            layer.d_indexer_query,
+                            batch_scratch.d_indexer_query +
+                                static_cast<size_t>(token) * INDEXER_Q,
+                            INDEXER_Q * sizeof(half),
+                            hipMemcpyDeviceToDevice,
+                            compute_stream));
+                        kernel::v4_half_to_float_n_kernel<<<1, 128, 0, compute_stream>>>(
+                            batch_scratch.d_indexer_weights + static_cast<size_t>(token) * kernel::DSV4_INDEX_N_HEADS,
+                            layer.d_indexer_weights,
+                            kernel::DSV4_INDEX_N_HEADS);
+                        hipLaunchKernelGGL(
+                            kernel::v4_save_compressor_state_kernel,
+                            dim3(1), dim3(256), 0, compute_stream,
+                            batch_scratch.d_indexer_compressor_kv +
+                                static_cast<size_t>(token) * coefficient * kernel::DSV4_INDEX_HEAD_DIM,
+                            batch_scratch.d_indexer_compressor_score +
+                                static_cast<size_t>(token) * coefficient * kernel::DSV4_INDEX_HEAD_DIM,
+                            layer.d_indexer_partial_kv, layer.d_indexer_partial_score,
+                            layer.d_indexer_partial_positions, layer.d_indexer_compressor_ape,
+                            static_cast<int64_t>(position), ratio,
+                            static_cast<int>(layer.state_layout().indexer_partial_capacity),
+                            coefficient * kernel::DSV4_INDEX_HEAD_DIM);
+                    }
+
+                    if ((position + 1u) % static_cast<uint32_t>(ratio) == 0) {
+                        const int compressed_index = static_cast<int>(
+                            (position + 1u) / static_cast<uint32_t>(ratio) - 1u);
+                        hipLaunchKernelGGL(
+                            kernel::v4_materialize_compressed_entry_kernel,
+                            dim3(1), dim3(512), 0, compute_stream,
+                            layer.d_compressor_partial_kv, layer.d_compressor_partial_score,
+                            layer.d_compressor_partial_positions, layer.d_compressor_norm,
+                            layer.d_compressed_key_cache, layer.d_compressed_value_cache,
+                            layer.d_compressed_positions,
+                            model_resources_.d_compressed_cos_cache,
+                            model_resources_.d_compressed_sin_cache,
+                            static_cast<int64_t>(position), ratio,
+                            static_cast<int>(layer.state_layout().compressor_partial_capacity),
+                            HEAD_DIM, compressor_width, compressed_index,
+                            kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM, 1e-6f);
+                        if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+                            hipLaunchKernelGGL(
+                                kernel::v4_materialize_compressed_entry_kernel,
+                                dim3(1), dim3(512), 0, compute_stream,
+                                layer.d_indexer_partial_kv, layer.d_indexer_partial_score,
+                                layer.d_indexer_partial_positions, layer.d_indexer_compressor_norm,
+                                layer.d_indexer_key_cache, layer.d_indexer_key_cache,
+                                layer.d_indexer_positions,
+                                model_resources_.d_compressed_cos_cache,
+                                model_resources_.d_compressed_sin_cache,
+                                static_cast<int64_t>(position), ratio,
+                                static_cast<int>(layer.state_layout().indexer_partial_capacity),
+                                kernel::DSV4_INDEX_HEAD_DIM,
+                                coefficient * kernel::DSV4_INDEX_HEAD_DIM,
+                                compressed_index,
+                                kernel::DSV4_INDEX_HEAD_DIM - kernel::DSV4_ROPE_DIM,
+                                kernel::DSV4_ROPE_DIM, 1e-6f);
+                        }
+                    }
+
+                    if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+                        if (layer.indexer_candidate_count_ != 0) {
+                            hipLaunchKernelGGL(
+                                kernel::v4_indexer_scores_kernel,
+                                dim3((layer.indexer_candidate_count_ + 255u) / 256u),
+                                dim3(256), 0, compute_stream,
+                                layer.d_indexer_query, layer.d_indexer_weights,
+                                layer.d_indexer_key_cache, layer.d_indexer_scores,
+                                static_cast<int>(layer.indexer_candidate_count_),
+                                kernel::DSV4_INDEX_N_HEADS, kernel::DSV4_INDEX_HEAD_DIM,
+                                1.0f / std::sqrt(static_cast<float>(kernel::DSV4_INDEX_HEAD_DIM)),
+                                1.0f / std::sqrt(static_cast<float>(kernel::DSV4_INDEX_N_HEADS)));
+                        }
+                        select_indexer_topk(layer);
+                    }
+                }
+
+                if (layer.spec().attention_kind == V4AttentionKind::Sliding) {
+                    hipLaunchKernelGGL(
+                        kernel::v4_cached_sliding_window_attn_wave32_kernel,
+                        dim3(NUM_HEADS), dim3(32), 0, compute_stream,
+                        query, layer.d_local_key_cache, layer.d_local_value_cache,
+                        layer.d_local_positions, layer.d_attn_sink,
+                        batch_scratch.d_attn_out + static_cast<size_t>(token) * TOTAL_Q,
+                        position, static_cast<int>(layer.local_cache_capacity()),
+                        kernel::DSV4_ATTN_SCALE);
+                } else {
+                    const bool uses_indexer = layer.spec().attention_kind == V4AttentionKind::CSA;
+                    const int compressed_count = static_cast<int>(layer.compressed_entry_count_);
+                    const int topk_count = uses_indexer
+                        ? std::min<int>(compressed_count, static_cast<int>(layer.state_layout().index_topk))
+                        : 0;
+                    hipLaunchKernelGGL(
+                        kernel::v4_cached_compressed_attention_wave32_kernel,
+                        dim3(NUM_HEADS), dim3(32), 0, compute_stream,
+                        query, layer.d_local_key_cache, layer.d_local_value_cache,
+                        layer.d_local_positions, layer.d_attn_sink,
+                        layer.d_compressed_key_cache, layer.d_compressed_value_cache,
+                        layer.d_compressed_positions,
+                        uses_indexer ? layer.d_indexer_topk_indices : nullptr,
+                        batch_scratch.d_attn_out + static_cast<size_t>(token) * TOTAL_Q,
+                        static_cast<int64_t>(position),
+                        static_cast<int>(layer.local_cache_capacity()), compressed_count,
+                        topk_count, uses_indexer, kernel::DSV4_ATTN_SCALE);
+                }
+                hipLaunchKernelGGL(
+                    kernel::v4_inverse_rope_at_pos_wave32_kernel,
+                    dim3(NUM_HEADS), dim3(32), 0, compute_stream,
+                    batch_scratch.d_attn_out + static_cast<size_t>(token) * TOTAL_Q,
+                    layer_cos_cache, layer_sin_cache, position,
+                    NUM_HEADS, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2);
+            }
+
+            hipLaunchKernelGGL(
+                kernel::v4_grouped_wo_a_wave32_kernel,
+                dim3(O_LORA, O_GROUPS, batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_attn_out, layer.d_wo_a, batch_scratch.d_z_lora, batch_count);
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_kernel,
+                dim3(H, batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_z_lora, layer.d_wo_b, batch_scratch.d_attn_proj, TOT_LORA);
+
+            kernel::v4_float_to_half_kernel<<<
+                (batch_count * HC_DIM + 255) / 256, 256, 0, compute_stream>>>(
+                    batch_scratch.d_res_in,
+                    batch_scratch.d_res_in_half,
+                    batch_count * HC_DIM);
+            hipLaunchKernelGGL(
+                kernel::hc_post_kernel,
+                dim3((H + 255) / 256, batch_count), dim3(256), 0, compute_stream,
+                batch_scratch.d_attn_proj, batch_scratch.d_res_in_half,
+                batch_scratch.d_post_a, batch_scratch.d_comb_a,
+                batch_scratch.d_res_mid_half, H);
+            kernel::v4_half_to_float_kernel<<<
+                (batch_count * HC_DIM + 255) / 256, 256, 0, compute_stream>>>(
+                    batch_scratch.d_res_mid_half,
+                    batch_scratch.d_res_mid,
+                    batch_count * HC_DIM);
+
+            hipLaunchKernelGGL(
+                kernel::hc_project_batched_kernel,
+                dim3(HC_MULT3, batch_count), dim3(256), 0, compute_stream,
+                batch_scratch.d_res_mid, layer.d_hc_ffn_fn, batch_scratch.d_mixes_f,
+                H, HC, 1e-6f);
+            hipLaunchKernelGGL(
+                kernel::hc_sinkhorn_normalize_kernel,
+                dim3(batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_mixes_f, layer.d_hc_ffn_scale, layer.d_hc_ffn_base,
+                batch_scratch.d_pre_f, batch_scratch.d_post_f, batch_scratch.d_comb_f,
+                1e-6f, 1e-6f, 2.0f, 20);
+            hipLaunchKernelGGL(
+                kernel::hc_pre_combine_batched_kernel,
+                dim3((H / 4 + 255) / 256, batch_count), dim3(256), 0, compute_stream,
+                batch_scratch.d_res_mid, batch_scratch.d_pre_f, batch_scratch.d_ffn_pre,
+                H, HC);
+            hipLaunchKernelGGL(
+                kernel::v4_rmsnorm_wave32_kernel,
+                dim3(batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_ffn_pre, layer.d_ffn_norm,
+                batch_scratch.d_ffn_norm_act, H, 1e-6f);
+
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_vec8_kernel,
+                dim3(INTER_DIM, batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_ffn_norm_act, layer.d_shared_w1,
+                batch_scratch.d_shared_gate, H);
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_vec8_kernel,
+                dim3(INTER_DIM, batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_ffn_norm_act, layer.d_shared_w3,
+                batch_scratch.d_shared_up, H);
+            kernel::v4_pipeline_swiglu_clamp_batched_kernel<<<
+                (batch_count * INTER_DIM + 255) / 256, 256, 0, compute_stream>>>(
+                batch_scratch.d_shared_gate,
+                batch_scratch.d_shared_up,
+                batch_scratch.d_shared_swiglu,
+                batch_count * INTER_DIM,
+                10.0f);
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_vec8_kernel,
+                dim3(H, batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_shared_swiglu, layer.d_shared_w2,
+                batch_scratch.d_moe_accum, INTER_DIM);
+
+            hipLaunchKernelGGL(
+                kernel::v4_gemv_fp16_vec8_kernel,
+                dim3(ROUTER_EXPERTS, batch_count), dim3(32), 0, compute_stream,
+                batch_scratch.d_ffn_norm_act, layer.d_gate_weight,
+                batch_scratch.d_router_logits_half, H);
+            kernel::v4_half_to_float_n_kernel<<<
+                (batch_count * ROUTER_EXPERTS + 255) / 256, 256, 0, compute_stream>>>(
+                batch_scratch.d_router_logits_half,
+                batch_scratch.d_router_logits,
+                batch_count * ROUTER_EXPERTS);
+            hipLaunchKernelGGL(
+                kernel::moe_router_kernel,
+                dim3(batch_count), dim3(64), 0, compute_stream,
+                batch_scratch.d_router_logits,
+                layer.is_hash_layer ? nullptr : layer.d_gate_bias,
+                layer.d_tid2eid,
+                batch_scratch.d_token_ids,
+                batch_scratch.d_topk_weights,
+                batch_scratch.d_topk_indices,
+                ROUTER_EXPERTS, ROUTED_EXPERTS, 1.5f, true);
+
+            std::vector<float> host_topk_weights(static_cast<size_t>(batch_count) * ROUTED_EXPERTS);
+            std::vector<int32_t> host_topk_indices(static_cast<size_t>(batch_count) * ROUTED_EXPERTS);
+            CHECK_HIP(hipMemcpyAsync(
+                host_topk_weights.data(), batch_scratch.d_topk_weights,
+                host_topk_weights.size() * sizeof(float), hipMemcpyDeviceToHost, compute_stream));
+            CHECK_HIP(hipMemcpyAsync(
+                host_topk_indices.data(), batch_scratch.d_topk_indices,
+                host_topk_indices.size() * sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream));
+            CHECK_HIP(hipStreamSynchronize(compute_stream));
+
+            for (int token = 0; token < batch_count; ++token) {
+                std::vector<int32_t> topk_indices(
+                    host_topk_indices.begin() + static_cast<size_t>(token) * ROUTED_EXPERTS,
+                    host_topk_indices.begin() + static_cast<size_t>(token + 1) * ROUTED_EXPERTS);
+                std::vector<float> topk_weights(
+                    host_topk_weights.begin() + static_cast<size_t>(token) * ROUTED_EXPERTS,
+                    host_topk_weights.begin() + static_cast<size_t>(token + 1) * ROUTED_EXPERTS);
+                std::vector<uint32_t> leased_experts;
+                auto active_prefetch = expert_supply_.dispatch_layer_prefetch(
+                    layer_index, start_position + static_cast<uint32_t>(token),
+                    topk_indices, leased_experts);
+                expert_supply_.materialize_layer_prefetch(active_prefetch);
+
+                kernel::SwizzledW13ExpertPtrs fused_w13{};
+                kernel::SwizzledW2ExpertPtrs fused_w2{};
+                for (int expert = 0; expert < ROUTED_EXPERTS; ++expert) {
+                    if (active_prefetch.is_prefetched[expert] && prefetch_staging_) {
+                        expert_supply_.mark_gpu_readiness_wait_start(
+                            active_prefetch.operation_ids[expert]);
+                        CHECK_HIP(hipStreamWaitEvent(
+                            compute_stream,
+                            prefetch_staging_->events[active_prefetch.staging_indices[expert]],
+                            0));
+                    }
+                    const int32_t slot = active_prefetch.vram_slots[expert];
+                    fused_w13.w1[expert] = reinterpret_cast<const uint4*>(
+                        unified_vram_pool_->get_w1_packed(slot));
+                    fused_w13.s1[expert] = unified_vram_pool_->get_w1_scale(slot);
+                    fused_w13.w3[expert] = reinterpret_cast<const uint4*>(
+                        unified_vram_pool_->get_w3_packed(slot));
+                    fused_w13.s3[expert] = unified_vram_pool_->get_w3_scale(slot);
+                    fused_w2.w2[expert] = reinterpret_cast<const uint4*>(
+                        unified_vram_pool_->get_w2_packed(slot));
+                    fused_w2.s2[expert] = unified_vram_pool_->get_w2_scale(slot);
+                }
+
+                layer.cache_hits = expert_registry_->hits_hot;
+                layer.cache_misses = expert_registry_->hits_warm + expert_registry_->misses_cold;
+                kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
+                    batch_scratch.d_ffn_norm_act + static_cast<size_t>(token) * H,
+                    fused_w13,
+                    scratch.d_swizzled_expert_hidden,
+                    scratch.d_swizzled_moe_accum_f32,
+                    H, ROUTED_EXPERTS, INTER_DIM, H, 10.0f, compute_stream);
+                CHECK_HIP(hipMemsetAsync(
+                    scratch.d_swizzled_counters, 0, 64 * sizeof(int32_t), compute_stream));
+                if (deterministic_expert_accumulation_) {
+                    for (int expert = 0; expert < ROUTED_EXPERTS; ++expert) {
+                        kernel::dispatch_aeon_w4a16_swizzled_gemv<8, 8, 4, 16>(
+                            scratch.d_swizzled_expert_hidden + static_cast<size_t>(expert) * INTER_DIM,
+                            reinterpret_cast<const uint32_t*>(fused_w2.w2[expert]),
+                            fused_w2.s2[expert],
+                            scratch.d_expert_down,
+                            H, INTER_DIM, compute_stream);
+                        hipLaunchKernelGGL(
+                            kernel::v4_pipeline_accumulate_expert_kernel,
+                            dim3((H + 255) / 256), dim3(256), 0, compute_stream,
+                            batch_scratch.d_moe_accum + static_cast<size_t>(token) * H,
+                            scratch.d_expert_down,
+                            topk_weights[expert], H);
+                    }
+                } else {
+                    kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
+                        scratch.d_swizzled_expert_hidden,
+                        fused_w2,
+                        batch_scratch.d_topk_weights + static_cast<size_t>(token) * ROUTED_EXPERTS,
+                        batch_scratch.d_moe_accum + static_cast<size_t>(token) * H,
+                        scratch.d_swizzled_moe_accum_f32,
+                        batch_scratch.d_moe_accum + static_cast<size_t>(token) * H,
+                        scratch.d_swizzled_counters,
+                        ROUTED_EXPERTS, H, INTER_DIM, compute_stream);
+                }
+
+                CHECK_HIP(hipStreamSynchronize(compute_stream));
+                for (int expert = 0; expert < ROUTED_EXPERTS; ++expert) {
+                    if (active_prefetch.is_prefetched[expert] && prefetch_staging_) {
+                        prefetch_staging_->release_after_gpu_transfer(
+                            active_prefetch.staging_indices[expert]);
+                    }
+                }
+                for (uint32_t global_expert : leased_experts) {
+                    expert_registry_->release_lease(global_expert);
+                }
+                reap_registry_transfers();
+                if (routing_counter_) {
+                    routing_counter_->record(
+                        RoutingPhase::Prefill,
+                        layer_index,
+                        start_position + static_cast<uint32_t>(token),
+                        topk_indices.data());
+                }
+            }
+
+            hipLaunchKernelGGL(
+                kernel::hc_post_kernel,
+                dim3((H + 255) / 256, batch_count), dim3(256), 0, compute_stream,
+                batch_scratch.d_moe_accum, batch_scratch.d_res_mid_half,
+                batch_scratch.d_post_f, batch_scratch.d_comb_f,
+                batch_scratch.d_res_out_half, H);
+            kernel::v4_half_to_float_kernel<<<
+                (batch_count * HC_DIM + 255) / 256, 256, 0, compute_stream>>>(
+                batch_scratch.d_res_out_half,
+                batch_scratch.d_res_out,
+                batch_count * HC_DIM);
+            std::swap(batch_scratch.d_res_in, batch_scratch.d_res_out);
+            std::swap(batch_scratch.d_res_in_half, batch_scratch.d_res_out_half);
+        }
+
+        const size_t last_residual_offset = static_cast<size_t>(batch_count - 1) * HC_DIM;
+        hipLaunchKernelGGL(
+            kernel::hc_head_wave32_kernel,
+            dim3(1), dim3(32), 0, compute_stream,
+            batch_scratch.d_res_in + last_residual_offset,
+            model_resources_.d_hc_head_fn,
+            model_resources_.d_hc_head_base,
+            model_resources_.d_hc_head_scale,
+            scratch.d_hc_head_out, H, HC, 1e-6f, 1e-6f);
+        hipLaunchKernelGGL(
+            kernel::v4_rmsnorm_wave32_kernel,
+            dim3(1), dim3(32), 0, compute_stream,
+            scratch.d_hc_head_out, model_resources_.d_final_norm,
+            scratch.d_head_norm, H, 1e-6f);
+        hipLaunchKernelGGL(
+            kernel::v4_gemv_fp16_vec8_kernel,
+            dim3(129280, 1), dim3(32), 0, compute_stream,
+            scratch.d_head_norm, model_resources_.d_lm_head, scratch.d_logits, H);
+        kernel::v4_argmax_fp16_partial_kernel<<<
+            kernel::V4_ARGMAX_BLOCKS, 256, 0, compute_stream>>>(
+            scratch.d_logits, 129280,
+            scratch.d_argmax_partial_vals, scratch.d_argmax_partial_idx);
+        kernel::v4_argmax_partial_reduce_kernel<<<1, 256, 0, compute_stream>>>(
+            scratch.d_argmax_partial_vals, scratch.d_argmax_partial_idx,
+            kernel::V4_ARGMAX_BLOCKS, scratch.d_argmax_result);
+
+        int32_t host_argmax = 0;
+        CHECK_HIP(hipMemcpyAsync(
+            &host_argmax, scratch.d_argmax_result, sizeof(host_argmax),
+            hipMemcpyDeviceToHost, compute_stream));
+        CHECK_HIP(hipStreamSynchronize(compute_stream));
+        if (sdma_stream) CHECK_HIP(hipStreamSynchronize(sdma_stream));
+        if (sdma_cold_stream) CHECK_HIP(hipStreamSynchronize(sdma_cold_stream));
+        if (demotion_stream) CHECK_HIP(hipStreamSynchronize(demotion_stream));
+        reap_registry_transfers();
+        current_seq_len_ = start_position + static_cast<uint32_t>(batch_count);
+        return static_cast<uint32_t>(host_argmax);
+    }
+
     void validate_prefill_span(
         std::span<const uint32_t> token_ids,
         uint32_t start_position

@@ -1,6 +1,6 @@
 # Project Aeon Documentation Status
 
-Status audited on 2026-09-13 against the current source tree.
+Status audited on 2026-09-14 against the current source tree.
 
 This file is the navigation point for project state. Detailed benchmark numbers belong in [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md); design rationale belongs in the reference and vision documents; this file and [AGENTS.md](../../AGENTS.md) should stay concise.
 
@@ -21,7 +21,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 | [WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) | Complete | Persistent Warm ownership, asynchronous refill, transfer safety, corrected demotion accounting, source-tier telemetry, and five-run silicon A/B are complete; configured capacity is eager while preload publication is content-lazy; see the [closure report](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md). |
 | [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md) | Paused | Paused single-GPU cold-tier, storage-layout, and memory-pressure work. Spikes 0-2 are complete; Spike 3 has a bounded implementation but open acceptance gates. |
 | [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](../execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) | Open | Native text path is implemented; external behavioral comparison and longer-context attention correctness remain open. |
-| [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) | Open; Stages 0-3 complete; Stage 4 current | Restores the selected 0731 base-decoder contract: config-driven layer schedule, CSA/HCA/indexer state, compressed RoPE, serial dispatch, prefill continuity, and trusted-reference parity. |
+| [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) | Open; Stages 0-5 serial/hybrid prefill subgates complete; trusted-reference parity next | Restores the selected 0731 base-decoder contract: config-driven layer schedule, CSA/HCA/indexer state, compressed RoPE, serial dispatch, hybrid prefill continuity, and trusted-reference parity. Fully batched stateful execution remains a performance direction. |
 | [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) | Open; evidence gated | Routing observer and durable profiler are implemented; representative profile/held-out data and placement evaluation remain gated by model correctness. |
 | [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) | Open; foundation implemented | Descriptor-driven native artifacts, opaque expert supply, manifest sidecar, backend capability selection, V4 dense binding, and source ownership boundaries are implemented; explicit factory, semantic dispatch, and second-backend gates remain open. |
 | [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Living record | Authoritative silicon results, regressions, and milestone measurements. |
@@ -33,7 +33,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 | --- | --- | --- |
 | [EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md](../analysis/current/EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md) | Current analysis | Records the registry, Hot/Warm/Cold residency findings and the rationale for the deferred rolling-residency direction. Implementation sequencing is recorded in the completed Warm-tier plan. |
 | [DEEPSEEK_V4_FLASH_AEON_COMPARISON.md](../analysis/current/DEEPSEEK_V4_FLASH_AEON_COMPARISON.md) | Current analysis | Compares the selected 0731 checkpoint contract with Aeon quantization, attention, runtime, and hardware behavior. |
-| [LLAMA_CPP_DSV4_BATCH_PREFILL_ANALYSIS.md](../analysis/current/LLAMA_CPP_DSV4_BATCH_PREFILL_ANALYSIS.md) | Current analysis | Compares llama.cpp's C++ DeepSeek-V4 batch/state-plan implementation with Aeon's Stage 5 true-prefill path and records the remaining batching gaps. |
+| [LLAMA_CPP_DSV4_BATCH_PREFILL_ANALYSIS.md](../analysis/current/LLAMA_CPP_DSV4_BATCH_PREFILL_ANALYSIS.md) | Current analysis | Compares llama.cpp's C++ DeepSeek-V4 batch/state-plan implementation with Aeon's Stage 5 hybrid-prefill path and records the remaining fully batched stateful gaps. |
 | [GPTQ_AEON_PARALLEL_BACKEND_ANALYSIS.md](../analysis/current/GPTQ_AEON_PARALLEL_BACKEND_ANALYSIS.md) | Current analysis | Records the feasibility, shared-versus-specialized boundary, artifact strategy, and performance gates for a parallel GPTQ-Aeon backend. |
 | [VLLM_RDNA3_DEEPSEEK_V4_REFERENCE_ANALYSIS.md](../analysis/current/VLLM_RDNA3_DEEPSEEK_V4_REFERENCE_ANALYSIS.md) | Current reference analysis | Maps the local vLLM gfx1100 GPTQ/W4A16, fused MoE, DeepSeek-V4 prefill, sparse-attention, indexer, and KV-cache sources to Aeon reuse and adaptation decisions. |
 | [EXPERT_KERNELS_REVIEW.md](../analysis/current/EXPERT_KERNELS_REVIEW.md) | Current review | Records the pending kernel-geometry, quant-layout, bottleneck, and interface questions for the next kernel investigation. |
@@ -53,7 +53,7 @@ This file is the navigation point for project state. Detailed benchmark numbers 
 
 ## Open work
 
-1. **Correctness:** execute [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md): dispatch the class-specific serial state machine, prove prefill continuity, then compare identical formatted IDs and outputs against a trusted compatible reference.
+1. **Correctness:** execute [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md): retain the class-specific serial state machine as the reference, preserve hybrid prefill continuity, then compare identical formatted IDs and outputs against a trusted compatible reference.
 2. **Cold tier:** characterize cold-cache and steady-state behavior, improve physical `.aeon` placement/extent layout, reduce host-memory pressure, and decide whether further scheduling or CPU fallback work is justified by measurements.
 3. **Swizzled full-model performance:** characterize representative 43-layer version-2 generation under controlled Hot/Warm conditions, collect useful rocprof counters, and tune occupancy/register pressure beyond the isolated kernel measurements.
 4. **Placement study:** collect profile and held-out corpora with the verified text contract, then compare measured placement against dynamic LRU. Do not use the existing pilot for placement decisions.
