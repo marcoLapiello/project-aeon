@@ -107,6 +107,11 @@ if(AEON_BUILD_TESTS)
     # Step 2.3 — RoPE forward and inverse, two bases, tail-only rotation, versus
     # the same oracle. Asserts the discriminating properties, not just closeness.
     aeon_add_test(test_v4_rope_oracle SOURCES tests/test_v4_rope_oracle.cpp)
+
+    # Step 2.2 — MLA Q/KV paths. A composition gate: replays the pipeline's kernel
+    # order and compares every intermediate, so a wrong wiring (trap 5) fails even
+    # though each kernel is individually correct.
+    aeon_add_test(test_v4_mla_oracle SOURCES tests/test_v4_mla_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------

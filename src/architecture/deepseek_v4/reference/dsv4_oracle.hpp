@@ -334,4 +334,109 @@ inline void rope_apply_tail(std::vector<double>& row,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Convenience
+// ---------------------------------------------------------------------------
+
+// Peak magnitude of a vector. Used as a comparison denominator and as a way to
+// state a tolerance as "a fraction of the data's own scale".
+inline double peak_abs(const std::vector<double>& v) {
+    double m = 0.0;
+    for (double x : v) m = std::fmax(m, std::fabs(x));
+    return m;
+}
+
+// ---------------------------------------------------------------------------
+// Dense projections — Step 2.2 (MLA), and every other `y = W @ x` in the graph
+// ---------------------------------------------------------------------------
+
+// `y[o] = Σ_i W[o, i] · x[i]`, with `W` given as `[out_dim, in_dim]` **row
+// major** — the checkpoint's `nn.Linear.weight` layout, which the GEMV kernel
+// consumes directly with no transpose.
+//
+// The element accessor is a callable `double(size_t o, size_t i)` rather than a
+// materialised matrix, so a gate can feed the fp16 weights through without first
+// widening 33 million values into doubles. The arithmetic — the accumulation
+// order, and the fact that it happens in double — stays here, in the oracle,
+// not in the test.
+template <class Accessor>
+std::vector<double> matvec(size_t out_dim, size_t in_dim,
+                           const std::vector<double>& x,
+                           Accessor w_at) {
+    std::vector<double> y(out_dim, 0.0);
+    for (size_t o = 0; o < out_dim; ++o) {
+        double acc = 0.0;
+        for (size_t i = 0; i < in_dim; ++i) acc += w_at(o, i) * x[i];
+        y[o] = acc;
+    }
+    return y;
+}
+
+// ---------------------------------------------------------------------------
+// MLA Q/KV paths — Step 2.2
+//
+// Multi-head Latent Attention with a low-rank Q path and a single shared KV
+// head. Two things this encodes that a "collapse the matmuls" implementation
+// loses (trap 5), and one it must not invent (trap 6):
+//
+//   Q:  x -> wq_a [4096 -> 1024] -> q_norm (weighted, over 1024)
+//          -> wq_b [1024 -> 64*512] -> per-head norm (WEIGHTLESS, over 512)
+//   KV: x -> wkv  [4096 -> 512]  -> kv_norm (weighted, over 512)
+//
+// The per-head Q norm is weightless. Cited two ways: upstream's
+// `fused_q_norm_rope(q_input, q_output, eps, freqs_cis, positions)` takes no
+// weight argument, and the checkpoint declares exactly
+// `attn.wq_a` / `attn.q_norm` / `attn.wq_b` / `attn.wkv` / `attn.kv_norm` —
+// there is no per-head norm tensor to load. The pipeline already uses the
+// weightless kernel, so kernel and contract agree.
+//
+// There is no separate V: `kv` is a single 512-wide row used as both key and
+// value (trap 6). Nothing here produces a second tensor, and a gate should fail
+// if one appears.
+// ---------------------------------------------------------------------------
+
+struct MlaQPath {
+    std::vector<double> q_lora;      // [q_lora_rank]  — after wq_a
+    std::vector<double> q_lora_norm; // [q_lora_rank]  — after the weighted norm
+    std::vector<double> q;           // [num_heads * head_dim] — after per-head norm
+};
+
+// `weights_are_fp16_rounded` is not a flag — the accessors are expected to yield
+// exactly the values the kernel reads. Feed this the fp16-rounded intermediates
+// so the delta measures the kernel, not the input quantization.
+template <class WqA, class WqB>
+MlaQPath mla_q_path(const std::vector<double>& x_norm,
+                    const std::vector<double>& q_norm_weight,
+                    size_t q_lora_rank, size_t num_heads, size_t head_dim,
+                    double eps,
+                    WqA wq_a, WqB wq_b) {
+    const size_t hidden = x_norm.size();
+    MlaQPath out;
+
+    out.q_lora = matvec(q_lora_rank, hidden, x_norm, wq_a);
+    out.q_lora_norm = rmsnorm(out.q_lora, q_norm_weight, eps);
+    out.q = matvec(num_heads * head_dim, q_lora_rank, out.q_lora_norm, wq_b);
+
+    // Per-head weightless RMSNorm over head_dim. Applied in place, head by head.
+    for (size_t h = 0; h < num_heads; ++h) {
+        const size_t base = h * head_dim;
+        double sum_sq = 0.0;
+        for (size_t d = 0; d < head_dim; ++d) {
+            const double v = out.q[base + d];
+            sum_sq += v * v;
+        }
+        const double inv = 1.0 / std::sqrt(sum_sq / static_cast<double>(head_dim) + eps);
+        for (size_t d = 0; d < head_dim; ++d) out.q[base + d] *= inv;
+    }
+    return out;
+}
+
+// KV: `x -> wkv -> weighted norm over head_dim`. One row, used as both K and V.
+template <class Wkv>
+std::vector<double> mla_kv_path(const std::vector<double>& x_norm,
+                                const std::vector<double>& kv_norm_weight,
+                                size_t head_dim, double eps, Wkv wkv) {
+    return rmsnorm(matvec(head_dim, x_norm.size(), x_norm, wkv), kv_norm_weight, eps);
+}
+
 } // namespace aeon::reference
