@@ -118,6 +118,12 @@ if(AEON_BUILD_TESTS)
     # convention (a transposed comb is still doubly stochastic), the third
     # hc_scale entry, the 20-iteration count, and the asymmetric eps placement.
     aeon_add_test(test_v4_hc_oracle SOURCES tests/test_v4_hc_oracle.cpp)
+
+    # Step 2.4.1 — attention score + sink + softmax. Asserts the exact local
+    # window boundary, the sink as a denominator-only term, and the full-head
+    # 1/sqrt(512) scale.
+    aeon_add_test(test_v4_attention_sink_oracle
+        SOURCES tests/test_v4_attention_sink_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------

@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace aeon::reference {
@@ -616,6 +617,115 @@ inline std::vector<double> hc_post(const std::vector<double>& layer_out,
                 acc += c * residual[i * hidden + h];
             }
             out[j * hidden + h] = acc;
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Attention score + sink + softmax — Step 2.4.1
+//
+// `out[h][d] = Σ_j p_j · k[j][d] / l` with
+//
+//   s_j = (q[h] · k[j]) · scale          scale = 1/sqrt(head_dim) = 1/sqrt(512)
+//   m   = max( max_j s_j , sink[h] )     <- the sink enters the MAX
+//   p_j = exp(s_j - m)
+//   l   = Σ_j p_j + exp(sink[h] - m)     <- the sink enters the DENOMINATOR
+//
+// The sink contributes **no value**: there is no `(p_sink · value)` term, so it
+// absorbs probability mass and nothing else. Upstream describes it as *"a virtual
+// extra K with V=0"* `[V sglang .../dsv4/unified_kv_kernels/paged_prefill.py:194-203]`.
+//
+// There is no separate value tensor: the same `k` rows are used as values
+// (trap 6).
+//
+// Note on the max. Including the sink in `m` is what keeps every exponent in
+// `exp(·) ≤ 0` when the sink dominates. It is a numerical-robustness property and
+// it is **not observable in the output**: in the regime where it matters (sink
+// far above every score) all mass sits on the sink and the output is zero whether
+// or not the sink was included in the max. A gate therefore cannot discriminate
+// on this by comparing outputs, and should not pretend to — see the note in the
+// attention gate.
+// ---------------------------------------------------------------------------
+
+inline std::vector<double> attention_scores_sink(
+    const std::vector<double>& q, size_t num_heads, size_t head_dim,
+    const std::vector<double>& k, size_t num_keys,
+    const std::vector<double>& sink, double scale) {
+    std::vector<double> out(num_heads * head_dim, 0.0);
+
+    for (size_t h = 0; h < num_heads; ++h) {
+        const double* qh = q.data() + h * head_dim;
+
+        std::vector<double> score(num_keys);
+        double m = sink[h];
+        for (size_t j = 0; j < num_keys; ++j) {
+            const double* kj = k.data() + j * head_dim;
+            double dot = 0.0;
+            for (size_t d = 0; d < head_dim; ++d) dot += qh[d] * kj[d];
+            score[j] = dot * scale;
+            m = std::fmax(m, score[j]);
+        }
+
+        double l = std::exp(sink[h] - m);
+        std::vector<double> p(num_keys);
+        for (size_t j = 0; j < num_keys; ++j) {
+            p[j] = std::exp(score[j] - m);
+            l += p[j];
+        }
+        const double denom = std::fmax(l, 1e-30);
+
+        double* oh = out.data() + h * head_dim;
+        for (size_t d = 0; d < head_dim; ++d) {
+            double acc = 0.0;
+            for (size_t j = 0; j < num_keys; ++j) acc += p[j] * k[j * head_dim + d];
+            oh[d] = acc / denom;
+        }
+    }
+    return out;
+}
+
+// The identical quantity written the other way: the sink is simply one more key
+// whose **value row is zero**. The plan states these two readings are numerically
+// identical; this function exists so a gate can confirm that rather than assume
+// it. (They are: the extra term contributes `p_sink · 0 = 0` to every numerator,
+// and `p_sink` to the denominator, under the same max.)
+inline std::vector<double> attention_sink_as_zero_value_key(
+    const std::vector<double>& q, size_t num_heads, size_t head_dim,
+    const std::vector<double>& k, size_t num_keys,
+    const std::vector<double>& sink, double scale) {
+    std::vector<double> out(num_heads * head_dim, 0.0);
+
+    for (size_t h = 0; h < num_heads; ++h) {
+        const double* qh = q.data() + h * head_dim;
+
+        // num_keys real scores, then the sink as an extra entry.
+        std::vector<double> score(num_keys + 1);
+        double m = -std::numeric_limits<double>::infinity();
+        for (size_t j = 0; j < num_keys; ++j) {
+            const double* kj = k.data() + j * head_dim;
+            double dot = 0.0;
+            for (size_t d = 0; d < head_dim; ++d) dot += qh[d] * kj[d];
+            score[j] = dot * scale;
+            m = std::fmax(m, score[j]);
+        }
+        score[num_keys] = sink[h];
+        m = std::fmax(m, score[num_keys]);
+
+        double l = 0.0;
+        std::vector<double> p(num_keys + 1);
+        for (size_t j = 0; j <= num_keys; ++j) {
+            p[j] = std::exp(score[j] - m);
+            l += p[j];
+        }
+        const double denom = std::fmax(l, 1e-30);
+
+        double* oh = out.data() + h * head_dim;
+        for (size_t d = 0; d < head_dim; ++d) {
+            double acc = 0.0;
+            for (size_t j = 0; j < num_keys; ++j) acc += p[j] * k[j * head_dim + d];
+            // The sink row's value is zero, so it adds nothing to `acc`.
+            oh[d] = acc / denom;
         }
     }
     return out;
