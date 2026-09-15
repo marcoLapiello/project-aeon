@@ -151,6 +151,13 @@ if(AEON_BUILD_TESTS)
     # permutation), the clamp rule, and the composed FFN against an fp64 oracle,
     # then re-checks W1 and the whole FFN on a real artifact payload.
     aeon_add_test(test_v4_expert_oracle SOURCES tests/test_v4_expert_oracle.cpp)
+
+    # Step 2.10.4 — shared expert: dense fp16 FFN, no routing, same clamp. The
+    # clamp rule itself is certified at item 14; this certifies the structure,
+    # the numerics on real artifact tensors, and that the combine applies the
+    # shared contribution exactly once.
+    aeon_add_test(test_v4_shared_expert_oracle
+        SOURCES tests/test_v4_shared_expert_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------

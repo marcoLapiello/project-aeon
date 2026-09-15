@@ -1444,4 +1444,50 @@ inline ExpertGateUp expert_gate_up(const uint8_t* payload,
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Dense (unquantized) FFN — Step 2.10.4, the shared expert
+// ---------------------------------------------------------------------------
+//
+// Structurally the same op as 2.10.3 and **deliberately a separate function**,
+// because the two differ in exactly the ways a shared helper would have hidden:
+//
+//   * the weights are fp16 and stored row-major `[out, in]` with no
+//     quantization — this is not the swizzled W4A16 format;
+//   * there is no routing at all. The shared expert fires on every token
+//     unconditionally `[V config n_shared_experts == 1; V vllm model.py:1024-1031
+//     shared_output = self.shared_experts(hidden_states)]`;
+//   * the activation rule is the *same* one — `activation_clamp` is passed to
+//     both the routed and the shared path in the reference `[V model.py:1016-1021]`.
+//
+// So this uses `clamped_swiglu` rather than re-deriving it: the rule is shared on
+// purpose, and the gate for it lives with 2.10.3.
+//
+// `w1`, `w3` are `[intermediate, hidden]` and `w2` is `[hidden, intermediate]`,
+// all row-major, as the checkpoint stores `nn.Linear.weight`.
+inline std::vector<double> dense_ffn(size_t intermediate, size_t hidden,
+                                     const std::vector<double>& activation,
+                                     const std::vector<double>& w1,
+                                     const std::vector<double>& w3,
+                                     const std::vector<double>& w2,
+                                     double limit = 10.0,
+                                     ClampMode mode = ClampMode::Asymmetric) {
+    if (activation.size() != hidden || w1.size() != intermediate * hidden ||
+        w3.size() != intermediate * hidden || w2.size() != hidden * intermediate) {
+        throw std::invalid_argument("dsv4_oracle: dense_ffn shape mismatch");
+    }
+
+    const std::vector<double> gate = matvec(intermediate, hidden, activation,
+        [&](size_t o, size_t i) { return w1[o * hidden + i]; });
+    const std::vector<double> up = matvec(intermediate, hidden, activation,
+        [&](size_t o, size_t i) { return w3[o * hidden + i]; });
+
+    std::vector<double> hidden_act(intermediate, 0.0);
+    for (size_t i = 0; i < intermediate; ++i) {
+        hidden_act[i] = clamped_swiglu(gate[i], up[i], limit, mode);
+    }
+
+    return matvec(hidden, intermediate, hidden_act,
+                  [&](size_t o, size_t i) { return w2[o * intermediate + i]; });
+}
+
 } // namespace aeon::reference
