@@ -361,6 +361,10 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 - **Inverse RoPE** on the attention-output tail **before** the grouped projection. The DSV4 rope `forward` takes an explicit `inverse` flag that negates `sin` `[V deepseek_scaling_rope.py:249-252, 281-284]`; `ds4` passes `inverse=true` for the output `[V ds4:13993, 14490]`.
 - **Gate:** forward∘inverse = identity; tables match reference at two positions, one of them past `original_max_position_embeddings = 65536`; **the rotated slice is the last 64 dims, not the first.**
 
+> **Gate result (Tier 1, item 6) — CERTIFIED.** `kernels/v4_rope.hpp` (forward/inverse, batched and single-position) plus the two-class spec in `reference/dsv4_oracle.hpp`. Measured: tables match to `3.0e-8` at position 1; forward and inverse match the oracle to `4.9e-4` (= one fp16 ulp); the nope region `[0,448)` is **bit-identical** after a forward rotation, which is what makes trap 27 impossible to pass silently; device forward∘inverse returns the input to within one fp16 ulp of the row.
+>
+> **One quantified finding worth carrying forward.** Both our kernel and the reference store the tables in **fp32** and compute `angle = pos * freq` in fp32. Beyond `original_max_position_embeddings` the fp32 angle has an ulp of `2^-7 ≈ 7.8e-3` at position 65537, so the two tables differ by up to **`3.4e-3` in cos/sin before any kernel error is involved** (measured: `2.4e-3` sliding, `3.4e-3` compressed over all positions; `8.6e-4` / `1.1e-3` at position 65537 alone). This is a precision floor, not a defect — it bounds how tightly long-context logits can ever agree with a reference that rounds the same way, and it is the reason an fp64 table comparison at large positions must be judged in **absolute** terms. Rotating to fp64 tables would remove it and is a candidate change, but it is **not** part of this revision: the reference does not do it.
+
 #### 2.4 — Attention
 
 **2.4.1 — Score, sink, and softmax (all layers)**
@@ -641,7 +645,7 @@ Build and certify in this order. Each item's gate must be green before the next 
 
 **Tier 1 — Primitives (GPU, one at a time).**
 5. ~~**RMSNorm** — vs fp64 reference.~~ **DONE.** `reference/dsv4_oracle.hpp` (host-only, fp64, kernel-free) + `kernels/v4_norm.hpp` + `tests/test_v4_norm_oracle.cpp`. Weighted and unit forms both pass; max relative error 4.9e-4 = one fp16 ulp, i.e. the kernel is exact and only the fp16 store rounds. The gate also asserts the oracle against a closed-form host-only case, so a wrong oracle cannot certify a wrong kernel.
-6. **RoPE forward and inverse** — separately; two bases; forward∘inverse = identity.
+6. ~~**RoPE forward and inverse** — separately; two bases; forward∘inverse = identity.~~ **DONE.** `kernels/v4_rope.hpp` + `tests/test_v4_rope_oracle.cpp`, 18 lines green. Both bases certified (theta 10000 plain, 160000 YaRN factor 16); the gate asserts the two bases are distinguishable, that `[0,448)` is bit-identical after rotation (trap 27), and that forward∘inverse returns the input. See the gate result under 2.3 for the fp32 table-precision bound.
 7. **MLA q path and kv path** — including both intermediate norms.
 8. **HC project + Sinkhorn** — verify doubly-stochastic convergence *before* composing it with anything.
 9. **Attention score + sink + softmax** — verify at pos 0, within window, beyond window.

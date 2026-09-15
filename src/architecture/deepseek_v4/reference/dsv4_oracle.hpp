@@ -26,6 +26,7 @@
 // is the bug.
 // -----------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -170,6 +171,167 @@ inline std::vector<double> rmsnorm_unit(const std::vector<double>& x, double eps
     std::vector<double> out(dim);
     for (size_t i = 0; i < dim; ++i) out[i] = x[i] * inv_rms;
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// RoPE — Step 2.3
+//
+// Deliberately *not* parameterised by "which of the two upstream classes am I".
+// The only knob is the spec, and there are exactly two specs in the graph, so a
+// caller cannot silently invent a third. (trap 7)
+// ---------------------------------------------------------------------------
+
+// The two RoPE classes the graph actually has, keyed on `compress_ratio`:
+//   ratio <= 1 -> Sliding:    theta = rope_theta          = 10000,  plain RoPE
+//   ratio >  1 -> Compressed: theta = compress_rope_theta = 160000, YaRN factor 16
+enum class RopeClass { Sliding, Compressed };
+
+inline RopeClass rope_class_for_ratio(int64_t compress_ratio) noexcept {
+    // Upstream keys on `compress_ratio > 1` [rope.py:28-30], not `!= 0` — the two
+    // agree for our {0, 4, 128}, and `> 1` is the one the reference uses.
+    return compress_ratio > 1 ? RopeClass::Compressed : RopeClass::Sliding;
+}
+
+struct RopeSpec {
+    uint32_t head_dim{512};
+    uint32_t rotary_dim{64};   // only the tail rotates
+    double   theta{10000.0};
+    double   factor{1.0};      // 1.0 disables YaRN entirely
+    double   beta_fast{32.0};
+    double   beta_slow{1.0};
+    uint32_t original_max_position{65536};
+};
+
+inline RopeSpec rope_spec_for(RopeClass cls) noexcept {
+    RopeSpec spec;
+    if (cls == RopeClass::Compressed) {
+        spec.theta = 160000.0;
+        spec.factor = 16.0;
+    }
+    // Sliding keeps factor = 1.0. Upstream still routes it through
+    // `deepseek_yarn`, but with factor 1.0 the interpolation and extrapolation
+    // frequencies coincide, so the ramp cancels and the result is plain RoPE
+    // [V vllm/models/deepseek_v4/common/rope.py:31-44].
+    return spec;
+}
+
+// Inverse frequencies, length `rotary_dim / 2`.
+//
+// Plain form: `1 / theta^(2k/rotary_dim)` — note the exponent step is `2k/dim`,
+// not `k/(dim/2)`, which is what makes the pair stride 2.
+//
+// YaRN form [V vllm/.../rotary_embedding/deepseek_scaling_rope.py:78-107,
+//           V vllm/.../rotary_embedding/common.py:25-70]:
+//   low  = floor(correction_dim(beta_fast))          clamp >= 0
+//   high = ceil (correction_dim(beta_slow))          clamp <= rotary_dim - 1
+//   w_k  = clamp((k - low) / (high - low), 0, 1)
+//   inv_k = (1 - w_k) * inv_k + w_k * (inv_k / factor)
+// with correction_dim(r) = rotary_dim * ln(orig_max_pos / (r * 2pi)) / (2 ln theta).
+// Low k (high frequency) keeps the original; high k is interpolated.
+//
+// Note on the clamp: the reference clamps `high` to `rotary_dim - 1` = 63, while
+// the 32-element ramp it feeds is indexed only to 31. For this model's
+// parameters (compressed: low 15, high 25; sliding: no ramp) the clamp never
+// binds, so the two agree. It is called out because it *would* diverge for a
+// checkpoint whose correction range extended past `rotary_dim / 2`.
+inline std::vector<double> rope_inv_freq(const RopeSpec& spec) {
+    const size_t half = spec.rotary_dim / 2;
+    std::vector<double> inv(half);
+    for (size_t k = 0; k < half; ++k) {
+        inv[k] = 1.0 / std::pow(spec.theta, (2.0 * static_cast<double>(k)) / spec.rotary_dim);
+    }
+    if (spec.factor <= 1.0) return inv;
+
+    constexpr double kPi = 3.14159265358979323846;
+    const auto correction_dim = [&spec](double rotations) {
+        return static_cast<double>(spec.rotary_dim) *
+               std::log(static_cast<double>(spec.original_max_position) / (rotations * 2.0 * kPi)) /
+               (2.0 * std::log(spec.theta));
+    };
+
+    const double low = std::fmax(0.0, std::floor(correction_dim(spec.beta_fast)));
+    const double high = std::fmin(static_cast<double>(spec.rotary_dim) - 1.0,
+                                  std::ceil(correction_dim(spec.beta_slow)));
+
+    for (size_t k = 0; k < half; ++k) {
+        double w = 0.0;
+        if (low >= high) {
+            w = (static_cast<double>(k) < low) ? 0.0 : 1.0;
+        } else {
+            w = std::clamp((static_cast<double>(k) - low) / (high - low), 0.0, 1.0);
+        }
+        inv[k] = (1.0 - w) * inv[k] + w * (inv[k] / spec.factor);
+    }
+    return inv;
+}
+
+// Reference cos/sin tables, laid out `[max_position][rotary_dim / 2]` so a gate
+// can compare them directly against the kernel's flat caches.
+struct RopeTableRef {
+    RopeSpec spec;
+    std::vector<double> cos;
+    std::vector<double> sin;
+
+    uint32_t half() const noexcept { return spec.rotary_dim / 2; }
+};
+
+inline RopeTableRef rope_table(const RopeSpec& spec, uint32_t max_position) {
+    RopeTableRef table;
+    table.spec = spec;
+    const std::vector<double> inv = rope_inv_freq(spec);
+    const uint32_t half = spec.rotary_dim / 2;
+
+    table.cos.assign(static_cast<size_t>(max_position) * half, 0.0);
+    table.sin.assign(static_cast<size_t>(max_position) * half, 0.0);
+    for (uint32_t p = 0; p < max_position; ++p) {
+        for (uint32_t k = 0; k < half; ++k) {
+            // Accumulated in double. The kernel computes this in float; at large
+            // positions that difference is real and is expected — see the gate.
+            const double angle = static_cast<double>(p) * inv[k];
+            const size_t at = static_cast<size_t>(p) * half + k;
+            table.cos[at] = std::cos(angle);
+            table.sin[at] = std::sin(angle);
+        }
+    }
+    return table;
+}
+
+// Rotates the tail `rotary_dim` of a single head row **in place**. The row is
+// `head_dim` wide; the leading `head_dim - rotary_dim` (= 448) entries are the
+// nope part and are never touched. (trap 27)
+//
+// GPT-J interleave: the pairs are adjacent, `(rotary + 2k, rotary + 2k + 1)`.
+//   forward: out[2k]   = x[2k]*cos - x[2k+1]*sin
+//            out[2k+1] = x[2k]*sin + x[2k+1]*cos
+//   inverse: out[2k]   = x[2k]*cos + x[2k+1]*sin
+//            out[2k+1] = x[2k+1]*cos - x[2k]*sin
+// i.e. the inverse is the transpose of the forward rotation, equivalently the
+// forward rotation with `sin` negated [V deepseek_scaling_rope.py:281-284].
+inline void rope_apply_tail(std::vector<double>& row,
+                            const RopeTableRef& table,
+                            uint32_t position,
+                            bool inverse) {
+    const uint32_t half = table.half();
+    const uint32_t rope_offset = table.spec.head_dim - table.spec.rotary_dim;
+
+    for (uint32_t k = 0; k < half; ++k) {
+        const size_t pair = static_cast<size_t>(position) * half + k;
+        const double c = table.cos[pair];
+        const double s = table.sin[pair];
+
+        const size_t i0 = rope_offset + 2 * k;
+        const size_t i1 = i0 + 1;
+        const double x0 = row[i0];
+        const double x1 = row[i1];
+
+        if (inverse) {
+            row[i0] = x0 * c + x1 * s;
+            row[i1] = x1 * c - x0 * s;
+        } else {
+            row[i0] = x0 * c - x1 * s;
+            row[i1] = x0 * s + x1 * c;
+        }
+    }
 }
 
 } // namespace aeon::reference

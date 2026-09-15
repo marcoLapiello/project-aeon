@@ -38,11 +38,11 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 20 infrastructure/backend/text/kept-component/Tier-1 tests |
-| Legacy `ctest` | 22 (the 20 plus 2 gated parity anchors) |
+| Default `ctest` | 21 infrastructure/backend/text/kept-component/Tier-1 tests |
+| Legacy `ctest` | 23 (the 21 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
-| Tier 1 | Harness built; **RMSNorm certified** at one fp16 ulp. Next: RoPE, then MLA, HC, attention, compressor, indexer, output, router, MoE |
+| Tier 1 | Rule-worthy harness built; **RMSNorm** (one fp16 ulp) and **RoPE** (18 lines, both bases) certified. Next: MLA q/kv paths, then HC, attention, compressor, indexer, output, router, MoE |
 
 ---
 

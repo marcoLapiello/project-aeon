@@ -103,6 +103,10 @@ endif()
 if(AEON_BUILD_TESTS)
     # Step 2.1 — RMSNorm, weighted and unit forms, versus reference/dsv4_oracle.hpp.
     aeon_add_test(test_v4_norm_oracle SOURCES tests/test_v4_norm_oracle.cpp)
+
+    # Step 2.3 — RoPE forward and inverse, two bases, tail-only rotation, versus
+    # the same oracle. Asserts the discriminating properties, not just closeness.
+    aeon_add_test(test_v4_rope_oracle SOURCES tests/test_v4_rope_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------

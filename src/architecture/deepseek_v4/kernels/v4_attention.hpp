@@ -9,10 +9,11 @@
 #include <cstdint>
 #include <cassert>
 
-// The Wave32 RMSNorm kernels moved to `v4_norm.hpp` so the primitive can be
-// gated on its own, outside the legacy graph. This header keeps including them
-// for its existing callers; there is no second definition.
+// The Wave32 RMSNorm and RoPE kernels moved to focused modules so each
+// primitive can be gated on its own, outside the legacy graph. This header
+// keeps including them for its existing callers; there is no second definition.
 #include "architecture/deepseek_v4/kernels/v4_norm.hpp"
+#include "architecture/deepseek_v4/kernels/v4_rope.hpp"
 
 namespace aeon::kernel {
 
@@ -37,60 +38,9 @@ constexpr float DSV4_ROPE_THETA = 10000.0f;
 constexpr float DSV4_ATTN_SCALE = 0.04419417382415922f; // 1.0f / sqrtf(512.0f)
 
 // ---------------------------------------------------------------------------
-// RoPE and YaRN configuration
 // ---------------------------------------------------------------------------
-struct RopeTable {
-    uint32_t max_seq_len{4096};
-    uint32_t rope_dim{DSV4_ROPE_DIM};
-    uint32_t half_rope{DSV4_ROPE_DIM / 2}; // 32
-    std::vector<float> cos_cache; // [max_seq_len, half_rope]
-    std::vector<float> sin_cache; // [max_seq_len, half_rope]
-
-    void init(
-        uint32_t seq_len = 4096,
-        float theta = DSV4_ROPE_THETA,
-        float factor = 1.0f,
-        float beta_fast = 32.0f,
-        float beta_slow = 1.0f,
-        uint32_t orig_max_pos = 65536
-    ) {
-        max_seq_len = seq_len;
-        cos_cache.resize(max_seq_len * half_rope);
-        sin_cache.resize(max_seq_len * half_rope);
-
-        for (uint32_t k = 0; k < half_rope; ++k) {
-            float freq = 1.0f / std::pow(theta, (2.0f * k) / (float)rope_dim);
-            if (factor > 1.0f) {
-                // YaRN interpolates between the original and scaled
-                // frequencies across the beta-derived correction range.
-                constexpr float pi = 3.14159265358979323846f;
-                const auto correction_dim = [this, theta, orig_max_pos](float rotations) {
-                    return static_cast<float>(rope_dim) *
-                        std::log(static_cast<float>(orig_max_pos) / (rotations * 2.0f * pi)) /
-                        (2.0f * std::log(theta));
-                };
-                const float low = std::max(
-                    0.0f, std::floor(correction_dim(beta_fast)));
-                const float high = std::min(
-                    static_cast<float>(half_rope - 1),
-                    std::ceil(correction_dim(beta_slow)));
-                if (low >= high) {
-                    freq = static_cast<float>(k) < low ? freq : freq / factor;
-                } else {
-                    const float w = std::clamp(
-                        (static_cast<float>(k) - low) / (high - low), 0.0f, 1.0f);
-                    freq = (1.0f - w) * freq + w * (freq / factor);
-                }
-            }
-
-            for (uint32_t pos = 0; pos < max_seq_len; ++pos) {
-                float angle = pos * freq;
-                cos_cache[pos * half_rope + k] = std::cos(angle);
-                sin_cache[pos * half_rope + k] = std::sin(angle);
-            }
-        }
-    }
-};
+// RoPE and YaRN configuration: see `v4_rope.hpp` (`RopeTable`).
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Device Kernels (RDNA3 Wave32 Optimized)
@@ -98,69 +48,7 @@ struct RopeTable {
 
 // 1. Wave32 RMSNorm kernels: see `v4_norm.hpp` (included above).
 
-// 2. Wave32 Forward GPT-J RoPE on trailing 64 elements of [T, num_heads, head_dim] or [T, 1, head_dim]
-// Interleaved layout: for k in 0..31: out[2k] = x[2k]*cos - x[2k+1]*sin, out[2k+1] = x[2k]*sin + x[2k+1]*cos
-__global__ void __launch_bounds__(32) v4_forward_rope_wave32_kernel(
-    __half* __restrict__ vec,           // [num_tokens, num_heads, head_dim]
-    const float* __restrict__ cos_cache,// [max_seq, 32]
-    const float* __restrict__ sin_cache,// [max_seq, 32]
-    int num_heads,
-    int head_dim,                       // 512
-    int nope_dim,                       // 448
-    int half_rope                       // 32
-) {
-    int token_idx = blockIdx.y;
-    int head_idx  = blockIdx.x;
-    int k         = threadIdx.x; // 0..31 (one thread per frequency pair)
-
-    if (k < half_rope) {
-        int base_idx = token_idx * (num_heads * head_dim) + head_idx * head_dim + nope_dim + 2 * k;
-
-        float c = cos_cache[token_idx * half_rope + k];
-        float s = sin_cache[token_idx * half_rope + k];
-
-        float x0 = __half2float(vec[base_idx + 0]);
-        float x1 = __half2float(vec[base_idx + 1]);
-
-        float rot0 = x0 * c - x1 * s;
-        float rot1 = x0 * s + x1 * c;
-
-        vec[base_idx + 0] = __float2half(rot0);
-        vec[base_idx + 1] = __float2half(rot1);
-    }
-}
-
-// 3. Wave32 Inverse GPT-J RoPE on trailing 64 elements of attention output [T, 64, 512]
-// Inverse applies negative sin: out[2k] = x[2k]*cos + x[2k+1]*sin, out[2k+1] = x[2k+1]*cos - x[2k]*sin
-__global__ void __launch_bounds__(32) v4_inverse_rope_wave32_kernel(
-    __half* __restrict__ vec,           // [num_tokens, 64, 512]
-    const float* __restrict__ cos_cache,// [max_seq, 32]
-    const float* __restrict__ sin_cache,// [max_seq, 32]
-    int num_heads,                      // 64
-    int head_dim,                       // 512
-    int nope_dim,                       // 448
-    int half_rope                       // 32
-) {
-    int token_idx = blockIdx.y;
-    int head_idx  = blockIdx.x;
-    int k         = threadIdx.x; // 0..31
-
-    if (k < half_rope) {
-        int base_idx = token_idx * (num_heads * head_dim) + head_idx * head_dim + nope_dim + 2 * k;
-
-        float c = cos_cache[token_idx * half_rope + k];
-        float s = sin_cache[token_idx * half_rope + k];
-
-        float x0 = __half2float(vec[base_idx + 0]);
-        float x1 = __half2float(vec[base_idx + 1]);
-
-        float inv0 = x0 * c + x1 * s;
-        float inv1 = x1 * c - x0 * s;
-
-        vec[base_idx + 0] = __float2half(inv0);
-        vec[base_idx + 1] = __float2half(inv1);
-    }
-}
+// 2/3. Forward and inverse GPT-J RoPE on the trailing 64 dims: see `v4_rope.hpp`.
 
 // 4. Causal Sliding-Window Attention Kernel with Attention Sink (Wave32)
 // Q: [num_tokens, 64, 512]
@@ -455,66 +343,8 @@ __global__ void __launch_bounds__(256) v4_argmax_partial_reduce_kernel(
         out_idx[0] = s_idx[0];
     }
 }
-__global__ void __launch_bounds__(32) v4_forward_rope_at_pos_wave32_kernel(
-    __half* __restrict__ vec,           // [num_heads, head_dim]
-    const float* __restrict__ cos_cache,// [max_seq, 32]
-    const float* __restrict__ sin_cache,// [max_seq, 32]
-    int pos,
-    int num_heads,
-    int head_dim,                       // 512
-    int nope_dim,                       // 448
-    int half_rope                       // 32
-) {
-    int head_idx = blockIdx.x;
-    int k        = threadIdx.x; // 0..31
 
-    if (k < half_rope) {
-        int base_idx = head_idx * head_dim + nope_dim + 2 * k;
-
-        float c = cos_cache[pos * half_rope + k];
-        float s = sin_cache[pos * half_rope + k];
-
-        float x0 = __half2float(vec[base_idx + 0]);
-        float x1 = __half2float(vec[base_idx + 1]);
-
-        float rot0 = x0 * c - x1 * s;
-        float rot1 = x0 * s + x1 * c;
-
-        vec[base_idx + 0] = __float2half(rot0);
-        vec[base_idx + 1] = __float2half(rot1);
-    }
-}
-
-// 8. Single-position Inverse RoPE for autoregressive generation
-__global__ void __launch_bounds__(32) v4_inverse_rope_at_pos_wave32_kernel(
-    __half* __restrict__ vec,           // [num_heads, head_dim]
-    const float* __restrict__ cos_cache,// [max_seq, 32]
-    const float* __restrict__ sin_cache,// [max_seq, 32]
-    int pos,
-    int num_heads,
-    int head_dim,                       // 512
-    int nope_dim,                       // 448
-    int half_rope                       // 32
-) {
-    int head_idx = blockIdx.x;
-    int k        = threadIdx.x; // 0..31
-
-    if (k < half_rope) {
-        int base_idx = head_idx * head_dim + nope_dim + 2 * k;
-
-        float c = cos_cache[pos * half_rope + k];
-        float s = sin_cache[pos * half_rope + k];
-
-        float x0 = __half2float(vec[base_idx + 0]);
-        float x1 = __half2float(vec[base_idx + 1]);
-
-        float inv0 = x0 * c + x1 * s;
-        float inv1 = x1 * c - x0 * s;
-
-        vec[base_idx + 0] = __float2half(inv0);
-        vec[base_idx + 1] = __float2half(inv1);
-    }
-}
+// 7/8. Single-position RoPE (forward + inverse): see `v4_rope.hpp`.
 
 // 9. Autoregressive Sliding-Window Attention with persistent KV Cache
 __global__ void __launch_bounds__(32) v4_cached_sliding_window_attn_wave32_kernel(
@@ -926,54 +756,6 @@ inline void cpu_rmsnorm(
     float inv_rms = 1.0f / std::sqrt((sum_sq / (float)dim) + eps);
     for (int i = 0; i < dim; ++i) {
         output[i] = input[i] * inv_rms * weight[i];
-    }
-}
-
-inline void cpu_forward_rope(
-    float* vec,
-    int token_idx,
-    const RopeTable& rope,
-    int num_heads = DSV4_NUM_HEADS,
-    int head_dim = DSV4_HEAD_DIM,
-    int nope_dim = DSV4_NOPE_DIM,
-    int half_rope = DSV4_ROPE_DIM / 2
-) {
-    for (int h = 0; h < num_heads; ++h) {
-        for (int k = 0; k < half_rope; ++k) {
-            int base_idx = h * head_dim + nope_dim + 2 * k;
-            float c = rope.cos_cache[token_idx * half_rope + k];
-            float s = rope.sin_cache[token_idx * half_rope + k];
-
-            float x0 = vec[base_idx + 0];
-            float x1 = vec[base_idx + 1];
-
-            vec[base_idx + 0] = x0 * c - x1 * s;
-            vec[base_idx + 1] = x0 * s + x1 * c;
-        }
-    }
-}
-
-inline void cpu_inverse_rope(
-    float* vec,
-    int token_idx,
-    const RopeTable& rope,
-    int num_heads = DSV4_NUM_HEADS,
-    int head_dim = DSV4_HEAD_DIM,
-    int nope_dim = DSV4_NOPE_DIM,
-    int half_rope = DSV4_ROPE_DIM / 2
-) {
-    for (int h = 0; h < num_heads; ++h) {
-        for (int k = 0; k < half_rope; ++k) {
-            int base_idx = h * head_dim + nope_dim + 2 * k;
-            float c = rope.cos_cache[token_idx * half_rope + k];
-            float s = rope.sin_cache[token_idx * half_rope + k];
-
-            float x0 = vec[base_idx + 0];
-            float x1 = vec[base_idx + 1];
-
-            vec[base_idx + 0] = x0 * c + x1 * s;
-            vec[base_idx + 1] = x1 * c - x0 * s;
-        }
     }
 }
 
