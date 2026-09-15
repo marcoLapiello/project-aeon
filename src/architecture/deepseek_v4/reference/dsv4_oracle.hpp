@@ -30,7 +30,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace aeon::reference {
@@ -1115,6 +1117,330 @@ inline RouterSelection router_hash(const std::vector<double>& logits,
         out.weights[k] /= sum;
         out.weights[k] *= scaling;
     }
+    return out;
+}
+
+// ===========================================================================
+// Swizzled W4A16 expert format — Steps 2.10.2 / 2.10.3
+// ===========================================================================
+//
+// The artifact stores each routed expert as W1, W2, W3 in a *swizzled* W4A16
+// layout: 4-bit symmetric weights (signed, zero point 8), one fp16 scale per
+// 32-column group, and a storage permutation chosen so that a Wave32 reads a
+// row as `uint4` words with the activation in `half2` pairs.
+//
+// Nothing here is derived from a kernel. The address arithmetic is written out
+// scalar-by-scalar from the format definition, and every element is read back
+// through it, so the device and this file agree only if both understand the same
+// byte layout.
+//
+// Two facts the format fixes, both of which a plausible reader can get wrong and
+// both of which the gate below measures rather than assumes:
+//
+//  * the zero point is **signed**: `w = (q − 8) · scale`, so a stored nibble of
+//    8 means zero;
+//  * the eight nibbles of a word are **not** in column order — the column whose
+//    offset within the 8-column slice is `s` lives at nibble position
+//    `kNibbleSlot[s]`.
+//
+// `SwizzledDecodeOptions` carries the two deliberately-wrong readings, in the
+// same spirit as `transpose_comb`, `apply_relu` and `bias_before_softplus`
+// elsewhere in this file. Nothing in the graph passes a non-default option.
+
+enum class SwizzledKind { W1, W2, W3 };
+
+struct SwizzledShape {
+    size_t packed_offset;
+    size_t scale_offset;
+    int rows;
+    int columns;
+    int rows_per_wave;
+    int lanes_per_row;
+
+    int iterations() const { return (columns / 32) / lanes_per_row; }
+    size_t weight_count() const { return static_cast<size_t>(rows) * columns; }
+};
+
+// Offsets and shapes from the artifact's own format constants.
+inline SwizzledShape swizzled_shape(SwizzledKind kind) {
+    switch (kind) {
+        case SwizzledKind::W1: return {0,        4194304,  2048, 4096, 4, 8};
+        case SwizzledKind::W2: return {4718592,  8912896,  4096, 2048, 8, 4};
+        case SwizzledKind::W3: return {9437184,  13631488, 2048, 4096, 4, 8};
+    }
+    throw std::invalid_argument("dsv4_oracle: unknown swizzled matrix kind");
+}
+
+// Nibble position inside its 4-byte word for a column's offset `s` within the
+// 8-column slice, derived from the Wave32 `half2` read order: the first `half2`
+// pairs activation columns 0 and 1 with the nibbles that sit in the low and high
+// halves of the word, which are nibbles 0 and 4 — hence `{0,4,1,5,2,6,3,7}`.
+inline int swizzled_nibble_slot(int s) {
+    static constexpr int kSlot[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    return kSlot[s & 7];
+}
+
+struct SwizzledAddress {
+    size_t storage_slot; // index of the fp16 scale shared by 32 weights
+    size_t packed_word;  // index of the uint32 holding this weight
+    int nibble;          // nibble position inside that word
+};
+
+inline SwizzledAddress swizzled_address(const SwizzledShape& shape, int row, int column) {
+    const int group = column / 32;
+    const int word_in_group = (column % 32) / 8;
+    const int source_nibble = column % 8;
+    const int iteration = group / shape.lanes_per_row;
+    const int slice = group % shape.lanes_per_row;
+    const int row_block = row / shape.rows_per_wave;
+    const int row_in_block = row % shape.rows_per_wave;
+    const int lane = row_in_block * shape.lanes_per_row + slice;
+
+    const size_t storage = (static_cast<size_t>(row_block) * shape.iterations() +
+                            static_cast<size_t>(iteration)) * 32u +
+                           static_cast<size_t>(lane);
+    SwizzledAddress address;
+    address.storage_slot = storage;
+    address.packed_word = storage * 4u + static_cast<size_t>(word_in_group);
+    address.nibble = swizzled_nibble_slot(source_nibble);
+    return address;
+}
+
+inline uint16_t load_le_u16(const uint8_t* address) {
+    uint16_t value = 0;
+    std::memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+inline uint32_t load_le_u32(const uint8_t* address) {
+    uint32_t value = 0;
+    std::memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+inline void store_le_u16(uint8_t* address, uint16_t value) {
+    std::memcpy(address, &value, sizeof(value));
+}
+
+inline void store_le_u32(uint8_t* address, uint32_t value) {
+    std::memcpy(address, &value, sizeof(value));
+}
+
+inline double half_bits_to_double(uint16_t bits) {
+    const int sign = (bits >> 15) & 1;
+    const int exponent = (bits >> 10) & 0x1F;
+    const int mantissa = bits & 0x3FF;
+    double value;
+    if (exponent == 0) {
+        value = std::ldexp(static_cast<double>(mantissa), -24);
+    } else if (exponent == 0x1F) {
+        value = std::numeric_limits<double>::quiet_NaN();
+    } else {
+        value = std::ldexp(1.0 + static_cast<double>(mantissa) / 1024.0, exponent - 15);
+    }
+    return sign != 0 ? -value : value;
+}
+
+// Exact fp16 bit pattern for 2^exponent. Scales in the synthetic fixtures are
+// restricted to powers of two so the encoder needs no fp32->fp16 rounding step:
+// a power of two is representable exactly, and its bits are trivial.
+inline uint16_t half_bits_of_power_of_two(int exponent) {
+    if (exponent < -14) exponent = -14;
+    if (exponent > 15) exponent = 15;
+    return static_cast<uint16_t>((exponent + 15) << 10);
+}
+
+struct SwizzledDecodeOptions {
+    bool signed_zero_point = true; // false: read the nibble as an unsigned magnitude
+    bool permute_nibbles = true;   // false: take the nibble straight from the column offset
+};
+
+// Reads the payload back into a row-major `[rows, columns]` double matrix.
+inline std::vector<double> swizzled_decode(const uint8_t* payload, SwizzledKind kind,
+                                           SwizzledDecodeOptions options = {}) {
+    if (payload == nullptr) {
+        throw std::invalid_argument("dsv4_oracle: null swizzled payload");
+    }
+    const SwizzledShape shape = swizzled_shape(kind);
+    std::vector<double> weights(shape.weight_count(), 0.0);
+
+    for (int row = 0; row < shape.rows; ++row) {
+        for (int column = 0; column < shape.columns; ++column) {
+            SwizzledAddress address = swizzled_address(shape, row, column);
+            if (!options.permute_nibbles) {
+                address.nibble = column % 8;
+            }
+            const uint32_t word = load_le_u32(payload + shape.packed_offset +
+                                              address.packed_word * sizeof(uint32_t));
+            const int nibble = static_cast<int>((word >> (4 * address.nibble)) & 0xFu);
+
+            const double scale = half_bits_to_double(load_le_u16(
+                payload + shape.scale_offset + address.storage_slot * sizeof(uint16_t)));
+
+            const double quantized = options.signed_zero_point
+                ? static_cast<double>(nibble - 8)
+                : static_cast<double>(nibble);
+            weights[static_cast<size_t>(row) * shape.columns + column] = quantized * scale;
+        }
+    }
+    return weights;
+}
+
+// Inverse of `swizzled_decode`, used only to build synthetic fixtures. `w` must
+// be `[rows * columns]` row-major.
+//
+// The per-(row, group-of-32) scale is the smallest **power of two** that is at
+// least `max|w| / 7`, so every quantized magnitude stays inside the signed 4-bit
+// range `[-8, 7]` and the scale is exactly representable in fp16. That trades up
+// to one bit of precision for an encoder with no rounding step to get wrong.
+inline void swizzled_encode(uint8_t* payload, SwizzledKind kind,
+                            const std::vector<double>& w) {
+    if (payload == nullptr) {
+        throw std::invalid_argument("dsv4_oracle: null swizzled payload");
+    }
+    const SwizzledShape shape = swizzled_shape(kind);
+    if (w.size() != shape.weight_count()) {
+        throw std::invalid_argument("dsv4_oracle: swizzled_encode size mismatch");
+    }
+
+    // Zero the packed and scale regions of this matrix.
+    std::memset(payload + shape.packed_offset, 0,
+                static_cast<size_t>(shape.rows) * static_cast<size_t>(shape.columns) / 2);
+    std::memset(payload + shape.scale_offset, 0,
+                shape.weight_count() / 32 * sizeof(uint16_t));
+
+    for (int row = 0; row < shape.rows; ++row) {
+        for (int group = 0; group < shape.columns / 32; ++group) {
+            double peak = 0.0;
+            for (int j = 0; j < 32; ++j) {
+                peak = std::fmax(peak, std::fabs(w[static_cast<size_t>(row) * shape.columns +
+                                                    group * 32 + j]));
+            }
+            const int exponent = peak > 0.0
+                ? static_cast<int>(std::ceil(std::log2(peak / 7.0)))
+                : -14;
+            const uint16_t scale_bits = half_bits_of_power_of_two(exponent);
+            const double scale = half_bits_to_double(scale_bits);
+
+            for (int j = 0; j < 32; ++j) {
+                const int column = group * 32 + j;
+                const double value = w[static_cast<size_t>(row) * shape.columns + column];
+                int quantized = static_cast<int>(std::lround(value / scale));
+                quantized = std::max(-8, std::min(7, quantized));
+
+                const SwizzledAddress address = swizzled_address(shape, row, column);
+                store_le_u16(payload + shape.scale_offset +
+                                 address.storage_slot * sizeof(uint16_t),
+                             scale_bits);
+                uint8_t* word_address = payload + shape.packed_offset +
+                                        address.packed_word * sizeof(uint32_t);
+                uint32_t word = load_le_u32(word_address);
+                word &= ~(0xFu << (4 * address.nibble));
+                word |= static_cast<uint32_t>(quantized + 8) << (4 * address.nibble);
+                store_le_u32(word_address, word);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clamped SwiGLU — Step 2.10.3
+//
+//     hidden = silu(clamp(gate, max = limit)) * clamp(up, min = -limit, max = +limit)
+//
+// The clamp is **asymmetric** and re-cited from `vllm/.../activation.py:241-242`
+// (`SiluAndMulWithClamp`): the gate is bounded only above, the up branch both
+// sides. A symmetric clamp looks like the obvious reading and still produces
+// plausible activations, so the mode is a parameter here and the gate measures
+// the difference.
+enum class ClampMode {
+    Asymmetric, // the reference: gate max-only, up both sides
+    Symmetric,  // gate clamped both sides — the plausible-but-wrong reading
+    None        // no clamp at all
+};
+
+inline double clamped_swiglu(double gate, double up, double limit,
+                             ClampMode mode = ClampMode::Asymmetric) {
+    switch (mode) {
+        case ClampMode::Asymmetric:
+            gate = std::fmin(gate, limit);
+            up = std::fmin(std::fmax(up, -limit), limit);
+            break;
+        case ClampMode::Symmetric:
+            gate = std::fmin(std::fmax(gate, -limit), limit);
+            up = std::fmin(std::fmax(up, -limit), limit);
+            break;
+        case ClampMode::None:
+            break;
+    }
+    return (gate / (1.0 + std::exp(-gate))) * up;
+}
+
+// The whole routed expert body: `gate = W1·x`, `up = W3·x`, clamped SwiGLU, then
+// `out = W2·hidden` — Step 2.10.3 exactly, in double.
+//
+// Note that the device writes `hidden` to fp16 between the two halves (the fused
+// kernel's output is a `half*`), so the gate must allow for that one rounding;
+// this function keeps `hidden` in double. The alternative — rounding here too —
+// would hide a rounding question behind the oracle.
+inline std::vector<double> expert_ffn(const uint8_t* payload,
+                                      const std::vector<double>& activation,
+                                      double limit = 10.0,
+                                      ClampMode mode = ClampMode::Asymmetric) {
+    const SwizzledShape w1_shape = swizzled_shape(SwizzledKind::W1);
+    const SwizzledShape w2_shape = swizzled_shape(SwizzledKind::W2);
+    const SwizzledShape w3_shape = swizzled_shape(SwizzledKind::W3);
+    // `x` is the 4096-wide hidden state; W1/W3 map it to the 2048-wide
+    // intermediate, which W2 maps back to 4096.
+    if (activation.size() != static_cast<size_t>(w1_shape.columns) ||
+        activation.size() != static_cast<size_t>(w3_shape.columns) ||
+        w1_shape.rows != w2_shape.columns ||
+        w2_shape.rows != w1_shape.columns) {
+        throw std::invalid_argument("dsv4_oracle: expert_ffn shape mismatch");
+    }
+
+    const std::vector<double> w1 = swizzled_decode(payload, SwizzledKind::W1);
+    const std::vector<double> w2 = swizzled_decode(payload, SwizzledKind::W2);
+    const std::vector<double> w3 = swizzled_decode(payload, SwizzledKind::W3);
+
+    const std::vector<double> gate = matvec(
+        static_cast<size_t>(w1_shape.rows), static_cast<size_t>(w1_shape.columns),
+        activation, [&](size_t o, size_t i) { return w1[o * w1_shape.columns + i]; });
+    const std::vector<double> up = matvec(
+        static_cast<size_t>(w3_shape.rows), static_cast<size_t>(w3_shape.columns),
+        activation, [&](size_t o, size_t i) { return w3[o * w3_shape.columns + i]; });
+
+    std::vector<double> hidden(gate.size(), 0.0);
+    for (size_t i = 0; i < gate.size(); ++i) {
+        hidden[i] = clamped_swiglu(gate[i], up[i], limit, mode);
+    }
+
+    return matvec(static_cast<size_t>(w2_shape.rows),
+                  static_cast<size_t>(w2_shape.columns), hidden,
+                  [&](size_t o, size_t i) { return w2[o * w2_shape.columns + i]; });
+}
+
+// The two pre-activations, so a gate can check that the clamp actually fires in
+// the data it is testing rather than only comparing the composed result.
+struct ExpertGateUp {
+    std::vector<double> gate;
+    std::vector<double> up;
+};
+
+inline ExpertGateUp expert_gate_up(const uint8_t* payload,
+                                   const std::vector<double>& activation) {
+    const std::vector<double> w1 = swizzled_decode(payload, SwizzledKind::W1);
+    const std::vector<double> w3 = swizzled_decode(payload, SwizzledKind::W3);
+    const SwizzledShape w1_shape = swizzled_shape(SwizzledKind::W1);
+    const SwizzledShape w3_shape = swizzled_shape(SwizzledKind::W3);
+
+    ExpertGateUp out;
+    out.gate = matvec(static_cast<size_t>(w1_shape.rows),
+                      static_cast<size_t>(w1_shape.columns), activation,
+                      [&](size_t o, size_t i) { return w1[o * w1_shape.columns + i]; });
+    out.up = matvec(static_cast<size_t>(w3_shape.rows),
+                    static_cast<size_t>(w3_shape.columns), activation,
+                    [&](size_t o, size_t i) { return w3[o * w3_shape.columns + i]; });
     return out;
 }
 

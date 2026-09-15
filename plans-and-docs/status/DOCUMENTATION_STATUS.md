@@ -38,11 +38,11 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 28 infrastructure/backend/text/kept-component/Tier-1 tests |
-| Legacy `ctest` | 30 (the 28 plus 2 gated parity anchors) |
+| Default `ctest` | 29 infrastructure/backend/text/kept-component/Tier-1 tests |
+| Legacy `ctest` | 31 (the 29 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
-| Tier 1 | Certified: **RMSNorm**, **RoPE** (both bases), **MLA Q/KV**, **HC + Sinkhorn** (found a transposed comb index in the plan), **attention + sink + softmax**, **compressor + APE** (both ratio classes), **indexer + top-k** (found the ReLU missing from the kernel), **grouped output projection** (per-group reduction asserted, not assumed), **MoE router** (all four traps shown load-bearing; `tid2eid` checked against the artifact). Next: expert matmul, shared expert |
+| Tier 1 | Certified: **RMSNorm**, **RoPE** (both bases), **MLA Q/KV**, **HC + Sinkhorn** (found a transposed comb index in the plan), **attention + sink + softmax**, **compressor + APE** (both ratio classes), **indexer + top-k** (found the ReLU missing from the kernel), **grouped output projection** (per-group reduction asserted, not assumed), **MoE router** (all four traps shown load-bearing; `tid2eid` checked against the artifact), **routed expert** (format + asymmetric clamp rule, re-checked on a real payload; Gate 14 partially settled). Next: shared expert |
 
 ---
 

@@ -145,6 +145,12 @@ if(AEON_BUILD_TESTS)
     # n_group/topk_group), the lowest-index tie-break, and the hash/biased layer
     # split — the last against the artifact's own tid2eid table, at real token ids.
     aeon_add_test(test_v4_router_oracle SOURCES tests/test_v4_router_oracle.cpp)
+
+    # Steps 2.10.2 / 2.10.3 — routed expert: fused INT4 dequant, matmul, and the
+    # asymmetric clamped SwiGLU. Certifies the format (signed zero point, nibble
+    # permutation), the clamp rule, and the composed FFN against an fp64 oracle,
+    # then re-checks W1 and the whole FFN on a real artifact payload.
+    aeon_add_test(test_v4_expert_oracle SOURCES tests/test_v4_expert_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------
