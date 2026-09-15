@@ -492,8 +492,17 @@ __global__ void v4_materialize_compressed_entry_kernel(
 }
 
 // 12. Float32 Lightning Indexer score path. One thread owns one compressed
-// candidate; the host performs the final stable top-k ordering so ties remain
-// deterministic while the semantic path is being proven.
+// candidate.
+//
+//   score[c] = Σ_h w[h] · relu( q[h] · k[c] ) · softmax_scale · head_scale
+//
+// THE RELU IS ON THE PER-HEAD DOT, BEFORE THE WEIGHTING — not on the sum, and
+// not after the weight. This is trap 11 and the kernel shipped without it: the
+// gate `tests/test_v4_indexer_oracle.cpp` caught `max_rel = 0.98` and 65 of 512
+// wrong top-k indices, because a missing ReLU still yields a plausible attention
+// score. Reference `[V sglang .../dsv4/indexer.py:119-124]`:
+//   `score = bmm(kv, q.T); score = F.relu(score); score = score * weight;
+//    score = score.sum(dim=2)`
 __global__ void v4_indexer_scores_kernel(
     const __half* __restrict__ query,
     const float* __restrict__ weights,
@@ -517,7 +526,8 @@ __global__ void v4_indexer_scores_kernel(
             dot += __half2float(query[head_offset + static_cast<size_t>(dimension)]) *
                    __half2float(key[static_cast<size_t>(dimension)]);
         }
-        score += dot * weights[head] * softmax_scale * head_scale;
+        // ReLU here, per head, before the weight (trap 11).
+        score += fmaxf(dot, 0.0f) * weights[head] * softmax_scale * head_scale;
     }
     scores[candidate] = score;
 }

@@ -472,6 +472,32 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 - `top_k = 512` `[V config index_topk=512]`. Invalid/padded candidates take score `0` (not `-INF`) `[V sglang dsv4/indexer.py:133]`.
 - **Gate:** selected index set matches reference **exactly** for scripted inputs; the Hadamard choice is recorded as an explicit, measured decision.
 
+> **Gate result (Tier 1, item 11) — CERTIFIED, and the gate found a real bug in a kept kernel.** `tests/test_v4_indexer_oracle.cpp`, 11 lines green. Scores now match the oracle to `2.4e-7` and the top-k selection matches **exactly** (`0 of 512` differ).
+>
+> **`v4_indexer_scores_kernel` was missing the ReLU.** It computed `Σ_h w_h·(q_h·k_c,h)` with no rectification. On the first run the gate reported `max_rel = 0.98` on the scores and **65 of 512 wrong top-k indices** — a wrong selection of which compressed rows attention reads, which would have surfaced only as a subtle quality regression. Fixed in place; trap 11 updated to record that it was found in *our* code, not merely documented.
+>
+> **Why it survived every existing test, stated precisely.** The legacy `test_v4_real_dense_parity` loads real checkpoint weights and still passed with the ReLU missing. That is not a circularity failure — it is a **coverage** failure: that test calls exactly four kernels (`v4_gemv_fp16_kernel`, `v4_gemv_fp16_vec8_kernel`, `v4_grouped_wo_a_wave32_kernel`, `v4_rmsnorm_wave32_kernel`) and never touches the indexer or top-k. A green real-weight test says nothing about a kernel it does not call. (Verified by inspection: no `indexer`/`topk` reference anywhere in that file.)
+>
+> **The gate proves the ReLU is load-bearing before relying on it.** 50% of the per-head dots in the test data are negative, the with-ReLU and without-ReLU score vectors differ by `0.98`, and the two selections differ in `65 of 512` indices. Without that, a passing score comparison could not distinguish a correct indexer from one that omits the ReLU.
+>
+> **Top-k details verified:** descending order, ties to the **lower index** (trap 18), and the degenerate case `candidates <= top_k` selects all of them with no padding.
+
+> ### Gate 11 — the Hadamard rotation: **SETTLED (do not apply it)**
+>
+> This item had been mis-stated three times, so it is now settled by **measurement** rather than argument. The gate applies a normalized `1/sqrt(128)` Sylvester–Hadamard to each 128-wide indexer head and compares:
+>
+> | Configuration | Scores | Top-k |
+> |---|---|---|
+> | Hadamard on **both** Q and K | unchanged, `3.6e-16` | unchanged, `0 of 512` |
+> | Hadamard on **Q only** | differ by `1.46` | differ, `180 of 512` |
+> | Orthogonality check (Gram matrix preserved) | deviation `0.0` | — |
+>
+> So the plan's framing is correct and now demonstrated: the rotation is **logit-preserving** because it is orthogonal, and it is harmless only when applied **symmetrically**. One-sided application is the failure mode, and it is a *large* one.
+>
+> **Decision and its basis.** Our engine does **not** apply it, for two independent reasons: (1) the reference itself drops it in its fused path, labelled *"(logit-preserving)"* `[V dsa_indexer.py:395-398]`; and (2) the rotation exists to condition values before an **fp8 round-trip**, and our indexer stores its K cache in fp16 — there is nothing to condition. If the indexer K store is ever moved to fp8, this decision must be revisited, and the rotation must then be applied to **both** Q and K.
+>
+> The remaining indexer-store difference is recorded rather than hidden: the canonical path keeps the indexer K cache in **fp8 (UE8M0)** with a **per-key scale** (`kv_scale[c]` in the reference's score), and neither is present in our fp16 path. That delta belongs to the KV-precision gate (Gates 9/10), not here.
+
 **2.4.4 — Attention composition: local rows + compressed rows** `[Tier 0.2f: re-cited]`
 
 > **Tier 0.2f.** The composition was re-read from the readable kernels
@@ -689,7 +715,7 @@ Build and certify in this order. Each item's gate must be green before the next 
 8. ~~**HC project + Sinkhorn** — verify doubly-stochastic convergence *before* composing it with anything.~~ **DONE.** `tests/test_v4_hc_oracle.cpp`, 14 lines green. Verified doubly stochastic (to `eps`, see 2.0), the 20-iteration count, the third `hc_scale` entry, the asymmetric eps placement, and — the finding that matters — the **comb index convention**, where the kernel matches the upstream einsum to `4.0e-4` while the transposed reading differs by `0.52`. A plan-prose error was found and corrected; see trap 34.
 9. ~~**Attention score + sink + softmax** — verify at pos 0, within window, beyond window.~~ **DONE.** `tests/test_v4_attention_sink_oracle.cpp`, 19 lines green at pos 0 / 5 / 127 / 149. Asserts the exact window boundary (an out-of-window key has **exactly zero** influence), the sink as a pure scalar rescale, and the full-head scale against both wrong candidates. Trap 35 records the one property that cannot be tested from the output.
 10. ~~**Compressor** — verify pooling and boundary firing.~~ **DONE.** `tests/test_v4_compressor_oracle.cpp`, 32 lines green at both ratio classes (4 and 128), covering both kernels. Verified: APE is a `score`-only term (kv bit-exact), the APE row is `position % ratio`, the per-dimension softmax, both overlap segments, the RoPE position, the truncated first entry, and the `blockDim >= head_dim` launch contract.
-11. **Indexer + top-k** — exact index match. **Verifies the confirmed ReLU and fp8/UE8M0 quantization, and settles the Hadamard choice.**
+11. ~~**Indexer + top-k** — exact index match. **Verifies the confirmed ReLU and fp8/UE8M0 quantization, and settles the Hadamard choice.**~~ **DONE.** `tests/test_v4_indexer_oracle.cpp`, 11 lines green; top-k matches exactly. **The gate found the ReLU missing from `v4_indexer_scores_kernel`** (`max_rel 0.98`, 65 of 512 wrong indices) and it is now fixed — trap 11. **Gate 11 is settled by measurement: do not apply the Hadamard** (two-sided is a no-op to `3.6e-16`, one-sided shifts scores by `1.46` and 180 of 512 indices). The indexer-K fp8 + per-key scale delta is deferred to the KV-precision gates.
 12. **Grouped output projection** — low-rank and final.
 13. **Router** — exact ids and weights, one hash layer and one top-k layer. **Verifies `tid2eid == [vocab,6]` against our artifact.**
 14. **Expert matmul with fused dequant and clamped SwiGLU** — vs independent decoder.
@@ -722,7 +748,7 @@ Build and certify in this order. Each item's gate must be green before the next 
 | ~~HC comb scale~~ | **Resolved Tier 0.2e: `hc_scale[2]`** | The comb logits are scaled and biased before softmax; `hc_scale` is `[3]`. The plan previously applied only two scales. |
 | ~~Attention row-set composition~~ | **Resolved Tier 0.2f** | Three classes: ratio 0 = local only; ratio 4 (CSA) = local + indexer top-512; **ratio 128 (HCA) = local + *all* committed compressed rows, no indexer**. Two KV sources merge under one order-invariant online softmax. |
 | ~~Indexer ReLU~~ | **Resolved Tier 0.2: REQUIRED** | `relu` on the **per-head dot before weighting**, then `Σ_h w_h·relu(dot)` `[V sglang dsv4/indexer.py:121; qsa/dsa_indexer.py:43; cutedsl_fp8_paged_mqa_logits.py:43]`. My earlier retraction was wrong; my original assertion was right. |
-| **Indexer Hadamard rotation** | **Open (measured at Gate 11)** | Real and in the DSV4 tree, but **logit-preserving** — a pre-quantization conditioning choice, not graph semantics. Both sglang paths (with/without) are valid. Decide by measuring score/top-k agreement; **must be symmetric over Q and K if used**. This item has now been mis-stated in three directions; it is listed here to stop further flip-flopping. |
+| **Indexer Hadamard rotation** | **SETTLED at Gate 11 — do not apply it** | Measured, not argued. A normalized Hadamard is orthogonal, so a **two-sided** rotation leaves scores identical (`3.6e-16`) and the top-k identical (`0 of 512`), while a **one-sided** rotation changes scores by `1.46` and flips `180 of 512` indices. The reference drops it in its fused path and labels it *"(logit-preserving)"*; its only purpose is conditioning values before an fp8 round-trip, and our indexer K is fp16. **Revisit if the indexer K store moves to fp8 — and then apply it to BOTH Q and K.** |
 | ~~`tid2eid` orientation~~ | **Resolved: `[vocab, 6]`** | Reference declares `(config.vocab_size, config.num_experts_per_tok)` `[V nvidia/model.py:820]`; still verify against our artifact at Gate 13. |
 | KV fp8/E4M3 round-trip required vs optional | Gates 9 / 10 | **Strengthened toward required:** the canonical compressor kernel applies bf16+FP8/UE8M0 at two store points `[V fused_compress_quant_cache.py:288-345]`, and the checkpoint card states `--kv-cache-dtype` resolves to `fp8_ds_mla`, *"the only layout these backends implement"* `[V checkpoint README]`. Still a gate, because bf16 is a supported alternative and the delta must be measured. |
 | MoE combine accumulation order | Gate 14 | **Shared-vs-routed order is now settled** (routed sum, then `+= shared` `[V nvidia/model.py:1020-1031]`). Still open: the **intra-routed** slot order, which affects fp rounding vs tolerance. |
@@ -748,7 +774,7 @@ These are the specific things that will break this model if implemented naively.
 8. **Inverse RoPE on the tail of the attention output**, before the grouped projection. Easy to omit, hard to diagnose.
 9. **Attention sink enters the denominator only.** It must contribute no value vector, and must be included in the max.
 10. **Indexer storage and quantization are fp8/UE8M0** — not INT8 `[V fused_indexer_q.py; V attention.py:964-975]`.
-11. **Indexer ReLU is required and easy to omit.** `score[c] = kv_scale[c]·Σ_h w_h·relu(q_h·k_c,h)` — the ReLU is on the **per-head dot, before weighting**, not on the sum `[V sglang dsv4/indexer.py:121]`. At least three independent DSV4 implementations apply it.
+11. **Indexer ReLU is required and easy to omit.** `score[c] = kv_scale[c]·Σ_h w_h·relu(q_h·k_c,h)` — the ReLU is on the **per-head dot, before weighting**, not on the sum `[V sglang dsv4/indexer.py:121]`. At least three independent DSV4 implementations apply it. **It is not hypothetical: `v4_indexer_scores_kernel` shipped without it, and the Tier-1 gate is what caught it** (`max_rel = 0.98`, 65 of 512 top-k indices wrong). A missing ReLU produces a plausible-looking score, and the real-weight dense parity test never called this kernel, so nothing else would have flagged it. `[Tier 1]`
 12. **The Hadamard is real but logit-preserving.** A Hadamard-128 rotation (scale `1/sqrt(128)`) conditions indexer Q and K before quantization; the reference explicitly calls it *"logit-preserving"* `[V dsa_indexer.py:396]`. It is **not** required for semantics, **but if applied it must be applied to both Q and K** — one-sided application silently changes every score. Do not repeat this plan's earlier error of asserting it mandatory, *nor* its second error of asserting it absent. `[V dsa_indexer.py:192-204; V fused_q_indexer_rope_hadamard_quant (CUDA+ROCm)]`
 13. **Hash routing for layers < 3.** These layers use a token-id lookup (`tid2eid`, shaped `[vocab,6]`) and have no bias tensor. Applying biased top-k to them reads a tensor that is not there.
 14. **Router selection is biased, weighting is unbiased**, then normalized and scaled by 1.5; ties break to the lowest expert index.

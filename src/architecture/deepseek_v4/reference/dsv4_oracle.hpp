@@ -850,4 +850,121 @@ inline int64_t compressor_rope_position(int64_t boundary_position, int64_t ratio
     return (boundary_position / ratio) * ratio;
 }
 
+// ---------------------------------------------------------------------------
+// Lightning indexer — Step 2.4.3
+//
+// Reference: `sglang/.../srt/layers/attention/dsv4/indexer.py`
+//   `fp8_paged_mqa_logits_torch` / the SM120 variant, lines 100-126 / 245-267.
+// The whole scoring path there is five readable lines:
+//
+//     score  = bmm(kv_value, q.transpose)      # [B, candidates, n_heads]
+//     score  = F.relu(score)                   # <-- per HEAD, before weighting
+//     score  = score * weight.unsqueeze(1)     # per-head weight, broadcast
+//     score  = score.sum(dim=2)                # sum over heads
+//     score  = score * kv_scale                # per-key scale (fp8 store)
+//
+// In closed form
+//
+//     score[c] = kv_scale[c] · Σ_h w[h] · relu( q[h] · k[c] )
+//
+// THE RELU IS ON THE PER-HEAD DOT, BEFORE THE WEIGHTING — not on the sum, and
+// not after the weight. This is trap 11, and it is easy to omit precisely
+// because the result still looks like a plausible attention score.
+//
+// Scales, from `C4Indexer.__init__` `[V indexer.py:1034, 1075]`:
+//   softmax_scale = head_dim**-0.5        = 1/sqrt(128)   (the INDEX head)
+//   weight_scale  = softmax_scale·n_heads**-0.5 = 1/sqrt(128·64)
+// The pipeline passes the two factors separately rather than their product,
+// which is algebraically identical; the oracle takes them separately too so the
+// gate exercises the same decomposition.
+//
+// HADAMARD. Upstream applies a `1/sqrt(n)` Hadamard rotation to indexer Q and K
+// before quantization in some paths, and explicitly **drops it in the fused
+// path**, labelled *"(logit-preserving)"* `[V dsa_indexer.py:395-398]`. It is a
+// conditioning step for the fp8 round-trip, not a graph semantic: because the
+// rotation is orthogonal, rotating *both* Q and K leaves every dot product
+// unchanged. `hadamard_rotated` below exists so a gate can *measure* that claim
+// instead of repeating it — and can show that a one-sided application, which
+// would silently change every score, is the failure mode to avoid.
+// ---------------------------------------------------------------------------
+
+// Normalized Sylvester–Hadamard transform, in place, `n` a power of two.
+// Orthogonal: `H·Hᵀ = I`, which is exactly why a two-sided rotation is
+// score-preserving.
+inline std::vector<double> hadamard_rotated(std::vector<double> x) {
+    const size_t n = x.size();
+    for (size_t step = 1; step < n; step *= 2) {
+        for (size_t i = 0; i < n; i += 2 * step) {
+            for (size_t j = 0; j < step; ++j) {
+                const double a = x[i + j];
+                const double b = x[i + j + step];
+                x[i + j] = a + b;
+                x[i + j + step] = a - b;
+            }
+        }
+    }
+    const double norm = 1.0 / std::sqrt(static_cast<double>(n));
+    for (double& v : x) v *= norm;
+    return x;
+}
+
+// Rotates each `head_dim`-wide head of a `[heads, head_dim]` row independently.
+inline std::vector<double> hadamard_rotate_heads(const std::vector<double>& x,
+                                                 size_t num_heads, size_t head_dim) {
+    std::vector<double> out(x.size());
+    for (size_t h = 0; h < num_heads; ++h) {
+        const std::vector<double> head(x.begin() + h * head_dim,
+                                       x.begin() + (h + 1) * head_dim);
+        const std::vector<double> rotated = hadamard_rotated(head);
+        for (size_t d = 0; d < head_dim; ++d) out[h * head_dim + d] = rotated[d];
+    }
+    return out;
+}
+
+// `apply_relu` is not a feature — like `transpose_comb` in `hc_post`, it exists
+// so a gate can compute the *wrong* variant deliberately and demonstrate that
+// the difference is real. Nothing in the graph passes `false`.
+inline std::vector<double> indexer_scores(const std::vector<double>& query,
+                                          const std::vector<double>& key,
+                                          const std::vector<double>& weights,
+                                          size_t num_heads, size_t head_dim,
+                                          double softmax_scale, double head_scale,
+                                          bool apply_relu = true) {
+    const size_t candidates = key.size() / head_dim;
+    std::vector<double> scores(candidates, 0.0);
+    for (size_t c = 0; c < candidates; ++c) {
+        double acc = 0.0;
+        for (size_t h = 0; h < num_heads; ++h) {
+            double dot = 0.0;
+            for (size_t d = 0; d < head_dim; ++d) {
+                dot += query[h * head_dim + d] * key[c * head_dim + d];
+            }
+            const double rectified = apply_relu ? std::fmax(dot, 0.0) : dot;
+            acc += rectified * weights[h] * softmax_scale * head_scale;
+        }
+        scores[c] = acc;
+    }
+    return scores;
+}
+
+// Top-k by descending score, ties broken to the **lower index** (trap 18). Ties
+// are broken by index rather than left to the sort, so the selection is
+// deterministic — the same rule the plan states for the router.
+inline std::vector<int32_t> topk_indices(const std::vector<double>& scores, size_t k) {
+    std::vector<int32_t> order(scores.size());
+    for (size_t i = 0; i < scores.size(); ++i) order[i] = static_cast<int32_t>(i);
+
+    std::stable_sort(order.begin(), order.end(),
+                     [&scores](int32_t a, int32_t b) {
+                         const double sa = scores[static_cast<size_t>(a)];
+                         const double sb = scores[static_cast<size_t>(b)];
+                         if (sa != sb) return sa > sb;
+                         return a < b;
+                     });
+
+    const size_t take = std::min(k, order.size());
+    order.resize(take);
+    return order;
+}
+
 } // namespace aeon::reference

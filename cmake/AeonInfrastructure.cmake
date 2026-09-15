@@ -130,6 +130,10 @@ if(AEON_BUILD_TESTS)
     # the window length, the two-segment overlap mapping, and the RoPE position.
     aeon_add_test(test_v4_compressor_oracle
         SOURCES tests/test_v4_compressor_oracle.cpp)
+
+    # Step 2.4.3 — lightning indexer + top-k, and the Gate 11 measurement that
+    # settles the Hadamard rotation question empirically.
+    aeon_add_test(test_v4_indexer_oracle SOURCES tests/test_v4_indexer_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------

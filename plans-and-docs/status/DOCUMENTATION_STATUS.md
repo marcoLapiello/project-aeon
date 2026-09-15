@@ -38,11 +38,11 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 25 infrastructure/backend/text/kept-component/Tier-1 tests |
-| Legacy `ctest` | 27 (the 25 plus 2 gated parity anchors) |
+| Default `ctest` | 26 infrastructure/backend/text/kept-component/Tier-1 tests |
+| Legacy `ctest` | 28 (the 26 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
-| Tier 1 | Certified: **RMSNorm**, **RoPE** (both bases), **MLA Q/KV**, **HC project + Sinkhorn** (found a transposed comb index in the plan), **attention + sink + softmax**, **compressor + APE** (both ratio classes). Next: indexer + top-k, grouped output, router, MoE |
+| Tier 1 | Certified: **RMSNorm**, **RoPE** (both bases), **MLA Q/KV**, **HC + Sinkhorn** (found a transposed comb index in the plan), **attention + sink + softmax**, **compressor + APE** (both ratio classes), **indexer + top-k** (found the ReLU missing from the kernel). Next: grouped output, router, MoE |
 
 ---
 
@@ -99,10 +99,9 @@ and gate harness first, then the Tier 1 primitives, then the layer body, then
 compare identical formatted inputs, intermediate checkpoints, and final logits
 against a trusted compatible reference before any placement work.
 
-Four gates are settled empirically, not by reading — they are specified in the
-plan and must be measured:
+Four gates are settled empirically, not by reading. **One is now closed; three remain:**
 
-1. Indexer Hadamard rotation — apply or not (must be symmetric over Q/K).
+1. ~~Indexer Hadamard rotation — apply or not (must be symmetric over Q/K).~~ **SETTLED at Gate 11: do not apply it.** Two-sided is a no-op to `3.6e-16`; one-sided shifts scores by `1.46`. See 2.4.3.
 2. KV fp8/E4M3 vs bf16 storage delta.
 3. MoE routed-expert accumulation order.
 4. Local-window prefix-reuse boundary behaviour.
