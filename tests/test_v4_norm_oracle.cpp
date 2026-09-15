@@ -171,6 +171,69 @@ int main() {
     }
     ok &= report("rmsnorm (unit)", aeon::reference::compare(ref, widen(h_y)));
 
+    // --- Low-magnitude input: where `eps` is load-bearing ---------------------
+    //
+    // Found by mutation testing, not by review. With unit-scale input the eps
+    // shifts `inv_rms` by ~5e-7 relative, which is *below* one fp16 ulp, so a
+    // kernel with the eps deleted is bit-identical to a correct one and this gate
+    // passed it. The eps exists for exactly the case the first version did not
+    // test: an input whose RMS is comparable to `eps` itself.
+    //
+    // Scaling by 2^-10 makes mean(x^2) ~ 1e-6 = eps, so `rsqrt(rms^2)` and
+    // `rsqrt(rms^2 + eps)` differ by a factor of ~sqrt(2). That is not a
+    // tolerance question; it is a 40% error, and it is caught outright.
+    {
+        const double kShrink = 1.0 / 1024.0;
+        std::vector<__half> h_small(kCount);
+        for (size_t i = 0; i < kCount; ++i) {
+            h_small[i] = __float2half(static_cast<float>(x_src[i] * kShrink));
+        }
+        const std::vector<double> x_small = widen(h_small);
+
+        CHECK_HIP(hipMemcpy(d_x, h_small.data(), kCount * sizeof(__half),
+                            hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemset(d_y, 0, kCount * sizeof(__half)));
+        aeon::kernel::v4_rmsnorm_wave32_kernel<<<kRows, 32>>>(d_x, d_w, d_y, kDim, kEps);
+        CHECK_HIP(hipGetLastError());
+        CHECK_HIP(hipDeviceSynchronize());
+        CHECK_HIP(hipMemcpy(h_y.data(), d_y, kCount * sizeof(__half),
+                            hipMemcpyDeviceToHost));
+
+        for (int r = 0; r < kRows; ++r) {
+            const std::vector<double> row_in(
+                x_small.begin() + static_cast<size_t>(r) * kDim,
+                x_small.begin() + static_cast<size_t>(r + 1) * kDim);
+            const std::vector<double> row_out = aeon::reference::rmsnorm(row_in, w, kEps);
+            for (int i = 0; i < kDim; ++i) ref[static_cast<size_t>(r) * kDim + i] = row_out[i];
+        }
+        ok &= report("rmsnorm (weighted, low RMS: eps is load-bearing)",
+                     aeon::reference::compare(ref, widen(h_y)));
+
+        // And confirm the regime really is discriminating: the eps-free oracle
+        // must differ from the eps-full one by far more than a rounding step.
+        std::vector<double> no_eps(kCount);
+        for (int r = 0; r < kRows; ++r) {
+            const std::vector<double> row_in(
+                x_small.begin() + static_cast<size_t>(r) * kDim,
+                x_small.begin() + static_cast<size_t>(r + 1) * kDim);
+            const std::vector<double> row_out = aeon::reference::rmsnorm(row_in, w, 0.0);
+            for (int i = 0; i < kDim; ++i) {
+                no_eps[static_cast<size_t>(r) * kDim + i] = row_out[i];
+            }
+        }
+        const ErrorStats s = aeon::reference::compare(ref, no_eps);
+        {
+            // A LARGE difference is the pass condition here: this line exists to
+            // prove the regime above can see the eps at all.
+            const bool discriminating = s.max_abs > 1e-3;
+            std::printf("  %-58s %-24s %s\n",
+                        "   (eps-free reading is distinguishable here)",
+                        ("max_abs = " + std::to_string(s.max_abs)).c_str(),
+                        discriminating ? "PASS" : "FAIL");
+            ok &= discriminating;
+        }
+    }
+
     CHECK_HIP(hipFree(d_x));
     CHECK_HIP(hipFree(d_w));
     CHECK_HIP(hipFree(d_y));

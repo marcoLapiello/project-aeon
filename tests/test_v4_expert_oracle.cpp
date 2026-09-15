@@ -368,6 +368,42 @@ int main() {
                         "max_abs = " + std::to_string(s.max_abs));
         }
 
+        // (2b) THE DEVICE must be on the asymmetric side of that fork.
+        //
+        //      Found by mutation testing. Every check above is either
+        //      oracle-vs-oracle (1, 3) or a relative comparison whose floor is
+        //      the probe's peak of ~1600 (2), and the whole asymmetric/symmetric
+        //      difference is at most `silu(-limit)*limit` = 4.5e-3. So a kernel
+        //      that clamps the gate symmetrically passed this gate completely.
+        //
+        //      The fix is a TARGETED comparison: restrict to the entries where
+        //      the two rules actually disagree — gate below -limit — because a
+        //      max_abs over the whole probe is dominated by the ~1600-magnitude
+        //      entries that both rules treat identically.
+        {
+            size_t differing = 0;
+            double worst_vs_right = 0.0, worst_vs_wrong = 0.0;
+            const std::vector<double> device_out = widen(out_h);
+            for (size_t i = 0; i < kSwigluCount; ++i) {
+                if (!(gate_d[i] < -kLimit)) continue;
+                ++differing;
+                const double wrong = aeon::reference::clamped_swiglu(
+                    widen(gate_h)[i], widen(up_h)[i], kLimit, ClampMode::Symmetric);
+                worst_vs_right = std::fmax(worst_vs_right, std::fabs(device_out[i] - want[i]));
+                worst_vs_wrong = std::fmax(worst_vs_wrong, std::fabs(device_out[i] - wrong));
+            }
+            // The tolerance is tied to the magnitude of the affected entries
+            // (~4.5e-3), not to the probe peak, so fp16 rounding on the large
+            // entries cannot mask the difference.
+            const double tol = 1e-5;
+            ok &= check("device follows the ASYMMETRIC rule at gate < -limit",
+                        differing > 0 && worst_vs_right < tol &&
+                            worst_vs_wrong > 100.0 * tol,
+                        std::to_string(differing) + " entries; vs asymmetric = " +
+                            std::to_string(worst_vs_right) + ", vs symmetric = " +
+                            std::to_string(worst_vs_wrong));
+        }
+
         // (3) State the asymmetry itself as a measurable, not just "the outputs
         //     differ": gate = -40 must NOT be clamped, while up = -40 must be.
         {
@@ -516,6 +552,31 @@ int main() {
             if (gate_below > 0) {
                 ok &= check("large: the asymmetric edge is observable",
                             sym_delta > 1e-5, engagement);
+
+                // ...and the DEVICE is on the asymmetric side of it. Same
+                // targeted comparison as section B, for the same reason: a
+                // max_abs over `hidden` is dominated by the ~40-magnitude
+                // entries, where the two rules agree, so it cannot see a
+                // symmetrically-clamped kernel. Restricting to gate < -limit
+                // isolates the entries that carry the information.
+                size_t differing = 0;
+                double worst_vs_right = 0.0, worst_vs_wrong = 0.0;
+                const std::vector<double> device_hidden = widen(hidden_h);
+                for (int i = 0; i < kW1Rows; ++i) {
+                    if (!(gu.gate[i] < -kLimit)) continue;
+                    ++differing;
+                    worst_vs_right = std::fmax(worst_vs_right,
+                                               std::fabs(device_hidden[i] - want_hidden[i]));
+                    worst_vs_wrong = std::fmax(worst_vs_wrong,
+                                               std::fabs(device_hidden[i] - sym_hidden[i]));
+                }
+                const double tol = 1e-4;
+                ok &= check("device follows the ASYMMETRIC rule (fused W13 kernel)",
+                            differing > 0 && worst_vs_right < tol &&
+                                worst_vs_wrong > 10.0 * tol,
+                            std::to_string(differing) + " entries; vs asymmetric = " +
+                                std::to_string(worst_vs_right) + ", vs symmetric = " +
+                                std::to_string(worst_vs_wrong));
             } else {
                 std::printf("  %-54s %-22s %s\n",
                             "large: asymmetric edge not reached (section B covers it)",

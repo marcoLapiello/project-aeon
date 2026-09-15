@@ -616,6 +616,8 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 >
 > **B. The clamped SwiGLU rule.** The device matches the asymmetric clamp to `9.1e-5`. The symmetric reading (gate clamped both sides) differs by `4.5e-3` absolute, and removing the clamp by `1500` — so the clamp is not decorative. The **asymmetry itself** is stated as a measurement, not inferred from "outputs differ": `gate = −40` is *not* clamped (`silu(−40) ≈ −1.7e-16`) while `up = −40` *is* (`0`), and the symmetric rule gives `−4.54e-4` for the same input. The probe data hits all three edges (16 above `+10`, 32 `|up| > 10`, 16 below `−10`) so the test cannot pass vacuously.
 >
+> **`[corrected by mutation testing]` The asymmetry claim above was initially WRONG, and this gate printed PASS while a symmetrically-clamped kernel went undetected.** Every assertion in this section was either oracle-vs-oracle (the `ClampMode` fork) or a relative comparison whose floor was the probe peak of ~1600, while the whole asymmetric/symmetric difference is capped at `silu(−limit)·limit = 4.5e-3`. Two kernels were affected — this one and the fused W13 path. The gate now restricts comparison to the entries where the two rules actually disagree (`gate < −limit`) and requires the device to match the asymmetric oracle there by an absolute margin; measured separation after repair is `0.000000` vs `0.004540`, and injecting either mutation now fails the gate. The general rule is in "Mutation testing" above: **a gate that prints PASS is not evidence until a wrong kernel has been shown to fail it.**
+>
 > **C. The composed routed FFN.** Fused W13 + SwiGLU + W2 matches the fp64 oracle on hidden (`3.1e-4`) and on the 4096-wide output (`3.5e-4` moderate, `2.6e-4` at 8× activation).
 >
 > **D. Real artifact bytes.** `layers.3` expert 17: W1 matches the decoder to `2.9e-4` and the full FFN to `4.0e-4`, with 87% of W1 weights non-zero (a degenerate payload would pass every comparison trivially). This section is what makes A–C more than an internal consistency check — A–C build their payloads with an encoder written from the same format description as the decoder, so that pair is self-consistent by construction, and only artifact bytes prove the description matches what the converter wrote.
@@ -808,6 +810,38 @@ Build and certify in this order. Each item's gate must be green before the next 
 ### Anti-circularity rule
 
 An oracle that shares code with the kernel tests only self-consistency. **Every Tier-1 gate must compare against an oracle written from the architecture description, independently of the kernel under test.** This is the specific defect that allowed the previous implementation's tests to pass on wrong logic.
+
+### Mutation testing — the second rule (added after Tier 1)
+
+The anti-circularity rule removes one failure mode: the oracle agreeing with the kernel because they are the same code. It does **not** remove two others:
+
+1. the oracle and the plan both being *my* reading of the reference, so a consistent misreading passes every gate;
+2. a gate whose **tolerance or metric cannot see** the difference it is supposedly certifying.
+
+Rule 2 is not hypothetical — it happened, and only mutation testing found it. The procedure is therefore now part of the method: **for each certified property, inject the specific wrong variant into the *kernel* and require the gate to go red.** A mutation that survives is either (a) a gate defect to repair, or (b) an equivalent mutation to be named as such. It is never ignored.
+
+Ten mutations were run across nine kernels (2026-09-15, `gfx1100`). **Eight were killed, one is provably equivalent, and zero remain unclassified.**
+
+| # | Mutation (injected into the kernel) | Gate | Result |
+| :-- | :--- | :--- | :--- |
+| M0 | `v4_indexer_scores_kernel`: ReLU removed | indexer | **Killed** — `max_rel 0.98`, 65/512 indices (control; reproduces the shipped bug) |
+| M1 | `v4_rmsnorm_*`: `eps` deleted | norm | **SURVIVED** → gate repaired → **killed** |
+| M2 | `v4_rope_*`: rotate head, not tail | rope | **Killed** — including the `[0,448)` bit-identical assertion |
+| M4 | `v4_sliding_window_attn_*`: sink removed from the max | attention | **Equivalent** (see below) |
+| M5 | `hc_sinkhorn`: comb uses `hc_scale[1]` instead of `[2]` | HC | **Killed** — `comb[16] max_abs 0.27` |
+| M6 | `v4_save_compressor_state`: APE term dropped | compressor | **Killed** — 4 lines red |
+| M7 | `v4_grouped_wo_a_*`: `wo_a` read interleaved | grouped out | **Killed** — `max_rel 1.38` |
+| M8 | `moe_router_kernel`: bias on the logit, not the score | router | **Killed** — 8/8 tokens re-route |
+| M9 | `v4_pipeline_swiglu_clamp_kernel`: symmetric gate clamp | expert §B | **SURVIVED** → gate repaired → **killed** |
+| M9b | `aeon_swiglu_clamped` (fused W13): symmetric gate clamp | expert §C | **SURVIVED** → gate repaired → **killed** |
+
+**The M9/M9b finding was the important one, and it contradicted a claim this plan's own gate report made.** Item 14's gate was reported as certifying the asymmetric clamp rule. It did not: every assertion it made was either *oracle-vs-oracle* (the `ClampMode` fork) or a **relative** comparison whose floor was the probe's peak of ~1600, while the entire asymmetric/symmetric difference is bounded by `silu(−limit)·limit` = `4.5e-3`. A kernel that clamped the gate symmetrically passed the gate completely — in both the standalone and the fused form. The claim was wrong, and review would not have caught it because the gate printed `PASS`.
+
+The repair is a **targeted comparison**: select only the entries where the two rules actually disagree (`gate < −limit`) and require the device to match the asymmetric oracle there, by an absolute margin. A `max_abs` over the whole vector cannot express this, because it is dominated by entries the two rules treat identically. Measured after repair: `vs asymmetric = 0.000000` / `0.000002`, `vs symmetric = 0.004540` — roughly 2000× separation, and each check trips only on its own kernel.
+
+**M1 was a coverage gap, not a wrong assertion.** At unit-scale input the `eps` moves `inv_rms` by ~5e-7 relative, below one fp16 ulp, so an eps-free kernel is *bit-identical* — the gate was correct and the data could not exercise it. The repair adds a low-RMS regime (input scaled by 2⁻¹⁰, making `mean(x²) ≈ eps`), where the difference is a factor of ~√2. Re-measured: `max_abs 0.89` versus `2.4e-4` before.
+
+**M4 is a provably equivalent mutation, and that is itself a result: it confirms trap 35 by experiment rather than assertion.** Removing the sink from the max can only change a result when `sink > max(score)`. In that regime the output is `exp(s_i − sink)·v_j / (1 + Σ exp(...) − sink)` either way — algebraically identical — and when the exponent overflows, the numerator stays finite while the denominator goes to `inf`, so the output is `0` and the correct path also returns `≈0`. There is no input for which the two differ observably. The property is real (it prevents the exponent from going positive) and it is genuinely untestable from the output. Do not "fix" a gate to catch it; record that it cannot be caught.
 
 ---
 

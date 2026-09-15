@@ -42,7 +42,7 @@ reference code; every remaining unknown names the gate that settles it.
 | Legacy `ctest` | 32 (the 30 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
-| Tier 1 | **COMPLETE — all 11 primitives certified.** RMSNorm, RoPE (both bases), MLA Q/KV, HC + Sinkhorn, attention + sink + softmax, compressor + APE, indexer + top-k, grouped output projection, MoE router, routed expert, shared expert. Four real findings: a transposed comb index in the plan, the indexer ReLU missing from the kernel, the plan's normalization-guard claim being wrong, and the combine-order claim describing only the unfused path. Next: Tier 2 — the layer body |
+| Tier 1 | **COMPLETE — all 11 primitives certified, then mutation-tested.** RMSNorm, RoPE (both bases), MLA Q/KV, HC + Sinkhorn, attention + sink + softmax, compressor + APE, indexer + top-k, grouped output projection, MoE router, routed expert, shared expert. Four real findings: a transposed comb index in the plan, the indexer ReLU missing from the kernel, the plan's normalization-guard claim being wrong, and the combine-order claim describing only the unfused path. **Mutation testing then found two gate defects that review and a green suite had both missed** (see the plan's "Mutation testing" section): the clamp-rule gates could not see a symmetrically-clamped kernel, and the RMSNorm gate could not see a deleted `eps`. 10 mutations: 8 killed, 1 provably equivalent, 0 unclassified. Next: Tier 2 — the layer body |
 
 ---
 
