@@ -3,13 +3,28 @@
     "configurePresets": [
         {
             "name": "rocm-hipcc",
-            "displayName": "ROCm hipcc (gfx1100)",
+            "displayName": "ROCm hipcc (gfx1100) — rewrite",
+            "description": "Default build for the graph rewrite. The legacy V4 graph is excluded.",
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/build",
             "cacheVariables": {
                 "CMAKE_CXX_COMPILER": "/usr/bin/hipcc",
                 "ROCM_PATH": "/opt/rocm",
-                "AEON_GPU_TARGET": "gfx1100"
+                "AEON_GPU_TARGET": "gfx1100",
+                "AEON_ENABLE_LEGACY_V4_GRAPH": "OFF"
+            }
+        },
+        {
+            "name": "rocm-hipcc-legacy",
+            "displayName": "ROCm hipcc (gfx1100) — legacy graph",
+            "description": "Reference build that also compiles the pre-rewrite DeepSeek-V4 graph and its tests. Use only to re-derive a specific value from the old path.",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build-legacy",
+            "cacheVariables": {
+                "CMAKE_CXX_COMPILER": "/usr/bin/hipcc",
+                "ROCM_PATH": "/opt/rocm",
+                "AEON_GPU_TARGET": "gfx1100",
+                "AEON_ENABLE_LEGACY_V4_GRAPH": "ON"
             }
         }
     ]
