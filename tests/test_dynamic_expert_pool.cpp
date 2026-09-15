@@ -3,7 +3,6 @@
 #include "platform/rdna3/device.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 #include "architecture/deepseek_v4/core/memory_budget.hpp"
-#include "architecture/deepseek_v4/core/v4_pipeline.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 
 #include <cassert>
@@ -140,42 +139,11 @@ int main() {
     std::cout << "  > [PASSED] Opaque future-format payload storage and view guard verified!\n";
 
     // -------------------------------------------------------------------------
-    // Test 5: End-to-End V4Pipeline with Global Unified Pool on Physical Silicon
+    // NOTE: the former Test 5 drove a full-model `V4Pipeline` step and
+    // generation to exercise the global pool end to end. It was removed with the
+    // pre-rewrite graph (branch `rewrite/graph-v2`); the graph no longer exists,
+    // and this file now validates the budget engine and pool in isolation.
     // -------------------------------------------------------------------------
-    std::cout << "\n[Test 5] Initializing end-to-end full-model V4Pipeline with Global Unified Pool..." << std::endl;
-    aeon::core::V4Pipeline pipeline;
-    aeon::core::AeonRuntimeConfig pipeline_cfg;
-    pipeline_cfg.context_size = 4096;
-    pipeline_cfg.warm_host_bytes = 0; // Warm disabled
-
-    pipeline.initialize(aeon_model_dir, pipeline_cfg);
-
-    // Run forward step (token 1, pos 0)
-    std::cout << "\n  > Executing forward step on Global Unified Pool..." << std::endl;
-    uint32_t next_tok = pipeline.step(1, 0);
-    std::cout << "  > Output next token: " << next_tok << std::endl;
-    assert(next_tok < 129280);
-
-    // Multi-token generation
-    std::cout << "  > Running multi-token autoregressive generation (4 new tokens)..." << std::endl;
-    std::vector<uint32_t> prompt = {1, 100, 256};
-    double ttft_ms = 0.0;
-    double tok_sec = 0.0;
-    auto gen = pipeline.generate(prompt, 4, &ttft_ms, &tok_sec);
-
-    std::cout << "  > Generated tokens: [";
-    for (size_t i = 0; i < gen.size(); ++i) {
-        std::cout << gen[i] << (i + 1 < gen.size() ? ", " : "");
-    }
-    std::cout << "]" << std::endl;
-    assert(gen.size() == 4);
-    for (auto t : gen) assert(t < 129280);
-
-    // Check registry hit statistics
-    std::cout << "  > Global Pool Registry Stats: Hot Hits=" << pipeline.expert_registry_->hits_hot
-              << ", Warm Hits=" << pipeline.expert_registry_->hits_warm
-              << ", Cold Misses=" << pipeline.expert_registry_->misses_cold << std::endl;
-    assert(pipeline.expert_registry_->hits_hot > 0);
 
     std::cout << "\n================================================================================" << std::endl;
     std::cout << "  [SUCCESS] Dynamic memory budget and global pool validation passed on silicon!" << std::endl;

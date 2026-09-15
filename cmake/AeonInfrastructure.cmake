@@ -72,6 +72,9 @@ endif()
 
 # --- Expert supply and telemetry ---------------------------------------------
 if(AEON_BUILD_TESTS)
+    # Dynamic memory budget and global hot pool.
+    aeon_add_test(test_dynamic_expert_pool SOURCES tests/test_dynamic_expert_pool.cpp)
+
     # Persistent Warm ownership, pending transfers, and leases.
     aeon_add_test(test_expert_registry_warm_state SOURCES tests/test_expert_registry_warm_state.cpp)
 
@@ -80,4 +83,22 @@ if(AEON_BUILD_TESTS)
 
     # Routing profile parser and checkpoint validation.
     aeon_add_test(test_routing_profile SOURCES tests/test_routing_profile.cpp)
+endif()
+
+# --- Kept model-side components ----------------------------------------------
+# These validate components the rewrite keeps, against references written
+# independently of the code under test. They are promoted out of the legacy gate
+# because they are not coupled to the pre-rewrite layer schedule.
+if(AEON_BUILD_TESTS)
+    # Checkpoint contract: 43-layer schedule, tensor names and shapes, hash/biased
+    # router split. Validates the artifact, not the graph.
+    aeon_add_test(test_v4_model_contract SOURCES tests/test_v4_model_contract.cpp)
+
+    # Dual-mode MoE router: sqrt(softplus) scoring, bias on scores, hash layers
+    # with no bias, flat top-6. Matches the reference (Tier 0.2d).
+    aeon_add_test(test_moe_router SOURCES tests/test_moe_router.cpp)
+
+    # Hyper-Connections Sinkhorn and stream expansion, against an inline host
+    # reference. Covers the 3-entry HC scale.
+    aeon_add_test(test_hc_sinkhorn SOURCES tests/test_hc_sinkhorn.cpp)
 endif()

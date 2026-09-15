@@ -52,55 +52,62 @@ validation. The bounded Hot/Warm/Cold path is implemented, while physical layout
 cold-cache measurement, and latency-hiding acceptance remain open in
 [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md).
 
-## Active production validation
+## Active validation (default `ctest` — 18 tests)
 
-These targets exercise the current `.aeon` and three-tier direction and should be
-kept prominent while Phase 2 is in progress:
+These targets do not depend on the model graph and are built on every branch. They
+validate the artifact format, the storage tiers, the W4A16 kernels, the text front
+end, and the kept model-side components (contract, router, HC Sinkhorn).
 
 - `tests/test_aeon_loader.cpp`
 - `tests/test_aeon_swizzled_loader.cpp`
 - `tests/test_dynamic_expert_pool.cpp`
-- `tests/bench_full_model.cpp`
 - `tests/test_model_direct_io.cpp`
-- `tests/test_hot_warm_cold_pipeline.cpp`
 - `tests/test_dsv4_tokenizer.cpp`
 - `tests/test_dsv4_chat_formatter.cpp`
 - `tests/test_text_generation.cpp`
-- `tools/profile_routing.cpp` / `profile_routing`
-- `tools/aeon_chat.cpp` / `aeon_chat`
-
-`tests/bench_full_model.cpp` is a benchmark, not a correctness test. Its results
-belong in `PERFORMANCE_LEDGER.md` only when a run completes with clearly recorded
-conditions.
-
-## Regression coverage for completed work
-
-These targets validate pieces that are already part of the engine and should remain
-as regression tests, even though they are not runtime binaries:
-
 - `tests/test_swiglu_clamp.cpp`
 - `tests/test_hc_sinkhorn.cpp`
+- `tests/test_moe_router.cpp`
+- `tests/test_v4_model_contract.cpp`
 - `tests/test_w4a16_swizzle.cpp`
 - `tests/test_w4a16_swizzled_gemv.cpp`
 - `tests/test_w4a16_swizzled_dual_gemv.cpp`
-- `tests/test_aeon_moe_fused_w13.cpp`
 - `tests/test_aeon_moe_fused_w2.cpp`
-- `tests/test_moe_router.cpp`
-- `tests/test_v4_attention.cpp`
+- `tests/test_expert_registry_warm_state.cpp`
+- `tests/test_supply_telemetry.cpp`
+- `tests/test_routing_profile.cpp`
 
-These are registered with CTest and protect current production contracts while
-providing smaller failure surfaces when the integrated pipeline changes.
+`tests/bench_model_direct_io.cpp` is a benchmark, not a correctness test. Its
+results belong in `PERFORMANCE_LEDGER.md` only when a run completes with clearly
+recorded conditions.
+
+## Gated: legacy graph (`AEON_ENABLE_LEGACY_V4_GRAPH=ON`)
+
+Gated targets depend on the pre-rewrite graph. With the option OFF (the default)
+they are not configured, so `ctest` cannot see them.
+
+- `tests/test_v4_real_expert_parity.cpp` - fused expert kernels against the
+  independent `reference/v4_int4_reference.hpp`.
+- `tests/test_v4_real_dense_parity.cpp` - dense projections, HC and RMSNorm against
+  the same independent reference.
+- `tools/aeon_chat.cpp`, `tools/profile_routing.cpp`, `tools/aeon_model_contract.cpp`,
+  `tools/record_v4_gpu_evidence.cpp` - drive the old pipeline.
+
+The parity tests are not circular (their oracle is independently written), so they
+are retained as tier-0 anchors to re-derive before deletion. The rest of the
+pre-rewrite tests were deleted on 2026-09-15: the layer-schedule tests asserted a
+design that is being replaced, and `test_aeon_moe_fused_w13` and
+`test_v4_real_attention_oracle` compared a kernel against an oracle derived from
+the same helper.
 
 ## Manual diagnostics and benchmarks
 
 These targets are intentionally outside the default CTest suite because they are
-manual hardware diagnostics or measurements for open performance gates:
+manual hardware diagnostics or measurements:
 
 - `src/smoke.cpp` / `smoke_check` - compiler and HIP toolchain sanity check.
 - `tools/aeon_info.cpp` / `aeon_info` - hardware and topology inspection.
 - `tests/bench_model_direct_io.cpp` - model-backed cold-read request-shape benchmark.
-- `tests/bench_aeon_moe_fused_w13.cpp` - current fused expert-kernel measurement.
-- `tests/bench_full_model.cpp` - full 43-layer generation measurement.
 
 ## Offline scripts
 

@@ -45,71 +45,19 @@ aeon_add_executable(profile_routing
 # Opt-in full-model GPU evidence recorder (never a default CTest).
 aeon_add_executable(record_v4_gpu_evidence SOURCES tools/record_v4_gpu_evidence.cpp)
 
-# --- Legacy benchmarks -------------------------------------------------------
-aeon_add_benchmark(bench_full_model SOURCES tests/bench_full_model.cpp)
-
-# Six separate routed W1/W3/SwiGLU paths versus one fused dispatch.
-aeon_add_benchmark(bench_aeon_moe_fused_w13 SOURCES tests/bench_aeon_moe_fused_w13.cpp)
-
 # --- Legacy graph tests ------------------------------------------------------
-# NOTE: test_aeon_moe_fused_w13 and test_v4_real_attention_oracle compare a
-# kernel against an oracle derived from the same helper. They are circular and
-# are scheduled for deletion rather than migration.
+# The pre-rewrite layer-schedule tests and the circular kernel checks were
+# deleted with the graph (2026-09-15). What remains are the model-backed parity
+# tests: they load real checkpoint weights and compare against
+# `reference/v4_int4_reference.hpp`, which is written independently of the code
+# under test. They are kept gated because they exercise kernels the rewrite
+# audits, so they are not evidence about the new graph — but they are the closest
+# thing to a tier-0 anchor and are worth re-deriving before deleting.
 if(AEON_BUILD_TESTS)
-    # MoE router (bias placement, hash path, flat top-6).
-    aeon_add_test(test_moe_router SOURCES tests/test_moe_router.cpp)
-
-    # Hyper-Connections Sinkhorn and expansion.
-    aeon_add_test(test_hc_sinkhorn SOURCES tests/test_hc_sinkhorn.cpp)
-
-    # Six-expert fused W1/W3 plus clamped SwiGLU (compares against v4_pipeline_ops).
-    aeon_add_test(test_aeon_moe_fused_w13 SOURCES tests/test_aeon_moe_fused_w13.cpp)
-
-    # Model contract and layer schedule.
-    aeon_add_test(test_v4_model_contract SOURCES tests/test_v4_model_contract.cpp)
-
-    # Sliding-window attention and rotary embeddings.
-    aeon_add_test(test_v4_attention SOURCES tests/test_v4_attention.cpp)
-
-    # Host oracle: sliding, ratio-4 CSA, ratio-128 HCA, state transitions.
-    aeon_add_test(test_v4_attention_oracle SOURCES tests/test_v4_attention_oracle.cpp)
-
-    # Model-backed host oracle: real layer 0/2/3 dense projections and traces.
-    aeon_add_test(test_v4_real_attention_oracle
-        SOURCES tests/test_v4_real_attention_oracle.cpp
-        TIMEOUT 120)
-
-    # Class-aware persistent attention state sizing (host).
-    aeon_add_test(test_v4_layer_state SOURCES tests/test_v4_layer_state.cpp)
-
-    # Persistent class-aware state allocation and reset (silicon).
-    aeon_add_test(test_v4_layer_state_device SOURCES tests/test_v4_layer_state_device.cpp)
-
-    # Serial compressor, indexer, and mixed attention primitives (silicon).
-    aeon_add_test(test_v4_class_attention_device SOURCES tests/test_v4_class_attention_device.cpp)
-
-    # Serial C4A/C128A boundary dispatch.
-    aeon_add_test(test_v4_stage4_dispatch SOURCES tests/test_v4_stage4_dispatch.cpp)
-
-    # HIP attention traces versus the CPU oracle.
-    aeon_add_test(test_v4_stage4_trace
-        SOURCES tests/test_v4_stage4_trace.cpp
-        TIMEOUT 300)
-
-    # Serialized and chunked prefill state equivalence.
-    aeon_add_test(test_v4_prefill_state
-        SOURCES tests/test_v4_prefill_state.cpp
-        TIMEOUT 900)
-
-    # Real INT4 expert parity (Stage 1).
+    # Real INT4 expert parity: fused kernels versus the independent reference.
     aeon_add_test(test_v4_real_expert_parity SOURCES tests/test_v4_real_expert_parity.cpp)
 
-    # Real dense projection parity (Stage 1).
+    # Real dense projection parity: wq_a/wq_b/wo_a/wo_b, HC, RMSNorm versus the
+    # independent reference. Depends on kernels/v4_attention.hpp.
     aeon_add_test(test_v4_real_dense_parity SOURCES tests/test_v4_real_dense_parity.cpp)
-
-    # Dynamic memory budget and global hot pool (pulls core/v4_pipeline.hpp).
-    aeon_add_test(test_dynamic_expert_pool SOURCES tests/test_dynamic_expert_pool.cpp)
-
-    # End-to-end hot/warm initialization and cold streaming (drives the pipeline).
-    aeon_add_test(test_hot_warm_cold_pipeline SOURCES tests/test_hot_warm_cold_pipeline.cpp)
 endif()

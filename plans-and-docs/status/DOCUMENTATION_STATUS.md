@@ -38,8 +38,8 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 14 infrastructure/backend/text tests |
-| Legacy `ctest` | 31 tests, only with the gate ON |
+| Default `ctest` | 18 infrastructure/backend/text/kept-component tests |
+| Legacy `ctest` | 20 (the 18 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Next | Tier 1 primitives, beginning with the oracle and gate harness |
 
@@ -121,3 +121,9 @@ all remain open and are unaffected by the correctness rewrite.
   `execution/superseded/` or `analysis/historical/`.
 - **Do not add a fourth place to record state.** Measurements go in the ledger,
   the implementation sequence in the plan, navigation here.
+- **Target availability.** The rewrite deleted several pre-rewrite test targets
+  (`bench_full_model`, `test_hot_warm_cold_pipeline`, the `test_v4_stage*` /
+  `attention*` / `layer_state*` families, `test_aeon_moe_fused_w13`,
+  `bench_aeon_moe_fused_w13`). Older plans and ledger evidence lines still name
+  them, which is correct for historical records but **not** for instructions.
+  [CODEBASE_MAP.md](CODEBASE_MAP.md) is authoritative for what actually builds.
