@@ -290,6 +290,30 @@ uint32_t Dsv4Tokenizer::thinking_end_token_id() const {
     return thinking_end_token_id_;
 }
 
+bool Dsv4Tokenizer::has_added_token(std::string_view content) const {
+    if (!loaded_) {
+        throw std::runtime_error("Tokenizer is not loaded");
+    }
+    return added_content_to_id_.find(std::string(content)) != added_content_to_id_.end();
+}
+
+std::string Dsv4Tokenizer::added_token_text(std::string_view content) const {
+    if (!loaded_) {
+        throw std::runtime_error("Tokenizer is not loaded");
+    }
+    const auto found = added_content_to_id_.find(std::string(content));
+    if (found == added_content_to_id_.end()) {
+        throw std::runtime_error("Tokenizer does not define special token: " + std::string(content));
+    }
+    const uint32_t id = found->second;
+    for (const AddedToken& token : added_tokens_) {
+        if (token.id == id) {
+            return token.content;
+        }
+    }
+    throw std::runtime_error("Tokenizer added-token table is inconsistent for: " + std::string(content));
+}
+
 uint32_t Dsv4Tokenizer::token_id(std::string_view content) const {
     if (!loaded_) {
         throw std::runtime_error("Tokenizer is not loaded");

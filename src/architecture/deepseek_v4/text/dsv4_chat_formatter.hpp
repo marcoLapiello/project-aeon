@@ -1,5 +1,6 @@
 #pragma once
 
+#include "architecture/deepseek_v4/text/dsv4_prompt_encoder.hpp"
 #include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
 
 #include <cstdint>
@@ -12,11 +13,6 @@ enum class Dsv4MessageRole {
     System,
     User,
     Assistant,
-};
-
-enum class Dsv4ThinkingMode {
-    Chat,
-    Thinking,
 };
 
 struct Dsv4Message {

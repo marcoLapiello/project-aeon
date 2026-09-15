@@ -32,6 +32,7 @@ aeon_add_executable(aeon_chat
         tools/aeon_chat.cpp
         src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
         src/architecture/deepseek_v4/text/dsv4_chat_formatter.cpp
+        src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp
         src/infrastructure/text/text_generation.cpp)
 
 # Stage 0 evidence: model contract and dense tensor inventory.

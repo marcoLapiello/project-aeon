@@ -196,38 +196,46 @@ point; it is the independent oracle Step 0 currently lacks.
 A pass/fail per vector, plus the exact rendered diff for any failure. A green Stage B means the
 graph's first step is trustworthy.
 
-### B.5 Status: harness built, first result recorded (2026-09-15)
+### B.5 Status: **PASS — 4/4 vectors byte-identical** (2026-09-15)
 
-The oracle is implemented and running: `tests/test_dsv4_prompt_encoding_oracle.cpp`, registered as
-`test_dsv4_prompt_encoding_oracle` in the default `ctest`. It locates the vectors by searching for
-`encoding/tests` under the model directory (the snapshot hash is not fixed), renders each vector
-through `Dsv4ChatFormatter`, and compares byte-for-byte. It distinguishes **FAIL** (we can represent
-the input and render it wrong) from **BLOCKED** (the input needs surface the formatter cannot
-express). While Step 0 is incomplete it exits 0 when nothing FAILs, so the suite stays green; pass
-`--strict` to make BLOCKED a hard failure once Step 0 is declared complete.
+Implemented as `src/architecture/deepseek_v4/text/dsv4_prompt_encoder.{hpp,cpp}`, verified by
+`tests/test_dsv4_prompt_encoding_oracle.cpp` (`test_dsv4_prompt_encoding_oracle` in the default
+`ctest`). The harness locates `encoding/tests` by search (the snapshot hash is not fixed), renders
+each vector, and compares byte-for-byte.
 
-First run, against the artifact's vectors:
+| Vector | Mode | Result |
+| :--- | :--- | :--- |
+| 1 | thinking + tools | **PASS** byte-identical |
+| 2 | thinking, no tools | **PASS** byte-identical |
+| 3 | thinking + developer + latest_reminder + tools | **PASS** byte-identical |
+| 4 | chat + latest_reminder + task | **PASS** byte-identical |
 
-| Vector | Mode | Result | Reason |
-| :--- | :--- | :--- | :--- |
-| 1 | thinking + tools | **BLOCKED** | top-level `tools` rendering, `tool_calls`, and the `tool` role are unimplemented |
-| 2 | thinking, no tools | **PASS** | byte-identical |
-| 3 | thinking + developer + tools | **BLOCKED** | `latest_reminder`, `developer`, `tool` roles; formatter throws (no user message) |
-| 4 | chat + task | **BLOCKED** | `latest_reminder` role and `task` messages; diverges at the reminder token |
+Interim finding worth keeping: the first run scored **1/4**, with the basic skeleton already correct
+and the gap exactly the extended surface (tools, `developer`, `latest_reminder`, `task`, `mask`, the
+`tool` role). That is the value of having an oracle before the implementation — the missing surface
+was diagnosed rather than discovered later through a mysteriously different prefix.
 
-**What this establishes.** The **basic skeleton is correct**: system/user/assistant with thinking
-mode, reasoning rendering and `drop_thinking` reproduce the reference exactly (vector 2). The gap is
-entirely the extended surface — tools, `developer`, `latest_reminder`, `task`, `mask`, and the
-`tool` role — which matches the missing-surface list in the graph plan's Step 0 (Tier 0.2e). Two
-concrete consequences for Step 0:
+### B.6 What the port needed (useful if the template is ever extended)
 
-- `Dsv4MessageRole` needs `Developer`, `LatestReminder`, and `Tool`; `Dsv4Message` needs `tools`,
-  `tool_calls`, `task` and `mask`.
-- The formatter currently **throws** on a tool conversation with no user message (vector 3). That
-  guard is correct for a chat turn but wrong for tool/agent history, which has no user message.
+Three things were not obvious and are worth recording:
 
-This is the first step in the rewrite where an independent oracle exists before the implementation,
-which is the point of the Tier-1 earning order.
+1. **An order-preserving JSON codec.** Tool schemas are embedded in the prompt as
+   `json.dumps(value, ensure_ascii=False)`. The shared `core/json.hpp` cannot produce that: its
+   object type is `std::map` (**sorted**, so `{"type","properties","required"}` re-emits wrong) and
+   its numbers are all `double` (**`-1` vs `-1.0` is lost**). Hence
+   `text/dsv4_prompt_json.hpp`, a small codec used only for prompt text. Objects are stored as two
+   parallel vectors because `std::pair` needs its members complete and `PromptJson` is necessarily
+   incomplete inside itself.
+2. **Structural tokens are resolved from the artifact tokenizer**, not hardcoded, via
+   `Dsv4Tokenizer::added_token_text` / `has_added_token`. A renamed or missing token then fails
+   loudly. All of `<｜User｜>`, `<｜Assistant｜>`, `<｜latest_reminder｜>`, the six `<｜task｜>` tokens
+   and `｜DSML｜` are present as added tokens in this artifact (verified).
+3. **`\xNN` escapes consume following hex digits.** `"\x9CAssistant"` parses one escape
+   (`0x9CA…` is not even valid). Token contents are assembled from adjacent literals for this reason.
+
+The renderer now has one implementation: `Dsv4ChatFormatter` is a thin, validated front door that
+converts and delegates to `Dsv4PromptEncoder`, so a simple chat turn and a tool history cannot
+diverge.
 
 ---
 

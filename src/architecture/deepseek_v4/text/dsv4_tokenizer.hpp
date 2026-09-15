@@ -21,6 +21,13 @@ public:
     uint32_t thinking_end_token_id() const;
     uint32_t token_id(std::string_view content) const;
 
+    // Canonical text for a special/added token, as stored in the artifact. Throws
+    // if the artifact does not define it. The prompt encoder uses this so every
+    // structural token it emits is validated against this tokenizer rather than
+    // hardcoded.
+    std::string added_token_text(std::string_view content) const;
+    bool has_added_token(std::string_view content) const;
+
     std::vector<uint32_t> encode(std::string_view text) const;
     std::string decode(const std::vector<uint32_t>& token_ids, bool skip_special_tokens = false) const;
 
