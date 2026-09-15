@@ -41,6 +41,7 @@ reference code; every remaining unknown names the gate that settles it.
 | Default `ctest` | 18 infrastructure/backend/text/kept-component tests |
 | Legacy `ctest` | 20 (the 18 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
+| Step 0 oracle | The artifact ships its own encoder + 4 golden vectors — see checkpoint plan Stage B |
 | Next | Tier 1 primitives, beginning with the oracle and gate harness |
 
 ---
@@ -52,7 +53,7 @@ reference code; every remaining unknown names the gate that settles it.
 | Document | Purpose |
 | :--- | :--- |
 | [inference_pipeline_plan.md](../analysis/current/inference_pipeline_plan.md) | **The specification.** Evidence-tagged, cited step-by-step graph procedure with gates. Authoritative for semantics. |
-| [checkpoint_verification_plan.md](../analysis/current/checkpoint_verification_plan.md) | Independently falsifiable stages validating the source checkpoint, the INT4 transcode, and the `.aeon` repack. |
+| [checkpoint_verification_plan.md](../analysis/current/checkpoint_verification_plan.md) | **Checkpoint & artifact integrity.** Validates the input: structural audit, the prompt-encoder oracle (the artifact ships its own encoder + golden vectors), repack round-trip, streaming integrity. Deliberately does **not** compare against the original FP4 checkpoint — the graph is the goal, and the artifact is swappable. |
 | [deepseek_v4_flash_architecture.md](../analysis/current/deepseek_v4_flash_architecture.md) | Orientation overview of the model family. Not authoritative — defer to the plan. |
 
 ### Execution records (`execution/`)

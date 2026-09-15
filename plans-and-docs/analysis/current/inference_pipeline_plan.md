@@ -31,11 +31,20 @@ A `[V]` tag is only valid if the cited source is authoritative for **RDNA 3 + th
 | Rank | Source | Authoritative for | NOT authoritative for |
 |---|---|---|---|
 | 1 | `aeon-references/vllm` @ `94848ed`, `vllm/models/deepseek_v4/**` and `vllm/model_executor/layers/mhc.py` | **Graph semantics only** — op order and formulas | formats, kernels, batching, quantization, runtime |
+| 1b | **The artifact's own `encoding/encoding_dsv4.py`** + 4 golden vectors | **Prompt encoding (Step 0) only** — see 2 below | the graph |
 | 2 | our `config.json` + `.aeon` index | **Parameters** — dims, thetas, ratios, limits | op semantics |
 | 3 | `aeon-references/ds4` @ `6289c51` | **Executable cross-check** (RDNA, full CPU graph) | model identity — it serves multiple families; comments are not proof of which graph a path belongs to |
 | 4 | our own kernels / format layer | storage layout, swizzle | numerical correctness (circular — see Part V) |
 
-**Platform caveat (mandatory):** vLLM's DeepSeek-V4 ROCm path is gated on `_ON_GFX950` (MI350/CDNA4) and its quant config accepts only `fp8` / `deepseek_v4_fp8` / Quark-MXFP4-OCP `[V vllm/platforms/rocm.py:226, vllm/models/deepseek_v4/quant_config.py:142-165]`. There is **no `rdna`/`gfx11` path** in that tree `[V grep]`. Our checkpoint is `compressed-tensors`/`pack-quantized`/int4 `[V config.json]`, which does not match. Therefore vLLM is a **graph-semantics reference only** — never cite it for storage, kernels, or batching.
+**Platform caveat (mandatory):** upstream vLLM's DeepSeek-V4 ROCm path is gated on `_ON_GFX950` (MI350/CDNA4) and its quant config accepts only `fp8` / `deepseek_v4_fp8` / Quark-MXFP4-OCP `[V vllm/platforms/rocm.py:226, vllm/models/deepseek_v4/quant_config.py:142-165]`. There is **no `rdna`/`gfx11` path** in that tree `[V grep]`. Our checkpoint is `compressed-tensors`/`pack-quantized`/int4 `[V config.json]`, which does not match. Therefore upstream vLLM is a **graph-semantics reference only** — never cite it for storage, kernels, or batching.
+
+> **Correction to the caveat above — a patched RDNA reference *does* exist.** The checkpoint card
+> documents this exact W4A16 artifact running end to end on 4 `gfx1030` dies with `--dtype float16`:
+> coherent greedy generation, perplexity 2.42 (prose) / 1.72 (code), and a 3,011-token prompt
+> exercising the sparse attention indexer `[V checkpoint README]`. It requires *a vLLM build carrying
+> the RDNA2 DeepSeek-V4 patches*, not upstream vLLM. So the accurate statement is **"no upstream
+> gfx11 path"**, not "no gfx11 reference" — this is a candidate trusted-compatible reference for the
+> correctness gate, for the same weights.
 
 > **Hyper-Connections were re-cited (Tier 0.1, done).** The HC steps — **2.0, 2.6, 2.7,
 > Step 3** — were re-read from `vllm/model_executor/layers/mhc.py` and
@@ -171,6 +180,16 @@ RDNA 3 (gfx1100) provides:
 
 **In scope (base decoder):** embedding → 43 layers → HC head → final norm → `lm_head` → sampling, for prefill and decode.
 
+**Artifact portability (binding design constraint).** The goal is a graph that runs this model correctly
+and can accept a **better W4A16 artifact later with little effort**. Two consequences:
+- Op semantics come from the config and this specification. Anything that is a property of *this*
+  checkpoint — its quantization scheme, expert payload layout, tensor naming — stays behind the
+  descriptor/backend boundary, never hardcoded in the graph.
+- **Do not fit tolerances to this artifact's fidelity floor.** The transcode is lossy (SNR min
+  22.71 dB, median 25.69 dB `[V checkpoint README]`). A tolerance chosen merely to accommodate it
+  would hide the same bug in the next checkpoint. Interpret a parity result against that floor;
+  do not target it.
+
 **Explicitly out of scope for this revision** (present in config, not required for base-decoder correctness) `[V config.json]`:
 - MTP / DSpark next-token head (`num_nextn_predict_layers=1`, `dspark_target_layer_ids=[40,41,42]`).
 - Multi-GPU pipeline parallelism.
@@ -254,10 +273,12 @@ Everything else about tool use (schema formatting, parser, turn orchestration) i
 
 ### Step 0 — Tokenization & Prompt Encoding `[Tier 0.2e: template located]`
 
-> **Tier 0.2e.** The canonical DeepSeek-V4 prompt encoder is **code, not data**:
-> `vllm/vllm/tokenizers/deepseek_v4_encoding.py::encode_messages`. Our `.aeon` artifact carries
-> **no** chat template — `tokenizer_config.json` has no `chat_template` field, and neither does the
-> repack. The template must therefore be reproduced from that reference, not read from the model.
+> **Tier 0.2e.** The canonical DeepSeek-V4 prompt encoder is **code, not data**: the artifact ships
+> its **own** revision (`encoding/encoding_dsv4.py`, 760 lines) plus four golden vectors — use that
+> copy, not vLLM's sibling revision (648 lines; it differs). `tokenizer_config.json` has **no**
+> `chat_template` field, and neither does the repack. The template must be reproduced from the
+> artifact's encoder, and **Stage B of the** [checkpoint plan](checkpoint_verification_plan.md)
+> **is its oracle** — this step must not be implemented from memory.
 
 - Input text → token IDs via the model's tokenizer. Host-side.
 - **Special tokens and defaults** `[V tokenizer_config.json; V encoding.py:21-29]`: `bos = "<｜begin▁of▁sentence｜>"` (id 0), `eos = pad = "<｜end▁of▁sentence｜>"` (id 1), `USER = "<｜User｜>"`, `ASSISTANT = "<｜Assistant｜>"`, `LATEST_REMINDER = "<｜latest_reminder｜>"`. **There is no system role token** — system/developer content is emitted bare (`system_msg_template = "{content}"`) `[V encoding.py:50,292]`.
@@ -268,7 +289,7 @@ Everything else about tool use (schema formatting, parser, turn orchestration) i
 - **`[new]` `_drop_thinking_messages` semantics.** Keep `{user, system, tool, latest_reminder}` and everything at/after the last user; strip `reasoning` from earlier assistant messages; **drop** earlier `developer` messages entirely `[V encoding.py:641-648]`.
 - **Extended surface our current formatter omits** (it matches the basic skeleton only): `developer` role, `latest_reminder` messages, `task` classification tokens (`<｜action｜>` …), tool-call/tool-result rendering (`<｜DSML｜invoke name=…>`, `tool_output_template = "<tool_result>{content}</tool_result>"`), `response_format_template`, and the tools→keep-thinking rule `[V encoding.py:26-70,142-190,302,343,394-414; V src/architecture/deepseek_v4/text/dsv4_chat_formatter.cpp]`.
 - **Not deferrable:** the exact template including tool sections, and the record of **non-token inputs that affect the graph** (thinking mode, reasoning effort, active tool set, response format) so they enter the prefix cache key `[V ds4_kvstore.h ext_flags]`. See Part I §6.4.
-- **Gate:** `encode_messages` output for a scripted 5-message conversation (including a system+tool message) is **byte-identical** to the reference in both `chat` and `thinking` modes, with `reasoning_effort` default and non-default; and the template round-trips.
+- **Gate:** our formatter renders the artifact's four golden vectors (`encoding/tests/test_input_{1..4}.json` → `test_output_{1..4}.txt`) **byte-identically**, in both `chat` and `thinking` modes, with `reasoning_effort` default and non-default; the template round-trips; and the rendered text tokenizes to the same ids as the reference tokenizer. **This is the Step 0 oracle — see [checkpoint_verification_plan.md](checkpoint_verification_plan.md) Stage B.**
 
 ### Step 1 — Embedding Lookup
 
@@ -659,7 +680,7 @@ Build and certify in this order. Each item's gate must be green before the next 
 | ~~Indexer ReLU~~ | **Resolved Tier 0.2: REQUIRED** | `relu` on the **per-head dot before weighting**, then `Σ_h w_h·relu(dot)` `[V sglang dsv4/indexer.py:121; qsa/dsa_indexer.py:43; cutedsl_fp8_paged_mqa_logits.py:43]`. My earlier retraction was wrong; my original assertion was right. |
 | **Indexer Hadamard rotation** | **Open (measured at Gate 11)** | Real and in the DSV4 tree, but **logit-preserving** — a pre-quantization conditioning choice, not graph semantics. Both sglang paths (with/without) are valid. Decide by measuring score/top-k agreement; **must be symmetric over Q and K if used**. This item has now been mis-stated in three directions; it is listed here to stop further flip-flopping. |
 | ~~`tid2eid` orientation~~ | **Resolved: `[vocab, 6]`** | Reference declares `(config.vocab_size, config.num_experts_per_tok)` `[V nvidia/model.py:820]`; still verify against our artifact at Gate 13. |
-| KV fp8/E4M3 round-trip required vs optional | Gates 9 / 10 | **Strengthened toward required:** the canonical compressor kernel applies bf16+FP8/UE8M0 at two store points `[V fused_compress_quant_cache.py:288-345]`. Still a gate, because bf16 is a supported alternative and the delta must be measured. |
+| KV fp8/E4M3 round-trip required vs optional | Gates 9 / 10 | **Strengthened toward required:** the canonical compressor kernel applies bf16+FP8/UE8M0 at two store points `[V fused_compress_quant_cache.py:288-345]`, and the checkpoint card states `--kv-cache-dtype` resolves to `fp8_ds_mla`, *"the only layout these backends implement"* `[V checkpoint README]`. Still a gate, because bf16 is a supported alternative and the delta must be measured. |
 | MoE combine accumulation order | Gate 14 | **Shared-vs-routed order is now settled** (routed sum, then `+= shared` `[V nvidia/model.py:1020-1031]`). Still open: the **intra-routed** slot order, which affects fp rounding vs tolerance. |
 | Local-window reuse boundary behavior | Tier 4 gate 20 | Whether a reused prefix whose boundary predates the local window must rebuild the ring, or whether compressed state fully covers attention. sglang tombstones such leaves; confirm the correct handling for our state rather than assuming. |
 

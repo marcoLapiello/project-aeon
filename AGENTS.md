@@ -15,7 +15,7 @@ Use [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) for th
 
 **The project is rewriting its DeepSeek-V4 inference graph.** The storage, streaming, artifact-format, and kernel layers are kept; the graph that composes them is being rebuilt on branch `rewrite/graph-v2`. The specification is:
 - [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md): **the authority for graph semantics.** Evidence-tagged (`[V]`/`[?]`/`[I]`), cited step-by-step procedure with per-step gates, a reference hierarchy, and an anti-circularity rule. Every claim is cited or flagged unverified.
-- [Checkpoint Verification Plan](plans-and-docs/analysis/current/checkpoint_verification_plan.md): independently falsifiable stages validating the source checkpoint, the INT4 transcode, and the `.aeon` repack.
+- [Checkpoint & Artifact Integrity Plan](plans-and-docs/analysis/current/checkpoint_verification_plan.md): proves the **input** is sound (structural audit, prompt-encoder oracle, repack round-trip, streaming integrity) so a graph failure is a graph failure. Companion to the specification; it does not cover the graph.
 
 Current execution records:
 - [Phase 2 Execution Plan](plans-and-docs/execution/active/PHASE_2_EXECUTION_PLAN.md): paused single-GPU Hot/Warm/Cold runtime and remaining cold-tier work.
