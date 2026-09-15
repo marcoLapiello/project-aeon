@@ -99,6 +99,21 @@ A `[V]` tag is only valid if the cited source is authoritative for **RDNA 3 + th
 > three agree because `sqrt(softplus) > 0`. Our existing `moe_router.hpp` already matches the
 > reference on every point — recorded as positive evidence, not a gate substitute.
 
+> **Tier 0.2e (done) — the non-attention tail: prompt encoding, embedding, HC head, LM head,
+> sampling, attention scale.** Re-read from `vllm/.../tokenizers/deepseek_v4_encoding.py`,
+> `vllm/.../kernels/mhc/torch.py` + `triton.py`, `vllm/.../models/deepseek_v4/attention.py`,
+> `vllm/.../models/deepseek_v4/nvidia/model.py`, `vllm/.../layers/mhc.py`, `generation_config.json`,
+> `tokenizer_config.json`, and the safetensors headers. **Confirmed:** the attention scale is
+> `head_dim**-0.5` = `1/sqrt(512)` (two references); the HC head reduction is exactly as 2.0/Step 3
+> state (RMSNorm **without weight**, `hc_head_fn [4,16384]`, `hc_head_base [4]`, `hc_head_scale [1]`);
+> the LM head is a separate `[129280,4096]` matrix (`tie_word_embeddings=False`); the combine order is
+> routed-sum-then-`+= shared`; the embedding is expanded to 4 HC streams before layer 0.
+> **Two real gaps found:** (1) the **HC comb logits carry a third scale** `hc_scale[2]` (checkpoint
+> `hc_attn_scale` is `[3]`), which the plan omitted — now in 2.0; (2) **Step 0's chat template is not
+> in `tokenizer_config.json`** — it is code in `deepseek_v4_encoding.py::encode_messages`, and our
+> formatter implements only its basic skeleton. Step 0 is now specified against that reference.
+> **Resolved:** the sampling defaults (`T=1, top_p=1, do_sample=true`) and the attention-scale `[?]`.
+
 ---
 
 ## Part I — Foundational Decisions
@@ -225,19 +240,33 @@ Everything else about tool use (schema formatting, parser, turn orchestration) i
 
 ## Part II — The Forward Pass, Step by Step
 
-### Step 0 — Tokenization
+### Step 0 — Tokenization & Prompt Encoding `[Tier 0.2e: template located]`
+
+> **Tier 0.2e.** The canonical DeepSeek-V4 prompt encoder is **code, not data**:
+> `vllm/vllm/tokenizers/deepseek_v4_encoding.py::encode_messages`. Our `.aeon` artifact carries
+> **no** chat template — `tokenizer_config.json` has no `chat_template` field, and neither does the
+> repack. The template must therefore be reproduced from that reference, not read from the model.
 
 - Input text → token IDs via the model's tokenizer. Host-side.
-- **Not deferrable:** the exact chat template, including tool-definition sections. Tool schemas are part of the prompt token stream, so a template that is *almost* right silently changes every prefix and defeats prefix caching.
-- **Not deferrable:** produce, alongside the tokens, a record of the **non-token inputs that affect the graph** (active tool set, thinking visibility, etc.) so they can enter the prefix cache key `[V ds4_kvstore.h ext_flags]`. See Part I §6.4.
-- **Gate:** known prompt → token ids byte-identical to the reference tokenizer; template round-trips.
+- **Special tokens and defaults** `[V tokenizer_config.json; V encoding.py:21-29]`: `bos = "<｜begin▁of▁sentence｜>"` (id 0), `eos = pad = "<｜end▁of▁sentence｜>"` (id 1), `USER = "<｜User｜>"`, `ASSISTANT = "<｜Assistant｜>"`, `LATEST_REMINDER = "<｜latest_reminder｜>"`. **There is no system role token** — system/developer content is emitted bare (`system_msg_template = "{content}"`) `[V encoding.py:50,292]`.
+- **BOS is conditional and off by default.** `add_bos_token: False` `[V tokenizer_config.json]`; the encoder prepends BOS only when `add_default_bos_token and len(context) == 0` `[V encoding.py:589]` — a fresh conversation gets it, a prefix-cache continuation does not.
+- **Thinking mode is a parameter, not a fixed template.** `thinking_mode ∈ {"chat","thinking"}`; in thinking mode `<think>`/`</think>` wrap the reasoning, and assistant history renders `reasoning + thinking_end + content + eos` `[V encoding.py:373-381,407-414]`.
+- **`[new]` Reasoning-effort prefix.** In thinking mode at index 0 the encoder prepends `REASONING_EFFORT_PROMPTS[effort]`, default `"low"` — **which is the empty string** `[V encoding.py:72-85,282-288]`. `high`/`max` inject a long literal instruction block. The default graph is unaffected by omitting it, but `reasoning_effort` must be a **parameter**, or `high`/`max` prompts silently differ.
+- **`[new]` Tools force thinking to be kept.** `if any(m.get("tools")): effective_drop_thinking = False` `[V encoding.py:591-593]`. Dropping reasoning while rendering a tool-using prompt is a silent prefix change.
+- **`[new]` `_drop_thinking_messages` semantics.** Keep `{user, system, tool, latest_reminder}` and everything at/after the last user; strip `reasoning` from earlier assistant messages; **drop** earlier `developer` messages entirely `[V encoding.py:641-648]`.
+- **Extended surface our current formatter omits** (it matches the basic skeleton only): `developer` role, `latest_reminder` messages, `task` classification tokens (`<｜action｜>` …), tool-call/tool-result rendering (`<｜DSML｜invoke name=…>`, `tool_output_template = "<tool_result>{content}</tool_result>"`), `response_format_template`, and the tools→keep-thinking rule `[V encoding.py:26-70,142-190,302,343,394-414; V src/architecture/deepseek_v4/text/dsv4_chat_formatter.cpp]`.
+- **Not deferrable:** the exact template including tool sections, and the record of **non-token inputs that affect the graph** (thinking mode, reasoning effort, active tool set, response format) so they enter the prefix cache key `[V ds4_kvstore.h ext_flags]`. See Part I §6.4.
+- **Gate:** `encode_messages` output for a scripted 5-message conversation (including a system+tool message) is **byte-identical** to the reference in both `chat` and `thinking` modes, with `reasoning_effort` default and non-default; and the template round-trips.
 
 ### Step 1 — Embedding Lookup
 
 - Token IDs → embedding vectors. Table is unquantized fp16 `[V contract: embed.weight F16 [129280, 4096]]`.
-- **`[corrected]` Output is *not* a plain `[batch, seq, hidden]` tensor.** The state entering the layer stack is `4 × 4096` per token: the embedding row is **replicated across the 4 Hyper-Connection streams** `[V config hc_mult=4]`.
+- **`[corrected]` Output is *not* a plain `[batch, seq, hidden]` tensor.** The state entering the layer stack is `4 × 4096` per token: the embedding row is **expanded across the 4 Hyper-Connection streams**, and that shape is held until `hc_head` collapses it `[V nvidia/model.py:1379-1385 “V4 expands the token embedding to hc_mult streams before the first decoder layer and keeps that shape until hc_head() collapses it”; V config hc_mult=4]`.
+- **Ensure:** the expansion is a broadcast (`expand`), so all 4 streams are identical — and it happens **before** layer 0's HC pre-mix.
 - **Gate:** all 4 streams byte-identical to the checkpoint row for a known token id.
-- **Kernel:** gather (sharded table), then replicate.
+- **Kernel:** gather (sharded table), then broadcast.
+
+> `[Tier 0.2e]` **MTP layers are present but out of scope.** The checkpoint also carries `mtp.0/1/2.*` (a Multi-Token-Prediction draft stack) `[V checkpoint]`. It is speculative-decoding machinery, not part of the base 43-layer forward pass; note it exists so the loader does not mistake it for a missing main-model tensor.
 
 ### Step 2 — Per-Layer Loop (repeated 43 times)
 
@@ -257,7 +286,8 @@ The residual state is 4 streams. Before each sublayer, a control vector is compu
 - **Project:** `mixes = (x_flat @ fnᵀ) · rsqrt(sumsq(x_flat)/(hc_mult·hidden) + rms_eps)`, where `x_flat` is the flattened `4 × 4096 = 16384` residual and `fn` is `hc_attn_fn [24, 16384]`. RMS is over the flattened dim, not per stream `[V mhc_pre_torch; V ds4 hc_split_sinkhorn_one]`. (Scaling-then-project and project-then-scale are algebraically identical; the reference scales the projection output.)
 - **Pre-mix:** `pre[j] = sigmoid(mixes[j]·scale[0] + base[j]) + hc_pre_eps`, `j∈[0,4)` `[V]`.
 - **Post-mix:** `post[j] = sigmoid(mixes[j+4]·scale[1] + base[j+4]) · hc_post_mult_value`, `j∈[0,4)` `[V]`. **`hc_post_mult_value = 2.0`** — a hardcoded constant in the model, not a config field `[V vllm amd/model.py:709 hc_post_alpha = 2.0; V ds4 hc_post_alpha=2.0f]`.
-- **Comb logits:** stored as `mixes[2·hc + 4·dst + src]`, i.e. index = `8 + 4·output + contraction` `[V mhc_pre_torch mixes[:,2*hc:].view(T,hc,hc); V ds4 c[src + dst*n_hc]]`.
+- **Comb logits:** stored as `mixes[2·hc + 4·dst + src]`, i.e. index = `8 + 4·output + contraction`, then **scaled and biased** before softmax: `comb_logits[dst,src] = mixes[2·hc + 4·dst + src]·hc_scale[2] + hc_base[2·hc + 4·dst + src]` `[V kernels/mhc/torch.py:75-77 `comb_logits = mixes[:, 2*hc_mult:].view(...) * hc_scale[2] + hc_base[2*hc_mult:].view(...)`; V ds4]`.
+  - **`[new — Tier 0.2e]` `hc_scale` is `[3]`, not `[2]`:** `[0]` pre, `[1]` post, `[2]` **comb**. Our checkpoint exposes `hc_attn_scale`/`hc_ffn_scale` as `F32 [3]` `[V checkpoint]`. **Omitting the `scale[2]`/`base` transform on the comb** silently changes the comb sharpness and hence every residual mix.
 - **Sinkhorn:** softmax over the **source (contraction)** axis, add `hc_sinkhorn_eps`; normalize over the **output** axis with `hc_sinkhorn_eps`; then `(sinkhorn_repeat − 1)` iterations of (normalize over source, normalize over output), **each denominator adding `hc_sinkhorn_eps`** `[V mhc_pre_torch; V ds4]`. `sinkhorn_repeat = hc_sinkhorn_iters = 20` `[V config]`.
 - **Pre-combine:** `layer_input = Σ_j pre[j] · residual[j, :]` `[V]`.
 
@@ -300,7 +330,8 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 #### 2.4 — Attention
 
 **2.4.1 — Score, sink, and softmax (all layers)**
-- Scores `S = q·k / sqrt(512)`, fp32 accumulate `[V]`.
+- Scores `S = q·k / sqrt(512)`, fp32 accumulate. The scale is `head_dim**-0.5` with `head_dim = 512` (the **full** head, nope+rope), **not** the index head dimension `[V vllm attention.py:210-231 `self.head_dim=config.head_dim; self.scale=self.head_dim**-0.5`; V sglang deepseek_v4.py:665 `self.softmax_scale=self.head_dim**-0.5`]`. The indexer uses a separate `128**-0.5` (2.4.3).
+- **`[new — Tier 0.2e]`** This plan previously asserted the scale as `[V]` without a citation; it is now cited at both references and is a plain `1/sqrt(head_dim)` — no extra low-rank MLA scale factor.
 - **Attention sink** `[V Tier 0.2b]`: a per-head fp32 logit `attn_sink[H]`, described by the reference as *"a virtual extra K with V=0"*. Concretely `m_final = max(m_i, sink)`, `l_final = l_i·alpha + exp(sink − m_final)`, and *"the sink itself contributes 0 to acc since V_sink = 0"* `[V sglang dsv4/unified_kv_kernels/paged_prefill.py:194-203]`. So it enters the **max and the denominator only**, and contributes **no value** — exactly as this plan stated. The alternative implementation (a zero *value* row with the sink logit) is numerically identical.
 - Sink is padded to `padded_heads` when the head count is padded (vLLM fills padding with `-inf`, sglang with `0`) — a host-side padding detail only `[V vllm attention.py:235-238; V sglang deepseek_v4.py:824-834]`.
 - Mask disallowed keys with `-INF` (not zero) so they are excluded from both max and denominator.
@@ -433,7 +464,8 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 - Always fires; unquantized fp16 `[V contract ffn.shared_experts.* F16]`. Same clamped-SwiGLU as 2.10.3.
 
 **2.10.5 — Combine**
-- `shared + Σ_k weight_k · down_k`. **`[?]` Confirm the accumulation order matches the reference** — a different order changes fp rounding and can differ from the reference beyond tolerance.
+- **Order is fixed: routed sum first, shared expert added after.** The reference computes `final_hidden_states = experts(...)` and then `final_hidden_states += shared_output` `[V nvidia/model.py:1020-1031]` — i.e. `out = Σ_k weight_k · down_k`, then `out += shared`. Our 2.10.4 note is consistent with this.
+- **`[?]` The intra-routed accumulation order** (top-k slot order vs expert-id order) is still a measurement item: a different order changes fp rounding and can exceed tolerance. **Gate 14.**
 
 #### 2.11 — Hyper-Connections FFN post-mix
 
@@ -457,13 +489,14 @@ Layers 0 and 1 have **no compressor and no indexer** (`compress_ratios[0]=compre
 
 ### Step 4 — Final RMSNorm + LM Head
 
-- Final RMSNorm over 4096 `[V contract norm.weight]`.
-- `logits = lm_head @ hidden` → 129280 `[V contract head.weight F16 [129280,4096]]`; fp32 accumulate.
+- Final RMSNorm over 4096 with a learned weight `[V contract norm.weight F16 [4096]]`.
+- `logits = head_weight @ hidden` → 129280; fp32 accumulate `[V contract head.weight F16 [129280,4096]]`.
+- **Ensure the head is a separate matrix, not tied to the embedding.** `tie_word_embeddings = False`, and both `embed.weight` and `head.weight` exist as distinct `[129280, 4096]` F16 tensors in our checkpoint `[V config; V checkpoint]`.
 - **Gate:** logits match reference; top-1 token matches.
 
 ### Step 5 — Sampling
 
-- Apply temperature, top-k, top-p as configured.
+- Apply temperature, top-k, top-p as configured. **Defaults from our artifact:** `do_sample = true`, `temperature = 1.0`, `top_p = 1.0` `[V generation_config.json]` — at these values sampling is *untruncated*, so a first implementation may legitimately start at argmax, but the real defaults are `T=1, top_p=1`.
 - **Not deferrable:** expose a **logit-processor seam** — a hook that may mask or bias the logits *before* sampling. Tool-call and structured-output grammar constraints are implemented as logit masks. A hardcoded argmax with no hook forces a pipeline change later.
 - Softmax in fp32.
 - Sample or take argmax.
@@ -516,7 +549,7 @@ True chunked batched prefill is a hard requirement, not an optimization. Without
 
 | # | Kernel | Precision | Hardware path | Notes |
 |---|---|---|---|---|
-| 1 | Embedding gather + HC replicate | fp16/bf16 | memory | Output is 4 × 4096 |
+| 1 | Embedding gather + HC broadcast | fp16/bf16 | memory | Output is 4 × 4096 (embedding expanded to `hc_mult` streams) |
 | 2 | RMSNorm | fp32 accumulate | reduction | Stable on long seq |
 | 3 | **HC project** | fp32 | reduction + dot | 16384 → 24 mixes; RMS over flattened dim |
 | 4 | **HC Sinkhorn** | fp32 | iterative | **On the 4×4 comb matrix**, 20 iterations |
@@ -536,7 +569,7 @@ True chunked batched prefill is a hard requirement, not an optimization. Without
 | 18 | Dequantization | INT4 → fp16/bf16 | registers | Fused with matmul; signed −8 bias |
 | 19 | Expert matmul | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | Fused with dequant; **clamped SwiGLU** |
 | 20 | Shared expert | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | Not quantized; same clamp |
-| 21 | LM head | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | fp32 accumulate |
+| 21 | LM head | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | fp32 accumulate; **separate matrix, not tied to embedding** |
 | 22 | Sampling | fp32 | reduction | Host-side acceptable |
 
 ---
@@ -586,11 +619,14 @@ Build and certify in this order. Each item's gate must be green before the next 
 |---|---|---|
 | ~~Hyper-Connections semantics~~ | **Resolved Tier 0.1** | Confirmed against `mhc.py` + `kernels/mhc/torch.py`. Found and fixed one real error: `hc_sinkhorn_eps` applies to **every** denominator. |
 | ~~Compressor APE~~ | **Resolved Tier 0.2c: REQUIRED** | The plan omitted it. `score += ape[pos % ratio]`, `[ratio, coff·head_dim]` fp32, added to **score only**. Present as 62 trained tensors in our checkpoint. |
+| ~~Attention softmax scale~~ | **Resolved Tier 0.2e: `1/sqrt(512)`** | `head_dim**-0.5` over the full 512-wide head, cited in both vLLM and sglang `[V attention.py:231; V deepseek_v4.py:665]`. |
+| ~~Chat template location~~ | **Resolved Tier 0.2e: code, not data** | `tokenizer_config.json` has no `chat_template`; the encoder is `deepseek_v4_encoding.py::encode_messages`. Step 0 now specifies it, and flags the surface our formatter omits. |
+| ~~HC comb scale~~ | **Resolved Tier 0.2e: `hc_scale[2]`** | The comb logits are scaled and biased before softmax; `hc_scale` is `[3]`. The plan previously applied only two scales. |
 | ~~Indexer ReLU~~ | **Resolved Tier 0.2: REQUIRED** | `relu` on the **per-head dot before weighting**, then `Σ_h w_h·relu(dot)` `[V sglang dsv4/indexer.py:121; qsa/dsa_indexer.py:43; cutedsl_fp8_paged_mqa_logits.py:43]`. My earlier retraction was wrong; my original assertion was right. |
 | **Indexer Hadamard rotation** | **Open (measured at Gate 11)** | Real and in the DSV4 tree, but **logit-preserving** — a pre-quantization conditioning choice, not graph semantics. Both sglang paths (with/without) are valid. Decide by measuring score/top-k agreement; **must be symmetric over Q and K if used**. This item has now been mis-stated in three directions; it is listed here to stop further flip-flopping. |
 | ~~`tid2eid` orientation~~ | **Resolved: `[vocab, 6]`** | Reference declares `(config.vocab_size, config.num_experts_per_tok)` `[V nvidia/model.py:820]`; still verify against our artifact at Gate 13. |
 | KV fp8/E4M3 round-trip required vs optional | Gates 9 / 10 | **Strengthened toward required:** the canonical compressor kernel applies bf16+FP8/UE8M0 at two store points `[V fused_compress_quant_cache.py:288-345]`. Still a gate, because bf16 is a supported alternative and the delta must be measured. |
-| MoE combine accumulation order | Gate 14 | Affects fp rounding vs reference tolerance. |
+| MoE combine accumulation order | Gate 14 | **Shared-vs-routed order is now settled** (routed sum, then `+= shared` `[V nvidia/model.py:1020-1031]`). Still open: the **intra-routed** slot order, which affects fp rounding vs tolerance. |
 | Local-window reuse boundary behavior | Tier 4 gate 20 | Whether a reused prefix whose boundary predates the local window must rebuild the ring, or whether compressed state fully covers attention. sglang tombstones such leaves; confirm the correct handling for our state rather than assuming. |
 
 ### Anti-circularity rule
@@ -632,3 +668,6 @@ These are the specific things that will break this model if implemented naively.
 27. **DSV4 RoPE rotates the *last* 64 dims.** The DSV4 subclass `DeepseekV4ScalingRotaryEmbedding` overrides the generic parent to slice `[..., -rotary_dim:]`; the parent slices `[..., :rotary_dim]`. Reaching for the wrong one rotates the wrong dims and passes every "does it run" check. `[Tier 0.2c]`
 28. **The router's correction bias is stored as `ffn.gate.bias` but is NOT a linear bias.** The reference renames it `{".ffn.gate.bias": ".ffn.gate.e_score_correction_bias"}` `[V nvidia/model.py:1704]`. It is added to the **post-`softplus` scores** (`selection = scores + bias`), never to the logits before `softplus`. Treating it as `nn.Linear.bias` shifts every routing score. Present only on layers 3..42, F32 `[256]`. `[Tier 0.2d]`
 29. **There is no group-limited routing.** `n_group`/`topk_group` are absent from the config; selection is a **flat top-6 over all 256 experts**. Do not introduce the DeepSeek-V3 grouped variant. `[Tier 0.2d]`
+30. **`hc_scale` has three entries, and the comb uses the third.** `pre` uses `hc_scale[0]`, `post` uses `hc_scale[1]`, and the comb logits use `hc_scale[2]` (+ its own `hc_base` slice) **before** the softmax/Sinkhorn `[V kernels/mhc/torch.py:75-77]`. Our `hc_attn_scale`/`hc_ffn_scale` are `F32 [3]`. Applying only two scales silently changes comb sharpness. `[Tier 0.2e]`
+31. **The chat template is code, not a model file.** `tokenizer_config.json` has **no** `chat_template`; the canonical encoder is `vllm/.../tokenizers/deepseek_v4_encoding.py::encode_messages`. It carries a `thinking_mode`, a `reasoning_effort` prefix (default `"low"` = empty), conditional BOS (`add_bos_token: False`), no system role token, DSML tool-call/tool-result rendering, `latest_reminder`/`developer`/`task` messages, and a **tools→keep-thinking** rule. An "almost right" template silently changes every prefix. `[Tier 0.2e]`
+32. **The attention softmax scale is `1/sqrt(head_dim)` with `head_dim = 512`** — the full head, not the 64-wide RoPE part and not the indexer's 128. Both vLLM and sglang set `softmax_scale = head_dim**-0.5` `[V attention.py:231; V deepseek_v4.py:665]`. `[Tier 0.2e]`
