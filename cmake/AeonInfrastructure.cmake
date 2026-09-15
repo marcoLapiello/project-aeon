@@ -112,6 +112,12 @@ if(AEON_BUILD_TESTS)
     # order and compares every intermediate, so a wrong wiring (trap 5) fails even
     # though each kernel is individually correct.
     aeon_add_test(test_v4_mla_oracle SOURCES tests/test_v4_mla_oracle.cpp)
+
+    # Steps 2.0 / 2.7 — Hyper-Connections. The audit found a structural error
+    # here, so the gate asserts the discriminating properties: the comb index
+    # convention (a transposed comb is still doubly stochastic), the third
+    # hc_scale entry, the 20-iteration count, and the asymmetric eps placement.
+    aeon_add_test(test_v4_hc_oracle SOURCES tests/test_v4_hc_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------

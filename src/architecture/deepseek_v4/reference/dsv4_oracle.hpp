@@ -439,4 +439,186 @@ std::vector<double> mla_kv_path(const std::vector<double>& x_norm,
     return rmsnorm(matvec(head_dim, x_norm.size(), x_norm, wkv), kv_norm_weight, eps);
 }
 
+// ---------------------------------------------------------------------------
+// Hyper-Connections — Step 2.0 (pre-mix + Sinkhorn), 2.7 (post expansion)
+//
+// Written directly from the upstream reference, which is the best arbiter here
+// because the comb's index convention is easy to get backwards and a transposed
+// comb is still a plausible-looking doubly-stochastic matrix.
+//
+//   [V vllm/model_executor/kernels/mhc/torch.py:6-93  `mhc_pre_torch`]
+//   [V vllm/model_executor/kernels/mhc/torch.py:96-108 `mhc_post_torch`]
+//
+// THE COMB INDEX CONVENTION, stated once and unambiguously, because the plan's
+// own 2.0 prose gets it backwards (see the correction note in the plan):
+//
+//   Let `C` be the 4x4 comb, flattened `C[i * hc_mult + j]`. Then
+//
+//     * `i` is the CONTRACTION index — the incoming residual stream being read.
+//     * `j` is the OUTPUT index — the outgoing residual stream being written.
+//
+//   and the post expansion is `out[j][h] = Σ_i C[i][j] · residual[i][h]`.
+//
+// That is exactly upstream's `torch.einsum("...ij,...ih->...jh", comb, residual)`:
+// the comb's first axis is contracted against the residual's stream axis, and the
+// comb's second axis becomes the output stream. The logits, the softmax axis and
+// the normalization axis all follow from it:
+//
+//   logits  C[i][j] = mixes[2·hc + i·hc + j] · scale[2] + base[2·hc + i·hc + j]
+//   C ← softmax(C, axis = j) + sinkhorn_eps     <- the OUTPUT axis (upstream dim=-1)
+//   C ← C / (Σ_i C[i][j] + sinkhorn_eps)        <- the CONTRACTION axis (dim=-2)
+//   then (iters − 1) × ( normalize over j, then normalize over i )
+//
+// Every denominator carries `hc_sinkhorn_eps`, not just the row ones.
+// ---------------------------------------------------------------------------
+
+inline double sigmoid(double x) noexcept {
+    return 1.0 / (1.0 + std::exp(-x));
+}
+
+struct HcParams {
+    double rms_eps{1e-6};
+    double pre_eps{1e-6};
+    double sinkhorn_eps{1e-6};
+    double post_mult{2.0};   // hc_post_mult_value: a hardcoded constant, not a config key
+    int sinkhorn_iters{20};
+};
+
+struct HcPreResult {
+    std::vector<double> mixes;       // [hc_mults3] = 24
+    std::vector<double> pre_mix;     // [hc_mult]  = 4
+    std::vector<double> post_mix;    // [hc_mult]  = 4
+    std::vector<double> comb;        // [hc_mult * hc_mult] flat, C[contraction * hc + output]
+    std::vector<double> layer_input; // [hidden]
+};
+
+// `mixes[m] = (x · fn[m]) · rsqrt(mean(x²) + rms_eps)` over the flattened
+// `hc_mult × hidden` residual. The RMS is over the *flattened* dimension, not per
+// stream, and it scales the projection output rather than the input — algebraically
+// the same thing, and the form upstream uses.
+template <class Fn>
+std::vector<double> hc_mixes(const std::vector<double>& residual,
+                             size_t hc_mult3, Fn fn_at, size_t hc_hidden,
+                             double rms_eps) {
+    double sum_sq = 0.0;
+    for (double v : residual) sum_sq += v * v;
+    const double inv_rms = 1.0 / std::sqrt(sum_sq / static_cast<double>(hc_hidden) + rms_eps);
+
+    std::vector<double> mixes(hc_mult3, 0.0);
+    for (size_t m = 0; m < hc_mult3; ++m) {
+        double dot = 0.0;
+        for (size_t k = 0; k < hc_hidden; ++k) dot += residual[k] * fn_at(m, k);
+        mixes[m] = dot * inv_rms;
+    }
+    return mixes;
+}
+
+// Applies the scale/base transform, the axis-wise softmax, and the Sinkhorn
+// iterations. Split out from `hc_mixes` so a gate can feed it the kernel's own
+// `mixes` and isolate this step from the projection.
+inline void hc_sinkhorn(const std::vector<double>& mixes,
+                        const std::vector<double>& hc_scale, // [3]
+                        const std::vector<double>& hc_base,  // [hc_mult3]
+                        size_t hc_mult, const HcParams& p, HcPreResult& out) {
+    const size_t hc_mult2 = hc_mult * hc_mult;
+
+    out.pre_mix.resize(hc_mult);
+    for (size_t j = 0; j < hc_mult; ++j) {
+        out.pre_mix[j] = sigmoid(mixes[j] * hc_scale[0] + hc_base[j]) + p.pre_eps;
+    }
+
+    out.post_mix.resize(hc_mult);
+    for (size_t j = 0; j < hc_mult; ++j) {
+        // No eps here — only the pre-mix carries `hc_pre_eps`.
+        out.post_mix[j] = sigmoid(mixes[j + hc_mult] * hc_scale[1] + hc_base[j + hc_mult]) * p.post_mult;
+    }
+
+    // C[i][j]: i contracts the residual streams, j is the output stream.
+    std::vector<double>& C = out.comb;
+    C.assign(hc_mult2, 0.0);
+    for (size_t i = 0; i < hc_mult; ++i) {
+        for (size_t j = 0; j < hc_mult; ++j) {
+            const size_t idx = 2 * hc_mult + i * hc_mult + j;
+            C[i * hc_mult + j] = mixes[idx] * hc_scale[2] + hc_base[idx];
+        }
+    }
+
+    // softmax over j (the OUTPUT axis) — upstream `dim=-1`.
+    for (size_t i = 0; i < hc_mult; ++i) {
+        double max_v = C[i * hc_mult];
+        for (size_t j = 1; j < hc_mult; ++j) max_v = std::fmax(max_v, C[i * hc_mult + j]);
+        double sum_e = 0.0;
+        for (size_t j = 0; j < hc_mult; ++j) {
+            const double e = std::exp(C[i * hc_mult + j] - max_v);
+            C[i * hc_mult + j] = e;
+            sum_e += e;
+        }
+        for (size_t j = 0; j < hc_mult; ++j) C[i * hc_mult + j] = C[i * hc_mult + j] / sum_e + p.sinkhorn_eps;
+    }
+
+    // normalize over i (the CONTRACTION axis) — upstream `dim=-2`.
+    auto normalize_over_i = [&]() {
+        for (size_t j = 0; j < hc_mult; ++j) {
+            double col_sum = 0.0;
+            for (size_t i = 0; i < hc_mult; ++i) col_sum += C[i * hc_mult + j];
+            const double inv = 1.0 / (col_sum + p.sinkhorn_eps);
+            for (size_t i = 0; i < hc_mult; ++i) C[i * hc_mult + j] *= inv;
+        }
+    };
+    auto normalize_over_j = [&]() {
+        for (size_t i = 0; i < hc_mult; ++i) {
+            double row_sum = 0.0;
+            for (size_t j = 0; j < hc_mult; ++j) row_sum += C[i * hc_mult + j];
+            const double inv = 1.0 / (row_sum + p.sinkhorn_eps);
+            for (size_t j = 0; j < hc_mult; ++j) C[i * hc_mult + j] *= inv;
+        }
+    };
+
+    normalize_over_i();
+    for (int it = 0; it < p.sinkhorn_iters - 1; ++it) {
+        normalize_over_j();
+        normalize_over_i();
+    }
+}
+
+// `layer_input[h] = Σ_j pre_mix[j] · residual[j][h]` — the pre-combine.
+inline std::vector<double> hc_pre_combine(const std::vector<double>& residual,
+                                          const std::vector<double>& pre_mix,
+                                          size_t hidden) {
+    const size_t hc_mult = pre_mix.size();
+    std::vector<double> out(hidden, 0.0);
+    for (size_t h = 0; h < hidden; ++h) {
+        double acc = 0.0;
+        for (size_t j = 0; j < hc_mult; ++j) acc += pre_mix[j] * residual[j * hidden + h];
+        out[h] = acc;
+    }
+    return out;
+}
+
+// `out[j][h] = Σ_i C[i][j] · residual[i][h] + post_mix[j] · layer_out[h]`.
+//
+// `transpose_comb` is not a feature — it exists so a gate can *demonstrate* that
+// the convention matters by computing the wrong reading deliberately. Nothing in
+// the graph should ever pass `true`.
+inline std::vector<double> hc_post(const std::vector<double>& layer_out,
+                                   const std::vector<double>& residual,
+                                   const std::vector<double>& post_mix,
+                                   const std::vector<double>& C,
+                                   size_t hidden,
+                                   bool transpose_comb = false) {
+    const size_t hc_mult = post_mix.size();
+    std::vector<double> out(hc_mult * hidden, 0.0);
+    for (size_t j = 0; j < hc_mult; ++j) {
+        for (size_t h = 0; h < hidden; ++h) {
+            double acc = post_mix[j] * layer_out[h];
+            for (size_t i = 0; i < hc_mult; ++i) {
+                const double c = transpose_comb ? C[j * hc_mult + i] : C[i * hc_mult + j];
+                acc += c * residual[i * hidden + h];
+            }
+            out[j * hidden + h] = acc;
+        }
+    }
+    return out;
+}
+
 } // namespace aeon::reference

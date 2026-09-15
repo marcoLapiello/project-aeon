@@ -38,11 +38,11 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 22 infrastructure/backend/text/kept-component/Tier-1 tests |
-| Legacy `ctest` | 24 (the 22 plus 2 gated parity anchors) |
+| Default `ctest` | 23 infrastructure/backend/text/kept-component/Tier-1 tests |
+| Legacy `ctest` | 25 (the 23 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
-| Tier 1 | Oracle harness. Certified: **RMSNorm** (one fp16 ulp), **RoPE** (18 lines, both bases), **MLA Q/KV** (9 lines, full dimensions, incl. a composition order check). Next: HC project + Sinkhorn, then attention, compressor, indexer, output, router, MoE |
+| Tier 1 | Certified: **RMSNorm** (one fp16 ulp), **RoPE** (18 lines, both bases), **MLA Q/KV** (9 lines, full dimensions, composition order), **HC project + Sinkhorn** (14 lines). Next: attention score + sink + softmax, then compressor, indexer, output, router, MoE |
 
 ---
 
