@@ -63,6 +63,20 @@ if(AEON_BUILD_TESTS)
             src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
             src/architecture/deepseek_v4/text/dsv4_chat_formatter.cpp)
 
+    # Step 0 oracle: render the artifact's golden vectors and compare byte-for-byte
+    # against the checkpoint's own encoder output (checkpoint plan Stage B).
+    #
+    # While Step 0 is incomplete this runs in diagnostic mode: it FAILS when a
+    # vector our formatter can represent is rendered differently, but only reports
+    # BLOCKED vectors that need surface the formatter lacks. Drop `--strict`'s
+    # opt-in by passing it here once Step 0 is declared complete, so missing
+    # surface becomes a hard failure.
+    aeon_add_test(test_dsv4_prompt_encoding_oracle
+        SOURCES
+            tests/test_dsv4_prompt_encoding_oracle.cpp
+            src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
+            src/architecture/deepseek_v4/text/dsv4_chat_formatter.cpp)
+
     # EOS-aware token generation loop and stop reasons (CPU-side).
     aeon_add_test(test_text_generation
         SOURCES
