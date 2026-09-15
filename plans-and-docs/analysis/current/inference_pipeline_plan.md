@@ -114,6 +114,18 @@ A `[V]` tag is only valid if the cited source is authoritative for **RDNA 3 + th
 > formatter implements only its basic skeleton. Step 0 is now specified against that reference.
 > **Resolved:** the sampling defaults (`T=1, top_p=1, do_sample=true`) and the attention-scale `[?]`.
 
+> **Tier 0.2f (done) — the attention composition (2.4.4).** Re-read from
+> `sglang/.../dsv4/unified_kv_kernels/paged_prefill.py`, `.../dsv4/sparse_prefill_utils.py`
+> (`combine_topk_swa_indices`), and `vllm/.../deepseek_v4/common/ops/{cache_utils,sparse_mla}.py`.
+> **Confirmed:** the local window is `min(pos+1,128)`; the two KV sources (paged `unified_kv`
+> prefix + per-forward `kv` extend) are summed under one order-invariant online softmax; the
+> sink finalization is `m_final=max(m_i,sink)`, `l_final=l_i·α+exp(sink−m_final)`, `out=(acc·α)/max(l_final,1e−30)`.
+> **One real error found and fixed:** 2.4.4 said compressed layers attend “the selected compressed
+> rows”. **Only ratio-4 CSA layers select (indexer top-512). Ratio-128 HCA layers have *no
+> indexer* and attend *all* committed compressed rows** (width `≥ seq_len/ratio`, capped at 8192).
+> Ratio-0 layers attend local rows only. The checkpoint corroborates it: `attn.indexer.*` tensors
+> exist only on ratio-4 layers. This is now stated explicitly in 2.4.4 and trap 33.
+
 ---
 
 ## Part I — Foundational Decisions
@@ -357,7 +369,12 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 - **`[new]` Store-time quantization.** The canonical path then does `normed → bf16 → fp32` (an explicit round-trip "to match reference"), UE8M0-quantizes to E4M3, and stores **only the non-RoPE 448 dims as fp8**, with the RoPE part handled separately `[V fused_compress_quant_cache.py:288-345]`. This is a second place where an fp8 round-trip is part of the graph (see Step 7).
 - **Gate:** for a scripted sequence, compressed rows/positions match reference; the boundary fires exactly when `(pos+1) % ratio == 0`; the two-segment overlap is populated from the correct offsets; **the `ape[pos % ratio]` add is applied to `score` and only `score`**, with the checkpoint's `[ratio, width]` order.
 
-**2.4.3 — Lightning Indexer (ratio == 4 layers only: even layers 2..42)** `[corrected]`
+**2.4.3 — Lightning Indexer (CSA layers only — the ratio-4 layers: even indices 2..42)** `[corrected]` `[Tier 0.2f: scope confirmed]`
+
+> **Scope (Tier 0.2f).** The indexer runs **only** on ratio-4 (CSA) layers. Ratio-128 (HCA)
+> layers have a compressor but **no indexer** — they attend all committed compressed rows
+> directly (2.4.4), and the checkpoint carries no `attn.indexer.*` tensors for them
+> `[V sparse_mla.py:252-260; V cache_utils.py:938; V safetensors header]`.
 
 > **Re-cited (Tier 0.2b).** ReLU is **required**; indexer Q and K are **fp8/UE8M0**.
 >
@@ -390,9 +407,25 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 - `top_k = 512` `[V config index_topk=512]`. Invalid/padded candidates take score `0` (not `-INF`) `[V sglang dsv4/indexer.py:133]`.
 - **Gate:** selected index set matches reference **exactly** for scripted inputs; the Hadamard choice is recorded as an explicit, measured decision.
 
-**2.4.4 — Paged / chunked attention over local + compressed rows**
-- Attend over the last `min(pos+1, 128)` local rows plus the selected compressed rows `[V config sliding_window=128]`.
-- **Gate:** state and output match the serial reference across a ratio boundary.
+**2.4.4 — Attention composition: local rows + compressed rows** `[Tier 0.2f: re-cited]`
+
+> **Tier 0.2f.** The composition was re-read from the readable kernels
+> `sglang/.../kernels/ops/attention/dsv4/unified_kv_kernels/paged_prefill.py`
+> (`_sparse_attn_v4_paged_prefill_kernel`), `sglang/.../layers/attention/dsv4/sparse_prefill_utils.py`
+> (`combine_topk_swa_indices`), and `vllm/.../models/deepseek_v4/common/ops/cache_utils.py` +
+> `sparse_mla.py`. **One real error found and fixed: the plan implied every compressed layer
+> *selects* compressed rows. Only CSA does; HCA attends all of them and has no indexer.**
+
+- **Three attention row-sets, one per layer class** `[V cache_utils.py:938-939 `topk_width = active_topk_width if compress_ratio == 128 else index_topk`; V :1478-1484]`:
+  - **ratio 0 — Sliding (layers 0, 1):** local SWA rows only. `topk = 0`; the compressed branch is a no-op `[V :939 `topk = 0 if compress_ratio == 1 else …`; V sparse_prefill_utils.py:31-32]`.
+  - **ratio 4 — CSA (indexer layers):** local SWA rows **+ the indexer-selected `index_topk = 512`** compressed rows. `topk_width = index_topk` `[V :938; V config index_topk=512]`. Indices are **request/sequence-local** `[V :1484 `decode_compressed_indices_are_local=compress_ratio == 4`]`.
+  - **`[corrected]` ratio 128 — HCA:** local SWA rows **+ ALL committed compressed rows — there is no indexer and no top-k selection.** The width is `active_topk_width = min(max(next_pow2(ceil(seq_len / ratio)), 128), c128a_max_compressed)`, and the code asserts `active_topk_width ≥ seq_len // ratio`, i.e. it always covers **every** compressed entry so far `[V sparse_mla.py:252-260]`. The cap is `c128a_max_compressed = ceil(ceil(max_model_len / 128) / 128)·128` = **8192** for our `max_position_embeddings = 1048576` `[V sparse_mla.py:39,158-170]`. Indices are **global** `[V :1484 `has_decode_compressed_lens=compress_ratio == 128`]`.
+  - Structural confirmation from the checkpoint: `attn.indexer.*` tensors exist **only** on ratio-4 layers `[V safetensors header — `layers.11.attn.compressor.ape [128,512]` has no sibling `indexer.compressor.ape`; `layers.10` has both]`. Running the indexer on a ratio-128 layer would read tensors that do not exist.
+- **Local rows are exactly `min(pos+1, 128)`.** `swa_start = max(pos − (WINDOW_SIZE−1), 0)`, `swa_len = pos − swa_start + 1` `[V cache_utils.py:893-894]`. (`left_add`/`right`/`image_width` widen this only for the vision variant, which is not our graph.)
+- **Composition of the two sources.** One buffer `unified_kv [total_pages, D]` holds **both** the SWA ring (slots `[0, swa_pages)`) and the compressed pages (`[swa_pages, total_pages)`); the current chunk's freshly-computed K lives in a separate per-forward `kv [total_tokens, D]` **not yet written to the SWA ring** `[V paged_prefill.py:13-33 docstring]`. Per query, the selected rows are an int32 list `combined_indices = [ compressed indices (rebased) | swa positional indices (rebased) ]`, with `-1` marking padding/skips `[V sparse_prefill_utils.py:11-12,31; V combine kernel]`. The kernel then sums the two regions sequentially under **one shared online-softmax accumulator**, which is **order-invariant** — region order and index order are not semantically load-bearing `[V paged_prefill.py:45-47 docstring “Order of regions does not affect correctness”]`.
+- **Score and mask in the kernel:** `scores = (q·kᵀ)·softmax_scale`, masked to `-3.4e38` for invalid slots/heads, then online max/rescale; `softmax_scale = head_dim**-0.5` (2.4.1) `[V paged_prefill.py:145-190]`.
+- **Sink finalization (exact form).** After the loops, `m_final = max(m_i, sink)`, `alpha = exp(m_i − m_final)`, `l_final = l_i·alpha + exp(sink − m_final)`, `out = (acc·alpha) / max(l_final, 1e−30)`, and `out = 0` wherever `l_final ≤ 0` `[V paged_prefill.py:194-206]`. This is the 2.4.1 sink rule implemented exactly — sink enters the max and the denominator, contributing zero to the numerator.
+- **Gate:** for a scripted sequence across a ratio boundary, (a) the ratio-0/4/128 row-sets are each correct — in particular **HCA attends every compressed row and never calls the indexer**; (b) the local row count is `min(pos+1,128)`; (c) output matches the serial reference; (d) the online-softmax result is **bit-stable under index permutation** (a cheap invariant that catches accumulation bugs).
 
 #### 2.5 — Output Projection `[corrected — grouped, not a single matmul]`
 
@@ -474,7 +507,7 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 
 #### Note on Layers 0 and 1 `[corrected]`
 
-Layers 0 and 1 have **no compressor and no indexer** (`compress_ratios[0]=compress_ratios[1]=0`) `[V config; V artifact]`.
+Layers 0 and 1 have **no compressor and no indexer** (`compress_ratios[0]=compress_ratios[1]=0`) `[V config; V artifact]`. They attend the local window only (2.4.4).
 
 `[corrected]` They **do** run Hyper-Connections, including the HC Sinkhorn. The first revision said "no Sinkhorn step" on layers 0–1 — that was a consequence of placing Sinkhorn in the attention block; with Sinkhorn restored to HC (2.0), it applies to all 43 layers.
 
@@ -561,7 +594,7 @@ True chunked batched prefill is a hard requirement, not an optimization. Without
 | 10 | Attention scores + sink | fp32 accumulate | WMMA + softmax | Sink enters max + denominator only, no value |
 | 11 | Softmax | fp32 | reduction | Mask with −INF, not 0 |
 | 12 | Compressor | fp16/bf16 | WMMA + pooling | ratio ≠ 0 layers; per-dim softmax pooling; **`[Tier 0.2c]` `score += ape[pos%ratio]`** |
-| 13 | Indexer | **fp8 (E4M3/UE8M0)** | WMMA (dequant to fp16) | `[corrected]` not INT8; **`[V]` ReLU required, per-head, before weighting** |
+| 13 | Indexer | **fp8 (E4M3/UE8M0)** | WMMA (dequant to fp16) | `[corrected]` not INT8; **`[V]` ReLU required, per-head, before weighting**; **CSA (ratio-4) layers only — HCA has no indexer** |
 | 14 | Top-k selection | int32 | sort/select | Must match reference exactly; must be on-device for prefill |
 | 15 | Grouped output projection | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | `[corrected]` 8 groups × 1024 → `wo_b` |
 | 16 | Router | fp16 logits → fp32 | small matmul | `sqrt(softplus)`; bias (`ffn.gate.bias`) added to **scores**; hash branch for layers < 3; flat top-6, no groups |
@@ -622,6 +655,7 @@ Build and certify in this order. Each item's gate must be green before the next 
 | ~~Attention softmax scale~~ | **Resolved Tier 0.2e: `1/sqrt(512)`** | `head_dim**-0.5` over the full 512-wide head, cited in both vLLM and sglang `[V attention.py:231; V deepseek_v4.py:665]`. |
 | ~~Chat template location~~ | **Resolved Tier 0.2e: code, not data** | `tokenizer_config.json` has no `chat_template`; the encoder is `deepseek_v4_encoding.py::encode_messages`. Step 0 now specifies it, and flags the surface our formatter omits. |
 | ~~HC comb scale~~ | **Resolved Tier 0.2e: `hc_scale[2]`** | The comb logits are scaled and biased before softmax; `hc_scale` is `[3]`. The plan previously applied only two scales. |
+| ~~Attention row-set composition~~ | **Resolved Tier 0.2f** | Three classes: ratio 0 = local only; ratio 4 (CSA) = local + indexer top-512; **ratio 128 (HCA) = local + *all* committed compressed rows, no indexer**. Two KV sources merge under one order-invariant online softmax. |
 | ~~Indexer ReLU~~ | **Resolved Tier 0.2: REQUIRED** | `relu` on the **per-head dot before weighting**, then `Σ_h w_h·relu(dot)` `[V sglang dsv4/indexer.py:121; qsa/dsa_indexer.py:43; cutedsl_fp8_paged_mqa_logits.py:43]`. My earlier retraction was wrong; my original assertion was right. |
 | **Indexer Hadamard rotation** | **Open (measured at Gate 11)** | Real and in the DSV4 tree, but **logit-preserving** — a pre-quantization conditioning choice, not graph semantics. Both sglang paths (with/without) are valid. Decide by measuring score/top-k agreement; **must be symmetric over Q and K if used**. This item has now been mis-stated in three directions; it is listed here to stop further flip-flopping. |
 | ~~`tid2eid` orientation~~ | **Resolved: `[vocab, 6]`** | Reference declares `(config.vocab_size, config.num_experts_per_tok)` `[V nvidia/model.py:820]`; still verify against our artifact at Gate 13. |
@@ -642,7 +676,7 @@ These are the specific things that will break this model if implemented naively.
 1. **Hyper-Connections are not optional and not a subset.** All 43 layers run a 4-stream HC pre-mix, Sinkhorn, and post-mix before and after each sublayer. Omitting it is a structural omission, not a numerical detail.
 2. **Sinkhorn operates on the HC 4×4 comb matrix**, not on attention or compressor output. `[corrected]`
 3. **Sinkhorn needs exactly 20 iterations** `[V config]`, with `eps` in the specific places (pre-mix add, row denominators, column denominators). Fewer iterations leave the comb not doubly stochastic.
-4. **Layers 0–1 are compressor/indexer-free but still run HC.** Branch only the compressor/indexer, never the HC. `[corrected]`
+4. **Layers 0–1 are compressor/indexer-free but still run HC.** Branch only the compressor/indexer, never the HC. `[corrected]` And the indexer is not merely ratio-≠0: it is **CSA-only** (ratio 4). HCA (ratio 128) compresses but does **not** index. `[Tier 0.2f]`
 5. **The Q path is low-rank with two norms.** `wq_a → q-norm(1024) → wq_b → per-head norm(512)`. Collapsing this into one matmul produces plausible but wrong output.
 6. **There is no separate V.** A single shared KV head; attention uses the same tensor as key and value.
 7. **Two RoPE bases.** Compressed layers use a different theta plus YaRN, with no amplitude scaling. Using one base everywhere is silently wrong.
@@ -671,3 +705,4 @@ These are the specific things that will break this model if implemented naively.
 30. **`hc_scale` has three entries, and the comb uses the third.** `pre` uses `hc_scale[0]`, `post` uses `hc_scale[1]`, and the comb logits use `hc_scale[2]` (+ its own `hc_base` slice) **before** the softmax/Sinkhorn `[V kernels/mhc/torch.py:75-77]`. Our `hc_attn_scale`/`hc_ffn_scale` are `F32 [3]`. Applying only two scales silently changes comb sharpness. `[Tier 0.2e]`
 31. **The chat template is code, not a model file.** `tokenizer_config.json` has **no** `chat_template`; the canonical encoder is `vllm/.../tokenizers/deepseek_v4_encoding.py::encode_messages`. It carries a `thinking_mode`, a `reasoning_effort` prefix (default `"low"` = empty), conditional BOS (`add_bos_token: False`), no system role token, DSML tool-call/tool-result rendering, `latest_reminder`/`developer`/`task` messages, and a **tools→keep-thinking** rule. An "almost right" template silently changes every prefix. `[Tier 0.2e]`
 32. **The attention softmax scale is `1/sqrt(head_dim)` with `head_dim = 512`** — the full head, not the 64-wide RoPE part and not the indexer's 128. Both vLLM and sglang set `softmax_scale = head_dim**-0.5` `[V attention.py:231; V deepseek_v4.py:665]`. `[Tier 0.2e]`
+33. **Only CSA (ratio 4) layers have an indexer. HCA (ratio 128) layers attend *all* committed compressed rows with no selection.** The width is `active_topk_width ≥ seq_len/ratio` (capped at 8192) `[V sparse_mla.py:252-260; V cache_utils.py:938]`. Running an indexer on a ratio-128 layer reads `attn.indexer.*` tensors that **do not exist** in the checkpoint — only ratio-4 layers carry them. The three classes are: ratio 0 = local only, ratio 4 = local + indexer top-512, ratio 128 = local + all compressed. `[Tier 0.2f]`
