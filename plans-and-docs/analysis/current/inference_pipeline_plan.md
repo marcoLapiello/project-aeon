@@ -640,7 +640,7 @@ Build and certify in this order. Each item's gate must be green before the next 
 4. **Dequantization decode.** Verify against an independent decoder. Exact match required. (Our format layer already round-trips `[V our tests]` — reuse, re-validate.)
 
 **Tier 1 — Primitives (GPU, one at a time).**
-5. **RMSNorm** — vs fp64 reference.
+5. ~~**RMSNorm** — vs fp64 reference.~~ **DONE.** `reference/dsv4_oracle.hpp` (host-only, fp64, kernel-free) + `kernels/v4_norm.hpp` + `tests/test_v4_norm_oracle.cpp`. Weighted and unit forms both pass; max relative error 4.9e-4 = one fp16 ulp, i.e. the kernel is exact and only the fp16 store rounds. The gate also asserts the oracle against a closed-form host-only case, so a wrong oracle cannot certify a wrong kernel.
 6. **RoPE forward and inverse** — separately; two bases; forward∘inverse = identity.
 7. **MLA q path and kv path** — including both intermediate norms.
 8. **HC project + Sinkhorn** — verify doubly-stochastic convergence *before* composing it with anything.

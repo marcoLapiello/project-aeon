@@ -95,6 +95,16 @@ if(AEON_BUILD_TESTS)
     aeon_add_test(test_routing_profile SOURCES tests/test_routing_profile.cpp)
 endif()
 
+# --- Tier-1 primitives: independent-oracle gates -----------------------------
+# The rewrite certifies graph primitives one at a time, each against a host fp64
+# reference written from the specification and sharing no code with the kernel
+# (plan Part V, anti-circularity rule). These targets belong to the rewrite, not
+# the legacy graph, so they stay in the default build.
+if(AEON_BUILD_TESTS)
+    # Step 2.1 — RMSNorm, weighted and unit forms, versus reference/dsv4_oracle.hpp.
+    aeon_add_test(test_v4_norm_oracle SOURCES tests/test_v4_norm_oracle.cpp)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate

@@ -9,6 +9,11 @@
 #include <cstdint>
 #include <cassert>
 
+// The Wave32 RMSNorm kernels moved to `v4_norm.hpp` so the primitive can be
+// gated on its own, outside the legacy graph. This header keeps including them
+// for its existing callers; there is no second definition.
+#include "architecture/deepseek_v4/kernels/v4_norm.hpp"
+
 namespace aeon::kernel {
 
 // Hyperparameters for DeepSeek-V4 Attention
@@ -91,67 +96,7 @@ struct RopeTable {
 // Device Kernels (RDNA3 Wave32 Optimized)
 // ---------------------------------------------------------------------------
 
-// 1. Wave32 RMSNorm kernel: 1 warp (32 threads) per token row
-__global__ void __launch_bounds__(32) v4_rmsnorm_wave32_kernel(
-    const __half* __restrict__ input,
-    const __half* __restrict__ weight,
-    __half* __restrict__ output,
-    int dim,
-    float eps
-) {
-    int lane = threadIdx.x; // 0..31
-    int row = blockIdx.x;
-
-    const __half* in_row = input + row * dim;
-    __half* out_row = output + row * dim;
-
-    float sum_sq = 0.0f;
-    for (int i = lane; i < dim; i += 32) {
-        float v = __half2float(in_row[i]);
-        sum_sq += v * v;
-    }
-
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        sum_sq += __shfl_xor(sum_sq, offset, 32);
-    }
-
-    float inv_rms = rsqrtf((sum_sq / (float)dim) + eps);
-
-    for (int i = lane; i < dim; i += 32) {
-        float v = __half2float(in_row[i]);
-        float w = __half2float(weight[i]);
-        out_row[i] = __float2half(v * inv_rms * w);
-    }
-}
-
-__global__ void __launch_bounds__(32) v4_rmsnorm_unit_wave32_kernel(
-    const __half* __restrict__ input,
-    __half* __restrict__ output,
-    int dim,
-    float eps
-) {
-    const int lane = threadIdx.x;
-    const int row = blockIdx.x;
-    const __half* in_row = input + row * dim;
-    __half* out_row = output + row * dim;
-
-    float sum_sq = 0.0f;
-    for (int i = lane; i < dim; i += 32) {
-        const float value = __half2float(in_row[i]);
-        sum_sq += value * value;
-    }
-
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        sum_sq += __shfl_xor(sum_sq, offset, 32);
-    }
-
-    const float inv_rms = rsqrtf((sum_sq / static_cast<float>(dim)) + eps);
-    for (int i = lane; i < dim; i += 32) {
-        out_row[i] = __float2half(__half2float(in_row[i]) * inv_rms);
-    }
-}
+// 1. Wave32 RMSNorm kernels: see `v4_norm.hpp` (included above).
 
 // 2. Wave32 Forward GPT-J RoPE on trailing 64 elements of [T, num_heads, head_dim] or [T, 1, head_dim]
 // Interleaved layout: for k in 0..31: out[2k] = x[2k]*cos - x[2k+1]*sin, out[2k+1] = x[2k]*sin + x[2k+1]*cos
