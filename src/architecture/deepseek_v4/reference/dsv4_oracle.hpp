@@ -967,4 +967,49 @@ inline std::vector<int32_t> topk_indices(const std::vector<double>& scores, size
     return order;
 }
 
+// ---------------------------------------------------------------------------
+// Grouped low-rank output projection — Step 2.5
+//
+//     z[t, g, r] = Σ_d o[t, g, d] · wo_a[g, r, d]
+//
+// with `o` `[T, G, D]` and `wo_a` `[G, R, D]`, flattened to `[T, G·R]`
+// `[V sglang models/deepseek_v4.py:1718-1738 einsum("tgd,grd->tgr", o, wo_a)]`.
+//
+// Two structural facts this encodes, both of which a plausible implementation
+// can get wrong:
+//
+//  * The group axis of `o` is a plain `view(T, G, -1)` of the token-major
+//    `[T, heads, head_dim]` attention output `[V sglang :1785
+//    o.view(o.shape[0], self.n_local_groups, -1)]`, so group g is the **8
+//    contiguous heads** [8g, 8g+8) — not an interleaved slice of heads.
+//  * The checkpoint tensor is stored `[G·R, D]` = `[8192, 4096]` and is a view
+//    of `[G, R, D]` `[V sglang :3346 weight.view(G * R, D)]`, so the group
+//    blocks are contiguous in the row-major layout: flat index `(g·R + r)·D + d`.
+//
+// `contiguous_blocks=false` exists for the same reason `transpose_comb` and
+// `apply_relu` do elsewhere in this file: so a gate can compute the *wrong*
+// layout deliberately and demonstrate that the difference is material. Nothing
+// in the graph passes `false`.
+template <class Accessor>
+std::vector<double> grouped_wo_a(size_t tokens, size_t groups, size_t rank,
+                                 size_t group_dim, const std::vector<double>& o,
+                                 Accessor w_at, bool contiguous_blocks = true) {
+    std::vector<double> z(tokens * groups * rank, 0.0);
+    for (size_t t = 0; t < tokens; ++t) {
+        for (size_t g = 0; g < groups; ++g) {
+            for (size_t r = 0; r < rank; ++r) {
+                double acc = 0.0;
+                for (size_t d = 0; d < group_dim; ++d) {
+                    const size_t wi = contiguous_blocks
+                        ? g * (rank * group_dim) + r * group_dim + d
+                        : r * (groups * group_dim) + g * group_dim + d;
+                    acc += w_at(wi) * o[(t * groups + g) * group_dim + d];
+                }
+                z[(t * groups + g) * rank + r] = acc;
+            }
+        }
+    }
+    return z;
+}
+
 } // namespace aeon::reference

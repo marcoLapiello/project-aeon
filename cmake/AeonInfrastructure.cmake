@@ -134,6 +134,12 @@ if(AEON_BUILD_TESTS)
     # Step 2.4.3 — lightning indexer + top-k, and the Gate 11 measurement that
     # settles the Hadamard rotation question empirically.
     aeon_add_test(test_v4_indexer_oracle SOURCES tests/test_v4_indexer_oracle.cpp)
+
+    # Step 2.5 — grouped output projection (wo_a low-rank + wo_b). Asserts the
+    # per-group structure by construction: group isolation under perturbation,
+    # and that the group-major weight layout is load-bearing.
+    aeon_add_test(test_v4_grouped_wo_oracle
+        SOURCES tests/test_v4_grouped_wo_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------

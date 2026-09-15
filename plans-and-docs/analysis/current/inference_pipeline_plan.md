@@ -528,6 +528,17 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 - **Ensure:** group assignment is **8 contiguous heads** per group; the stored `wo_a` row-major layout must match the `[G, R, D]` interpretation (group-major), i.e. `wo_a[g]` is a `[1024, 4096]` block, not an interleaved slice.
 - **Gate:** low-rank tensor (8192) and final 4096 match reference.
 
+> **Gate result (Tier 1, item 12) — CERTIFIED.** `reference/dsv4_oracle.hpp::grouped_wo_a` + `tests/test_v4_grouped_wo_oracle.cpp`, 14 lines green. `z` matches the einsum to `2.9e-4` (fp16 inputs, one fp16 ulp); `attn_proj` matches the oracle to `3.1e-4` fed the kernel's own `z` and `4.2e-4` over the full chain.
+>
+> **The group structure is asserted by construction, not by closeness.** Three checks make a flat or shared implementation impossible to pass:
+>  * Reading the same bytes as an interleaved `[R, G, D]` moves the result by `1.38` — so "group-major" is falsifiable here, not an assumption.
+>  * Perturbing group 0's eight contiguous heads leaves **all 14 336 elements of groups 1–7 bit-identical**, and moves 1024 of 1024 of group 0. A shared weight block, a global reduction over the whole 32 768-wide row, and a wrong group stride all violate this; a plain closeness check does not.
+>  * Perturbing the *last* element of group 0 (head 7, dim 511) still moves group 0 (1008 of 1024), so the reduction reaches the whole 4096-wide block rather than truncating at the first head.
+>
+> **`wo_b` is certified twice, and its orientation is shown load-bearing.** Fed the kernel's own `z` it isolates the 8192→4096 map (`3.1e-4`); fed the oracle `z` it certifies the chain (`4.2e-4`). Reading `wo_b` transposed differs by `1.52` — the plan states "no transpose anywhere in the path", and this is the line that would fail if that stopped being true.
+>
+> **Corroboration, not certification.** The legacy real-weight `test_v4_real_dense_parity` *does* exercise this pair (`run_grouped_wo_a` → `run_fp16_gemv` on `attn.wo_b.weight`, lines 429–432) and passes with real checkpoint weights. That is consistent with the above but is not the evidence — it shares the layer's `[8192, 4096]` interpretation, so it cannot falsify the layout question the way the interleaved measurement does. (The reverse also held: that same test's coverage gap is why the indexer ReLU survived — see item 11.)
+
 #### 2.6 — Hyper-Connections attention post-mix `[corrected — was a plain residual add]`
 
 - The residual is **not** a single-stream add. `res_mid[dst,h] = post_a[dst]·attn_proj[h] + Σ_src comb_a[src,dst]·res_in[src,h]` — the contraction runs over the **source (residual) index**, and the output is indexed by `dst` `[V mhc_post_torch einsum "...ij,...ih->...jh"; V ds4]`.
@@ -687,7 +698,7 @@ True chunked batched prefill is a hard requirement, not an optimization. Without
 | 12 | Compressor | fp16/bf16 | WMMA + pooling | ratio ≠ 0 layers; per-dim softmax pooling; **`[Tier 0.2c]` `score += ape[pos%ratio]`** |
 | 13 | Indexer | **fp8 (E4M3/UE8M0)** | WMMA (dequant to fp16) | `[corrected]` not INT8; **`[V]` ReLU required, per-head, before weighting**; **CSA (ratio-4) layers only — HCA has no indexer** |
 | 14 | Top-k selection | int32 | sort/select | Must match reference exactly; must be on-device for prefill |
-| 15 | Grouped output projection | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | `[corrected]` 8 groups × 1024 → `wo_b` |
+| 15 | Grouped output projection | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | `[corrected]` 8 groups × 1024 → `wo_b`; **`[Tier 1]` per-group reduction is load-bearing** |
 | 16 | Router | fp16 logits → fp32 | small matmul | `sqrt(softplus)`; bias (`ffn.gate.bias`) added to **scores**; hash branch for layers < 3; flat top-6, no groups |
 | 17 | Expert fetch | — | memory | Async, overlapped |
 | 18 | Dequantization | INT4 → fp16/bf16 | registers | Fused with matmul; signed −8 bias |
@@ -716,7 +727,7 @@ Build and certify in this order. Each item's gate must be green before the next 
 9. ~~**Attention score + sink + softmax** — verify at pos 0, within window, beyond window.~~ **DONE.** `tests/test_v4_attention_sink_oracle.cpp`, 19 lines green at pos 0 / 5 / 127 / 149. Asserts the exact window boundary (an out-of-window key has **exactly zero** influence), the sink as a pure scalar rescale, and the full-head scale against both wrong candidates. Trap 35 records the one property that cannot be tested from the output.
 10. ~~**Compressor** — verify pooling and boundary firing.~~ **DONE.** `tests/test_v4_compressor_oracle.cpp`, 32 lines green at both ratio classes (4 and 128), covering both kernels. Verified: APE is a `score`-only term (kv bit-exact), the APE row is `position % ratio`, the per-dimension softmax, both overlap segments, the RoPE position, the truncated first entry, and the `blockDim >= head_dim` launch contract.
 11. ~~**Indexer + top-k** — exact index match. **Verifies the confirmed ReLU and fp8/UE8M0 quantization, and settles the Hadamard choice.**~~ **DONE.** `tests/test_v4_indexer_oracle.cpp`, 11 lines green; top-k matches exactly. **The gate found the ReLU missing from `v4_indexer_scores_kernel`** (`max_rel 0.98`, 65 of 512 wrong indices) and it is now fixed — trap 11. **Gate 11 is settled by measurement: do not apply the Hadamard** (two-sided is a no-op to `3.6e-16`, one-sided shifts scores by `1.46` and 180 of 512 indices). The indexer-K fp8 + per-key scale delta is deferred to the KV-precision gates.
-12. **Grouped output projection** — low-rank and final.
+12. ~~**Grouped output projection** — low-rank and final.~~ **DONE.** `tests/test_v4_grouped_wo_oracle.cpp`, 14 lines green. `z` matches the einsum to `2.9e-4`, `attn_proj` to `4.2e-4` over the chain. The gate asserts the **per-group structure** rather than only closeness: the interleaved weight reading differs by `1.38`, perturbing group 0 leaves groups 1–7 bit-identical while moving all of group 0, and the group-0 reduction is shown to reach its last head. See the gate result under 2.5.
 13. **Router** — exact ids and weights, one hash layer and one top-k layer. **Verifies `tid2eid == [vocab,6]` against our artifact.**
 14. **Expert matmul with fused dequant and clamped SwiGLU** — vs independent decoder.
 15. **Shared expert** — separately.
