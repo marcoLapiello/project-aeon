@@ -68,8 +68,8 @@ A `[V]` tag is only valid if the cited source is authoritative for **RDNA 3 + th
 > was **wrong** — the Hadamard *is* in the DSV4 tree (`dsa_indexer.py:192-204`, ROCm-registered)
 > but is **logit-preserving**, so it is a quantization-conditioning choice, not a missing graph op.
 > Neither of this plan's two earlier claims about it was accurate; the truthful statement is
-> in 2.4.3. A second item (the MoE router's normalization guard) remains a practice-level
-> choice rather than a semantics question.
+> in 2.4.3. A second item (the MoE router's normalization guard) was left soft here and is
+> **resolved in Tier 0.2d** below — it is a non-semantic robustness detail, not a graph choice.
 
 > **Tier 0.2c (done) — two-base RoPE, YaRN, compressor window, and a missing op.** Re-read
 > from `vllm/.../deepseek_v4/common/rope.py`, `vllm/.../rotary_embedding/deepseek_scaling_rope.py`
@@ -85,6 +85,19 @@ A `[V]` tag is only valid if the cited source is authoritative for **RDNA 3 + th
 > `[coff·head_dim, ratio]`. One near-miss avoided: the *generic* rope class rotates the first
 > `rotary_dim`; DSV4 uses the subclass that rotates the **last** `rotary_dim` — citing the
 > parent would have rotated the wrong 64 dims.
+
+> **Tier 0.2d (done) — the MoE router, closed.** Re-read against the **naive** reference
+> `vllm/tests/kernels/moe/test_topk_softplus_sqrt.py::_torch_topk_softplus_sqrt` — a better
+> arbiter than the fused kernel because it carries no robustness shortcuts — plus the fused
+> kernel, its dispatch, `nvidia/model.py`, and `ds4`. **No semantic errors.** Findings:
+> the checkpoint names the correction bias **`ffn.gate.bias`** (renamed on load to
+> `e_score_correction_bias`); it is added to **post-softplus scores**, not logits; there is
+> **no group-limited routing** (`n_group`/`topk_group` absent); `norm_topk_prob=True`; the
+> hash branch (layers 0–2) takes ids straight from `tid2eid` with no bias and no top-k. The
+> earlier "normalization guard" soft spot is now **resolved as non-semantic**: the naive
+> reference has no guard, the fused kernel uses `Σ>0?Σ:1`, `ds4` floors at `2⁻¹⁴`, and all
+> three agree because `sqrt(softplus) > 0`. Our existing `moe_router.hpp` already matches the
+> reference on every point — recorded as positive evidence, not a gate substitute.
 
 ---
 
@@ -376,24 +389,29 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 - RMSNorm over 4096, fp32 accumulate.
 - **Gate:** matches fp32 reference.
 
-#### 2.9 — MoE Router `[corrected — scoring and layer branching were wrong]`
+#### 2.9 — MoE Router `[corrected — scoring and layer branching were wrong]` `[Tier 0.2d: re-cited]`
 
-> **Re-cited (Tier 0.2).** Confirmed against
-> `vllm/model_executor/layers/fused_moe/router/dsv4_topk.py` and
-> `vllm/models/deepseek_v4/nvidia/model.py`.
+> **Re-cited (Tier 0.2 + 0.2d).** Confirmed against the **naive reference**
+> `vllm/tests/kernels/moe/test_topk_softplus_sqrt.py::_torch_topk_softplus_sqrt` (the arbiter for
+> semantics and tie-break), the fused kernel `vllm/.../router/dsv4_topk.py`, the dispatch
+> `vllm/.../router/fused_topk_bias_router.py`, `vllm/models/deepseek_v4/nvidia/model.py`, and the
+> `ds4` cross-check. **No semantic errors found.** Two facts the plan was missing are added:
+> the **checkpoint tensor name** and the **absence of group routing**.
 
-- **Logits:** `logits = gate_weight @ x` → 256 `[V contract ffn.gate.weight F16 [256,4096]]`.
-- **Score:** `weights[e] = sqrt(softplus(logits[e]))`, computed stably as
-  `sqrt(x > 20 ? x : log(1+exp(x)))` `[V dsv4_topk.py:82; V config scoring_func=sqrtsoftplus]`.
-- **Selection (either branch):**
-  - **`[corrected]` Layers 0–2 use hash routing, not top-k.** `is_hash_moe = layer_index < num_hash_layers`; expert ids come from `ffn.gate.tid2eid[token_id]`, and those layers have **no** bias tensor `[V nvidia/model.py:810-835 comment "hash MoE doesn't use e_score_correction_bias"; V config num_hash_layers=3; V contract]`. The table is shaped `(vocab_size, num_experts_per_tok)` — **`[vocab, 6]`** `[V nvidia/model.py:820]`.
-  - Layers ≥3: `selection[e] = weights[e] + e_score_correction_bias[e]`, take top-6 by `selection` `[V dsv4_topk.py:83; V config topk_method=noaux_tc]`.
-  - **Tie-break: lowest expert index wins** — `expert_id = min(where(current == max, offsets, NUM_EXPERTS))` `[V dsv4_topk.py:91-92]`.
-  - NaN selection scores are replaced by `-1e30` `[V dsv4_topk.py:86]`.
-- **Weighting:** the weight stored for each selected expert is the **unbiased** `weights[id]`, *not* the biased selection score `[V dsv4_topk.py:93-97 "selected_weight = weights[...]"` separate from `current = weights + bias`]`.
-- **Normalize then scale:** `selected_weights *= routed_scaling_factor / (Σ selected_weights)` `[V dsv4_topk.py:102-105]`. Note the reference guards with `Σ>0 ? Σ : 1` whereas ds4 used a `6.1e-5` floor — equivalent in practice because `sqrt(softplus) ≥ 0`, but record which we implement.
+- **Logits:** `logits = gate_weight @ x` → 256, computed in **fp32** (`router_logits_dtype=float32`) `[V contract ffn.gate.weight F16 [256,4096]; V nvidia/model.py:979]`.
+- **Score:** `scores[e] = sqrt(softplus(logits[e]))`, `softplus` with the default threshold 20 — i.e. `sqrt(x > 20 ? x : log(1+exp(x)))` `[V test_topk_softplus_sqrt.py:32 `F.softplus(...).sqrt()`; V dsv4_topk.py:82; V config scoring_func=sqrtsoftplus]`.
+- **Selection — two mutually exclusive branches:**
+  - **`[corrected]` Layers 0–2 use hash routing, not top-k.** `is_hash_moe = layer_index < num_hash_layers` `[V nvidia/model.py:810]`. IDs are taken **directly** from a table: `topk_ids = tid2eid[input_ids]` — **no bias, no top-k, no score comparison** `[V test:38 `hash_indices_table[input_ids.long()]`; V ds4:11540-11545]`. Those layers have **no bias tensor** `[V nvidia/model.py:812-813 comment "hash MoE doesn't use e_score_correction_bias"; **V checkpoint: `ffn.gate.bias` present only on layers 3..42, absent on 0..2**]`. The table is `(vocab_size, num_experts_per_tok)`; **measured in our artifact as `I64 [129280, 6]`** `[V safetensors header; V nvidia/model.py:820 *expected* [vocab,6]]`.
+  - Layers ≥3: `selection[e] = scores[e] + e_score_correction_bias[e]`, then top-6 by `selection` `[V test:69-75; V dsv4_topk.py:83; V config topk_method=noaux_tc]`.
+  - **`[new — Tier 0.2d]` No group-limited routing.** `n_group` and `topk_group` are **absent** from `config.json`, so this is a **flat top-6 over all 256 experts**, not the DeepSeek-V3 `noaux_tc` grouped variant `[V config.json: fields absent; V the flat kernel has no group term]`. Do **not** add `n_group`/`topk_group` grouping.
+  - **Tie-break: lowest expert index wins.** Reference: stable descending `argsort`, so equal scores retain ascending index order `[V test:75-77; V dsv4_topk.py:91-92]`.
+  - NaN selection scores → `-1e30` is a **fused-kernel robustness guard only**, absent from the naive reference `[V dsv4_topk.py:86; V absent in test]`.
+- **Weighting (both branches):** the stored weight is the **unbiased** `scores[id]` — in the hash branch it is `scores` of the table-selected experts `[V test:80 gather; V ds4:11620-11626; V our moe_router.hpp hash branch]`.
+- **Normalize then scale:** the reference divides by `Σ` **then** multiplies by `routed_scaling_factor = 1.5` `[V test:77-80; V config norm_topk_prob=True, routed_scaling_factor=1.5]`. (Mathematically `w·f/Σ` ≡ `(w/Σ)·f`; the plan's single-expression form is equivalent.) **Guard:** the naive reference has **no** guard; the fused kernel uses `Σ>0 ? Σ : 1`; `ds4` floors at `6.103515625e-5` (= `2⁻¹⁴`) `[V dsv4_topk.py:102-103; V ds4:11626]`. Since `sqrt(softplus) > 0` always, the three agree in practice — **record which we implement** (ours uses the fused `Σ>0?Σ:1`).
+  - *Order note:* in the hash branch the expert ids keep the **table's column order** (not score-sorted); only the top-k branch is score-ordered. Irrelevant to the weighted sum, but it changes the id *sequence* if compared positionally.
+- **`[new — Tier 0.2d]` The checkpoint tensor is named `ffn.gate.bias`**, not `e_score_correction_bias — the reference renames it on load: `{".ffn.gate.bias": ".ffn.gate.e_score_correction_bias"}` `[V nvidia/model.py:1704]`. It is F32 `[256]` `[V safetensors header]`. A loader that treats `ffn.gate.bias` as a **linear logit bias** (adding it before `softplus`) is silently wrong — it must be added to the **post-softplus scores**. Our loader already maps it correctly (loaded as `d_gate_bias`, nulled for hash layers) `[V v4_dense_weight_binding.hpp:144; V v4_pipeline.hpp:1024]`.
 - **Ensure:** `num_experts == 256`, `top_k == 6` `[V dsv4_topk.py can_use_dsv4_topk]`.
-- **Gate:** selected ids **and** weights match reference exactly, for one hash layer and one top-k layer. `tid2eid` orientation is verified against our artifact (`[vocab,6]` expected).
+- **Gate:** selected ids **and** weights match the naive reference exactly, for one hash layer (0–2) and one top-k layer (≥3); ids compared **as a set and positionally**; `tid2eid` `[129280,6]` verified against our artifact; and specifically that the bias is added **after** `softplus`.
 
 #### 2.10 — Expert Computation
 
@@ -513,7 +531,7 @@ True chunked batched prefill is a hard requirement, not an optimization. Without
 | 13 | Indexer | **fp8 (E4M3/UE8M0)** | WMMA (dequant to fp16) | `[corrected]` not INT8; **`[V]` ReLU required, per-head, before weighting** |
 | 14 | Top-k selection | int32 | sort/select | Must match reference exactly; must be on-device for prefill |
 | 15 | Grouped output projection | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | `[corrected]` 8 groups × 1024 → `wo_b` |
-| 16 | Router | fp16/bf16 | small matmul | `sqrt(softplus)`; hash branch for layers < 3 |
+| 16 | Router | fp16 logits → fp32 | small matmul | `sqrt(softplus)`; bias (`ffn.gate.bias`) added to **scores**; hash branch for layers < 3; flat top-6, no groups |
 | 17 | Expert fetch | — | memory | Async, overlapped |
 | 18 | Dequantization | INT4 → fp16/bf16 | registers | Fused with matmul; signed −8 bias |
 | 19 | Expert matmul | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | Fused with dequant; **clamped SwiGLU** |
@@ -612,3 +630,5 @@ These are the specific things that will break this model if implemented naively.
 25. **Prefix reuse is not merely an optimization here.** On a tiered engine where the dominant cost is re-streaming experts from NVMe, recomputing the context each turn dominates everything; the state contract in Part I §6 is a correctness-of-design issue, not a tuning knob.
 26. **The compressor has a learned APE added to `score`.** `score += ape[pos % ratio]`, shape `[ratio, coff·head_dim]`, fp32, added **before** the window softmax and **only to `score`** — not to `kv`. It is a real trained tensor in our checkpoint (62 of them). Omitting it, adding it to `kv`, or transposing it (`ds4` keeps it transposed) all shift every compressed row silently. `[Tier 0.2c]`
 27. **DSV4 RoPE rotates the *last* 64 dims.** The DSV4 subclass `DeepseekV4ScalingRotaryEmbedding` overrides the generic parent to slice `[..., -rotary_dim:]`; the parent slices `[..., :rotary_dim]`. Reaching for the wrong one rotates the wrong dims and passes every "does it run" check. `[Tier 0.2c]`
+28. **The router's correction bias is stored as `ffn.gate.bias` but is NOT a linear bias.** The reference renames it `{".ffn.gate.bias": ".ffn.gate.e_score_correction_bias"}` `[V nvidia/model.py:1704]`. It is added to the **post-`softplus` scores** (`selection = scores + bias`), never to the logits before `softplus`. Treating it as `nn.Linear.bias` shifts every routing score. Present only on layers 3..42, F32 `[256]`. `[Tier 0.2d]`
+29. **There is no group-limited routing.** `n_group`/`topk_group` are absent from the config; selection is a **flat top-6 over all 256 experts**. Do not introduce the DeepSeek-V3 grouped variant. `[Tier 0.2d]`
