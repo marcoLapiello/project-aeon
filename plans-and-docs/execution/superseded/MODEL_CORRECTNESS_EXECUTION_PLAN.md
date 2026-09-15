@@ -1,5 +1,23 @@
 # DeepSeek-V4 Flash Model Correctness Execution Plan
 
+> ## ⛔ SUPERSEDED — do not execute
+>
+> **Superseded 2026-09-15 by [inference_pipeline_plan.md](../../analysis/current/inference_pipeline_plan.md).**
+>
+> Stages 0-6 were executed against the runtime and produced useful *evidence*
+> (contract parsing, INT4 parity, CPU oracles, class-aware device state, serial
+> dispatch). But the staged approach treated the graph as something to repair in
+> place, and the graph-level review that followed found **structural** errors the
+> stages could not catch — because each stage's oracle shared assumptions with the
+> code under test. Confirmed errors include a missing Hyper-Connections comb scale,
+> a missing compressor APE term, and HCA layers running indexer selection they do
+> not have.
+>
+> The replacement plan rebuilds the graph from an evidence-tagged specification
+> with independent oracles. **Retained for chronology only** — the Stage 0-6
+> results and their recorded traces remain valid as measurements of the old runtime,
+> not as a specification for the rewrite. Do not resume Stage 7 here.
+
 **Date:** 2026-09-14
 **Status:** Open; Stages 0-6 serial correctness complete; Stage 5 serialized/chunk equivalence and hybrid batched-prefill subgates complete; Stage 7 trusted-reference parity is active but its independent reference-runtime lane is pending; fully batched stateful optimization remains separate
 **Target:** `DeepSeek-V4-Flash-0731-INT4-W4A16` on the native `.aeon` artifact and AMD RDNA3/gfx1100  
@@ -277,11 +295,11 @@ They must not be presented as proof of selected-checkpoint correctness.
 
 ### 5.1 In-repository references
 
-- [DeepSeek-V4 Flash versus Aeon comparison](../../analysis/current/DEEPSEEK_V4_FLASH_AEON_COMPARISON.md)
+- [DeepSeek-V4 Flash versus Aeon comparison](../../analysis/historical/DEEPSEEK_V4_FLASH_AEON_COMPARISON.md)
   is the current diagnosis and records the selected 0731 schedule correction.
 - [DeepSeek-V4 architecture notes](../../analysis/current/deepseek_v4_flash_architecture.md)
   records the model geometry, cache categories, and causal requirements.
-- [VLLM RDNA3 and DeepSeek-V4 reference analysis](../../analysis/current/VLLM_RDNA3_DEEPSEEK_V4_REFERENCE_ANALYSIS.md)
+- [VLLM RDNA3 and DeepSeek-V4 reference analysis](../../analysis/historical/VLLM_RDNA3_DEEPSEEK_V4_REFERENCE_ANALYSIS.md)
   maps the external reference attention, compressor, indexer, prefill, and
   hardware paths to Aeon ownership boundaries.
 - [Native text-in/text-out plan](TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md)

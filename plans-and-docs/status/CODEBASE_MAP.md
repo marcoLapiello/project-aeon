@@ -1,5 +1,14 @@
 # Project Aeon Codebase Map
 
+> **Rewrite note (2026-09-15).** The project is rewriting its DeepSeek-V4 inference graph
+> on branch `rewrite/graph-v2`. The "current engine path" below describes the **pre-rewrite**
+> runtime: it is being replaced and its graph logic carries known errors. The storage,
+> streaming, artifact-format and kernel sections remain current. A stable map will replace
+> this one as the rewrite lands. See [DOCUMENTATION_STATUS.md](DOCUMENTATION_STATUS.md).
+>
+> The pre-rewrite graph and its tests are gated behind `AEON_ENABLE_LEGACY_V4_GRAPH`
+> (CMake default `OFF`) — see `cmake/AeonLegacyGraph.cmake`.
+
 *Status: current runtime map, audited 2026-09-12.*
 
 This document distinguishes the current inference engine from validation programs,

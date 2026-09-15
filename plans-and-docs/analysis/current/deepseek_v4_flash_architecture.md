@@ -6,6 +6,12 @@ This document consolidates the model-architecture information identified for the
 
 > **Checkpoint note:** DeepSeek-V4-Flash preview and later releases such as DeepSeek-V4-Flash-0731 should not be assumed to be tensor- or serving-compatible. The selected checkpoint's `config.json`, model implementation, tokenizer, and tensor metadata are authoritative where they differ from this summary.
 
+> **Authority note (2026-09-15).** This is an **orientation overview** of the model
+> family. For the selected checkpoint's authoritative op semantics — each claim
+> tagged and cited against readable reference code — use
+> [inference_pipeline_plan.md](inference_pipeline_plan.md). Where the two differ,
+> the plan governs.
+
 ## 1. Model overview
 
 DeepSeek-V4-Flash is a causal decoder-only sparse mixture-of-experts language model.

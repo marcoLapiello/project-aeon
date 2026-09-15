@@ -11,16 +11,21 @@ Aeon solves the memory wall for massive MoE models (e.g., DeepSeek-V4 architectu
 ---
 
 ## 2. Documentation and References
-Use [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) for the current plan inventory, open gates, and historical-document boundaries.
+Use [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) for the current plan inventory, open gates, and historical-document boundaries. It is the navigation point; read it before any other planning document.
+
+**The project is rewriting its DeepSeek-V4 inference graph.** The storage, streaming, artifact-format, and kernel layers are kept; the graph that composes them is being rebuilt on branch `rewrite/graph-v2`. The specification is:
+- [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md): **the authority for graph semantics.** Evidence-tagged (`[V]`/`[?]`/`[I]`), cited step-by-step procedure with per-step gates, a reference hierarchy, and an anti-circularity rule. Every claim is cited or flagged unverified.
+- [Checkpoint Verification Plan](plans-and-docs/analysis/current/checkpoint_verification_plan.md): independently falsifiable stages validating the source checkpoint, the INT4 transcode, and the `.aeon` repack.
 
 Current execution records:
 - [Phase 2 Execution Plan](plans-and-docs/execution/active/PHASE_2_EXECUTION_PLAN.md): paused single-GPU Hot/Warm/Cold runtime and remaining cold-tier work.
 - [Native Text-In/Text-Out Plan](plans-and-docs/execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md): native frontend status and correctness gates.
-- [Model Correctness Execution Plan](plans-and-docs/execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md): config-driven SWA/CSA/HCA/indexer recovery, compressed RoPE, prefill state, and trusted-reference parity gates.
 - [Routing Profile Study](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md): profiler contract and placement-study gates.
 - [Backend Generalization Execution Plan](plans-and-docs/execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md): descriptor-driven artifact and expert-supply boundary; manifest and second-backend gates.
-- [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md): authoritative silicon measurements.
-- [Expert Performance Review Conclusions](plans-and-docs/analysis/historical/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md): historical latency diagnosis and measurement rationale.
+- [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md): authoritative silicon measurements. **Read its banner before comparing any `E2E` entry** — pre-rewrite model-path measurements are marked invalid.
+
+Superseded records (retained for chronology; do not execute):
+- [Model Correctness Execution Plan](plans-and-docs/execution/superseded/MODEL_CORRECTNESS_EXECUTION_PLAN.md): the staged in-place repair approach, replaced by the Inference Pipeline Plan.
 
 Completed execution records:
 - [Warm-Tier Repair and Supply Telemetry Plan](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md): persistent Warm ownership, asynchronous refill, and source-tier telemetry; see the [closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
@@ -33,43 +38,42 @@ The primary external source references are maintained as shallow, default-branch
 - [FreeToken reference checkout](../aeon-references/freetoken): bandwidth-adaptive CPU/GPU execution, expert caching, prefill streaming, and agent-facing serving.
 - [Colibri reference checkout](../aeon-references/colibri): VRAM/RAM/NVMe tiering, routing-aware placement, direct I/O, prefetch, and persistent KV state.
 - [DwarfStar (ds4) reference checkout](../aeon-references/ds4): DeepSeek-V4-specific kernels, profile-derived expert hotlists, SSD streaming, KV/prefix caching, and native agent serving.
-- [vLLM reference checkout](../aeon-references/vllm): paged memory, prefix/KV caching, scheduling, resource management, and production serving.
-- [SGLang reference checkout](../aeon-references/sglang): radix/HiCache, chunked prefill, MoE scheduling, disaggregation, and AMD paths.
+- [vLLM reference checkout](../aeon-references/vllm): paged memory, prefix/KV caching, scheduling, resource management, and production serving. **Also the canonical DeepSeek-V4 prompt encoder** — `vllm/tokenizers/deepseek_v4_encoding.py::encode_messages` — since the checkpoint ships no `chat_template`.
+- [SGLang reference checkout](../aeon-references/sglang): radix/HiCache, chunked prefill, MoE scheduling, disaggregation, and AMD paths. Its readable `srt/layers/attention/dsv4/**` and `kernels/ops/attention/dsv4/**` are model-specific and are the preferred arbiter for DSV4 attention and indexer semantics.
 
 Update a reference checkout with `git -C <directory> pull --ff-only` and record its commit SHA whenever an implementation decision depends on a specific revision.
 
 ---
 
 ## 3. Progress Tracking & State of Execution
-*Status: 2026-09-14. Keep this summary current; put detailed measurements and historical execution notes in the linked documents.*
+*Status: 2026-09-15, branch `rewrite/graph-v2`. Keep this summary current; put detailed measurements and historical execution notes in the linked documents.*
 
-### Completed milestones
-- [x] Phase 0-2 foundations: single-GPU runtime gates; lossless Safetensors-to-`.aeon` conversion with sector-aligned indexing and bit-exact verification; dynamic Hot/Warm/Cold storage, direct `io_uring`, asynchronous SDMA staging, residency management, and 43-layer regression coverage.
-- [x] Modular runtime ownership: pipeline operations, scratch, layer state, V4 model resources, and architecture-neutral `TieredExpertSupply` were extracted; `V4Pipeline::initialize()` is the sole model-derived production path, with obsolete partial-layer and legacy initialization modes removed.
-- [x] Artifact and backend contracts: versioned manifest/sidecar validation, backend selection, V4 dense binding, opaque descriptor-driven payload storage, swizzled-view guards, and the intended infrastructure/architecture/backend/platform source boundaries are implemented while preserving the current v2 runtime.
-- [x] Native text and routing tools: tokenizer, DSV4 formatting, EOS-aware generation, detokenization, `aeon_chat`, and resumable routing-profile aggregation with rankings, summaries, and regeneration support.
-- [x] Stage 1 expert-kernel path: version-2 swizzled W4A16 artifacts, Wave32 GEMV, fused W1/W3 and W2 kernels, native conversion, production integration, and silicon validation. The [implementation report](plans-and-docs/analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) records the comparison and limits the kernels to resident expert payloads.
-- [x] Warm-tier repair and supply telemetry: persistent Warm ownership, event-ordered refill, lazy/eager preload modes, transactional transfer cleanup, pinned fallback handling, source-tier JSONL telemetry, and controlled silicon A/B validation are recorded in [the closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
-- [x] Stage 0 model correctness boundary: structured DeepSeek-V4 config parsing, explicit 43-layer Sliding/CSA/HCA classification, shape-aware 1,271-tensor dense inventory, strict required-tensor validation, class-specific compressor/indexer binding, and reproducible contract metadata are implemented and validated against the selected package.
-- [x] Stage 1 model correctness weight/dense gate: independent version-2 INT4 expert decoding, real early/middle/late routed-expert parity, representative dense/HC/RMSNorm/router parity, and full LM-head comparison pass on gfx1100 under fixed tolerances. The checkpoint-specific attention state machine remains open.
-- [x] Stage 2 model correctness CPU oracle: deterministic Sliding/C4A/C128A cache transitions, real layer 0/2/3 dense traces through position 131, compressed-entry and indexer boundary checks, class-aware RoPE, chunk/serialization equivalence, and deterministic C4 top-k selection.
-- [x] Stage 3 model correctness layer ownership: class-aware local/compressed/indexer device state, complete generation reset, main/compressed RoPE resources, bounded attention scratch, absolute-position ring reuse, and state-aware memory accounting are implemented and validated on gfx1100.
-- [x] Stage 4 model correctness serial dispatch: class-specific HIP attention, production trace capture, and layers 0/2/3 HIP-versus-CPU-oracle parity through position 131 are implemented and validated on gfx1100; the selected full-block composition trace now covers all 43 layers at position 0; trusted-reference parity remains open.
-- [x] Stage 5 serialized prefill state subgate: explicit absolute-position prefill, reset/state snapshots, repeated one-shot replay, aligned and unaligned chunk equivalence, exact token IDs, and fixed-tolerance logits pass on gfx1100 with deterministic expert accumulation.
-- [x] Stage 5 hybrid batched prefill semantic subgate: fixed-capacity 16-row batch projections, ordered per-token causal cache/compressor/indexer/attention and routed-expert updates, batched execution reporting, and 132-token hybrid-versus-serial state/logit/token equivalence pass on gfx1100; fully batched stateful execution and throughput optimization remain open.
-- [x] Stage 6 serial HIP correctness path: class-aware main/compressed RoPE, SWA/CSA/HCA dispatch, persistent compressor/indexer state, deterministic top-k selection, and layers 0/2/3 device traces against the CPU oracle through position 131 are implemented and validated on gfx1100.
+### Present: the graph rewrite
+- [ ] **Rewrite the DeepSeek-V4 inference graph** from [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md). The storage, streaming, artifact, and kernel layers are **kept**; the graph that composes them is rebuilt. An audit found structural graph errors — a missing Hyper-Connections comb scale (`hc_scale[2]`), a missing compressor APE term (`score += ape[pos % ratio]`), and HCA layers running indexer selection they do not have — plus tests that could not catch them because they were circular.
+- [x] **Specification research complete (phases 0.1–0.2f).** The whole forward pass is re-cited against readable reference code with an evidence convention and a reference hierarchy: Hyper-Connections, MLA/sink, both RoPE bases, compressor window + APE + store quantization, indexer scope, router bias placement, attention composition (local + compressed row-sets), prompt encoding, embedding, LM head, sampling. 33 known traps recorded.
+- [x] **Build separated and gated.** CMake split into focused modules; `AEON_ENABLE_LEGACY_V4_GRAPH` (default OFF) gates every target that depends on the pre-rewrite graph, so the old tests cannot be compiled or run by accident. Default `ctest`: 14 infra/backend/text tests; legacy: 31.
+- [ ] **Next: Tier 1 primitives.** Build the independent oracle and gate harness **first**, then the primitives. Do not begin with a kernel.
 
-### Current priority
-- [ ] **Stage 7 model correctness:** repair the failing native full-block smoke first, then compare the complete 43-layer base decoder with an independent accelerator-backed reference, including selected intermediate checkpoints and final logits, before using routing data for placement decisions. All 43 layer-specific HC/FFN/MoE composition checkpoints now pass at position 0; the remaining local gap is all-layer attention boundary coverage and the incoherent native answer, not another generic block test or a new production backend.
+### Superseded (retained for chronology, do not execute)
+- [Model Correctness Execution Plan](plans-and-docs/execution/superseded/MODEL_CORRECTNESS_EXECUTION_PLAN.md) — Stages 0–6 ran against the runtime and produced useful evidence (contract parsing, INT4 parity, CPU oracles, class-aware device state, serial dispatch), but the staged in-place approach could not catch the structural errors above. Its Stage 7 is not resumed.
+
+### Completed and still valid
+- [x] Phase 0–2 foundations: single-GPU runtime gates; lossless Safetensors-to-`.aeon` conversion with sector-aligned indexing and bit-exact verification; dynamic Hot/Warm/Cold storage, direct `io_uring`, asynchronous SDMA staging, residency management.
+- [x] Modular runtime ownership: pipeline operations, scratch, layer state, V4 model resources, and architecture-neutral `TieredExpertSupply`; V4 dense binding; opaque descriptor-driven payload storage; infrastructure/architecture/backend/platform source boundaries.
+- [x] Artifact and backend contracts: versioned manifest/sidecar validation, backend selection, swizzled-view guards.
+- [x] Native text front end: tokenizer, DSV4 formatting, EOS-aware generation, detokenization, `aeon_chat`, and resumable routing-profile aggregation.
+- [x] Stage 1 expert-kernel path: version-2 swizzled W4A16 artifacts, Wave32 GEMV, fused W1/W3 and W2 kernels, native conversion, and silicon validation. See the [implementation report](plans-and-docs/analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md).
+- [x] Warm-tier repair and supply telemetry: persistent Warm ownership, event-ordered refill, lazy/eager preload, transactional transfer cleanup, pinned fallback, source-tier JSONL telemetry, and controlled silicon A/B. See [the closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
 
 ### Paused work
-- [ ] **Phase 2 continuation:** broad cold-tier, storage-layout, placement, and latency-hiding work remains paused while model correctness and the 35 GiB host-pressure tradeoff are characterized. The existing Phase 2 document remains the historical execution record for completed spikes and open gates.
+- [ ] **Phase 2 continuation:** broad cold-tier, storage-layout, placement, and latency-hiding work remains paused while the graph rewrite and the 35 GiB host-pressure tradeoff are characterized. The Phase 2 document remains the historical execution record for its completed spikes and open gates.
 
 ### Open gates
-- [ ] **Model correctness:** compare identical formatted inputs, intermediate checkpoints, and outputs with a trusted compatible reference before using traces for placement.
+- [ ] **Graph correctness:** execute the plan — independent oracle and gate harness first, then primitives, then the layer body, then compare formatted inputs, intermediate checkpoints, and final logits against a trusted compatible reference before any placement work.
+- [ ] **Four measurement gates** (specified in the plan; settled on silicon, not by reading): indexer Hadamard rotation; KV fp8/E4M3 vs bf16 storage delta; MoE routed-expert accumulation order; local-window prefix-reuse boundary behaviour. See the ledger banner for why pre-rewrite numbers cannot be compared.
 - [ ] **Cold-tier performance:** characterize cold-cache and steady-state behavior, reduce host-memory pressure, improve physical `.aeon` placement, and test whether the exposed just-in-time miss path needs a new scheduling or CPU-fallback design. The model-backed `>= 6.0 GB/s` target remains open.
-- [ ] **Swizzled full-model performance:** validate representative 43-layer generation with the version-2 artifact under controlled Hot/Warm conditions, collect useful rocprof performance counters, and tune occupancy/register pressure beyond the isolated six-expert benchmarks. A residency invariant violation would produce invalid/stale results or a device memory fault rather than trigger an automatic fallback.
-- [ ] **Kernel quality:** several kernels are correctness-validated but remain conservative or potentially suboptimal; do not treat the current hybrid batched prefill, ordered routed-expert path, or fused atomic W2 path as final performance designs until they are benchmarked and profiled on gfx1100.
+- [ ] **Swizzled full-model performance:** validate representative 43-layer generation under controlled Hot/Warm conditions, collect useful rocprof counters, and tune occupancy/register pressure beyond the isolated six-expert benchmarks. A residency invariant violation would produce invalid/stale results or a device memory fault rather than trigger an automatic fallback.
+- [ ] **Kernel quality:** the HC, compressor, and attention kernels each carry at least one known gap from the audit (comb scale, APE, HCA/indexer scope); audit them against the plan before treating them as final. The batched prefill, ordered routed-expert path, and fused atomic W2 path remain conservative or unprofiled.
 - [ ] **Routing placement study:** collect representative profile and held-out corpora with the verified text contract, then evaluate frequency-informed placement against dynamic LRU.
 - [ ] **Backend specialization:** add an explicit backend factory, semantic dispatch, and a second working weight backend before introducing a universal V4 linear-dispatch abstraction.
 - [ ] **Phase 3:** multi-GPU pipeline parallelism and 1F1B scheduling remain future work.
@@ -89,6 +93,9 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 2. **Hardware-Grounded Verification**: Test and benchmark on physical hardware (`gfx1100`) at every step.
 3. **Commit Messages**: Follow standard conventional commits format (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `perf:`).
 4. **Maintenance of AGENTS.md**: Update the "Progress Tracking & State of Execution" section whenever milestones or micro-steps transition between Past, Present, and Future.
-5. **Empirical Milestone Logging**: For every significant milestone or architectural transition, log the exact test conditions, throughput (tok/s), latencies (TTFT, decode step ms), and cache metrics in [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md). Do not log noise for small code edits; log meaningful, comparable system-level milestones to provide clear before-and-after tracking on the path to production.
-6. **Strategic codebase searching**: When you need to collect any info from the codebase or search for specific code or entities, use the search subagent tool.
-7. **Modular, Scalable and Mantainable**: avoid growing monolitic files with mixed concerns, extract those concerns in separate smaller and focused modules, reuse and improve existing modules, avoid duplications and redundancies.
+5. **The specification is authoritative**: For DeepSeek-V4 graph semantics, [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) governs. Do not implement a graph op from memory, from this file, or from an unsourced reference. If the plan lacks a citation for something being implemented, add the citation or tag it `[?]` first.
+6. **Anti-circularity**: a test must not compare a kernel against an oracle derived from that kernel's own helper — that proves self-consistency, not correctness. New graph tests compare against an independently written reference.
+7. **The legacy graph is gated**: `AEON_ENABLE_LEGACY_V4_GRAPH` (default `OFF`) controls the pre-rewrite graph, its tests, and its tools. Leave it off. Enable it only to re-derive a specific value from the old path, and never treat a green legacy run as coverage.
+8. **Empirical Milestone Logging**: For every significant milestone or architectural transition, log the exact test conditions, throughput (tok/s), latencies (TTFT, decode step ms), and cache metrics in [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md). Do not log noise for small code edits; log meaningful, comparable system-level milestones to provide clear before-and-after tracking on the path to production.
+9. **Strategic codebase searching**: When you need to collect any info from the codebase or search for specific code or entities, use the search subagent tool.
+10. **Modular, Scalable and Maintainable**: avoid growing monolithic files with mixed concerns, extract those concerns in separate smaller and focused modules, reuse and improve existing modules, avoid duplications and redundancies.

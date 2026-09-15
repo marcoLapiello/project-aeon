@@ -1,75 +1,123 @@
-# Project Aeon Documentation Status
+# Project Aeon — Documentation Status
 
-Status audited on 2026-09-14 against the current source tree.
+**Audited: 2026-09-15, on branch `rewrite/graph-v2`.**
 
-This file is the navigation point for project state. Detailed benchmark numbers belong in [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md); design rationale belongs in the reference and vision documents; this file and [AGENTS.md](../../AGENTS.md) should stay concise.
+This file is the navigation point for project state. It is deliberately short:
+detailed numbers belong in [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md), design
+rationale in the reference documents, and step-by-step implementation in the plan
+linked below. [AGENTS.md](../../AGENTS.md) carries the engineering rules.
 
-## Directory layout
+---
 
-- `status/`: project navigation, current runtime map, and the living benchmark ledger.
-- `execution/active/`: plans with open acceptance gates or remaining implementation work.
-- `execution/completed/`: implementation plans whose execution gates are complete; unresolved correctness or product gates are called out from the active plans.
-- `analysis/current/`: current technical conclusions and reviews that guide the next measurement or implementation decision.
-- `analysis/historical/`: completed reviews and design analyses retained for rationale and chronology.
-- `reference/strategy/`: vision, risk, and specialization documents.
-- `reference/prior-art/`: external research and comparative implementation studies.
+## 1. Where the project is
 
-## Execution documents
+Project Aeon is **rewriting its DeepSeek-V4 inference graph**. The storage,
+streaming, artifact-format, and kernel layers are kept; the graph that composes
+them is being rebuilt from a verified specification.
+
+**Why.** An audit of the existing runtime against the selected checkpoint found
+structural errors in the graph — not tuning gaps. Concretely: a missing
+Hyper-Connections comb scale, a missing compressor APE term, and HCA layers
+running indexer selection they do not have. The existing tests did not catch them
+because several compared a kernel against an oracle derived from the same helper
+(see the anti-circularity rule in the plan). Measurements taken against that graph
+describe a different computation and are marked invalid in the ledger.
+
+**How.** The rewrite is driven by a single document, written with an
+evidence-tagging convention and an explicit reference hierarchy, so that every
+claim is either cited or flagged as unverified:
+
+> ### ➡️ [Inference Pipeline Plan](../analysis/current/inference_pipeline_plan.md) — the specification
+
+It is the authority for graph semantics. Every `[V]` claim in it cites readable
+reference code; every remaining unknown names the gate that settles it.
+
+### Current execution state
+
+| Field | Value |
+| :--- | :--- |
+| Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
+| Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
+| Default `ctest` | 14 infrastructure/backend/text tests |
+| Legacy `ctest` | 31 tests, only with the gate ON |
+| Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
+| Next | Tier 1 primitives, beginning with the oracle and gate harness |
+
+---
+
+## 2. Document map
+
+### Live — guides current work (`analysis/current/`)
+
+| Document | Purpose |
+| :--- | :--- |
+| [inference_pipeline_plan.md](../analysis/current/inference_pipeline_plan.md) | **The specification.** Evidence-tagged, cited step-by-step graph procedure with gates. Authoritative for semantics. |
+| [checkpoint_verification_plan.md](../analysis/current/checkpoint_verification_plan.md) | Independently falsifiable stages validating the source checkpoint, the INT4 transcode, and the `.aeon` repack. |
+| [deepseek_v4_flash_architecture.md](../analysis/current/deepseek_v4_flash_architecture.md) | Orientation overview of the model family. Not authoritative — defer to the plan. |
+
+### Execution records (`execution/`)
+
+| Folder | Meaning |
+| :--- | :--- |
+| `active/` | Plans with open gates that the project still depends on. |
+| `completed/` | Plans whose execution gates are complete. |
+| `superseded/` | Plans replaced by a different approach; retained for chronology only. |
 
 | Document | State | Purpose |
-| --- | --- | --- |
-| [WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) | Complete | Persistent Warm ownership, asynchronous refill, transfer safety, corrected demotion accounting, source-tier telemetry, and five-run silicon A/B are complete; configured capacity is eager while preload publication is content-lazy; see the [closure report](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md). |
-| [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md) | Paused | Paused single-GPU cold-tier, storage-layout, and memory-pressure work. Spikes 0-2 are complete; Spike 3 has a bounded implementation but open acceptance gates. |
-| [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](../execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) | Open | Native text path is implemented; external behavioral comparison and longer-context attention correctness remain open. |
-| [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md) | Open; Stages 0-5 serial/hybrid prefill subgates complete; trusted-reference parity next | Restores the selected 0731 base-decoder contract: config-driven layer schedule, CSA/HCA/indexer state, compressed RoPE, serial dispatch, hybrid prefill continuity, and trusted-reference parity. Fully batched stateful execution remains a performance direction. |
-| [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) | Open; evidence gated | Routing observer and durable profiler are implemented; representative profile/held-out data and placement evaluation remain gated by model correctness. |
-| [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) | Open; foundation implemented | Descriptor-driven native artifacts, opaque expert supply, manifest sidecar, backend capability selection, V4 dense binding, and source ownership boundaries are implemented; explicit factory, semantic dispatch, and second-backend gates remain open. |
-| [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Living record | Authoritative silicon results, regressions, and milestone measurements. |
-| [CODEBASE_MAP.md](CODEBASE_MAP.md) | Current map | Describes the production runtime, validation targets, and legacy diagnostics. |
+| :--- | :--- | :--- |
+| [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md) | Paused | Cold-tier, storage-layout, and host-pressure work. Spikes 0–2 complete; Spike 3 has open acceptance gates. |
+| [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](../execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) | Open | Native text path is implemented and kept. Its attention-correctness gate now belongs to the rewrite. |
+| [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) | Open; gated | Routing observer and durable profiler implemented; representative data and evaluation gated by correctness. |
+| [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) | Open | Descriptor-driven artifacts and manifest implemented; factory and second-backend gates remain. |
+| [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/superseded/MODEL_CORRECTNESS_EXECUTION_PLAN.md) | **Superseded** | The staged in-place repair approach, replaced by the plan. Retained for chronology. |
+| [WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) | Complete | Persistent Warm ownership, asynchronous refill, source-tier telemetry. See the [closure report](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md). |
+| [PHASE_0_EXECUTION_PLAN.md](../execution/completed/PHASE_0_EXECUTION_PLAN.md) | Complete | Build, hardware, I/O, overlap, and toy-cache foundations. |
+| [PHASE_1_EXECUTION_PLAN.md](../execution/completed/PHASE_1_EXECUTION_PLAN.md) | Complete | Single-GPU runtime gates. Its correctness portion is superseded by the plan. |
 
-## Current analysis
+### Status
 
-| Document | State | Purpose |
-| --- | --- | --- |
-| [EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md](../analysis/current/EXPERT_SUPPLY_CHAIN_AND_ROLLING_RESIDENCY_ANALYSIS.md) | Current analysis | Records the registry, Hot/Warm/Cold residency findings and the rationale for the deferred rolling-residency direction. Implementation sequencing is recorded in the completed Warm-tier plan. |
-| [DEEPSEEK_V4_FLASH_AEON_COMPARISON.md](../analysis/current/DEEPSEEK_V4_FLASH_AEON_COMPARISON.md) | Current analysis | Compares the selected 0731 checkpoint contract with Aeon quantization, attention, runtime, and hardware behavior. |
-| [LLAMA_CPP_DSV4_BATCH_PREFILL_ANALYSIS.md](../analysis/current/LLAMA_CPP_DSV4_BATCH_PREFILL_ANALYSIS.md) | Current analysis | Compares llama.cpp's C++ DeepSeek-V4 batch/state-plan implementation with Aeon's Stage 5 hybrid-prefill path and records the remaining fully batched stateful gaps. |
-| [GPTQ_AEON_PARALLEL_BACKEND_ANALYSIS.md](../analysis/current/GPTQ_AEON_PARALLEL_BACKEND_ANALYSIS.md) | Current analysis | Records the feasibility, shared-versus-specialized boundary, artifact strategy, and performance gates for a parallel GPTQ-Aeon backend. |
-| [VLLM_RDNA3_DEEPSEEK_V4_REFERENCE_ANALYSIS.md](../analysis/current/VLLM_RDNA3_DEEPSEEK_V4_REFERENCE_ANALYSIS.md) | Current reference analysis | Maps the local vLLM gfx1100 GPTQ/W4A16, fused MoE, DeepSeek-V4 prefill, sparse-attention, indexer, and KV-cache sources to Aeon reuse and adaptation decisions. |
-| [EXPERT_KERNELS_REVIEW.md](../analysis/current/EXPERT_KERNELS_REVIEW.md) | Current review | Records the pending kernel-geometry, quant-layout, bottleneck, and interface questions for the next kernel investigation. |
-| [EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md](../analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md) | Historical implementation report | Compares the external Stage 1 proposal with the implemented version-2 path and records the measured GPU-side effects that led to the v2-only promotion. |
+| Document | Purpose |
+| :--- | :--- |
+| [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Authoritative silicon record. **Read its banner before comparing any `E2E` entry** — pre-rewrite model-path measurements are marked invalid. |
+| [CODEBASE_MAP.md](CODEBASE_MAP.md) | Source-tree map. Its "current engine path" section describes the pre-rewrite runtime and is being superseded as the rewrite lands. |
 
-## Reference dossiers
+### Historical and reference (rationale only — not checklists)
 
-- [AEON_NATIVE_PRODUCTION_INFERENCE_DOSSIER.md](../reference/AEON_NATIVE_PRODUCTION_INFERENCE_DOSSIER.md) is a neutral, source-grounded package for external review of the native `aeon_chat` inference path, selected model contract, native artifact format, and production source closure. It intentionally excludes diagnosis, measurements, tests, and inferred gaps.
+`analysis/historical/` holds completed reviews, design analyses, and the
+pre-rewrite planning documents (`AEON_V4_REVIEW_AND_FIX_*`, the supply-chain and
+backend analyses, the vLLM reference map, and the llama.cpp prefill analysis).
+`reference/strategy/` and `reference/prior-art/` hold vision, risk, and external
+research. None of these are current implementation evidence.
 
-## Completed execution records
+---
 
-- [PHASE_0_EXECUTION_PLAN.md](../execution/completed/PHASE_0_EXECUTION_PLAN.md) is complete for the build, hardware, I/O, overlap, and toy-cache foundations.
-- [PHASE_1_EXECUTION_PLAN.md](../execution/completed/PHASE_1_EXECUTION_PLAN.md) is complete for the implemented single-GPU runtime gates. It is not a claim that the full model correctness gate is closed: compressed/indexed attention for layers 2-42 and external parity remain open in the text plan.
-- Phase 2 Spike 0 (lossless `.aeon` repacking), Spike 1 (budgeting and unified hot pool), and Spike 2 (asynchronous SDMA overlap) are complete. Their evidence is summarized in [PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md) and the ledger.
-- Phase 2 Spike 3 has reached bounded Hot/Warm/Cold integration, direct-I/O population, and a measured 35 GiB Warm profile. The model-backed `>= 6.0 GB/s` target, cold-cache/queue-saturation comparison, host-pressure tuning, and scheduling latency remain open.
-- The [Warm-tier repair plan](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) is complete. Its repaired default reduced median Decode Cold NVMe bytes by 22.9% versus the demotion-free Warm control across five runs per variant, with identical generated IDs and EOS stop behavior. The second-pass corrections remove the optional-demotion CPU synchronization, remove the undocumented layer filter, distinguish drop reasons, include registered host fallback in pinned accounting, and document the content-lazy/eager-capacity boundary; broader cold-tier and host-pressure work remains open.
-- Native tokenizer, DSV4 formatting, EOS-aware generation, and `aeon_chat` are implemented and have passed the simple 43-layer text turn. This is the native milestone, not external model-behavior parity.
-- Routing counting, resumable aggregation, rankings, compact summaries, and profile regeneration are implemented. The existing pilot remains a plumbing artifact until the correctness gate passes.
-- The version-2 swizzled expert path is now the sole native runtime and conversion path. Loader, pipeline, tests, and active tooling no longer expose the retired baseline format or kernels.
-- The backend generalization foundation now includes a converter-generated `model_manifest.json`, automatic runtime discovery, explicit source ownership directories, and the current V4 dense-binding boundary. The active backend plan records the remaining factory and second-backend work.
+## 3. Open gates
 
-## Open work
+**Correctness (the active work).** Execute the plan: build the independent oracle
+and gate harness first, then the Tier 1 primitives, then the layer body, then
+compare identical formatted inputs, intermediate checkpoints, and final logits
+against a trusted compatible reference before any placement work.
 
-1. **Correctness:** execute [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/active/MODEL_CORRECTNESS_EXECUTION_PLAN.md): retain the class-specific serial state machine as the reference, preserve hybrid prefill continuity, then compare identical formatted IDs and outputs against a trusted compatible reference.
-2. **Cold tier:** characterize cold-cache and steady-state behavior, improve physical `.aeon` placement/extent layout, reduce host-memory pressure, and decide whether further scheduling or CPU fallback work is justified by measurements.
-3. **Swizzled full-model performance:** characterize representative 43-layer version-2 generation under controlled Hot/Warm conditions, collect useful rocprof counters, and tune occupancy/register pressure beyond the isolated kernel measurements.
-4. **Placement study:** collect profile and held-out corpora with the verified text contract, then compare measured placement against dynamic LRU. Do not use the existing pilot for placement decisions.
-5. **Scaling:** Phase 3 multi-GPU pipeline parallelism remains future work.
-6. **Backend specialization:** add an explicit backend factory and semantic dispatch after a second working weight backend exists.
+Four gates are settled empirically, not by reading — they are specified in the
+plan and must be measured:
 
-## Historical and reference documents
+1. Indexer Hadamard rotation — apply or not (must be symmetric over Q/K).
+2. KV fp8/E4M3 vs bf16 storage delta.
+3. MoE routed-expert accumulation order.
+4. Local-window prefix-reuse boundary behaviour.
 
-These documents remain useful, but they are not current checklists:
+**Kept infrastructure.** Cold-tier characterization, physical `.aeon` layout,
+host-memory pressure, the model-backed `>= 6.0 GB/s` target, kernel occupancy
+tuning, the placement study, the explicit backend factory, and Phase 3 multi-GPU
+all remain open and are unaffected by the correctness rewrite.
 
-- [V4_PIPELINE_MODULARIZATION_ANALYSIS.md](../analysis/historical/V4_PIPELINE_MODULARIZATION_ANALYSIS.md) records the pre-refactor duplication analysis and completed extraction decisions.
-- [EXPERT_PERFORMANCE_REVIEW.md](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md) records the M15-era source review and the implemented M16-M20 follow-up steps; use the conclusions document and ledger for current status.
-- [EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md](../analysis/historical/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md) records the historical latency diagnosis that led to the current Warm-tier and supply-chain sequencing.
-- [PROJECT_AEON_VISION.md](../reference/strategy/PROJECT_AEON_VISION.md), [AEON_TECHNICAL_BLOCKERS_AND_RISKS.md](../reference/strategy/AEON_TECHNICAL_BLOCKERS_AND_RISKS.md), and [AEON_SPECIALIZATION_AND_ENTROPY_ANALYSIS.md](../reference/strategy/AEON_SPECIALIZATION_AND_ENTROPY_ANALYSIS.md) preserve strategic rationale and hypotheses.
-- [AEON_RESEARCH_AND_INSPIRATION.md](../reference/prior-art/AEON_RESEARCH_AND_INSPIRATION.md) and [REFERENCE_EXPERT_CACHING_AND_COLD_STREAMING_ANALYSIS.md](../reference/prior-art/REFERENCE_EXPERT_CACHING_AND_COLD_STREAMING_ANALYSIS.md) preserve external research and comparative implementation evidence.
+---
+
+## 4. Conventions
+
+- **Update this file and `AGENTS.md` §3 whenever a milestone transitions.** They
+  are the two documents a new session should read first.
+- **Mark superseded documents explicitly** rather than deleting them; move them to
+  `execution/superseded/` or `analysis/historical/`.
+- **Do not add a fourth place to record state.** Measurements go in the ledger,
+  the implementation sequence in the plan, navigation here.

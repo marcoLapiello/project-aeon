@@ -11,6 +11,31 @@ explicit comparison key and pass the entry gate.
   from cross-entry comparisons; the raw observation remains useful historical
   evidence and its reason must be short and explicit.
 
+> ## ⚠️ Read this before comparing any `E2E` entry (2026-09-15)
+>
+> The graph rewrite ([inference_pipeline_plan.md](../analysis/current/inference_pipeline_plan.md))
+> found **structural** errors in the runtime that produced the model-path
+> measurements below: a missing Hyper-Connections comb scale (`hc_scale[2]`), a
+> missing compressor APE term (`score += ape[pos % ratio]`), and HCA layers
+> running indexer selection they do not have.
+>
+> **Consequence:** every entry whose headline is absolute model throughput or
+> latency measured a graph that was doing *different work*. Those numbers are not
+> comparable to post-rewrite numbers in either direction — they are not merely
+> "slow", they are measurements of a different computation. They are marked
+> `Invalidate for comparison` below and retained as historical evidence.
+>
+> **What remains valid:** `Primitive`, `Kernel`, `I/O`, tier-integration and
+> supply-behaviour entries. These measure a component's cost or a transfer's
+> behaviour, not the composed graph, so the three graph errors do not move them.
+> Within-series `e2e-43L-A/B` *deltas* (M15-M20) stay informative because the
+> graph error acts as a common constant across both arms — but their **absolute**
+> throughput does not.
+>
+> A post-rewrite ledger section will be opened when the new graph reaches its
+> first end-to-end gate. Do not mix the two.
+
+
 ## 1. Recording contract
 
 - Compare only entries with the same **class**, **comparison key**, model
@@ -101,7 +126,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-07`; commit `5e27dd9`; DeepSeek-V4 INT4-W4A16, Safetensors
 - **Class / comparison key**: `E2E / e2e-2L`; prompt length and slot count are part of the key
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; model-path throughput measured a different computation (see banner)
 - **Workload / configuration**: 2 layers (L0-L1), 8 slots/layer (16 total, 216 MB), greedy argmax; short `4 -> 16` and medium `8 -> 32`; `n=1` per prompt
 - **Metrics**: short TTFT `422.20 ms`, decode `11.97 tok/s`, step `83.52 ms`, hit `1.8%`; medium TTFT `528.60 ms`, decode `19.11 tok/s`, step `52.33 ms`, hit `2.4%`
 - **Correctness / service**: `97.6%` misses required synchronous host transfers
@@ -112,7 +137,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-07`; commit `cc252c9`; DeepSeek-V4 INT4-W4A16, `.aeon`
 - **Class / comparison key**: `E2E / e2e-2L`; compare with M3 only after matching artifact and slot configuration
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; model-path throughput measured a different computation (see banner)
 - **Workload / configuration**: 2 layers (L0-L1), 664 dynamic Hot slots (`8.75 GB`), 4K context; short `4 -> 16` and medium `8 -> 32`; `n=1` per prompt
 - **Metrics**: short TTFT `43.76 ms`, decode `91.78 tok/s`, step `10.90 ms`, hit `100.0%`; medium TTFT `88.19 ms`, decode `89.48 tok/s`, step `11.18 ms`, hit `100.0%`
 - **Correctness / service**: complete working set stayed resident; no cold-miss transfer in the measured sequences
@@ -123,7 +148,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-07`; DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers, 11,008 experts
 - **Class / comparison key**: `E2E / e2e-43L-legacy`; cache state and prompt are part of the key
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; model-path throughput measured a different computation (see banner)
 - **Workload / configuration**: 664 Hot slots, 3,800 Warm slots, `4 -> 8` tokens; `n=1`
 - **Metrics**: init `16.05 s`; TTFT `5,816.63 ms` (`33.82 ms/token/layer`); decode `1.47 tok/s` (`678.32 ms/token`); service `1,684 Hot / 1,154 Cold` (`59.3%` hit)
 - **Correctness / service**: synchronous PCIe misses of `14.15 MB/expert` account for approximately `450 ms` of the step
@@ -134,7 +159,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-08`; DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
 - **Class / comparison key**: `E2E / e2e-43L-legacy`; warm file pages, so do not compare with cold-page runs
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; model-path throughput measured a different computation (see banner)
 - **Workload / configuration**: 664 Hot slots; Warm preload disabled; 10,344 experts streamed from mmap; `4 -> 8`; `n=1`
 - **Metrics**: init `4.42 s`; TTFT `2,549.36 ms`; decode `2.10 tok/s` (`476.48 ms/token`, `11.08 ms/token/layer`); service `1,609 Hot / 1,229 Cold` (`56.7%` hit)
 - **Correctness / service**: full model ran without allocating or populating a 35 GiB host staging buffer
@@ -145,7 +170,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-08`; DeepSeek-V4 INT4-W4A16, `.aeon`
 - **Class / comparison key**: `E2E / e2e-2L`; regression check against the 2-layer pool path
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; model-path throughput measured a different computation (see banner)
 - **Workload / configuration**: 2 layers, 664 Hot slots; `n=1`
 - **Metrics**: decode `48.81-49.01 tok/s`; step approximately `20.4 ms`; hit `100.0%`
 - **Correctness / service**: HC projection serialized 24 outputs on one Wave32 warp; kernel latency `1,188 us`
@@ -156,7 +181,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-08`; commit `c49b5b5`; DeepSeek-V4 INT4-W4A16, `.aeon`
 - **Class / comparison key**: `E2E / e2e-2L`; same 2-layer working-set family as M4/M7
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; model-path throughput measured a different computation. The HC kernel latency `1,188 -> 9.2 us` is a kernel measurement and stays valid.
 - **Workload / configuration**: 2 layers, 664 Hot slots; short `4 -> 16` and medium `8 -> 32`; `n=1` per prompt
 - **Metrics**: short TTFT `32.73 ms`, decode `122.90 tok/s`, step `8.14 ms`, hit `100.0%`; medium TTFT `65.66 ms`, decode `122.60 tok/s`, step `8.16 ms`, hit `100.0%`; HC kernel `1,188 -> 9.2 us`
 - **Correctness / service**: bit-exact within `4.5e-6`; `hc_pre_combine_kernel` `3.5 us`; CPU synchronization roundtrips removed
@@ -167,7 +192,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-08`; commit `fb2c7c0`; DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
 - **Class / comparison key**: `E2E / e2e-43L-legacy`; M6 control, cold-page run, and warm-page run are separate conditions
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; model-path throughput measured a different computation (see banner)
 - **Workload / configuration**: 664 Hot slots, on-demand `.aeon`, `4 -> 8`; `n=1` per condition
 - **Metrics**:
   | Condition | Init | TTFT | Decode / step | Service |
@@ -238,7 +263,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-08`; DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
 - **Class / comparison key**: `E2E / e2e-43L-A/B`; context and token counts match M16 and M18-M20
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; absolute throughput not comparable. The Warm on/off delta within this series remains valid (see banner).
 - **Workload / configuration**: context `4096`, `664` Hot slots, `4 -> 8`; Warm `0 GiB` versus `35 GiB`; `n=1` per variant
 - **Metrics**: Warm off `4.37 tok/s`, `229.1 ms/token`, `1,682 Hot / 1,156 Cold`; Warm on `5.15 tok/s`, `194.2 ms/token`, `1,682 Hot / 684 Warm / 472 Cold`; decode delta `+17.8%`
 - **Correctness / service**: generated IDs identical: `[237, 223, 223, 223, 223, 223, 223, 223]`; asynchronous D2H used per-slot HIP events
@@ -249,7 +274,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-08`; DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers; [review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md)
 - **Class / comparison key**: `E2E / e2e-43L-A/B`; same workload as M15
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; absolute throughput not comparable. The warm-traffic reduction within this series remains valid (see banner).
 - **Workload / configuration**: context `4096`, `664` Hot slots, `4 -> 8`; Warm `0` versus `35 GiB`; `n=1` per variant
 - **Metrics**: Warm off `4.36 tok/s` (`229.30 ms/token`), `1,682 Hot / 1,156 Cold`; Warm on `5.11 tok/s` (`195.82 ms/token`), `1,682 Hot / 157 Warm / 999 Cold`; warm traffic reduced from approximately `42 MB` to `14 MB` per hit without a throughput gain over M15
 - **Correctness / service**: regression suite passed; golden token `295`; generated IDs matched M15; shared-expert enqueue moved ahead of prefetch
@@ -271,7 +296,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-08`; [review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md); DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
 - **Class / comparison key**: `E2E / e2e-43L-A/B`; supporting kernel result is tagged in the metrics
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; the E2E figures measured a different computation. The isolated GEMV `10.0x` kernel speedup remains valid.
 - **Workload / configuration**: context `4096`, `4 -> 8`, 664 Hot slots, Warm off versus `35 GiB`; `n=1` per variant; decode uses `M=1` GEMV
 - **Metrics**: W1/W3 `138.8 -> 13.9 us` (`10.0x`, `340 GB/s`); W2 `13.9 us` (`338 GB/s`); Warm off `4.36 -> 5.25 tok/s` (`+20.4%`); Warm on `5.11 -> 5.79 tok/s` (`+13.3%`), TTFT `2,755 -> 1,835 ms`
 - **Correctness / service**: kernel max diff `0` versus CPU FP32; regression suite and golden token `295` passed; output `[237, 201, 1778, ...]` was deterministic and tier-independent, but differs from earlier near-tie argmax output
@@ -282,7 +307,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-08`; [review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md); DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
 - **Class / comparison key**: `E2E / e2e-43L-A/B`; same workload as M18
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; absolute throughput not comparable. The layout/stream-split delta within this series remains valid (see banner).
 - **Workload / configuration**: context `4096`, `4 -> 8`, 664 Hot slots, Warm off versus `35 GiB`; `n=1` per variant
 - **Metrics**: Warm `35 GiB` `5.79 -> 5.88 tok/s` (`172.6 -> 170.0 ms/token`), TTFT `1,835 -> 1,803 ms`; Warm off `5.25 -> 5.39 tok/s` (`190.4 -> 185.6 ms/token`)
 - **Correctness / service**: one contiguous `13.5 MiB` region per slot and one H2D copy replaced six; separate cold SDMA stream; regression group `5/5` passed; output matched M18
@@ -293,7 +318,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-08`; commit `HEAD`; [review](../analysis/historical/EXPERT_PERFORMANCE_REVIEW.md); DeepSeek-V4 INT4-W4A16, `.aeon`, 43 layers
 - **Class / comparison key**: `E2E / e2e-43L-A/B`; same workload as M19
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; absolute throughput not comparable. The CPU-stall removal delta within this series remains valid (see banner).
 - **Workload / configuration**: context `4096`, `4 -> 8`, 664 Hot slots, Warm off versus `35 GiB`; `n=1` per variant
 - **Metrics**: Warm `35 GiB` `5.88 -> 7.10 tok/s` (`170.0 -> 140.8 ms/token`), TTFT `1,803 -> 1,801 ms`; Warm off `5.39 -> 6.32 tok/s` (`185.6 -> 158.2 ms/token`)
 - **Correctness / service**: device-side router conversion and GPU argmax removed 43 per-layer drains and 258 KB/token CPU readback; golden token `295` and regression group passed; output returned to `[237, 223 x7]`
@@ -315,7 +340,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-09`; DeepSeek-V4 INT4-W4A16, `.aeon`
 - **Class / comparison key**: `E2E / native-text-simple-turn`
 - **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; this is the run whose output the rewrite exists to fix — the generated text is not a reference.
 - **Workload / configuration**: 43 layers, context `1024`, 674 Hot slots, Warm disabled; chat prompt `What is the capital of France?`; EOS-bounded; `n=1`
 - **Metrics**: TTFT `4,084.13 ms`; decode `3.04 tok/s`; IDs `[671, 6102, 294, 8760, 344, 2619, 51119, 42499, 1]`; stop `eos`
 - **Correctness / service**: response `The capital of France is **Paris**.`; router conversion, GPU argmax, query RMSNorm, and gate correction fixes passed the simple-turn gate
@@ -364,7 +389,7 @@ explicit comparison key and pass the entry gate.
 - **Run**: `2026-09-11`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, `.aeon`, 43 layers
 - **Class / comparison key**: `E2E / native-text-real-prompt`
 - **Platform**: `baseline`; RX 7900 XTX, ROCm 7.2.2, Linux 7.0.0-31-generic
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: pre-rewrite graph; absolute throughput not comparable. The Warm-vs-Hot/Cold delta within this instrumented A/B remains valid (see banner).
 - **Workload / configuration**: native tokenizer/formatter; prompt `What is the capital of France?`; context `1024`; EOS-bounded greedy generation; `n=3` per variant; wall time includes Warm preload
 - **Metrics**:
   | Variant | TTFT median (range) | Decode median (range) | Wall / service |
