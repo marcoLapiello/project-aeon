@@ -124,6 +124,12 @@ if(AEON_BUILD_TESTS)
     # 1/sqrt(512) scale.
     aeon_add_test(test_v4_attention_sink_oracle
         SOURCES tests/test_v4_attention_sink_oracle.cpp)
+
+    # Step 2.4.2 — compressor + APE, both ratio classes (4 with overlap, 128
+    # without). Asserts that APE is a score-only term, the APE row periodicity,
+    # the window length, the two-segment overlap mapping, and the RoPE position.
+    aeon_add_test(test_v4_compressor_oracle
+        SOURCES tests/test_v4_compressor_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------

@@ -38,11 +38,11 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 24 infrastructure/backend/text/kept-component/Tier-1 tests |
-| Legacy `ctest` | 26 (the 24 plus 2 gated parity anchors) |
+| Default `ctest` | 25 infrastructure/backend/text/kept-component/Tier-1 tests |
+| Legacy `ctest` | 27 (the 25 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
-| Tier 1 | Certified: **RMSNorm**, **RoPE** (both bases), **MLA Q/KV**, **HC project + Sinkhorn** (found a transposed comb index in the plan), **attention score + sink + softmax**. Next: compressor + APE, then indexer + top-k, grouped output, router, MoE |
+| Tier 1 | Certified: **RMSNorm**, **RoPE** (both bases), **MLA Q/KV**, **HC project + Sinkhorn** (found a transposed comb index in the plan), **attention + sink + softmax**, **compressor + APE** (both ratio classes). Next: indexer + top-k, grouped output, router, MoE |
 
 ---
 

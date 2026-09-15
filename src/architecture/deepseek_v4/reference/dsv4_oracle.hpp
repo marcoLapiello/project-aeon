@@ -731,4 +731,123 @@ inline std::vector<double> attention_sink_as_zero_value_key(
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Compressor — Step 2.4.2
+//
+// Reference: `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py`
+// (`compress_norm_rope_store_triton` → the softmax + weighted sum, then RMSNorm)
+// and `.../ops/save_partial_states.py` (the APE add).
+//
+// The compressor turns every `ratio` tokens into one compressed row. The pieces
+// that are easy to get wrong, in the order they bite:
+//
+//   1. THE APE GOES ON `score` AND ONLY `score`, indexed by `position % ratio`,
+//      in `[ratio, coeff·head_dim]` row-major order. It is added per token at
+//      *store* time, before the window softmax. Upstream:
+//        `ape_row = position % COMPRESS_RATIO; store(score + ape)`
+//      `[V save_partial_states.py:80-89]`. The checkpoint ships it in the same
+//      order (`[ratio, width]`); `ds4` stores it transposed and must not be
+//      copied.
+//   2. THE SOFTMAX IS PER DIMENSION, over the window. For each output `d`, the
+//      weights are `softmax_over_offsets(score[segment(o), d])` — the score is
+//      dimension-dependent, so each dimension has its own weight vector. The
+//      `kv` read is at the *same* `segment(o)·head_dim + d` offset.
+//   3. THE WINDOW IS `(1 + overlap)·ratio` long and ends at the boundary token,
+//      where `overlap = (ratio == 4)`. With overlap the row is twice as wide and
+//      the second half holds the newer `ratio` tokens: `coeff = 1 + overlap`,
+//      `segment = o / ratio`, offset `segment · head_dim + d`.
+//   4. THE ENTRY IS EMITTED ONLY WHEN `(pos + 1) % ratio == 0`, and its RoPE
+//      position is the window start `(pos / ratio)·ratio`, which equals the
+//      plan's `pos + 1 − ratio` exactly at those positions.
+// ---------------------------------------------------------------------------
+
+// Floor-mod, because Python's `%` (which the reference uses) and C++'s differ
+// for negative operands. The graph only calls this with non-negative positions,
+// so the two agree in practice; making it explicit removes the question.
+inline int64_t floor_mod(int64_t value, int64_t modulus) noexcept {
+    const int64_t r = value % modulus;
+    return r < 0 ? r + modulus : r;
+}
+
+// The APE row for a token, applied to its score row.
+inline std::vector<double> compressor_ape_apply(const std::vector<double>& score_row,
+                                                const std::vector<double>& ape,
+                                                int64_t position, int64_t ratio,
+                                                size_t width) {
+    const int64_t row = floor_mod(position, ratio);
+    std::vector<double> out(width);
+    for (size_t i = 0; i < width; ++i) out[i] = score_row[i] + ape[row * width + i];
+    return out;
+}
+
+// The window reduction: for each dimension `d`, a softmax over the window of the
+// (already APE-adjusted) scores at dimension `d`, used to combine the `kv`
+// values at dimension `d`.
+//
+// `window_kv` and `window_score` are the window entries in chronological order,
+// each of width `coeff · head_dim`. The segment of offset `o` is `o / ratio`.
+//
+// `valid`, when given, marks which offsets actually hold state. A window that
+// starts before position 0 has leading offsets that were never written, and the
+// kernel skips them (`if (source_position < 0) continue`). They must be skipped
+// here too — otherwise they would wrongly enter the max and the denominator.
+// Passing no `valid` means every offset is populated. If no offset is
+// populated the raw result is zero, matching the kernel's `has_value` guard
+// rather than dividing by an empty denominator.
+inline std::vector<double> compressor_raw(const std::vector<std::vector<double>>& window_kv,
+                                          const std::vector<std::vector<double>>& window_score,
+                                          size_t head_dim, int64_t ratio,
+                                          const std::vector<bool>* valid = nullptr) {
+    const size_t window = window_kv.size();
+    std::vector<double> raw(head_dim, 0.0);
+    if (window == 0) return raw;
+
+    const auto populated = [&](size_t o) { return valid == nullptr || (*valid)[o]; };
+
+    for (size_t d = 0; d < head_dim; ++d) {
+        // Scores for this dimension, one per populated window offset, using the
+        // segment mapping `segment = offset / ratio`.
+        std::vector<double> s(window, 0.0);
+        double m = -std::numeric_limits<double>::infinity();
+        size_t populated_count = 0;
+        for (size_t o = 0; o < window; ++o) {
+            if (!populated(o)) continue;
+            const size_t segment = o / static_cast<size_t>(ratio);
+            const size_t off = segment * head_dim + d;
+            s[o] = window_score[o][off];
+            m = std::fmax(m, s[o]);
+            ++populated_count;
+        }
+        if (populated_count == 0) continue;
+
+        double denom = 0.0;
+        std::vector<double> w(window, 0.0);
+        for (size_t o = 0; o < window; ++o) {
+            if (!populated(o)) continue;
+            w[o] = std::exp(s[o] - m);
+            denom += w[o];
+        }
+        if (denom <= 0.0) continue;
+
+        double acc = 0.0;
+        for (size_t o = 0; o < window; ++o) {
+            if (!populated(o)) continue;
+            const size_t segment = o / static_cast<size_t>(ratio);
+            const size_t off = segment * head_dim + d;
+            acc += (w[o] / denom) * window_kv[o][off];
+        }
+        raw[d] = acc;
+    }
+    return raw;
+}
+
+// The compressed entry's RoPE position: the start of its own window. Upstream
+// writes this as `(positions // compress_ratio) * compress_ratio`
+// `[V compressor.py; V fused_compress_quant_cache.py]`; the plan writes the
+// equivalent `pos + 1 − ratio`. Provided once so a gate can assert they agree
+// rather than assume it.
+inline int64_t compressor_rope_position(int64_t boundary_position, int64_t ratio) noexcept {
+    return (boundary_position / ratio) * ratio;
+}
+
 } // namespace aeon::reference
