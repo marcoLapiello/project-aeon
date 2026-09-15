@@ -140,6 +140,11 @@ if(AEON_BUILD_TESTS)
     # and that the group-major weight layout is load-bearing.
     aeon_add_test(test_v4_grouped_wo_oracle
         SOURCES tests/test_v4_grouped_wo_oracle.cpp)
+
+    # Step 2.9 — MoE router. Asserts the post-softplus bias, the flat top-6 (no
+    # n_group/topk_group), the lowest-index tie-break, and the hash/biased layer
+    # split — the last against the artifact's own tid2eid table, at real token ids.
+    aeon_add_test(test_v4_router_oracle SOURCES tests/test_v4_router_oracle.cpp)
 endif()
 
 # --- Kept model-side components ----------------------------------------------

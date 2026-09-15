@@ -1012,4 +1012,110 @@ std::vector<double> grouped_wo_a(size_t tokens, size_t groups, size_t rank,
     return z;
 }
 
+// ---------------------------------------------------------------------------
+// MoE router — Step 2.9
+//
+//     scores[e] = sqrt(softplus(logits[e])),   softplus threshold 20
+//     selection[e] = scores[e] + bias[e]
+//     ids = top-6(selection)   |  ids = tid2eid[token]     (layers 0..2)
+//     w[k] = scores[ids[k]] / Σ_k scores[ids[k]] · 1.5
+//
+// Written from the **naive reference**
+// `vllm/tests/kernels/moe/test_topk_softplus_sqrt.py::_torch_topk_softplus_sqrt`,
+// which is the arbiter for semantics and tie-break; the fused kernel and `ds4`
+// were used only as cross-checks. Three things this encodes that are easy to get
+// wrong and that the plan calls out explicitly:
+//
+//  * the bias enters **after** softplus and sqrt, on the score — not on the
+//    logit. `ffn.gate.bias` is renamed `e_score_correction_bias` on load
+//    `[V nvidia/model.py:1704]`, and a loader that treats it as a linear bias
+//    is silently wrong;
+//  * selection is **flat** — a top-6 over all 256 experts. `n_group` and
+//    `topk_group` are absent from the config, so no group pre-filter exists;
+//  * the stored weight is the **unbiased** score, normalized by its own sum and
+//    only then scaled (trap 29).
+//
+// `bias_before_softplus` is the deliberately-wrong variant that trap names, in
+// the same spirit as `transpose_comb` and `apply_relu`: a gate computes the
+// wrong answer on purpose to show the difference is material. Nothing in the
+// graph passes `true`.
+inline double softplus(double x) {
+    // `F.softplus` with the default threshold: above 20 the identity is used,
+    // because `log1p(exp(x))` has no precision left there.
+    return x > 20.0 ? x : std::log1p(std::exp(x));
+}
+
+inline double router_score(double logit) {
+    return std::sqrt(softplus(logit));
+}
+
+struct RouterSelection {
+    std::vector<int32_t> ids;
+    std::vector<double> weights;
+};
+
+// Layers >= num_hash_layers. `bias` is required here (it is `[n_routed_experts]`
+// F32 in the checkpoint); an empty bias means "behave as if it were zero", which
+// the gate uses to show the bias is load-bearing.
+inline RouterSelection router_topk(const std::vector<double>& logits,
+                                   const std::vector<double>& bias,
+                                   size_t top_k, double scaling,
+                                   bool bias_before_softplus = false) {
+    const size_t experts = logits.size();
+    std::vector<double> scores(experts, 0.0);
+    std::vector<double> selection(experts, 0.0);
+    for (size_t e = 0; e < experts; ++e) {
+        const double b = bias.empty() ? 0.0 : bias[e];
+        if (bias_before_softplus) {
+            scores[e] = router_score(logits[e] + b);
+        } else {
+            scores[e] = router_score(logits[e]);
+        }
+        selection[e] = bias.empty() ? scores[e] : scores[e] + b;
+    }
+
+    RouterSelection out;
+    out.ids = topk_indices(selection, top_k);
+    out.weights.resize(top_k, 0.0);
+
+    double sum = 0.0;
+    for (size_t k = 0; k < top_k; ++k) {
+        out.weights[k] = scores[static_cast<size_t>(out.ids[k])];
+        sum += out.weights[k];
+    }
+    // Order matters for reproducibility and matches the kernel: divide by the
+    // sum, then scale. The naive reference carries no guard; the fused kernel
+    // uses `Σ > 0 ? Σ : 1` and our kernel adds `1e-20`. Since
+    // `sqrt(softplus(x)) > 0` for every finite `x`, none of the three can fire
+    // for a logit reachable with fp16 weights — the divergence needs a score
+    // below ~1.6e-21, i.e. a logit below about -96.
+    for (size_t k = 0; k < top_k; ++k) {
+        out.weights[k] /= sum;
+        out.weights[k] *= scaling;
+    }
+    return out;
+}
+
+// Layers < num_hash_layers. The ids come **directly** from the table, in the
+// table's own column order — they are not sorted by score, so a positional
+// comparison must not assume ordering. There is no bias and no comparison.
+inline RouterSelection router_hash(const std::vector<double>& logits,
+                                   const std::vector<int64_t>& table_row,
+                                   double scaling) {
+    RouterSelection out;
+    out.weights.resize(table_row.size(), 0.0);
+
+    double sum = 0.0;
+    for (size_t k = 0; k < table_row.size(); ++k) {
+        out.ids.push_back(static_cast<int32_t>(table_row[k]));
+        out.weights[k] = router_score(logits[static_cast<size_t>(table_row[k])]);
+        sum += out.weights[k];
+    }
+    for (size_t k = 0; k < table_row.size(); ++k) {
+        out.weights[k] /= sum;
+        out.weights[k] *= scaling;
+    }
+    return out;
+}
+
 } // namespace aeon::reference
