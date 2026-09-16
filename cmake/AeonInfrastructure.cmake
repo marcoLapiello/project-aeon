@@ -170,6 +170,15 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_layer_body_oracle.cpp)
 endif()
 
+# --- Tier-2 composition: the compressed attention classes ---------------------
+# Item 17. The same body as above, on the ratio-4 (CSA) and ratio-128 (HCA)
+# layers, which is where trap 33 lives: only CSA selects compressed rows through
+# the indexer; HCA attends every committed compressed row and has no indexer.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_layer_body_compressed_oracle
+        SOURCES tests/test_v4_layer_body_compressed_oracle.cpp)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate

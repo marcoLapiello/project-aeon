@@ -776,7 +776,7 @@ Build and certify in this order. Each item's gate must be green before the next 
 
 **Tier 2 — Composition.**
 16. ~~**One full layer, Sliding class.** Verify `res_out` for a single token.~~ **DONE.** `core/v4_layer_body.hpp` (the layer body, Steps 2.0–2.11, one token) + `reference/dsv4_oracle.hpp::layer_sliding_body` (the composed fp64 reference) + `tests/test_v4_layer_body_oracle.cpp`. Device `res_out` and every named intermediate match the oracle on the artifact's real `layers.0` weights, for ten positions (the local ring is shrunk to 6 so the wrap is exercised). Every checkpoint is within **`1.1e-3` of its own peak**, which is the fp16 store and nothing else. Three mutations killed, one equivalent; and the gate found **a defect in the oracle itself** — a fp16 tensor widened with `std::vector<double>(uint16_t*, …)`, which converts the bit pattern arithmetically (`0x3C00` → `15360`) instead of decoding it. See the gate result below. **Next: item 17.**
-17. **Full layer, CSA class.** Then **HCA class**.
+17. ~~**Full layer, CSA class.** Then **HCA class**.~~ **DONE.** One body, all three classes. `reference/dsv4_oracle.hpp::layer_body` (generalized from `layer_sliding_body`, so the oracle mirrors the device's single structural branch) + `tests/test_v4_layer_body_compressed_oracle.cpp`, driving the artifact's real `layers.2` (CSA, ratio 4) and `layers.3` (HCA, ratio 128) weights across a sequence that crosses ratio boundaries. Every named intermediate matches — the compressor projections, the **APE-adjusted** partial ring row, the materialized compressed entry, the **indexer** scores and its top-k, the **row-set counts**, `attn_proj`, `ffn_norm`, `moe_out` and `res_out` — and the row-set rule itself (**trap 33**) is asserted directly: CSA reads the indexer-selected rows, HCA reads **every** committed compressed row and never touches the indexer. Five mutations, **all five killed**. See the gate result below. The shared gate scaffolding was extracted to `tests/support/v4_layer_body_gate.hpp`.
 18. **Serial multi-token decode.** Verify state evolution across compressor boundaries.
 
 > **Gate result (Tier 2, item 16) — CERTIFIED, and the gate found a defect in its own oracle.**
@@ -849,6 +849,114 @@ Build and certify in this order. Each item's gate must be green before the next 
 > "check your inputs": the failure was legible *only* because the report prints each
 > checkpoint's peak. An absolute or relative error alone could not distinguish "the oracle is
 > 3.5e4 out" from "the device is broken".
+
+> **Gate result (Tier 2, item 17) — CERTIFIED, both compressed classes, and the class
+distinction is the thing that was actually tested.**
+> `tests/test_v4_layer_body_compressed_oracle.cpp`; the default suite is **32 tests**.
+>
+> **What was built.** The item-16 oracle was generalized rather than duplicated:
+> `layer_sliding_body` became `layer_body`, whose only structural branch is the attention
+> class — the same shape as `core/v4_layer_body.hpp`, so oracle and device branch in the same
+> place. The compressor (`CompressorRing`, the two-segment window, the APE, the materializer),
+> the indexer (query from `q_lora_norm`, head weights, a second compressor, the score path,
+> the two-branch top-k), and the merged local+compressed row-set under one sink softmax were
+> added. The scaffolding the two Tier-2 gates share moved to
+> `tests/support/v4_layer_body_gate.hpp`.
+>
+> **CSA (layer 2) and HCA (layer 3), on the artifact's real weights.** CSA runs 20 tokens at
+> ratio 4 with the local window shrunk to 4 and `index_topk` shrunk to 3, so the selection is
+> **non-degenerate** (more candidates than slots) inside a short run; HCA runs **257** tokens
+> at ratio 128, which is the minimum that commits two compressed entries. Worst case per
+> checkpoint, as a fraction of that checkpoint's own peak:
+>
+> | checkpoint | CSA worst | HCA worst |
+> | :--- | ---: | ---: |
+> | `x_norm` (attention RMSNorm) | `9.4e-4` | `6.2e-4` |
+> | `q_rot` (MLA + per-head norm + RoPE, **compressed base**) | `1.2e-3` | `6.6e-4` |
+> | `kv_rot` (single shared K=V row) | `1.3e-3` | `5.2e-4` |
+> | `compressor_kv` / `compressor_score` (raw projections) | `7.4e-4` | `4.7e-4` |
+> | `partial_kv` / `partial_score` (**APE-adjusted** ring row) | `7.8e-4` | `5.0e-4` |
+> | `compressed entry` (materialized row) | `4.3e-4` | `6.0e-4` |
+> | `indexer scores` | `2.4e-3` (abs floor `5e-4`) | — (no indexer) |
+> | `attn_proj` (attention + inverse RoPE + grouped wo) | `1.9e-3` | `1.2e-3` |
+> | `ffn_norm` | `1.0e-3` | `8.2e-4` |
+> | `moe_out` (routed + shared) | `2.3e-3` | `1.1e-3` |
+> | `res_out` (the layer output) | `8.0e-4` | `5.2e-4` |
+> | `router logits` | `5.9e-4` | `5.6e-4` |
+>
+> Tolerances are `3e-3` of peak (`4e-3` post-MoE), i.e. ~2–4× the measured floor, which is the
+> fp16 store and nothing else. Every one of them is the same peak-relative basis item 16
+> established, for the same reason.
+>
+> **A: the oracle's compressed rules are pinned closed-form.** The ring adds the APE to
+> `score` and to **nothing else** — `kv` is compared against a plain widening of the input and
+> matches **exactly** (`0.0`), which is the bit-exact form of "score only". The APE row index is
+> shown to be a genuine modulo (`p` and `p+ratio` identical, `p` and `p+1` differing by `1.0`).
+> And the fp16-decode fast path is checked against the `ldexp` definition it replaced over the
+> full 16-bit space: **bit-exact, `0.0`** (see the performance note below).
+>
+> **B: the row-set rule, which IS trap 33, is asserted rather than assumed.** For each token the
+> gate checks that a boundary fires on exactly `(pos+1) % ratio == 0` and matches the device's
+> own committed count; that the local row count is `min(pos+1, window)`; and that the
+> **compressed row count** equals the class's rule — `min(committed, index_topk)` for CSA,
+> `committed` for HCA. On CSA, the indexer's returned top-k is compared **element-by-element**
+> against `select_indexer_topk`'s output, which is itself a re-derivation of the device's own
+> two-branch rule (ascending when the candidates fit, score-sorted otherwise) in the same order
+> the device writes it.
+>
+> **C: the class distinction is shown load-bearing, as the thing the comparison is for.**
+> Attention is recomputed by the oracle on the run's final state with the row-set altered:
+> dropping the compressed rows entirely moves `attn_out` by `104%` of peak (CSA) / `44%` (HCA),
+> so the compressed branch is genuinely in the row-set; **HCA's "every row"** is probed by
+> dropping the *oldest* committed entry, which moves it by `16%` — a row a top-k would be free
+> to skip; and **CSA's selection** is probed by swapping one selected entry for a candidate the
+> indexer rejected, which moves it by `69%`. These three are what separate the classes, and
+> each is visible in the output rather than argued.
+>
+> **A real finding, recorded rather than hidden: `router logits` disagree with the oracle at
+> ~`1.2e-3`, which is 2–3× every other checkpoint's error and enough to flip a near-tie.** The
+> gate began by requiring the six routed ids to match the oracle's, and **8 of 257 HCA tokens
+> failed** — with their weights matching to `8e-3`, the signature of a near-tie resolved
+differently rather than a routing bug. The cause is precision, not semantics: the oracle's
+> fm64 GEMV and the device's fp16 GEMV legitimately differ at ~1e-4 on the logits — and the
+> selection is `score + bias` over 256 experts, where the 6th and 7th experts are frequently
+> within that gap. Putting the **fp64** derived ids back made 5 tokens fail with a `gap` of
+> `1.6–1.8e-4`. The gate now compares the **logits** on the peak-relative basis (where the
+> precision belongs) and compares the **selection rule** against the ids re-derived from the
+> **device's own logits** — with a `1e-6` tie tolerance for the fp32-vs-fp64 `softplus_sqrt`.
+> That is a test of the *rule* (bias after softplus, flat top-6, ties to the lower index), which
+> is what a gate can honestly assert; the logits' precision is asserted on its own line. **This
+> is the same lesson as trap 36 in a new guise: pick the comparison whose instrument matches the
+> quantity.**
+>
+> **Five mutations, all killed.** M17-1 (CSA ignores the indexer and reads every compressed
+> row — **trap 33 exactly**) killed with 27 red lines; M17-2 (HCA reads only the newest
+> compressed row) killed with 81; M17-3 (compressed layers rotated with the sliding base) killed
+> with 1021; M17-4 (compressor partial state saved at the wrong position, so the APE row and the
+> ring slot are both wrong) killed with 577, `partial_score`/`partial_kv` at **100%** of peak;
+> M17-5 (indexer top-k ordered ascending) killed with 32. **M17-1 is the important one**: the
+> one property that separates CSA from HCA is now demonstrably visible to the gate.
+>
+> **A performance note that is also a correctness note.** The first version of this gate spent
+> essentially all its time inside the oracle's `half_bits_to_double`, which called `ldexp` with a
+> runtime exponent ~180M times per token (~3 s/token, and the 257-token HCA run could not
+> finish). `half_bits_to_double` now assembles the double's bit pattern (`f64(e-15+1023, m<<42)`) —
+> provably the same value, no rounding — and is checked **bit-exact against `ldexp` over the full
+> 16-bit range** by the gate rather than trusted; plus the six fixed routed payloads are decoded
+> once through a new `decode_expert_weights` seam instead of per token. The result is
+> **3 s → 0.6 s per token** (the remaining cost is the genuine 1.15 GFLOP/token of fp64 matvec)
+> and a **2m14s** gate. The `expert_ffn(payload, …)` entry point is unchanged, so item 16 still
+> exercises the swizzle walk on the artifact's real experts; only the multi-token gate opts into
+> the decoded cache.
+>
+> **What is NOT covered, named so it is not mistaken for coverage.** Serial state evolution
+> **without** re-seeding — the residual is still written from the oracle between steps, so this
+> measures one layer's composition and not a long loop's drift (item 18); the real 128-token
+> local window (shrunk to 4 so the wrap is reachable in a few tokens — a faithful mini-model,
+> since the window length is a launch parameter, but not the model's own); the indexer's own
+> saturated regime on HCA (there is no indexer there to saturate); the fp8/UE8M0 indexer and
+> compressed stores (Gates 9/10); and any tiering (the experts are synthetic and supplied
+> directly).
 
 **Tier 3 — Sequence.**
 19. **Chunked batched prefill** with one shared layer body. Gate: chunk ≡ serial.
@@ -946,6 +1054,25 @@ RoPE-shaped, a scaled activation for anything clamp-shaped (item 14's lesson), a
 low-RMS input for anything epsilon-shaped (M1's lesson). And **print the peak**: the oracle
 defect in item 16 was legible only because the report showed each checkpoint's own scale.
 
+**Tier 2 item 17 mutations (2026-09-16, `gfx1100`, the compressed classes).** Five mutations,
+injected into `run_layer_body_decoding`'s class branch, the compressor save, or the indexer's
+top-k. **All five killed.**
+
+| # | Mutation | Result |
+| :-- | :--- | :--- |
+| M17-1 | CSA **ignores the indexer** and reads every compressed row | **Killed** — 27 lines; the row-set count and `attn_proj` both go red. This is trap 33 injected deliberately. |
+| M17-2 | HCA reads only the **newest** compressed row | **Killed** — 81 lines; `attn_proj`/`res_out` and the row-set count |
+| M17-3 | Compressed layers rotate with the **sliding** RoPE base | **Killed** — 1021 lines, from position 1 (trap 36 again) |
+| M17-4 | Compressor partial state saved at the **wrong position** | **Killed** — 577 lines; `partial_score` and `partial_kv` at **100%** of peak |
+| M17-5 | Indexer top-k ordered **ascending** | **Killed** — 32 lines; the element-by-element top-k comparison |
+
+**M17-4 is worth reading as a small lesson in its own right.** Its first injection deleted the
+`v4_save_compressor_state_kernel` launch outright and the *build* failed rather than the gate —
+which proves nothing about the gate at all. The useful form of the same idea is a semantic
+mis-wiring: offsetting the saved position by one makes both the APE row (`pos % ratio`) and the
+ring slot (`pos % capacity`) different, and the gate reports **100% of peak** on exactly the two
+lines that exist to see it. **A mutation that does not compile is not a killed mutation.**
+
 **The M9/M9b finding was the important one, and it contradicted a claim this plan's own gate report made.** Item 14's gate was reported as certifying the asymmetric clamp rule. It did not: every assertion it made was either *oracle-vs-oracle* (the `ClampMode` fork) or a **relative** comparison whose floor was the probe's peak of ~1600, while the entire asymmetric/symmetric difference is bounded by `silu(−limit)·limit` = `4.5e-3`. A kernel that clamped the gate symmetrically passed the gate completely — in both the standalone and the fused form. The claim was wrong, and review would not have caught it because the gate printed `PASS`.
 
 The repair is a **targeted comparison**: select only the entries where the two rules actually disagree (`gate < −limit`) and require the device to match the asymmetric oracle there, by an absolute margin. A `max_abs` over the whole vector cannot express this, because it is dominated by entries the two rules treat identically. Measured after repair: `vs asymmetric = 0.000000` / `0.000002`, `vs symmetric = 0.004540` — roughly 2000× separation, and each check trips only on its own kernel.
@@ -996,3 +1123,4 @@ These are the specific things that will break this model if implemented naively.
 34. **The HC comb's flat index is `8 + 4·contraction + output` — contraction first.** The comb's **first** axis is the incoming residual stream being contracted; its **second** axis is the outgoing stream. Evidenced by the reference expansion `torch.einsum("...ij,...ih->...jh", comb_res_mix, residual)` — the comb's first axis is summed against the residual's stream axis `[V mhc/torch.py:96-108]`. This module's 2.0 prose previously stated the opposite, and the correction was made at Tier 1 only because the gate computed both readings: the kernel matches the einsum to `4.0e-4`, the transposed reading is off by `0.52`. **A transposed comb is still doubly stochastic and still produces plausible residuals**, so no closeness test can detect it. Note also that both 2.0 and 2.7 use comb indices, and 2.7 was already right — when the two disagree, that is the signal to re-read the reference. `[Tier 1]`
 35. **`sink in the max` is a robustness property, not an observable one — do not mistake a passing output comparison for coverage of it.** The sink must be in the max so that `exp(sink − m) ≤ 1` when the sink dominates; otherwise the exponent is positive and can overflow. But when the sink dominates, the output is zero *either way*, so a gate cannot tell the two implementations apart from the result. Assert finiteness instead, and do not claim the max placement is verified. `[Tier 1]`
 36. **At position 0 every RoPE is the identity, for every base — so position 0 cannot test RoPE at all.** The angle is `pos · inv_freq`, which is `0` at `pos = 0` for every frequency, so `cos = 1, sin = 0` and both the forward rotation and its inverse leave the vector untouched **whichever table was passed**. A gate that only tests the first token is blind to the wrong base class (numeric theta or YaRN), to a rotation applied to the head instead of the tail, and to an omitted inverse rotation — all three at once. Two Tier-2 mutations demonstrated this: the wrong RoPE base and a deleted inverse RoPE each **passed at position 0** and failed from position 1 (`5.4e-2` and `47%` of peak). Sweep positions. Note this is a *gate-design* trap, not a graph trap: the graph is correct here, the test was not. `[Tier 2]`
+37. **A discrete selection cannot be checked against a continuous oracle's inputs — re-derive it from the device's own.** The MoE router's ids are the `top-6` of `sqrt(softplus(logit)) + bias`; a *near-tie* (6th and 7th within the ~`1.2e-3` by which the device's fp16 GEMV and an fp64 oracle disagree on the logits) is then legitimately ordered either way, and the ids differ while the weights match to `8e-3`. Item 17 initially required the ids to equal the oracle's and **8 of 257** HCA tokens failed for this reason alone. The honest test compares the **logits** peak-relative (where precision belongs) and the **selection rule** against the ids re-derived from the **device's own** logits (where the rule belongs), with a `1e-6` allowance for the fp32-vs-fp64 activation. A gate that conflates the two cannot say whether a disagreement is a rule error or a rounding difference. `[Tier 2]`

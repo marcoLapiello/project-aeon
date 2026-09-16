@@ -42,50 +42,36 @@
 #include "architecture/deepseek_v4/core/v4_layer.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/core/v4_model_spec.hpp"
-#include "architecture/deepseek_v4/core/v4_pipeline_scratch.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
-#include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
-
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
+#include "support/v4_layer_body_gate.hpp"
 
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <string>
 #include <vector>
 
-#ifndef CHECK_HIP
-#define CHECK_HIP(cmd) do { \
-    hipError_t err = (cmd); \
-    if (err != hipSuccess) { \
-        std::cerr << "HIP Error: " << hipGetErrorString(err) << " at " \
-                  << __FILE__ << ":" << __LINE__ << std::endl; \
-        std::exit(1); \
-    } \
-} while (0)
-#endif
-
 namespace {
 
-using aeon::reference::ErrorStats;
 using aeon::reference::LayerBodyResult;
 using aeon::reference::LayerBodyShape;
+using aeon::reference::LayerBodyWeights;
+using aeon::reference::LayerKvState;
 using aeon::reference::RopeTableRef;
-using aeon::reference::SlidingKvRing;
-using aeon::reference::SlidingLayerWeights;
 
-constexpr uint32_t kHidden = 4096;
-constexpr uint32_t kHcDim = 4 * kHidden;
-constexpr uint32_t kHeadDim = 512;
-constexpr uint32_t kTotalQ = 64 * kHeadDim;
-constexpr uint32_t kRoutedExperts = 6;
+using aeon::testgate::check;
+using aeon::testgate::GateExpertExecutor;
+using aeon::testgate::kHeadDim;
+using aeon::testgate::kHcDim;
+using aeon::testgate::kHidden;
+using aeon::testgate::kRoutedExperts;
+using aeon::testgate::kTotalQ;
+using aeon::testgate::read_float;
+using aeon::testgate::report;
+using aeon::testgate::to_half;
+using aeon::testgate::upload_and_read;
 
 // The ring is deliberately smaller than the model's 128-token window so the
 // wrap is reachable in a handful of tokens. The device kernel takes the window
@@ -98,113 +84,6 @@ constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon
 // Token ids chosen so the hash table picks distinct expert sets; the first is a
 // real prompt token.
 const std::array<uint32_t, kTokens> kTokenIds = {1000, 42, 7777, 1780, 90125, 130, 55, 4096, 22222, 396};
-
-std::vector<__half> to_half(const std::vector<double>& v) {
-    std::vector<__half> out(v.size());
-    for (size_t i = 0; i < v.size(); ++i) out[i] = __float2half(static_cast<float>(v[i]));
-    return out;
-}
-
-// The comparison basis is `max_abs` against the oracle's own peak. The chain
-// stores every stage in fp16, so what matters is "how far off, as a fraction of
-// what this tensor's scale is". `max_rel` is printed for information but is not
-// the pass criterion: its denominator is floored, so on a checkpoint whose values
-// span three decades it is dominated by elements near the floor.
-bool report(const char* label, const std::vector<double>& want,
-            const std::vector<double>& got, double tol_frac) {
-    const ErrorStats s = aeon::reference::compare(want, got, 0.1);
-    if (s.size_mismatch) {
-        std::printf("  %-52s SIZE MISMATCH                FAIL\n", label);
-        return false;
-    }
-    const double peak = aeon::reference::peak_abs(want);
-    const double frac = (peak > 0.0) ? s.max_abs / peak : s.max_abs;
-    const bool pass = std::isfinite(frac) && frac <= tol_frac;
-    std::printf("  %-52s max_abs=%.3e  =%.2e*peak  (peak=%.3e)  %s\n",
-                label, s.max_abs, frac, peak, pass ? "PASS" : "FAIL");
-    return pass;
-}
-
-bool check(const char* label, bool ok, const std::string& detail) {
-    std::printf("  %-52s %-22s %s\n", label, detail.c_str(), ok ? "PASS" : "FAIL");
-    return ok;
-}
-
-// -----------------------------------------------------------------------------
-// The routed-expert seam, implemented for the gate.
-//
-// The pipeline implements this against the tiered supply system (Hot/Warm/Cold
-// promotion, prefetch, leases). Here it reads the selected experts' payloads
-// straight out of the artifact and runs the same fused kernels, so the layer
-// body's arithmetic is exercised identically without any storage tier involved.
-// -----------------------------------------------------------------------------
-class GateExpertExecutor final : public aeon::core::V4RoutedExpertExecutor {
-public:
-    aeon::core::AeonModelLoader* loader{nullptr};
-    aeon::core::PipelineScratchBuffers* scratch{nullptr};
-    hipStream_t stream{0};
-    std::array<uint8_t*, kRoutedExperts> d_payload{};
-    std::vector<int32_t> last_ids;
-
-    void accumulate_routed(uint32_t layer_id, uint32_t position,
-                           __half* moe_accum) override {
-        (void)position;
-
-        last_ids.assign(kRoutedExperts, 0);
-        CHECK_HIP(hipMemcpyAsync(last_ids.data(), scratch->d_topk_indices,
-                                 kRoutedExperts * sizeof(int32_t),
-                                 hipMemcpyDeviceToHost, stream));
-        CHECK_HIP(hipStreamSynchronize(stream));
-
-        aeon::kernel::SwizzledW13ExpertPtrs w13{};
-        aeon::kernel::SwizzledW2ExpertPtrs w2{};
-        for (uint32_t k = 0; k < kRoutedExperts; ++k) {
-            const uint8_t* payload = loader->get_expert_data(
-                layer_id, static_cast<uint32_t>(last_ids[k]));
-            CHECK_HIP(hipMemcpyAsync(d_payload[k], payload,
-                                     aeon::core::AEON_SWIZZLED_EXPERT_BYTES,
-                                     hipMemcpyHostToDevice, stream));
-            const uint8_t* base = d_payload[k];
-            w13.w1[k] = reinterpret_cast<const uint4*>(base + aeon::core::AEON_W1_PACKED_OFFSET);
-            w13.s1[k] = reinterpret_cast<const __half*>(base + aeon::core::AEON_W1_SCALE_OFFSET);
-            w13.w3[k] = reinterpret_cast<const uint4*>(base + aeon::core::AEON_W3_PACKED_OFFSET);
-            w13.s3[k] = reinterpret_cast<const __half*>(base + aeon::core::AEON_W3_SCALE_OFFSET);
-            w2.w2[k] = reinterpret_cast<const uint4*>(base + aeon::core::AEON_W2_PACKED_OFFSET);
-            w2.s2[k] = reinterpret_cast<const __half*>(base + aeon::core::AEON_W2_SCALE_OFFSET);
-        }
-
-        // Mirrors the pipeline's default (atomic) accumulation exactly.
-        aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
-            scratch->d_ffn_norm_act, w13, scratch->d_swizzled_expert_hidden,
-            scratch->d_swizzled_moe_accum_f32, kHidden, kRoutedExperts,
-            2048, kHidden, 10.0f, stream);
-        CHECK_HIP(hipMemsetAsync(scratch->d_swizzled_counters, 0,
-                                 64 * sizeof(int32_t), stream));
-        aeon::kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
-            scratch->d_swizzled_expert_hidden, w2, scratch->d_topk_weights,
-            moe_accum, scratch->d_swizzled_moe_accum_f32, moe_accum,
-            scratch->d_swizzled_counters, kRoutedExperts, kHidden, 2048, stream);
-    }
-};
-
-template <typename T>
-std::vector<double> upload_and_read(hipStream_t stream, const T* device, size_t count) {
-    std::vector<T> host(count);
-    CHECK_HIP(hipMemcpyAsync(host.data(), device, count * sizeof(T),
-                             hipMemcpyDeviceToHost, stream));
-    CHECK_HIP(hipStreamSynchronize(stream));
-    std::vector<double> out(count);
-    for (size_t i = 0; i < count; ++i) out[i] = static_cast<double>(host[i]);
-    return out;
-}
-
-std::vector<double> read_float(hipStream_t stream, const float* device, size_t count) {
-    std::vector<float> host(count);
-    CHECK_HIP(hipMemcpyAsync(host.data(), device, count * sizeof(float),
-                             hipMemcpyDeviceToHost, stream));
-    CHECK_HIP(hipStreamSynchronize(stream));
-    return std::vector<double>(host.begin(), host.end());
-}
 
 } // namespace
 
@@ -247,9 +126,11 @@ int main() {
     scratch.allocate();
 
     const uint32_t ring_capacity = layer.local_cache_capacity();
-    // The device layer is configured with a small context so the local ring
-    // wraps within a few tokens; the oracle must be told the same capacity.
+    // The device layer is configured with a small window so the local ring
+    // wraps within a few tokens; the oracle must be told the same capacity, and
+    // its class fields must say "Sliding" so it refuses any compressed path.
     shape.local_capacity = ring_capacity;
+    shape.compress_ratio = 0;
 
     // RoPE tables: built here from the ORACLE's tables, so the gate measures the
     // layer body and not a table discrepancy. (Table precision has its own gate.)
@@ -300,7 +181,7 @@ int main() {
         return reinterpret_cast<const uint16_t*>(loader.get_tensor(p + name).data);
     };
 
-    SlidingLayerWeights w{};
+    LayerBodyWeights w{};
     w.hc_attn_fn = loader.get_data_ptr<float>(p + "hc_attn_fn");
     w.hc_attn_base = loader.get_data_ptr<float>(p + "hc_attn_base");
     w.hc_attn_scale = loader.get_data_ptr<float>(p + "hc_attn_scale");
@@ -404,8 +285,8 @@ int main() {
         }
     }
 
-    SlidingKvRing ring;
-    ring.reset(ring_capacity, kHeadDim);
+    LayerKvState ring;
+    ring.reset(shape, ring_capacity);
 
     // The device side must start from the same residual the oracle does.
     {
@@ -436,8 +317,8 @@ int main() {
                 0, static_cast<uint32_t>(row_ids[k]));
         }
 
-        SlidingKvRing oracle_ring = ring;
-        const LayerBodyResult want = aeon::reference::layer_sliding_body(
+        LayerKvState oracle_ring = ring;
+        const LayerBodyResult want = aeon::reference::layer_body(
             shape, w, rope_ref, pos, residual, oracle_ring);
 
         // ---- compare ----
@@ -505,12 +386,12 @@ int main() {
         // move the layer output materially. This is the Tier-2 form of the
         // mutation rule: before trusting "device == oracle", show the properties
         // the comparison is supposed to be certifying are visible in `res_out`.
-        SlidingKvRing r1;
-        r1.reset(ring_capacity, kHeadDim);
+        LayerKvState r1;
+        r1.reset(shape, ring_capacity);
         std::vector<double> seed(kHcDim, 0.0);
         for (uint32_t i = 0; i < kHcDim; ++i) seed[i] = 0.05 * std::sin(0.01 * i);
 
-        const LayerBodyResult base = aeon::reference::layer_sliding_body(
+        const LayerBodyResult base = aeon::reference::layer_body(
             shape, w, rope_ref, 0, seed, r1);
 
         // (i) The attention RMSNorm is a real stage: the q-lora projection built

@@ -1226,19 +1226,44 @@ inline void store_le_u32(uint8_t* address, uint32_t value) {
     std::memcpy(address, &value, sizeof(value));
 }
 
+// fp16 **bit pattern** -> double.
+//
+// Not `std::ldexp(1.0 + mantissa/1024.0, exponent - 15)`, which is what this was
+// and is bit-exactly right but far too slow to sit in the inner loop of every
+// matrix multiply in the graph: a layer body reaches ~180M decodes, and `ldexp`
+// with a runtime exponent is a library call, which alone cost ~3 s per token and
+// made a 257-token gate unrunnable.
+//
+// The normal path below assembles the double's bit pattern instead. It is the
+// same value — `2^(e-15) * (1 + m/1024)` is exactly `f64(e-15+1023, m<<42)`,
+// with no rounding anywhere — and it is a handful of integer operations. The
+// subnormal and NaN paths keep the original expressions verbatim: neither occurs
+// in these tensors, and leaving them alone keeps the observable behaviour of
+// every existing tier-1 gate unchanged.
+//
+// The gate checks this against `ldexp` over a large set of bit patterns rather
+// than trusting the argument above.
 inline double half_bits_to_double(uint16_t bits) {
-    const int sign = (bits >> 15) & 1;
-    const int exponent = (bits >> 10) & 0x1F;
-    const int mantissa = bits & 0x3FF;
-    double value;
+    const uint32_t sign = static_cast<uint32_t>(bits >> 15);
+    const uint32_t exponent = static_cast<uint32_t>((bits >> 10) & 0x1Fu);
+    const uint32_t mantissa = static_cast<uint32_t>(bits & 0x3FFu);
+
     if (exponent == 0) {
-        value = std::ldexp(static_cast<double>(mantissa), -24);
-    } else if (exponent == 0x1F) {
-        value = std::numeric_limits<double>::quiet_NaN();
-    } else {
-        value = std::ldexp(1.0 + static_cast<double>(mantissa) / 1024.0, exponent - 15);
+        const double value = std::ldexp(static_cast<double>(mantissa), -24);
+        return sign != 0 ? -value : value;
     }
-    return sign != 0 ? -value : value;
+    if (exponent == 0x1F) {
+        const double value = std::numeric_limits<double>::quiet_NaN();
+        return sign != 0 ? -value : value;
+    }
+
+    const uint64_t pattern =
+        (static_cast<uint64_t>(sign) << 63) |
+        (static_cast<uint64_t>(exponent - 15u + 1023u) << 52) |
+        (static_cast<uint64_t>(mantissa) << 42);
+    double value;
+    std::memcpy(&value, &pattern, sizeof(value));
+    return value;
 }
 
 // Widens a run of fp16 **bit patterns** to doubles. This is not the same
@@ -1387,17 +1412,37 @@ inline double clamped_swiglu(double gate, double up, double limit,
     return (gate / (1.0 + std::exp(-gate))) * up;
 }
 
+// The three weight matrices of one routed expert, decoded from its payload into
+// row-major doubles. `swizzled_decode` is an element-at-a-time walk of the
+// permutation, which is fine for a one-shot check but is 25M decodes per expert:
+// a gate that drives many tokens with the *same* payloads should decode once.
+struct DecodedExpertWeights {
+    std::vector<double> w1;   // [2048, 4096] row-major
+    std::vector<double> w3;   // [2048, 4096] row-major
+    std::vector<double> w2;   // [4096, 2048] row-major
+};
+
+inline DecodedExpertWeights decode_expert_weights(const uint8_t* payload) {
+    DecodedExpertWeights out;
+    out.w1 = swizzled_decode(payload, SwizzledKind::W1);
+    out.w3 = swizzled_decode(payload, SwizzledKind::W3);
+    out.w2 = swizzled_decode(payload, SwizzledKind::W2);
+    return out;
+}
+
 // The whole routed expert body: `gate = W1·x`, `up = W3·x`, clamped SwiGLU, then
-// `out = W2·hidden` — Step 2.10.3 exactly, in double.
+// `out = W2·hidden` — Step 2.10.3 exactly, in double, given decoded weights.
 //
 // Note that the device writes `hidden` to fp16 between the two halves (the fused
 // kernel's output is a `half*`), so the gate must allow for that one rounding;
 // this function keeps `hidden` in double. The alternative — rounding here too —
 // would hide a rounding question behind the oracle.
-inline std::vector<double> expert_ffn(const uint8_t* payload,
-                                      const std::vector<double>& activation,
-                                      double limit = 10.0,
-                                      ClampMode mode = ClampMode::Asymmetric) {
+inline std::vector<double> expert_ffn_decoded(const std::vector<double>& w1,
+                                              const std::vector<double>& w3,
+                                              const std::vector<double>& w2,
+                                              const std::vector<double>& activation,
+                                              double limit = 10.0,
+                                              ClampMode mode = ClampMode::Asymmetric) {
     const SwizzledShape w1_shape = swizzled_shape(SwizzledKind::W1);
     const SwizzledShape w2_shape = swizzled_shape(SwizzledKind::W2);
     const SwizzledShape w3_shape = swizzled_shape(SwizzledKind::W3);
@@ -1409,10 +1454,11 @@ inline std::vector<double> expert_ffn(const uint8_t* payload,
         w2_shape.rows != w1_shape.columns) {
         throw std::invalid_argument("dsv4_oracle: expert_ffn shape mismatch");
     }
-
-    const std::vector<double> w1 = swizzled_decode(payload, SwizzledKind::W1);
-    const std::vector<double> w2 = swizzled_decode(payload, SwizzledKind::W2);
-    const std::vector<double> w3 = swizzled_decode(payload, SwizzledKind::W3);
+    if (w1.size() != w1_shape.weight_count() ||
+        w3.size() != w3_shape.weight_count() ||
+        w2.size() != w2_shape.weight_count()) {
+        throw std::invalid_argument("dsv4_oracle: decoded expert weight size mismatch");
+    }
 
     const std::vector<double> gate = matvec(
         static_cast<size_t>(w1_shape.rows), static_cast<size_t>(w1_shape.columns),
@@ -1429,6 +1475,17 @@ inline std::vector<double> expert_ffn(const uint8_t* payload,
     return matvec(static_cast<size_t>(w2_shape.rows),
                   static_cast<size_t>(w2_shape.columns), hidden,
                   [&](size_t o, size_t i) { return w2[o * w2_shape.columns + i]; });
+}
+
+// The payload entry point: decode, then the same arithmetic. One-shot callers
+// (and the Item-16 gate, on the artifact's real experts) use this; a gate that
+// drives many tokens over fixed payloads caches `decode_expert_weights` instead.
+inline std::vector<double> expert_ffn(const uint8_t* payload,
+                                      const std::vector<double>& activation,
+                                      double limit = 10.0,
+                                      ClampMode mode = ClampMode::Asymmetric) {
+    const DecodedExpertWeights decoded = decode_expert_weights(payload);
+    return expert_ffn_decoded(decoded.w1, decoded.w3, decoded.w2, activation, limit, mode);
 }
 
 // The two pre-activations, so a gate can check that the clamp actually fires in
@@ -1502,38 +1559,43 @@ inline std::vector<double> dense_ffn(size_t intermediate, size_t hidden,
 }
 
 // ===========================================================================
-// Tier 2 — the Sliding-class layer body (Steps 2.0 … 2.11)
+// Tier 2 — the layer body (Steps 2.0 … 2.11), all three attention classes
 // ===========================================================================
 //
 // This is not a new primitive. It is the *composition* the Tier-2 gate exists to
 // certify: Tier 1 proved each piece, and the failure mode of a layer is the
 // wiring between them, not the pieces.
 //
-// Written from the plan's Step 2 for a ratio-0 (Sliding) layer, in the order the
-// plan states, and built entirely from this file's primitives so that the
-// composition is the only new thing under test:
+// One function, mirroring the device: `core/v4_layer_body.hpp` is a single body
+// with exactly one structural branch — the attention class. So is this.
 //
-//   2.0    HC attention pre-mix + Sinkhorn            -> x_pre
-//   2.1    attention RMSNorm                          -> x_norm
+//   2.0    HC attention pre-mix + Sinkhorn            -> x_pre        (all)
+//   2.1    attention RMSNorm                          -> x_norm       (all)
 //   2.2    MLA Q path (q_lora -> q_norm -> wq_b -> per-head norm), KV path
-//   2.3    RoPE forward on q and kv, *sliding* base (theta 10000, plain)
-//   2.4.1  local sliding-window attention + sink
+//   2.3    RoPE forward on q and kv — *sliding* base (theta 10000, plain) for a
+//          ratio-0 layer, *compressed* base (theta 160000, YaRN-16) otherwise
+//   2.4.2  compressor: wkv/wgate projections, APE-add and the partial-state ring,
+//          then the boundary materialization           (ratio != 0 only)
+//   2.4.3  indexer: query from q_lora_norm, weights, a second compressor, the
+//          score path and the top-k                       (CSA — ratio 4 — only)
+//   2.4.4  attention over the class's row-set + sink:
+//            ratio 0   -> local rows only
+//            ratio 4   -> local rows + the indexer-selected compressed rows
+//            ratio 128 -> local rows + EVERY committed compressed row
 //   2.3    inverse RoPE on the attention-output tail
 //   2.5    grouped wo_a [8,1024,4096] then wo_b [4096,8192]
-//   2.6    HC attention post-mix                      -> res_mid
-//   2.7    HC FFN pre-mix + Sinkhorn
-//   2.8    FFN RMSNorm
-//   2.9    router (hash on layers < 3, biased flat top-6 otherwise)
-//   2.10   routed experts + shared expert, clamped SwiGLU
-//   2.10.5 combine: routed sum first, then `+= shared`
-//   2.11   HC FFN post-mix                            -> res_out
+//   2.6    HC attention post-mix                      -> res_mid      (all)
+//   2.7    HC FFN pre-mix + Sinkhorn                                  (all)
+//   2.8    FFN RMSNorm                                                (all)
+//   2.9    router (hash on layers < 3, biased flat top-6 otherwise)   (all)
+//   2.10   routed experts + shared expert, clamped SwiGLU             (all)
+//   2.10.5 combine: routed sum first, then `+= shared`                (all)
+//   2.11   HC FFN post-mix                            -> res_out      (all)
 //
-// Deliberately absent, and that absence is itself a property the gate asserts:
-// the compressor, the indexer, and the compressed row-set. A Sliding layer must
-// never read those tensors (traps 4 and 33) — layers 0 and 1 have no compressor
-// and no indexer at all, and running one on them would read tensors the artifact
-// does not contain. There is no state for them in `SlidingKvRing` and no code
-// path here that could consult them.
+// The branch is the plan's whole 2.4.4 and its trap 33: only CSA selects. HCA
+// compresses but does **not** index — it reads every committed compressed row,
+// and its `attn.indexer.*` tensors do not exist in the checkpoint at all. A
+// Sliding layer must never read the compressor or indexer tensors (trap 4).
 //
 // Ordering note, because it is the one place this composition is a *choice*.
 // Step 2.10.5 fixes the term set — `Σ_k w_k·down_k` plus the shared expert — but
@@ -1557,6 +1619,14 @@ struct LayerBodyShape {
     uint32_t top_k{6};
     uint32_t local_capacity{128};
 
+    // Attention class, keyed exactly as the device keys it: `compress_ratio`.
+    // 0 = Sliding (local only), 4 = CSA (local + indexer top-k), 128 = HCA
+    // (local + every committed compressed row).
+    int32_t compress_ratio{0};
+    uint32_t index_n_heads{64};
+    uint32_t index_head_dim{128};
+    uint32_t index_topk{512};
+
     double eps{1e-6};            // every RMSNorm site in this graph
     double routed_scaling{1.5};
     double swiglu_limit{10.0};
@@ -1569,12 +1639,32 @@ struct LayerBodyShape {
     double attn_scale() const noexcept {
         return 1.0 / std::sqrt(static_cast<double>(head_dim));
     }
+
+    bool is_compressed() const noexcept { return compress_ratio != 0; }
+    bool uses_indexer() const noexcept { return compress_ratio == 4; }
+    // `coeff = 1 + overlap` with `overlap = (ratio == 4)`, so the ratio-4
+    // compressor row is twice as wide and the second half is the newer tokens
+    // (plan 2.4.2).
+    uint32_t coefficient() const noexcept {
+        return compress_ratio == 0 ? 0u : (compress_ratio == 4 ? 2u : 1u);
+    }
+    uint32_t compressor_width() const noexcept { return coefficient() * head_dim; }
+    uint32_t index_width() const noexcept { return coefficient() * index_head_dim; }
+    // The compressor partial ring is exactly one window wide.
+    uint32_t compressor_capacity() const noexcept {
+        return coefficient() * static_cast<uint32_t>(compress_ratio);
+    }
 };
 
-// One Sliding layer's tensors, exactly as the artifact stores them. fp16 tensors
-// are passed as their raw 16-bit patterns so the oracle reads the same bits the
+// One layer's tensors, exactly as the artifact stores them. fp16 tensors are
+// passed as their raw 16-bit patterns so the oracle reads the same bits the
 // kernel does, with no widening step that could hide an input rounding question.
-struct SlidingLayerWeights {
+//
+// The compressor and indexer pointers are null on a Sliding layer and are never
+// dereferenced for one. The indexer pointers are null on an HCA layer, which is
+// not an omission: the checkpoint has no `attn.indexer.*` tensors for a
+// ratio-128 layer at all (trap 33).
+struct LayerBodyWeights {
     // Hyper-Connections — fp32 in the checkpoint.
     const float* hc_attn_fn{nullptr};     // [hc_mult3, hc_dim]
     const float* hc_attn_base{nullptr};   // [hc_mult3]
@@ -1603,8 +1693,31 @@ struct SlidingLayerWeights {
     const uint16_t* shared_w3{nullptr};     // [intermediate, hidden]
     const uint16_t* shared_w2{nullptr};     // [hidden, intermediate]
 
+    // Compressor — Steps 2.4.2/2.4.3. Present on every ratio != 0 layer.
+    const uint16_t* compressor_wkv{nullptr};    // [coeff*head_dim, hidden]
+    const uint16_t* compressor_wgate{nullptr};  // [coeff*head_dim, hidden]
+    const uint16_t* compressor_norm{nullptr};   // [head_dim]
+    const float* compressor_ape{nullptr};       // [ratio, coeff*head_dim], fp32
+
+    // Indexer — Step 2.4.3. CSA only; an HCA layer must leave these null.
+    const uint16_t* indexer_wq_b{nullptr};             // [index_n_heads*index_head_dim, q_lora_rank]
+    const uint16_t* indexer_weights_proj{nullptr};     // [index_n_heads, hidden]
+    const uint16_t* indexer_compressor_wkv{nullptr};   // [coeff*index_head_dim, hidden]
+    const uint16_t* indexer_compressor_wgate{nullptr}; // [coeff*index_head_dim, hidden]
+    const uint16_t* indexer_compressor_norm{nullptr};  // [index_head_dim]
+    const float* indexer_compressor_ape{nullptr};      // [ratio, coeff*index_head_dim], fp32
+
     // The six selected routed experts, swizzled W4A16 payloads.
     const uint8_t* routed_payloads[8]{};
+
+    // Optional: the same six experts already decoded. A gate that drives many
+    // tokens over fixed payloads sets these so the swizzle walk happens once
+    // instead of per token — the multi-token compressed gates would otherwise
+    // spend essentially all their time re-decoding 150M weights per token. The
+    // decode itself is certified by Tier-1 gate 13/15 and by Item 16 on the
+    // artifact's real experts, so leaving the payload path as the default keeps
+    // the fast path from being the only one exercised.
+    const DecodedExpertWeights* routed_decoded[8]{};
 };
 
 // The local ring. Key and value are the **same** row (trap 6), but the graph
@@ -1651,6 +1764,124 @@ struct SlidingKvRing {
     }
 };
 
+// The same cos/sin values read against a narrower head, so `rope_apply_tail`
+// places the rotation at the right offset. The indexer's head is 128 wide with
+// the same 64-dim rotary tail, so its nope part is 64 rather than 448 and the
+// table's own `head_dim` has to say so.
+inline RopeTableRef rebase_rope_table(const RopeTableRef& table, uint32_t head_dim) {
+    RopeTableRef out = table;
+    out.spec.head_dim = head_dim;
+    return out;
+}
+
+// A compressor partial-state ring — `capacity` rows of `width` floats addressed
+// by `position % capacity`, exactly as `v4_save_compressor_state_kernel` writes
+// them. The APE is added to the **score** row only, indexed by `position % ratio`
+// (trap 26). `LayerKvState::X` uses two of these: the main compressor and, on
+// CSA only, the indexer's.
+struct CompressorRing {
+    uint32_t width{0};
+    uint32_t capacity{0};
+    std::vector<double> kv;          // [capacity * width]
+    std::vector<double> score;       // [capacity * width], APE already added
+    std::vector<int64_t> positions;  // [capacity], -1 = never written
+
+    void reset(uint32_t width_, uint32_t capacity_) {
+        width = width_;
+        capacity = capacity_;
+        kv.assign(static_cast<size_t>(capacity_) * width_, 0.0);
+        score.assign(static_cast<size_t>(capacity_) * width_, 0.0);
+        positions.assign(capacity_, -1);
+    }
+
+    void store(int64_t position, int64_t ratio, const std::vector<double>& kv_row,
+               const std::vector<double>& score_row, const std::vector<double>& ape) {
+        const size_t slot = static_cast<size_t>(floor_mod(position, capacity));
+        const size_t at = slot * width;
+        const size_t ape_row = static_cast<size_t>(floor_mod(position, ratio)) * width;
+        for (uint32_t d = 0; d < width; ++d) {
+            kv[at + d] = kv_row[d];
+            score[at + d] = score_row[d] + ape[ape_row + d];
+        }
+        positions[slot] = position;
+    }
+};
+
+// Everything a layer keeps between tokens.
+struct LayerKvState {
+    SlidingKvRing local;                       // the local ring, all classes
+    CompressorRing compressor;                 // ratio != 0 only
+    CompressorRing indexer;                    // CSA only
+    std::vector<std::vector<double>> compressed_keys;   // [entry][head_dim]
+    std::vector<int64_t> compressed_positions;          // [entry]
+    std::vector<std::vector<double>> indexer_keys;      // [entry][index_head_dim]
+
+    void reset(const LayerBodyShape& shape, uint32_t local_capacity) {
+        local.reset(local_capacity, shape.head_dim);
+        compressed_keys.clear();
+        indexer_keys.clear();
+        compressed_positions.clear();
+        if (!shape.is_compressed()) return;
+        compressor.reset(shape.compressor_width(), shape.compressor_capacity());
+        if (shape.uses_indexer()) {
+            indexer.reset(shape.index_width(), shape.compressor_capacity());
+        }
+    }
+
+    // Materializes `entry` and remembers it. Entries are produced in order, so
+    // the vectors grow to exactly the committed count.
+    void commit(uint32_t entry, int64_t position, const std::vector<double>& row,
+                const std::vector<double>& indexer_row) {
+        if (compressed_keys.size() <= entry) {
+            compressed_keys.resize(entry + 1);
+            compressed_positions.resize(entry + 1, -1);
+        }
+        compressed_keys[entry] = row;
+        compressed_positions[entry] = position;
+        if (!indexer_row.empty()) {
+            if (indexer_keys.size() <= entry) indexer_keys.resize(entry + 1);
+            indexer_keys[entry] = indexer_row;
+        }
+    }
+};
+
+// Step 2.4.2 — materialize one compressed entry out of a compressor ring.
+//
+// Mirrors `v4_materialize_compressed_entry_kernel`: per-dimension softmax over
+// the causal window, an RMSNorm over the whole head, then the tail RoPE taken at
+// the **window start** rather than at `position` (plan 2.3: `pos + 1 − ratio`).
+// The window is `coefficient * ratio` positions ending at the boundary, and the
+// segment of window offset `o` is `o / ratio` — the overlap layout.
+inline std::vector<double> compressor_materialize(
+    const CompressorRing& ring, uint32_t head_dim, uint32_t ratio,
+    int64_t boundary_position, const std::vector<double>& norm_weight,
+    const RopeTableRef& rope, double eps) {
+    const uint32_t coefficient = ring.width / head_dim;
+    const uint32_t window = coefficient * ratio;
+
+    std::vector<std::vector<double>> window_kv(window);
+    std::vector<std::vector<double>> window_score(window);
+    std::vector<bool> valid(window, false);
+    for (uint32_t o = 0; o < window; ++o) {
+        const int64_t source = boundary_position - static_cast<int64_t>(window) + 1 +
+                               static_cast<int64_t>(o);
+        if (source < 0) continue;
+        const size_t slot = static_cast<size_t>(floor_mod(source, ring.capacity));
+        if (ring.positions[slot] != source) continue;
+        const size_t at = slot * ring.width;
+        window_kv[o].assign(ring.kv.begin() + at, ring.kv.begin() + at + ring.width);
+        window_score[o].assign(ring.score.begin() + at, ring.score.begin() + at + ring.width);
+        valid[o] = true;
+    }
+
+    std::vector<double> row =
+        rmsnorm(compressor_raw(window_kv, window_score, head_dim, ratio, &valid),
+                norm_weight, eps);
+    const int64_t rope_position = (boundary_position / ratio) * ratio;
+    rope_apply_tail(row, rope, static_cast<uint32_t>(rope_position), /*inverse=*/false);
+    return row;
+}
+
 struct LayerBodyResult {
     // Hyper-Connections (attention sublayer)
     std::vector<double> mixes_a;    // [hc_mult3]
@@ -1692,24 +1923,45 @@ struct LayerBodyResult {
 
     // Layer output
     std::vector<double> res_out;    // [hc_dim]
-    uint32_t local_keys_read{0};    // how many ring rows attention actually read
+    uint32_t local_keys_read{0};    // how many local ring rows attention read
+
+    // Compressed classes (empty on a Sliding layer)
+    std::vector<double> compressor_kv;     // [coeff*head_dim] raw wkv projection
+    std::vector<double> compressor_score;  // [coeff*head_dim] raw wgate projection
+    bool emitted_compressed{false};        // did this step cross a ratio boundary?
+    uint32_t compressed_index{0};          // the entry index that boundary produced
+    std::vector<double> compressed_entry;  // [head_dim] the materialized row
+
+    std::vector<double> indexer_query;     // [index_n_heads*index_head_dim] after RoPE
+    std::vector<double> indexer_weights;   // [index_n_heads]
+    std::vector<double> indexer_scores;    // [candidates]
+    std::vector<int32_t> indexer_topk;     // selected entries, in the device's order
+    uint32_t compressed_keys_read{0};      // how many compressed rows attention read
 };
 
-// One full Sliding layer for one token. `residual` is `[hc_mult * hidden]` (the
-// four HC streams); `ring` is updated in place with the token's own rotated key
-// **before** attention reads it, exactly as step D does in the pipeline.
-inline LayerBodyResult layer_sliding_body(
+// One full layer for one token. `residual` is `[hc_mult * hidden]` (the four HC
+// streams); `state` is updated in place — the token's own rotated key is written
+// to the local ring **before** attention reads it, and a ratio boundary writes a
+// new compressed entry before the indexer can select it, exactly as step D does
+// in the pipeline.
+inline LayerBodyResult layer_body(
     const LayerBodyShape& shape,
-    const SlidingLayerWeights& w,
+    const LayerBodyWeights& w,
     const RopeTableRef& rope,
     uint32_t position,
     const std::vector<double>& residual,
-    SlidingKvRing& ring) {
+    LayerKvState& state) {
     if (residual.size() != shape.hc_dim()) {
         throw std::invalid_argument("dsv4_oracle: layer body residual has the wrong width");
     }
-    if (ring.capacity != shape.local_capacity || ring.head_dim != shape.head_dim) {
+    if (state.local.capacity != shape.local_capacity ||
+        state.local.head_dim != shape.head_dim) {
         throw std::invalid_argument("dsv4_oracle: layer body ring does not match the shape");
+    }
+    if (shape.is_compressed() &&
+        (state.compressor.width != shape.compressor_width() ||
+         state.compressor.capacity != shape.compressor_capacity())) {
+        throw std::invalid_argument("dsv4_oracle: compressor ring does not match the shape");
     }
 
     const size_t hidden = shape.hidden;
@@ -1720,6 +1972,8 @@ inline LayerBodyResult layer_sliding_body(
     };
 
     const HcParams hc_params;
+    const int64_t position64 = static_cast<int64_t>(position);
+    const int64_t ratio = shape.compress_ratio;
 
     // -------------------------------------------------------------------
     // 2.0 — HC attention pre-mix + Sinkhorn -> x_pre
@@ -1773,8 +2027,9 @@ inline LayerBodyResult layer_sliding_body(
     }
 
     // -------------------------------------------------------------------
-    // 2.3 — RoPE forward (sliding base) on q (per head) and kv, then the ring
-    //       write. The token's own key is in the cache before attention runs.
+    // 2.3 — RoPE forward on q (per head) and kv, with the *class's* base, then
+    //       the local ring write. The token's own key is in the cache before
+    //       attention runs.
     // -------------------------------------------------------------------
     out.q_rot = out.q;
     for (size_t h = 0; h < num_heads; ++h) {
@@ -1786,26 +2041,168 @@ inline LayerBodyResult layer_sliding_body(
 
     out.kv_rot = out.kv_norm;
     rope_apply_tail(out.kv_rot, rope, position, /*inverse=*/false);
-    ring.store(static_cast<uint32_t>(position) % shape.local_capacity,
-               static_cast<int64_t>(position), out.kv_rot);
+    state.local.store(static_cast<uint32_t>(position) % shape.local_capacity,
+                      position64, out.kv_rot);
 
     // -------------------------------------------------------------------
-    // 2.4.1 — local sliding-window attention + sink. Ratio 0: local rows only.
+    // 2.4.2 / 2.4.3 — compressor, and on CSA the indexer.
+    //
+    // A Sliding layer skips all of this. Its compressor and indexer pointers are
+    // null and nothing below is reachable for it (trap 4).
+    // -------------------------------------------------------------------
+    if (shape.is_compressed()) {
+        if (w.compressor_wkv == nullptr || w.compressor_wgate == nullptr ||
+            w.compressor_norm == nullptr || w.compressor_ape == nullptr) {
+            throw std::invalid_argument(
+                "dsv4_oracle: compressed layer body is missing compressor tensors");
+        }
+        out.compressor_kv = matvec(
+            shape.compressor_width(), hidden, out.x_norm,
+            [&](size_t o, size_t i) { return f16(w.compressor_wkv, o * hidden + i); });
+        out.compressor_score = matvec(
+            shape.compressor_width(), hidden, out.x_norm,
+            [&](size_t o, size_t i) { return f16(w.compressor_wgate, o * hidden + i); });
+
+        const std::vector<double> compressor_ape(
+            w.compressor_ape,
+            w.compressor_ape + static_cast<size_t>(ratio) * shape.compressor_width());
+        state.compressor.store(position64, ratio, out.compressor_kv,
+                               out.compressor_score, compressor_ape);
+
+        const RopeTableRef indexer_rope = rebase_rope_table(rope, shape.index_head_dim);
+        if (shape.uses_indexer()) {
+            // Query comes from the *q_lora_norm* state, not from `q` (2.4.3).
+            out.indexer_query = matvec(
+                static_cast<size_t>(shape.index_n_heads) * shape.index_head_dim,
+                shape.q_lora_rank, out.q_lora_norm,
+                [&](size_t o, size_t i) {
+                    return f16(w.indexer_wq_b, o * shape.q_lora_rank + i);
+                });
+            for (size_t h = 0; h < shape.index_n_heads; ++h) {
+                std::vector<double> row(
+                    out.indexer_query.begin() + h * shape.index_head_dim,
+                    out.indexer_query.begin() + (h + 1) * shape.index_head_dim);
+                rope_apply_tail(row, indexer_rope, position, /*inverse=*/false);
+                std::copy(row.begin(), row.end(),
+                          out.indexer_query.begin() + h * shape.index_head_dim);
+            }
+
+            out.indexer_weights = matvec(
+                shape.index_n_heads, hidden, out.x_norm,
+                [&](size_t o, size_t i) {
+                    return f16(w.indexer_weights_proj, o * hidden + i);
+                });
+
+            const std::vector<double> indexer_kv = matvec(
+                shape.index_width(), hidden, out.x_norm,
+                [&](size_t o, size_t i) {
+                    return f16(w.indexer_compressor_wkv, o * hidden + i);
+                });
+            const std::vector<double> indexer_score = matvec(
+                shape.index_width(), hidden, out.x_norm,
+                [&](size_t o, size_t i) {
+                    return f16(w.indexer_compressor_wgate, o * hidden + i);
+                });
+            const std::vector<double> indexer_ape(
+                w.indexer_compressor_ape,
+                w.indexer_compressor_ape + static_cast<size_t>(ratio) * shape.index_width());
+            state.indexer.store(position64, ratio, indexer_kv, indexer_score, indexer_ape);
+        }
+
+        // The boundary: materialize this window's compressed entry. It exists
+        // before the indexer scores, so the just-committed row is a candidate.
+        if ((position64 + 1) % ratio == 0) {
+            const uint32_t entry = static_cast<uint32_t>((position64 + 1) / ratio - 1);
+            out.compressed_entry = compressor_materialize(
+                state.compressor, shape.head_dim, static_cast<uint32_t>(ratio),
+                position64, half_bits_to_doubles(w.compressor_norm, shape.head_dim),
+                rope, shape.eps);
+            std::vector<double> indexer_row;
+            if (shape.uses_indexer()) {
+                indexer_row = compressor_materialize(
+                    state.indexer, shape.index_head_dim, static_cast<uint32_t>(ratio),
+                    position64,
+                    half_bits_to_doubles(w.indexer_compressor_norm, shape.index_head_dim),
+                    indexer_rope, shape.eps);
+            }
+            state.commit(entry, position64, out.compressed_entry, indexer_row);
+            out.emitted_compressed = true;
+            out.compressed_index = entry;
+        }
+
+        // 2.4.3 — indexer scoring and selection. CSA only; HCA has no indexer.
+        if (shape.uses_indexer()) {
+            const uint32_t candidates = static_cast<uint32_t>(std::min<int64_t>(
+                static_cast<int64_t>(state.compressed_keys.size()), (position64 + 1) / ratio));
+            if (candidates != 0) {
+                std::vector<double> keys(
+                    static_cast<size_t>(candidates) * shape.index_head_dim, 0.0);
+                for (uint32_t c = 0; c < candidates; ++c) {
+                    std::copy(state.indexer_keys[c].begin(), state.indexer_keys[c].end(),
+                              keys.begin() + static_cast<size_t>(c) * shape.index_head_dim);
+                }
+                out.indexer_scores = indexer_scores(
+                    out.indexer_query, keys, out.indexer_weights,
+                    shape.index_n_heads, shape.index_head_dim,
+                    1.0 / std::sqrt(static_cast<double>(shape.index_head_dim)),
+                    1.0 / std::sqrt(static_cast<double>(shape.index_n_heads)));
+                // Same two branches as the device's `select_indexer_topk`: when
+                // every candidate fits, they are taken in ascending order; only
+                // otherwise is the score sort used.
+                if (candidates <= shape.index_topk) {
+                    out.indexer_topk.resize(candidates);
+                    for (uint32_t c = 0; c < candidates; ++c) {
+                        out.indexer_topk[c] = static_cast<int32_t>(c);
+                    }
+                } else {
+                    out.indexer_topk = topk_indices(out.indexer_scores, shape.index_topk);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // 2.4.4 — attention over the class's row-set, plus the sink.
+    //
+    // One merged key list under one softmax: the local rows, then the compressed
+    // rows the class admits. The order is not load-bearing — a single max, not an
+    // online accumulation — but the *set* is the whole distinction between the
+    // classes (trap 33).
     // -------------------------------------------------------------------
     const std::vector<double> sink(w.attn_sink, w.attn_sink + num_heads);
-
     {
-        const std::vector<size_t> slots = ring.gather(static_cast<int64_t>(position));
+        const std::vector<size_t> slots = state.local.gather(position64);
         out.local_keys_read = static_cast<uint32_t>(slots.size());
 
-        std::vector<double> keys(slots.size() * head_dim, 0.0);
-        for (size_t j = 0; j < slots.size(); ++j) {
-            std::copy(ring.keys.begin() + slots[j] * head_dim,
-                      ring.keys.begin() + (slots[j] + 1) * head_dim,
-                      keys.begin() + j * head_dim);
+        std::vector<double> keys;
+        keys.reserve((slots.size() + 16) * head_dim);
+        for (size_t slot : slots) {
+            keys.insert(keys.end(), state.local.keys.begin() + slot * head_dim,
+                        state.local.keys.begin() + (slot + 1) * head_dim);
         }
+
+        if (shape.is_compressed()) {
+            const uint32_t committed = static_cast<uint32_t>(std::min<int64_t>(
+                static_cast<int64_t>(state.compressed_keys.size()), (position64 + 1) / ratio));
+            const auto append_compressed = [&](int32_t index) {
+                if (index < 0 || static_cast<uint32_t>(index) >= committed) return;
+                keys.insert(keys.end(), state.compressed_keys[index].begin(),
+                            state.compressed_keys[index].end());
+                ++out.compressed_keys_read;
+            };
+            if (shape.uses_indexer()) {
+                for (int32_t index : out.indexer_topk) append_compressed(index);
+            } else {
+                // HCA: every committed compressed row, in entry order. There is
+                // no indexer and no top-k here (trap 33).
+                for (uint32_t index = 0; index < committed; ++index) {
+                    append_compressed(static_cast<int32_t>(index));
+                }
+            }
+        }
+
         out.attn_out = attention_scores_sink(
-            out.q_rot, num_heads, head_dim, keys, slots.size(), sink,
+            out.q_rot, num_heads, head_dim, keys, keys.size() / head_dim, sink,
             shape.attn_scale());
     }
 
@@ -1894,13 +2291,19 @@ inline LayerBodyResult layer_sliding_body(
     out.routed_expert_outputs.resize(out.routed_ids.size());
     out.routed_sum.assign(hidden, 0.0);
     for (size_t k = 0; k < out.routed_ids.size(); ++k) {
-        const uint8_t* payload = w.routed_payloads[k];
-        if (payload == nullptr) {
-            throw std::invalid_argument(
-                "dsv4_oracle: layer body is missing a routed expert payload");
+        if (w.routed_decoded[k] != nullptr) {
+            const DecodedExpertWeights& d = *w.routed_decoded[k];
+            out.routed_expert_outputs[k] = expert_ffn_decoded(
+                d.w1, d.w3, d.w2, out.ffn_norm, shape.swiglu_limit);
+        } else {
+            const uint8_t* payload = w.routed_payloads[k];
+            if (payload == nullptr) {
+                throw std::invalid_argument(
+                    "dsv4_oracle: layer body is missing a routed expert payload");
+            }
+            out.routed_expert_outputs[k] = expert_ffn(
+                payload, out.ffn_norm, shape.swiglu_limit);
         }
-        out.routed_expert_outputs[k] = expert_ffn(
-            payload, out.ffn_norm, shape.swiglu_limit);
         for (size_t i = 0; i < hidden; ++i) {
             out.routed_sum[i] += out.routed_weights[k] * out.routed_expert_outputs[k][i];
         }
