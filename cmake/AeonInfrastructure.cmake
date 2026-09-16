@@ -239,6 +239,25 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_expert_tiering.cpp TIMEOUT 300)
 endif()
 
+# --- Tier-4 integration: the prefix-cache state contract ----------------------
+# Item 22, first half. The plan's gate is "restore is byte-exact with respect to
+# never having evicted". `V4Layer::snapshot_state()` existed but nothing restored a
+# snapshot and no gate covered it, so the state contract had no executable
+# meaning. The instrument is the plan's own: a run the layer never stopped (tokens
+# 0..N+K-1) against one that ran the prefix, snapshotted, reset, restored and
+# continued, requiring the continuation's tokens and the final state to be
+# bit-identical. Boundaries are chosen to be genuinely mid-ratio-window as well as
+# on a boundary, so the compressor's in-progress partial state and the wrapped
+# local ring both have to survive the round trip. Section C makes the comparison
+# load-bearing: a cleared snapshot, a zeroed local ring and lost partial positions
+# each have to change the continuation, or B would only show that two runs of the
+# same code agree. Not covered, and named in the file: R4 (declining a boundary
+# outside the window), tier placement (R5), and the non-token cache-key inputs.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_state_restore
+        SOURCES tests/test_v4_state_restore.cpp TIMEOUT 600)
+endif()
+
 # --- Step 3: the HC head reduction -------------------------------------------
 # The one graph op that had no code, no oracle and no gate. `hc_head` collapses the
 # four residual streams to the single vector every downstream step reads, so an

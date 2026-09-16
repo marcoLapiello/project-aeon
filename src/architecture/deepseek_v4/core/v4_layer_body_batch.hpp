@@ -61,13 +61,15 @@
 // difference to exist. (Mutation M19-3 assembles descending slot order and is
 // killed.)
 //
-// The compressed path is untouched by all of this: the compressor's partial ring
-// is written in position order inside the pre-attention half (it is already
-// per-token there), its capacity is one window wide so a chunk no longer than that
-// window cannot clobber a row a boundary still needs, and compressed entries are
-// appended to a growing array rather than to a ring. `run_layer_body_chunk`
-// refuses a chunk larger than the compressor's partial ring for that reason, and
-// larger than the local ring for the reason above.
+// The compressed path needs no special care, and that is a measured claim rather
+// than an obvious one. The compressor's partial ring is written once per token in
+// position order inside phase 1, and each boundary **materializes immediately**, so
+// a row is read by every boundary that needs it before any later token in the chunk
+// can reach its slot. The ring is therefore exactly as wide as it must be (one
+// window) and no wider, and a chunk of any length is safe — the compressed entries
+// themselves are appended to a growing array rather than to a ring. This was
+// previously guarded against, and the guard was wrong: item 19's gate now asserts
+// the opposite, that a chunk larger than both rings is bit-identical to serial.
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
@@ -517,10 +519,11 @@ inline V4LayerBodyPre run_chunk_pre_attention(
 //   3. commit — the chunk's keys are written into the ring, in position order,
 //      once no query can need the rows they replace any more.
 //
-// Throws when the chunk is longer than the local ring (its row-set would not be
-// reconstructible) or longer than the compressor's partial ring (a boundary could
-// read a row a later token had already overwritten). Chunking a longer prompt into
-// ring-sized pieces is plain chunking, and the caller's job.
+// Throws when the chunk does not fit the caller's workspace. It does **not** throw
+// for a chunk larger than either ring: the local ring is not written until the
+// commit phase and the compressor materializes each boundary as its token is
+// processed, so neither ring bounds the chunk. The measured proof is in item 19's
+// gate and in the comment on the guard below.
 inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     V4Layer& layer,
     V4LayerBodyBatchScratch& workspace,
@@ -536,15 +539,30 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     if (count > V4LayerBodyBatchScratch::kMaxTokens || count > workspace.token_count()) {
         throw std::invalid_argument("run_layer_body_chunk: chunk exceeds the workspace");
     }
-    if (count > layer.local_cache_capacity()) {
-        throw std::invalid_argument(
-            "run_layer_body_chunk: chunk larger than the local ring has no row-set");
-    }
-    if (layer.state_layout().is_compressed() &&
-        count > layer.state_layout().compressor_partial_capacity) {
-        throw std::invalid_argument(
-            "run_layer_body_chunk: chunk larger than the compressor's partial ring");
-    }
+    // There is deliberately **no** check against the local ring or the compressor's
+    // partial ring here, and that is a measured decision rather than an omission.
+    //
+    // Both rings look like they bound the chunk size, and both were guarded against
+    // until they were tested. Neither does. A chunk's keys go to the chunk buffer,
+    // not the ring (trap 39), so the local ring is untouched until the commit phase
+    // and a query whose window predates the chunk still reads it; and the compressor
+    // **materializes each boundary immediately, in position order, inside phase 1**, so
+    // a row is consumed by every boundary that needs it before any later token in the
+    // chunk can reach its slot. For ratio 4 the last boundary that reads position `p`
+    // is at most `p + window - 1` (the r128 case:
+    // `p + ratio - 1 < p + window`), which is strictly before `p + window`, the first
+    // write that could share `p`'s slot. The margin is exactly zero — the ring is as
+    // narrow as it can be and still correct — which is why the false constraint was
+    // easy to believe and why removing it needed proof rather than argument.
+    //
+    // Measured (item 19's gate, `gfx1100`): a chunk of 16 tokens through the
+    // Sliding, CSA and HCA classes — larger than the local ring (10) *and* than the
+    // compressor ring (8) — is bit-identical to the same tokens run one at a time,
+    // across every token and the whole final state, with zero differing values. The
+    // real bounds are the workspace (`kMaxTokens`, `count <= workspace.token_count()`)
+    // and the composed row-set, which `compose_local_rows` checks against
+    // `max_composed_rows()`. Raising `kMaxTokens` is therefore a memory decision, not
+    // a state-contract one.
 
     // Phase 1. Every key the chunk owns is produced before any query runs, and
     // none of them touches the ring.

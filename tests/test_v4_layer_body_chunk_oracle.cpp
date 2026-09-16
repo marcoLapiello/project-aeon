@@ -543,11 +543,13 @@ int main() {
     // C. chunk ≡ serial
     // -------------------------------------------------------------------
     std::cout << "\n--- C. chunk == serial, bit-exact ---\n";
-    // Four schedules, each covering the 130 tokens exactly: the serial reference,
-    // and three chunkings whose boundaries fall inside ratio windows (CSA's ratio
-    // is 4), inside the window's wrap (10 tokens), and on the largest chunk the
-    // window permits (10 — the schedules stay at 6 so they are legal for CSA's
-    // 8-wide compressor ring as well).
+    // Six schedules, each covering the 130 tokens exactly: the serial reference, and
+    // five chunkings. Three of them have boundaries inside ratio windows (CSA's ratio
+    // is 4) and inside the local window's wrap (10 tokens); the last two are the
+    // measured counterexample to the cap this repository used to enforce — a chunk of
+    // 10 exceeds CSA's 8-wide compressor ring, and a chunk of 16 exceeds that *and*
+    // the 10-wide local ring. Both are bit-identical to serial, which is why neither
+    // ring guards the chunk size any more (see `v4_layer_body_batch.hpp`).
     std::vector<std::vector<uint32_t>> plan;
     plan.push_back(std::vector<uint32_t>(kTokens, 1));
     {
@@ -559,6 +561,13 @@ int main() {
         plan.push_back(s);
         s.clear();
         for (size_t cycle = 0; cycle < 13; ++cycle) s.insert(s.end(), {4, 4, 4, 1});
+        plan.push_back(s);
+        s.clear();
+        for (size_t cycle = 0; cycle < 13; ++cycle) s.insert(s.end(), {10});
+        plan.push_back(s);
+        s.clear();
+        for (size_t cycle = 0; cycle < 8; ++cycle) s.insert(s.end(), {16});
+        s.push_back(2);
         plan.push_back(s);
     }
 
@@ -718,12 +727,28 @@ int main() {
             }
             return check(what, false, "accepted");
         };
-        ok &= refuses(sliding, workspaces[0], sliding.local_capacity + 1,
-                      "    a chunk larger than the local ring");
-        // 9 is legal for the window (10) and illegal for CSA's compressor ring (8),
-        // so this isolates the second limit rather than the first.
-        ok &= refuses(csa, workspaces[1], csa.compressor_capacity + 1,
-                      "    a chunk larger than the compressor's ring");
+        const auto accepts = [&](StackLayer& layer, V4LayerBodyBatchScratch& workspace,
+                                 uint32_t count, const char* what) {
+            try {
+                (void)aeon::core::run_layer_body_chunk(layer.device, workspace, tables,
+                                                       ids.data(), 0, count, 0, executor,
+                                                       observer);
+            } catch (const std::exception&) {
+                return check(what, false, "refused");
+            }
+            return check(what, true, "accepted");
+        };
+        // The workspace is the real bound, and it is the *only* one. `workspaces[0]`
+        // was allocated for `kWorkspaceTokens` = 16 tokens, so 17 exceeds it.
+        ok &= refuses(sliding, workspaces[0], kWorkspaceTokens + 1,
+                      "    a chunk larger than the workspace");
+        // The rings are NOT a bound. CSA's local ring is 10 and its compressor ring
+        // is 8; a chunk of 16 exceeds both and is accepted. Section C proved it
+        // bit-identical to serial, so this acceptance is not merely paper: the old
+        // guard refused exactly this chunk, and its stated reason — a boundary
+        // reading a row a later token had overwritten — does not occur, because each
+        // boundary materializes as its token is processed, before any later write.
+        ok &= accepts(csa, workspaces[1], 16, "    a chunk larger than both rings (16)");
 
         std::printf("  %-58s %zu\n",
                     "D: total differing values across every comparison",

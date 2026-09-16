@@ -879,8 +879,7 @@ True chunked batched prefill is a hard requirement, not an optimization. Without
 | 17 | Expert fetch | — | memory | Async, overlapped |
 | 18 | Dequantization | INT4 → fp16/bf16 | registers | Fused with matmul; signed −8 bias; **`[Tier 1]` zero point and nibble permutation both shown load-bearing** |
 | 19 | Expert matmul | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | Fused with dequant; **clamped SwiGLU (asymmetric)** |
-| 19b | **Routed-expert accumulation** | **fp32** | reduction | `aeon_moe_fused_w2_contrib_kernel` (one fp32 slice per expert — one writer per element, so determinism is structural) + `v4_moe_accumulate_fixed_order_kernel` (slot order, single rounding). Replaces both the `atomicAdd` path (no fixed order, trap 38) and the fp16 read-modify-write path (§2.10.3 violation); **gated, and 3.43x more accurate than the fp16 path on the model's own routing shape** |
-| 19b | **Routed-expert accumulation** | **fp32** | reduction | `aeon_moe_fused_w2_contrib_kernel` (one fp32 slice per expert — one writer per element) + `v4_moe_accumulate_fixed_order_kernel` (slot order, single rounding). Replaces both the `atomicAdd` path (no fixed order, trap 38) and the fp16 read-modify-write path (§2.10.3 violation); **gated, 3.43x more accurate than the fp16 path on the model's routing shape** |
+| 19b | **Routed-expert accumulation** | **fp32** | reduction | `aeon_moe_fused_w2_contrib_kernel` (one fp32 slice per expert — one writer per element, so determinism is structural) + `v4_moe_accumulate_fixed_order_kernel` (slot order, single rounding), both sharing `swizzled_w2_row_dot`. Replaces both the `atomicAdd` path (no fixed order, trap 38) and the fp16 read-modify-write path (§2.10.3 violation); **gated, and 3.43x more accurate than the fp16 path on the model's own routing shape.** The helper performs the row reduction, so **the caller must not reduce again** — doing so was a silent `×LPR` on the committed path, found and fixed 2026-09-16 |
 | 20 | Shared expert | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | Not quantized; same clamp; **`[Tier 1]` clamp is dormant at nominal activation scale** |
 | 21 | LM head | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | fp32 accumulate; **separate matrix, not tied to embedding** |
 | 22 | Sampling | fp32 | reduction | Host-side acceptable |
@@ -1216,22 +1215,26 @@ differently rather than a routing bug. The cause is precision, not semantics: th
     non-structural halves, both explicitly open — and the first of them is *blocked*, not merely
     unmeasured.**
 
-    * **(a) Throughput — blocked on the chunk size, which is capped at 8.** `run_layer_body_chunk`
-      refuses a chunk longer than the compressor's partial ring, because
-      `v4_save_compressor_state_kernel` writes that state at `position % partial_capacity` into a
-      fixed ring of `coefficient · ratio` slots (**8** for CSA). Two tokens more than 8 apart inside
-      one chunk would therefore share a slot, and a boundary reading the earlier token's row would
-      silently get the later token's — so the guard throws rather than corrupt. This is Part I §6's
-      requirement not yet met: *"the reuse boundary must be allowed to fall mid-ratio-window"*
-      requires **position-addressed** partial state, which §6.2 and trap 24 named as the expensive
-      retrofit. **A usable chunk size (256–512) is unreachable until that state contract exists, and
-      the state contract is item 22's.** Second, and independent of the cap: **a per-token body
-      cannot show a chunk-size benefit at all.** Chunk 1 and chunk 8 execute the same code the same
+    * **(a) Throughput — open, but no longer blocked by any state contract.** This section previously
+      stated the throughput half was *"blocked on the chunk size, which is capped at 8"* by the
+      compressor's partial ring. **That claim was measured and is false.** `run_layer_body_chunk` did
+      refuse a chunk longer than that ring; the refusal was lifted, and a chunk of **16** tokens —
+      larger than the local ring (10) *and* than the compressor ring (8) — is **bit-identical to
+      serial**, across every token and the whole final state, in all three classes (item 19's gate,
+      extended below). The reason is that a boundary **materializes during phase 1, in position
+      order**: for ratio 4 the last boundary that reads position `p` is at most `p + window − 1`,
+      which is *strictly* less than `p + window`, the first write that could share `p`'s slot — so a
+      row is always consumed before it can be clobbered. The ring is therefore exactly as narrow as
+      it must be, with a margin of **exactly zero**, which is why the false constraint was so easy to
+      believe and why lifting it needed a measurement rather than an argument. **Part I §6.2's "the
+      reuse boundary must be allowed to fall mid-ratio-window" is a requirement on *prefix reuse*,
+      and item 22's restore half now covers it — it was never what bounded the chunk size.**
+      What (a) actually needs is the second half, which was always the real one: **a per-token body
+      cannot show a chunk-size benefit at all.** Chunk 1 and chunk N execute the same code the same
       number of times — the only difference is that keys are held outside the ring and each query
       composes its own row-set — so nothing is amortized and tok/s can only be flat or worse.
-      Batching the projections is an *implementation* step, not a measurement one. So (a) needs
-      **both** the position-addressed partial state and batched projections before any speed number
-      means anything; measuring before them would report the cost of a body that is deliberately
+      **Batching the projections is now the whole of (a)** — an implementation step, not a
+      measurement one. Measuring before it would report the cost of a body that is deliberately
       per-token.
       *Method, settled but not yet used:* hold every expert of the resident layers in VRAM so expert
       transfer is zero, isolating compute + composition — a **floor**, never comparable to model
@@ -1354,7 +1357,64 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > whether it chooses *well* is item 22's and the routing-placement study's question.
 
 22. **Prefix cache manager.** Block table, cache key (tokens **+ non-token graph inputs**), matching, eviction; state pieces placed across tiers. Gate: **restore is byte-exact** with respect to never having evicted, and a candidate boundary outside the local window is detected rather than served stale (Part I §6.3 R3–R4).
-    **This item now also gates item 19's throughput half**: the compressor's partial state is the one piece of §6.1's four still stored as a ring (`position % coefficient·ratio`), and that ring is what caps the chunk size at 8. Making it **position-addressed** is what allows a usable chunk (256–512), so the §6 layout contract should be treated as the prerequisite for prefill speed rather than as a Tier-4-optional refactor. It is also the piece a mid-ratio-window restore needs, which is the same requirement seen from the reuse side.
+    **Status (2026-09-16): the restore half (R3) is certified; the matcher half (R4) is not started.**
+    This item previously carried *"This item now also gates item 19's throughput half"*, on the grounds
+    that the compressor's partial ring capped the chunk at 8. **That is no longer part of this item:**
+    the cap was measured to be false and removed (see item 19(a)). The layout contract below is still
+    required *for prefix reuse*, which is what it was written for — but it is **not** a prerequisite
+    for prefill speed, and treating it as one deferred item 19(a) for no reason. It is also not what a
+    mid-ratio-window restore needs, because it turns out that **nothing** did: a boundary materializes
+    before any later token can overwrite it, so the partial state was already restorable mid-window —
+    which the R3 gate now demonstrates directly.
+    **`V4Layer::restore_state` did not exist.** `snapshot_state()` had been written and nothing ever
+    put a snapshot back, so the state contract had no executable meaning. It is now implemented, with
+    **size validation**: a snapshot taken from a differently shaped layer throws rather than writing
+    past a buffer, because a silently mismatched restore corrupts state in a way no later comparison
+    could attribute.
+
+> **Gate result (Tier 4, item 22 — R3) — CERTIFIED. The gate found that the capability was missing, not broken.**
+> `tests/test_v4_state_restore.cpp`; the default suite is **39 tests**. **146 checks, 0 failures**, in **5.5 s**.
+>
+> **The instrument is the plan's own, and it is not a copy round-trip.** A test that checked
+> `restore(snapshot()) == snapshot()` would be satisfied by a restore that forgets a counter or skips
+> a piece the layer's byte accessor reports as zero — and neither surfaces until a *continuation* goes
+> wrong, which is exactly the field failure a prefix cache produces. So the reference is **a run the
+> layer never stopped**: tokens `0 … N+K−1` straight through, against tokens `0 … N−1`, snapshot,
+> **reset**, restore, then `N … N+K−1`; the requirement is that the continuation's tokens and the final
+> state are bit-identical.
+>
+> **Every boundary is genuinely mid-window, not round.** CSA (ratio 4) is tested at prefix 10
+> (`10 % 4 == 2`, so the in-progress compressor state must survive) *and* at prefix 12 (exactly on a
+> boundary); HCA (ratio 128) at prefix 140, past its first committed entry at position 127. The gate
+> **asserts the label against the boundary arithmetic** and throws if they disagree, so "mid-window"
+> cannot silently become "on a boundary". The local ring (shrunk to 8) has wrapped in every case.
+>
+> **A: the round trip is not vacuous.** The snapshot is first compared against the *cleared* state, so
+> a restore that writes nothing cannot pass. Then all fourteen pieces **and** the four counters
+> (`local_valid_count`, `compressor_partial_count`, `compressed_entry_count`,
+> `indexer_candidate_count`) are compared after `snapshot → reset → restore → snapshot`.
+>
+> **B: R3 holds at every boundary, for all three classes** — the continuation and the final state are
+> **bit-identical**, with `0 differing values` across the whole gate.
+>
+> **C: the comparison is load-bearing, and this is what makes B mean something.** Three probes corrupt
+> one piece of the snapshot each and require the continuation to change: a **cleared snapshot** moves
+> 30 of 30 tokens; a **zeroed local ring** moves 7; **lost compressor partial positions** move 29. A
+> fourth shows the size check is real — a truncated snapshot is **refused** rather than written.
+> Without C, B would only show that two runs of the same code agree.
+>
+> **Anti-circularity.** There is no fp64 oracle here and none is wanted — Tier 1 and items 16–18 own
+> the arithmetic. Both sides go through `run_layer_body_decoding`, the Tier-2 certified body; the
+> **only** difference between them is the snapshot/restore in the middle, which is what makes this a
+> test of the state contract rather than of the graph. Same shape as item 19's C2, from the other side.
+>
+> **What is NOT covered, named so it is not mistaken for coverage.** **R4** — detecting a boundary
+> *outside* the local window and rebuilding the ring rather than serving a stale one; that is the
+> prefix *matcher*'s half and needs the cache key and block table, which do not exist. **Tier
+> placement (R5)** — the pieces move VRAM→VRAM, not to warm/cold. **The cache key's non-token inputs**
+> (thinking mode, active tool set) — trap 23. And the real 128-token window (shrunk to 8, as in items
+> 16–19) with the routed experts' synthetic payloads; the compressed paths run for real, since HCA
+> commits an entry.
 23. **Generation loop.** Coherent output; logits agree with reference over several steps.
 
 **Do not build the streaming system before the numerics are correct.** Streaming bugs and numerical bugs produce identical symptoms, and debugging both at once is intractable.
@@ -1377,7 +1437,7 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 | Local-window reuse boundary behavior | **Half settled at Tier 3 item 20 (7.1); the prefix half stays open for Tier 4 item 22** | Whether a reused prefix whose boundary predates the local window must rebuild the ring, or whether compressed state fully covers attention. sglang tombstones such leaves; confirm the correct handling for our state rather than assuming. **Item 19 sharpened this**: the local ring cannot be reconstructed from anything else, so a prefix boundary older than the window means the ring must be *rebuilt by replaying the last `C` tokens*, not restored. That is a cost the reuse decision has to weigh, and it is the same constraint trap 39 describes from the batching side. **Item 20 settled the other half, by measurement**: within the declared context the compressed store **never evicts** — its capacity is exactly the context's own entry count, verified for both ratios — so a reused prefix's *compressed* state is always fully present and only the **local ring** is window-bounded and must be replayed (7.1(a)/(b)). It also showed the converse, which is the part that makes the refusal structural: a wrapped compressed store is invisible to the kernel's own position guard *and* to the committed count, so if the capacity were ever exceeded the engine would silently serve a sliding window of compressed entries rather than fail (trap 40). |
 | **Indexer top-k on-device** | item 19's other remaining half — **countable now, needs no baseline** | `select_indexer_topk` copies the candidate scores to the host and synchronizes the stream **twice** (once after the scores' D2H, once after the indices' H2D), once per token per CSA layer with non-empty candidates. Part III forbids per-token host synchronization in a prefill — *"any device→host copy inside the layer loop serializes the whole chunk"*. It changes no value, so the `chunk ≡ serial` gate cannot see it by construction, and it is not a correctness gap. The target is **zero**, and the count is derived from the schedule rather than measured — so unlike the throughput half this one needs neither a baseline nor a faster body. |
 | **Streaming under concurrency (checkpoint plan Stage D.2)** | Tier 4 item 21's remainder — **no gate yet** | "Run a forward pass while experts stream in; verify no expert is read while partially written, and that index positions stay valid under concurrent access." The item-21 gate drives `TieredExpertSupply` one round at a time, which is what byte-exactness needs; this property needs a forward pass streaming experts *while the graph runs*, and the rewritten graph has no caller. It is a **correctness** half that no existing gate covers — the overlap the supply path already implements is a *throughput* property, measured by the warm-tier A/B report and the supply telemetry, not this. Listed so a green item 21 is not read as covering it. |
-| **Chunked-prefill throughput** | **blocked — item 19's throughput half; unblocked by item 22's state contract** | The structural gate is green; speed is a separate gate by the plan's own rule. **It is blocked, not merely unmeasured.** (i) The chunk size is capped at **8** by the compressor's partial ring (`position % coefficient·ratio` into a fixed ring), so a usable chunk size needs the **position-addressed** partial state that Part I §6.2 requires and item 22 owns. (ii) Independently, a per-token body cannot show a chunk-size benefit at all: chunk 1 and chunk N run the same code the same number of times, so nothing amortizes. Batching the projections is the implementation step that would create a win to measure. `compose_local_rows` is a per-query loop of up to `C` device-to-device copies. Method when it is measurable: all experts of the resident layers held in VRAM, giving a **compute+composition floor** with storage verified at zero — never comparable to model throughput. |
+| **Chunked-prefill throughput** | **open — item 19's throughput half; the alleged blocker was measured false** | The structural gate is green; speed is a separate gate by the plan's own rule. **The cap is gone because it was never real.** This row previously said the chunk size was capped at **8** by the compressor's partial ring and that item 22's state contract was the prerequisite. Measured (2026-09-16): a chunk of **16** exceeds both rings and is **bit-identical to serial** in all three classes, because a boundary materializes during phase 1 before any later token can reach its slot. The two ring-based refusals were **conservative, not protective**, and are removed. **What actually remains** is the real half: a per-token body cannot show a chunk-size benefit at all — chunk 1 and chunk N run the same code the same number of times, so nothing amortizes — so **batched projections** are the implementation step that would create a win to measure. `compose_local_rows` is also still a per-query loop of up to `C` device-to-device copies. Method when it is measurable: all experts of the resident layers held in VRAM, giving a **compute+composition floor** with storage verified at zero — never comparable to model throughput. |
 
 ### Anti-circularity rule
 
@@ -1573,6 +1633,72 @@ therefore not redundancy — it is what turns a two-line diagnosis into a bisect
 after each injection but does not rebuild, so the binary left in `build/bin` when the sweep ends is
 the last mutant. Three consecutive runs of it read `FAIL — 3 failed`, which is correct and is **not**
 a stability result; the unmutated source rebuilt cleanly and passed 3 of 3.
+
+**A second, worse instance of the same hazard — the committed tree was red (found 2026-09-16).**
+`ctest` does not build. When `db0d3ed` was committed, the binaries in `build/bin` for items 16, 17 and
+18 were **stale** — built *before* that commit's change to `aeon_moe_fused_w2_accum_kernel` — so the
+suite reported `38/38` while the **source** of the same commit was failing. Rebuilding that commit
+produced **21 failing lines in item 16 alone** (`moe_out` at `1.32×peak`, `res_out` at `1.28×peak`),
+reproducing across runs. The sweep-tooling note above and this are the same lesson from opposite ends:
+**a test result describes the binary that ran, not the source beside it.** Rebuild before believing a
+green transition, and rebuild before committing one.
+
+**The regression itself, and how it hid.** `db0d3ed` extracted `swizzled_w2_row_dot` **with its closing
+`__shfl_xor` reduction** — which is correct, and required: `aeon_moe_fused_w2_contrib_kernel` calls it
+once and writes the result, so the helper must return the finished row dot, and the item-22-style
+`contrib == weight × raw` check depends on exactly that. But the other caller,
+`aeon_moe_fused_w2_accum_kernel`, **kept its own reduction**. The two composed: the second summed four
+slice-totals that were each *already* the complete row, so the routed contribution was multiplied by
+`LPR` — a silent `×4` on the committed path. The kernel returned a plausible number at the wrong
+scale, which is why **only an oracle comparison could see it**: items 16/17/18 failed at `moe_out`,
+while any run-vs-run check agreed with itself and every phase-ordering assertion stayed green.
+
+Two independent oracles now agree on the repair (the helper reduces; the caller must not), and they
+disagree in opposite directions on the old code — which is what makes this a measurement rather than a
+preference:
+
+| | helper reduces, caller does not (**fixed**) | both reduce (`db0d3ed`) |
+| :--- | ---: | ---: |
+| `test_aeon_moe_fused_w2` — 4096 rows × 6 experts vs a plain fp32 dot | **`0.000976562`** ✓ | `8.55427` ✗ |
+| items 16/17/18, `moe_out` | pass ✓ | `1.32×peak` ✗ |
+| `swizzled_w2_row_dot` ↔ `contrib_kernel` | consistent ✓ | caller's path `×4` |
+
+The backend unit test is the sharper instrument: it predates the rewrite and compares against a plain
+fp32 dot with no swizzle reasoning in it, so `0.000976562` — one fp16 ulp at that magnitude — says the
+kernel is now exact and only the store rounds. Note also that the **deterministic** path routes through
+the same dispatch, which is why item 18, the gate that deliberately exercises the deterministic
+accumulation, failed alongside the other two.
+
+**Tier 3 item 19 — the chunk cap was false, and the schedule sweep now says so (2026-09-16).** The
+gate's schedules were extended from three to **five**, adding `{10}` (larger than CSA's 8-wide
+compressor ring) and `{16}` (larger than that *and* than the 10-wide local ring). Both are
+**bit-identical to serial** — every token, and the whole final state, `0 differing values`. Section D
+was rewritten to match: the workspace is the only bound (`kWorkspaceTokens + 1` is refused), and **a
+chunk of 16 is asserted to be *accepted***, which is the assertion that would have failed under the
+old guard. This is a finding about the plan, not about the kernel: the two ring-based refusals were
+**conservative, not protective**, and their stated reason — a boundary reading a row a later token had
+overwritten — cannot occur, because each boundary materializes as its token is processed. The header
+and function comment in `core/v4_layer_body_batch.hpp` carried the same false claim and are corrected
+in place, with the inequality and its exactly-zero margin.
+
+**Tier 4 item 22 mutations (2026-09-16, `gfx1100`, the restore path).** Six mutations, injected into
+`V4Layer::restore_state` / `write_state_bytes` — the pieces, the counters, and the size check. **All
+six killed**, each by a different check.
+
+| # | Mutation | Result |
+| :-- | :--- | :--- |
+| RS-1 | `local_key_cache` not restored | **Killed** — `8176/8192` bytes differ in the round trip |
+| RS-2 | `compressor_partial_positions` not restored | **Killed** — `64/64` differ |
+| RS-3 | `compressed_value_cache` not restored | **Killed** — `5104/131072` differ |
+| RS-4 | `local_valid_count` not restored (forced to 0) | **Killed** — the counter line reads `8 vs 0` |
+| RS-5 | `local_key_cache` written from the **value** snapshot | **Killed** — by section C's zeroed-ring probe going *inert* |
+| RS-6 | Size validation removed | **Killed** — the truncated snapshot is `written` instead of `refused` |
+
+**RS-5 is the interesting kill**, because it is caught by a *section-C* line rather than by A or B.
+Restoring the key cache from the value bytes leaves A and B red too, but the decisive evidence is that
+the "zeroed local ring changes the continuation" probe stops firing: the state it zeroes is no longer
+the state the continuation reads. Section C's probes are therefore not only a non-vacuity guard — they
+localise **which piece** the continuation depends on, and a swap makes two pieces cancel.
 
 **Step 3 `hc_head` mutations (2026-09-16, `gfx1100`, the head reduction).** Six mutations, injected
 into `hc_head_wave32_kernel`. **All six killed.**

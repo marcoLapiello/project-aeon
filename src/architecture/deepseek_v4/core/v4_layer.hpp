@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -208,6 +209,85 @@ public:
         return snapshot;
     }
 
+    // Puts a snapshot back, byte for byte, and restores the four counters.
+    //
+    // This is the prefix-reuse primitive the plan's state contract requires (Part I
+    // §6.3 R1–R3): the state is a set of independent, position-addressed pieces, and
+    // a restore must be **byte-exact with respect to never having evicted**. A
+    // snapshot that is only ever captured is a latent type, so the gate that matters
+    // is not "does the copy round-trip" but "does a *restored* layer continue exactly
+    // like one that never stopped" — `tests/test_v4_state_restore.cpp` drives both and
+    // requires the tokens and the final state to be identical.
+    //
+    // Every piece is written, including the ones a Sliding layer does not have: their
+    // expected byte count is zero, so `write_state_bytes` is a no-op there rather than
+    // a special case. Sizes are **validated**, not trusted — a snapshot taken from a
+    // differently shaped layer (a different window, ratio, or context) throws instead
+    // of writing past a buffer, because a silently mismatched restore would corrupt
+    // state in a way no later comparison could attribute.
+    void restore_state(const V4LayerStateSnapshot& snapshot) {
+        const auto& layout = state_layout_;
+        const size_t indexer_key_bytes = layout.uses_indexer() ? layout.indexer_key_bytes() : 0;
+        const size_t indexer_metadata_bytes =
+            layout.uses_indexer() ? layout.indexer_metadata_bytes() : 0;
+        const size_t indexer_partial_vector_bytes =
+            layout.uses_indexer() ? layout.indexer_partial_vector_bytes() : 0;
+        const size_t indexer_partial_metadata_bytes =
+            layout.uses_indexer() ? layout.indexer_partial_metadata_bytes() : 0;
+        const size_t indexer_query_bytes =
+            layout.uses_indexer() ? layout.indexer_query_bytes() : 0;
+        const size_t indexer_weights_bytes =
+            layout.uses_indexer() ? layout.indexer_weights_bytes() : 0;
+        const size_t indexer_scores_bytes =
+            layout.uses_indexer() ? layout.indexer_scores_bytes() : 0;
+        const size_t indexer_topk_bytes =
+            layout.uses_indexer() ? layout.indexer_topk_bytes() : 0;
+
+        write_state_bytes(d_local_key_cache, layout.local_vector_bytes(),
+                          snapshot.local_key_cache, "local_key_cache");
+        write_state_bytes(d_local_value_cache, layout.local_vector_bytes(),
+                          snapshot.local_value_cache, "local_value_cache");
+        write_state_bytes(d_local_positions, layout.local_metadata_bytes(),
+                          snapshot.local_positions, "local_positions");
+        write_state_bytes(d_compressed_key_cache, layout.compressed_vector_bytes(),
+                          snapshot.compressed_key_cache, "compressed_key_cache");
+        write_state_bytes(d_compressed_value_cache, layout.compressed_vector_bytes(),
+                          snapshot.compressed_value_cache, "compressed_value_cache");
+        write_state_bytes(d_compressed_positions, layout.compressed_metadata_bytes(),
+                          snapshot.compressed_positions, "compressed_positions");
+        write_state_bytes(d_compressor_partial_kv, layout.compressor_partial_vector_bytes(),
+                          snapshot.compressor_partial_kv, "compressor_partial_kv");
+        write_state_bytes(d_compressor_partial_score, layout.compressor_partial_vector_bytes(),
+                          snapshot.compressor_partial_score, "compressor_partial_score");
+        write_state_bytes(d_compressor_partial_positions,
+                          layout.compressor_partial_metadata_bytes(),
+                          snapshot.compressor_partial_positions,
+                          "compressor_partial_positions");
+        write_state_bytes(d_indexer_key_cache, indexer_key_bytes,
+                          snapshot.indexer_key_cache, "indexer_key_cache");
+        write_state_bytes(d_indexer_positions, indexer_metadata_bytes,
+                          snapshot.indexer_positions, "indexer_positions");
+        write_state_bytes(d_indexer_partial_kv, indexer_partial_vector_bytes,
+                          snapshot.indexer_partial_kv, "indexer_partial_kv");
+        write_state_bytes(d_indexer_partial_score, indexer_partial_vector_bytes,
+                          snapshot.indexer_partial_score, "indexer_partial_score");
+        write_state_bytes(d_indexer_partial_positions, indexer_partial_metadata_bytes,
+                          snapshot.indexer_partial_positions, "indexer_partial_positions");
+        write_state_bytes(d_indexer_query, indexer_query_bytes,
+                          snapshot.indexer_query, "indexer_query");
+        write_state_bytes(d_indexer_weights, indexer_weights_bytes,
+                          snapshot.indexer_weights, "indexer_weights");
+        write_state_bytes(d_indexer_scores, indexer_scores_bytes,
+                          snapshot.indexer_scores, "indexer_scores");
+        write_state_bytes(d_indexer_topk_indices, indexer_topk_bytes,
+                          snapshot.indexer_topk_indices, "indexer_topk_indices");
+
+        local_valid_count_ = snapshot.local_valid_count;
+        compressor_partial_count_ = snapshot.compressor_partial_count;
+        compressed_entry_count_ = snapshot.compressed_entry_count;
+        indexer_candidate_count_ = snapshot.indexer_candidate_count;
+    }
+
     void record_position(uint64_t position) {
         if (position >= max_seq_len_) {
             throw std::out_of_range("V4Layer: position exceeds configured context capacity");
@@ -269,6 +349,32 @@ private:
         std::vector<uint8_t> host(bytes);
         CHECK_HIP(hipMemcpy(host.data(), pointer, bytes, hipMemcpyDeviceToHost));
         return host;
+    }
+
+    // The inverse of `copy_state_bytes`. A piece with a zero byte count must carry a
+    // zero-length snapshot (a Sliding layer has no compressor, HCA no indexer), and a
+    // non-zero count must match exactly — a mismatch is a restore from the wrong
+    // layer, which is refused rather than written.
+    static void write_state_bytes(void* pointer, size_t bytes,
+                                  const std::vector<uint8_t>& host, const char* what) {
+        if (bytes == 0) {
+            if (!host.empty()) {
+                throw std::invalid_argument(
+                    std::string("V4Layer::restore_state: ") + what +
+                    " has no storage but the snapshot carries bytes");
+            }
+            return;
+        }
+        if (host.size() != bytes) {
+            throw std::invalid_argument(
+                std::string("V4Layer::restore_state: ") + what + " snapshot is " +
+                std::to_string(host.size()) + " bytes, expected " + std::to_string(bytes));
+        }
+        if (pointer == nullptr) {
+            throw std::runtime_error(
+                std::string("V4Layer::restore_state: ") + what + " has no device buffer");
+        }
+        CHECK_HIP(hipMemcpy(pointer, host.data(), bytes, hipMemcpyHostToDevice));
     }
 
     template<typename T>

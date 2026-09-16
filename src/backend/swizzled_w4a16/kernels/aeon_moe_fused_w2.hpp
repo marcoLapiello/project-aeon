@@ -96,17 +96,19 @@ void aeon_moe_fused_w2_accum_kernel(    const half* __restrict__ expert_hidden,
 
     float accumulator = 0.0f;
     if (expert < expert_count && row < N) {
+        // `swizzled_w2_row_dot` already reduces across the `LPR` slices of this row
+        // (its closing `__shfl_xor` loop), so the caller must **not** reduce again.
+        // It did, and the two reductions composed: the second one summed each slice's
+        // already-complete row total, multiplying the routed contribution by `LPR`
+        // (a silent 4x on the committed path). The kernel returned a plausible number
+        // at the wrong scale, which is why only an oracle comparison saw it — items
+        // 16/17/18 at `moe_out`, while any run-vs-run check agreed with itself.
         accumulator = swizzled_w2_row_dot<RPW, LPR, ITERS>(
             weights.w2[expert],
             weights.s2[expert],
             expert_hidden + static_cast<size_t>(expert) * (LPR * ITERS * 32),
             lane, slice, block_offset,
             /*valid=*/true);
-    }
-
-    #pragma unroll
-    for (int offset = LPR / 2; offset > 0; offset >>= 1) {
-        accumulator += __shfl_xor(accumulator, offset, 32);
     }
 
     if (expert < expert_count && row < N && slice == 0) {

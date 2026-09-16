@@ -65,17 +65,21 @@ Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
 | Tier 1 — oracle harness + all 11 primitives | done, mutation-tested | plan §Tier 1 |
 | Tier 2 — items 16–18: layer body, all three attention classes, serial loop | **closed** | plan §Tier 2 |
 | Tier 3 — items 19–20: chunked prefill, long-context lifecycle | done *(item 19's throughput half blocked)* | plan §Tier 3 |
-| Tier 4 — items 21–23: streaming/tiering, prefix cache, generating loop | item 21 done; 22–23 not started | plan §Tier 4 |
+| Tier 4 — items 21–23: streaming/tiering, prefix cache, generating loop | item 21 done; item 22's restore half (R3) done; 23 not started | plan §Tier 4 |
 
 `core/v4_layer_body.hpp` is the single layer body; decode, chunked prefill and every Tier-2/3 gate
 call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
-and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **38 tests** (legacy: 37).
+and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **39 tests** (legacy: 41).
 
-**Next: item 22's state layout.** The compressor's partial state is still a fixed ring, which caps
-`run_layer_body_chunk` at a chunk of 8 and thereby blocks item 19's throughput half; Part I §6.2
-requires position-addressed state for that *and* for mid-ratio-window reuse. Item 19's other half —
-the indexer top-k's per-token host round-trip, target zero — is countable today and needs no baseline.
-Reasoning and the full remaining sequence: plan item 19, item 22, and the open-unknowns table.
+**Next: item 22's second half (R4), or item 23's driver.** `V4Layer::restore_state` now exists and R3
+is certified, so the prefix cache can *materialize* state; what it cannot yet do is **decide** — there
+is no cache key, no block table, and no detection of a reuse boundary that predates the local window
+(R4, trap 22). Remaining open halves: the **indexer top-k's per-token host round-trip** in
+`select_indexer_topk`, target zero, countable today and needing no baseline; and item 19(a)'s
+**batched projections**, which are now the whole of the prefill-throughput half — the compressor-ring
+chunk cap that was said to block it was measured to be false and removed (a chunk of 16 is
+bit-identical to serial). The 43-layer stack has still **never been assembled**: that is item 23's
+driver. Reasoning and the full sequence: plan items 19, 22, 23 and the open-unknowns table.
 
 **Needs a decision — a numbering conflict.** "Item 21" currently names two different gates: the plan's
 Tier 4 item 21 is streaming/tiering, while `plans-and-docs/status/DOCUMENTATION_STATUS.md` and older notes use it for the comparison
