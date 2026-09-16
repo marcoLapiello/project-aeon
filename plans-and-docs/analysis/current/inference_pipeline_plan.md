@@ -1020,6 +1020,20 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > exercises the swizzle walk on the artifact's real experts; only the multi-token gate opts into
 > the decoded cache.
 >
+> **Parallelized (2026-09-16) — the gate is now `54 s`.** The oracle's two fp64 reductions
+> (`matvec`'s `o` axis and `grouped_wo_a`'s flattened `(t,g,r)` axis) are latency-bound dependent-add
+> chains, so one core reaches only ~2 GFLOP/s no matter the SIMD width; spreading the outer axis over
+> cores is where the time is, at no numerical cost (`acc` is a per-element local, `y[o]` has a single
+> writer, the accessor and `x` are read-only, so every element executes the identical instruction
+> sequence it did serially). Measured in isolation, the oracle's own op mix goes `119 s → 5.9 s` on
+> 32 threads. **The gate only reaches `137 s → 54 s`, and that gap is the finding worth keeping:**
+> ~48 s of what remains does not respond to host threads at all, and `OMP_WAIT_POLICY=passive`
+> removes the CPU burn (3019% → 471%) without moving the wall clock — so the floor is the gate's own
+> device half (per-token kernel launches and synchronised checkpoint readbacks), not the oracle.
+> Oracle parallelization is exhausted here; further gains would need the test to stop driving the
+> device one token and one readback at a time. Every reported checkpoint value is **byte-identical**
+> between a 1-thread and a 64-thread run. See `aeon_enable_openmp` and `AEON_OPENMP_THREADS`.
+>
 > **What is NOT covered, named so it is not mistaken for coverage.** Serial state evolution
 > **without** re-seeding — the residual is still written from the oracle between steps, so this
 > measures one layer's composition and not a long loop's drift (item 18); the real 128-token
@@ -1120,10 +1134,12 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > per-slot payloads, as in item 17 — Tier 1 and item 16 own it); any tiering; and the *batched*
 > path entirely (item 19).
 >
-> **A performance note.** 408 layer-steps, **3m21s**, registered with a 600-second timeout. The
-> cost is the oracle's fp64 matvecs, not the device; it is the price of comparing ~4 300
-> checkpoints against an independent reference, and it stays a single gate rather than being
-> traded for coverage.
+> **A performance note.** 408 layer-steps, **203 s** single-threaded and **`77 s`** now that the
+> oracle reductions are host-parallel (2026-09-16), registered with a 600-second timeout. The
+> single-threaded cost is the oracle's fp64 matvecs, not the device; it is the price of comparing
+> ~4 300 checkpoints against an independent reference, and it stays a single gate rather than being
+> traded for coverage. As on item 17, the residue after parallelization is the gate's device half —
+> a `TIMEOUT 600` is still the right bound, but the gate is no longer close to it.
 
 **Tier 3 — Sequence.**
 19. ~~**Chunked batched prefill** with one shared layer body. Gate: chunk ≡ serial.~~ **DONE as a

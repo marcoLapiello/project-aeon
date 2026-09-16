@@ -362,11 +362,29 @@ inline double peak_abs(const std::vector<double>& v) {
 // widening 33 million values into doubles. The arithmetic — the accumulation
 // order, and the fact that it happens in double — stays here, in the oracle,
 // not in the test.
+//
+// PARALLELISM AND WHY IT IS ARITHMETIC-NEUTRAL.
+// This loop is ~90% of a layer-body oracle call and it is **latency**-bound, not
+// throughput-bound: each `y[o]` is a dependent chain of fp64 adds against a
+// single accumulator, so one core reaches ~2 GFLOP/s regardless of SIMD width.
+// Spreading the outer loop over cores is therefore where the time is, and it is
+// free of any numerical consequence: `acc` is a per-`o` local, `y[o]` is written
+// by exactly one iteration, and the accessor and `x` are only ever read. Every
+// `o` therefore executes the identical instruction sequence it did serially and
+// produces a **bit-identical** value — unlike a reassociated reduction, which
+// would change the result (see option 4 in the discussion of this in the plan).
+// The `if` clause keeps a parallel region from being opened for the handful of
+// tiny projections (a 64-wide gate) where the fork/join would cost more than the
+// work. Guarded by `_OPENMP`, so a target that was not opted in compiles the
+// serial loop verbatim.
 template <class Accessor>
 std::vector<double> matvec(size_t out_dim, size_t in_dim,
                            const std::vector<double>& x,
                            Accessor w_at) {
     std::vector<double> y(out_dim, 0.0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out_dim >= 8 && out_dim * in_dim >= 65536)
+#endif
     for (size_t o = 0; o < out_dim; ++o) {
         double acc = 0.0;
         for (size_t i = 0; i < in_dim; ++i) acc += w_at(o, i) * x[i];
@@ -992,24 +1010,38 @@ inline std::vector<int32_t> topk_indices(const std::vector<double>& scores, size
 // `apply_relu` do elsewhere in this file: so a gate can compute the *wrong*
 // layout deliberately and demonstrate that the difference is material. Nothing
 // in the graph passes `false`.
+//
+// The `(t, g, r)` axes are flattened into one loop for the same reason `matvec`
+// parallelizes its `o` axis: it is the second-largest fp64 reduction in a layer
+// body (~34M MAC on a single decode token, ~11% of the total), it is a chain of
+// dependent adds per output element, and every element is an independent
+// reduction with its own accumulator. A single decode step has `tokens == 1`, so
+// parallelizing `t` alone would leave 31 cores idle; the flattening is what makes
+// the axis worth spreading. The output index is unchanged (`idx ==
+// (t·groups+g)·rank + r`), the accumulation order over `d` is unchanged, and
+// nothing is shared but read-only inputs — so this is bit-identical to the
+// serial nest.
 template <class Accessor>
 std::vector<double> grouped_wo_a(size_t tokens, size_t groups, size_t rank,
                                  size_t group_dim, const std::vector<double>& o,
                                  Accessor w_at, bool contiguous_blocks = true) {
-    std::vector<double> z(tokens * groups * rank, 0.0);
-    for (size_t t = 0; t < tokens; ++t) {
-        for (size_t g = 0; g < groups; ++g) {
-            for (size_t r = 0; r < rank; ++r) {
-                double acc = 0.0;
-                for (size_t d = 0; d < group_dim; ++d) {
-                    const size_t wi = contiguous_blocks
-                        ? g * (rank * group_dim) + r * group_dim + d
-                        : r * (groups * group_dim) + g * group_dim + d;
-                    acc += w_at(wi) * o[(t * groups + g) * group_dim + d];
-                }
-                z[(t * groups + g) * rank + r] = acc;
-            }
+    const size_t rows = tokens * groups * rank;
+    std::vector<double> z(rows, 0.0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows >= 8 && rows * group_dim >= 65536)
+#endif
+    for (size_t idx = 0; idx < rows; ++idx) {
+        const size_t t = idx / (groups * rank);
+        const size_t g = (idx / rank) % groups;
+        const size_t r = idx % rank;
+        double acc = 0.0;
+        for (size_t d = 0; d < group_dim; ++d) {
+            const size_t wi = contiguous_blocks
+                ? g * (rank * group_dim) + r * group_dim + d
+                : r * (groups * group_dim) + g * group_dim + d;
+            acc += w_at(wi) * o[(t * groups + g) * group_dim + d];
         }
+        z[idx] = acc;
     }
     return z;
 }

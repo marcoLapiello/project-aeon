@@ -174,9 +174,11 @@ endif()
 # Item 17. The same body as above, on the ratio-4 (CSA) and ratio-128 (HCA)
 # layers, which is where trap 33 lives: only CSA selects compressed rows through
 # the indexer; HCA attends every committed compressed row and has no indexer.
+# OPENMP: the oracle's fp64 GEMV is ~90% of this gate's cost and is spread
+# cleanly over cores (see aeon_enable_openmp); 136 s single-threaded.
 if(AEON_BUILD_TESTS)
     aeon_add_test(test_v4_layer_body_compressed_oracle
-        SOURCES tests/test_v4_layer_body_compressed_oracle.cpp)
+        SOURCES tests/test_v4_layer_body_compressed_oracle.cpp OPENMP)
 endif()
 
 # --- Tier-2 composition: the serial loop --------------------------------------
@@ -185,9 +187,10 @@ endif()
 # a loop does. This drives a three-layer stack (Sliding, CSA, HCA) for 136 tokens
 # with the device carrying its own residual — across 34 CSA boundaries and one
 # HCA boundary — and compares the whole accumulated state, not just the step.
+# OPENMP: 408 oracle layer-bodies, 203 s single-threaded (see aeon_enable_openmp).
 if(AEON_BUILD_TESTS)
     aeon_add_test(test_v4_layer_body_serial_oracle
-        SOURCES tests/test_v4_layer_body_serial_oracle.cpp TIMEOUT 600)
+        SOURCES tests/test_v4_layer_body_serial_oracle.cpp TIMEOUT 600 OPENMP)
 endif()
 
 # --- Tier-3 sequence: chunked batched prefill --------------------------------
