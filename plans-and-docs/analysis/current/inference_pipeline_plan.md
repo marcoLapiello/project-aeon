@@ -710,7 +710,78 @@ True chunked batched prefill is a hard requirement, not an optimization. Without
 
 **Gate:** `prefill(chunk)` must produce byte-equivalent state, logits, and token id to running the same tokens serially — **then**, separately, meet a throughput target. Structural equivalence and speed are two different gates; do not conflate them.
 
-> **Finding about the current implementation (checkable):** `prefill_batched` currently batches only the dense projections and HC; attention, compressor, indexer, and the MoE run in a per-token loop, and the indexer top-k does a device→host copy plus a stream synchronize per CSA layer. As written, the equivalence gate above cannot pass. This is a structural problem with the layer body's shape, not a tuning issue.
+> **Finding about the pre-rewrite implementation (checkable, and it was right about the gate):** the old `prefill_batched` batched only the dense projections and HC; attention, compressor, indexer, and the MoE ran in a per-token loop, and the indexer top-k did a device→host copy plus a stream synchronize per CSA layer. As written, the equivalence gate above could not pass. The rewrite's answer is item 19, below — and it turned out there was a second, sharper reason the gate could not pass, which no amount of batching the *arithmetic* would have fixed.
+
+> **Gate result (Tier 3, item 19) — CERTIFIED, and the gate found the ordering the naive implementation gets wrong.**
+> `tests/test_v4_layer_body_chunk_oracle.cpp`; the default suite is **34 tests**. The chunked path is
+> `core/v4_layer_body_batch.hpp`; the body it drives is the *same* `run_layer_body_pre_attention` /
+> `run_layer_body_attention_tail` pair the decode path calls, which is what "one body, not two" now
+> literally means.
+>
+> **THE FINDING — writing the chunk's keys into the ring first is not equivalent to serial, at any
+> chunk length above one (trap 39).** The obvious chunking is: run every token's pre-attention half,
+> then every token's attention half. It is wrong, and wrong for a reason that has nothing to do with
+> the compressed path that the plan's original finding was about.
+>
+> The local ring has `C` slots and position `p` lives in slot `p mod C`. Query `q` attends
+> `[q − C + 1, q]`. In a chunk spanning `[S, E]` with `E > S`, the write for `p ∈ [S, E]` lands in slot
+> `p mod C`, which before the write held `p − C`. Take `p = E`, the chunk's last write, and `q = S`, its
+> first query: `E − C ≥ S − C + 1` whenever `E ≥ S + 1`. So **the chunk's last write evicts the oldest
+> key of its own first query's window** — and every query below `E` loses the keys in
+> `[q − C + 1, E − C]`. The measurement that proves it is cheap: with a 10-slot ring and a 5-token
+> chunk, the naive order moves `attn_proj`, `moe_out` and the residual stream. `E = S` (a chunk of
+> one) is the only case where the eviction is not inside the chunk, which is exactly why **"serial"
+> in `chunk ≡ serial` must mean the same tokens one at a time** — the property under test is that
+> batching changes nothing, and a chunk of one has no batching in it.
+>
+> **The fix is the canonical design, and the reference already has this shape.** A token's key goes to
+> a per-chunk key buffer (the body takes `d_local_key_write` for this); each query attends a
+> **composed row-set** — the pre-chunk ring rows in its window plus the chunk's own rows up to and
+> including itself — and the chunk's keys are committed to the ring only once every query has run.
+> That is what the reference does: *"the current chunk's freshly-computed K lives in a separate
+> per-forward `kv [total_tokens, D]` **not yet written to the SWA ring**"*, with the row-set assembled
+> as `[compressed | swa positional]` (2.4.4). The plan's Part III requirement — "the compressor/indexer
+> run over the chunk and their ring boundaries must be respected mid-chunk" — was about the compressor;
+> the *local ring* had the same constraint and it was not written down.
+>
+> **The composed rows are ordered by ring slot, not by position, and that is what makes the gate an
+> equality.** The decode path hands the attention kernel the ring itself and lets it iterate slots
+> `0 … C-1`, so the order it sums the window in is slot order — for a wrapped window, a *rotation* of
+> position order. Composing in the same order makes both paths accumulate the identical `exp` terms in
+> the identical sequence over bit-identical keys, so the comparison can be exact and the gate does not
+> need a tolerance at all.
+>
+> **Measured: zero differing values anywhere.** Three classes × three chunk schedules × 130 tokens,
+> comparing the residual stream, the router logits, the selected ids and the routing weights per token,
+> plus the whole final state — ring keys and positions, every committed compressed entry with its
+> position, and the compressor's partial ring. Every line reads `bit-identical`, and the gate reports
+> a single total: **0**. The prompt is 130 tokens, so **HCA (ratio 128) commits a real compressed
+> entry** at position 127 and **CSA commits 32**, with boundaries falling mid-chunk in every schedule
+> and the 10-slot window wrapping thirteen times.
+>
+> **The three comparisons, and what each one catches.** (i) `chunk {5,5,3}` etc. vs the same tokens one
+> at a time — batching changes nothing. (ii) `{6,6,1}` and `{4,4,4,1}` against `{1,…}` — the answer is
+> schedule-independent, with `{4,4,4,1}` putting a chunk exactly on CSA's ratio so a boundary lands on
+> a chunk edge and `{6,6,1}` using the largest chunk the window allows. (iii) `chunk path at count 1`
+> vs **`run_layer_body_decoding`** — this is what keeps (i) and (ii) from being circular: the
+> one-at-a-time chunk run is tied to the **Tier-2 certified decode body**, so the equality is between
+> the batch path and the certified path, not between two copies of the same new code.
+>
+> **Section B asserts the ordering directly rather than only its consequence.** After every token's
+> pre-attention half — no query run, nothing committed — the ring's keys and positions are compared
+> against a snapshot taken before the chunk and must be **unchanged**, while the chunk buffer is shown
+> to be non-zero. Mutation M19-2 (the false version: write the ring as the chunk goes) is precisely
+> this and fails here.
+>
+> **What is NOT covered, named so it is not mistaken for coverage.** **Throughput.** The plan says
+> structural equivalence and speed are separate gates, and this composition is a per-query loop of
+> ~C device-to-device copies; correct, and not fast. Turning it into one gather kernel is its own step
+> with its own measurement. **The indexer's host round-trip** — `select_indexer_topk` still copies the
+> candidate scores to the host and synchronizes once per CSA token, which the plan forbids in a
+> prefill. It changes no value, so this gate cannot see it by construction; it is now recorded in the
+> open-unknowns table as item 19's own remainder rather than left implied by "item 19 done". And the
+> usual: synthetic experts, a shrunk window (10) and `index_topk` (3), no tiering.
+
 
 ### Decode
 
@@ -1034,9 +1105,13 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > Items 16 and 17 are structurally blind to all of this: they re-seed the residual every step, so
 > their trajectory never accumulates and their near-ties are decided once. The pipeline already
 > carries a deterministic alternative (`deterministic_expert_accumulation_`, a per-expert GEMV
-> plus `v4_pipeline_accumulate_expert_kernel`); this gate deliberately drives the **default**
-> path, and the finding is recorded rather than engineered away, because Gate 22's
-> byte-exact prefix restore and item 19's `chunk ≡ serial` gate are both directly affected by it.
+> plus `v4_pipeline_accumulate_expert_kernel`), and **the gate now requires it** — see the item-19
+> mutation note below for why that decision was taken rather than left open. The finding stands
+> and its measured quantities are unchanged; what changed is that the gate no longer *asserts*
+> against the nondeterministic path, because doing that made it fail roughly one run in ten, and
+> never on the near-tie step: once the device's trajectory and the oracle's diverge, the oracle's
+> *state* — the ring keys written in earlier steps — is no longer the device's, so a later
+> `attn_proj` disagreement is a consequence of the divergence rather than a defect.
 > **Trap 38.**
 >
 > **What is NOT covered, named so it is not mistaken for coverage.** The real 128-token local
@@ -1051,7 +1126,18 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > traded for coverage.
 
 **Tier 3 — Sequence.**
-19. **Chunked batched prefill** with one shared layer body. Gate: chunk ≡ serial.
+19. ~~**Chunked batched prefill** with one shared layer body. Gate: chunk ≡ serial.~~ **DONE as a
+    structural gate — see the result above and trap 39.** `core/v4_layer_body_batch.hpp` drives the
+    *same* two half-bodies decode calls, with the chunk's keys held outside the ring and a per-query
+    composed row-set; the gate is **exact equality** (0 differing values) against the same tokens run
+    one at a time, across three classes, three schedules, 130 tokens, and the whole final state, with
+    the serial run itself tied to the Tier-2 decode body. **What remains of item 19 is its two
+    non-structural halves, both explicitly open:** (a) **throughput** — the composition is a
+    per-query loop of up to `C` device-to-device copies and needs to become one gather kernel, with
+    its own measurement, because the plan requires speed to be a separate gate; and (b) the
+    **indexer top-k's per-token host round-trip** in `select_indexer_topk`, which the plan forbids in
+    a prefill and which no equivalence gate can see because it changes no value. Neither is a
+    correctness gap; both are recorded rather than implied by the checkmark.
 
 20. **Long-context lifecycle** — ring reuse and boundary compression past context capacity.
 
@@ -1077,7 +1163,9 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 | ~~`tid2eid` orientation~~ | **Resolved: `[vocab, 6]`** | Reference declares `(config.vocab_size, config.num_experts_per_tok)` `[V nvidia/model.py:820]`; still verify against our artifact at Gate 13. |
 | KV fp8/E4M3 round-trip required vs optional | Gates 9 / 10 | **Strengthened toward required:** the canonical compressor kernel applies bf16+FP8/UE8M0 at two store points `[V fused_compress_quant_cache.py:288-345]`, and the checkpoint card states `--kv-cache-dtype` resolves to `fp8_ds_mla`, *"the only layout these backends implement"* `[V checkpoint README]`. Still a gate, because bf16 is a supported alternative and the delta must be measured. |
 | MoE combine accumulation order | Gate 14 | **Shared-vs-routed order is now settled** (routed sum, then `+= shared` `[V nvidia/model.py:1020-1031]`). The **intra-routed** slot order was measured at the item-14 gate: it is `atomicAdd`, yet 32 identical 6-expert runs are **bit-identical** and the sum matches the weighted per-expert sum to `max_rel < 5e-7`. **Partially settled** — bounded for one configuration on this silicon, not in general. |
-| Local-window reuse boundary behavior | Tier 4 gate 20 | Whether a reused prefix whose boundary predates the local window must rebuild the ring, or whether compressed state fully covers attention. sglang tombstones such leaves; confirm the correct handling for our state rather than assuming. |
+| Local-window reuse boundary behavior | Tier 4 gate 20 | Whether a reused prefix whose boundary predates the local window must rebuild the ring, or whether compressed state fully covers attention. sglang tombstones such leaves; confirm the correct handling for our state rather than assuming. **Item 19 sharpened this**: the local ring cannot be reconstructed from anything else, so a prefix boundary older than the window means the ring must be *rebuilt by replaying the last `C` tokens*, not restored. That is a cost the reuse decision has to weigh, and it is the same constraint trap 39 describes from the batching side. |
+| **Indexer top-k on-device** | item 19, remaining half | `select_indexer_topk` still copies the candidate scores to the host and synchronizes the stream, **once per CSA token**, which Part III forbids in a prefill ("no per-token host synchronization"). It changes no value, so the `chunk ≡ serial` gate cannot see it by construction, and it is not a correctness gap. It is a scheduling debt with a throughput gate of its own. |
+| **Chunked-prefill throughput** | item 19, remaining half | The structural gate is green; speed is a separate gate by the plan's own rule. `compose_local_rows` is a per-query loop of up to `C` device-to-device copies and the body still runs the HC/MLA/compressor/MoE per token rather than as batched matmuls. Neither is measured yet. |
 
 ### Anti-circularity rule
 
@@ -1191,6 +1279,44 @@ structural blindness item 18 was added to remove, now demonstrated rather than a
 loop (item 18, 1485 lines); the position counter is visible only across the loop. Neither gate
 subsumes the other.
 
+**Tier 3 item 19 mutations (2026-09-16, `gfx1100`, the chunk composition).** Four mutations,
+injected into `compose_local_rows` and the commit loop — the ordering and the row-set, which is
+where a chunk can differ from serial. **All four killed, and the fourth is the one that found a
+defect in the gate rather than in the code.**
+
+| # | Mutation | Result |
+| :-- | :--- | :--- |
+| M19-1 | Every chunk query reads the chunk's **first** key instead of its own | **Killed** — 10 lines; `every token` and the final state both red |
+| M19-2 | **The false version**: the chunk writes the ring as it goes (no deferral) | **Killed** — 31 lines, including section B's "the ring is untouched by phase 1" |
+| M19-3 | Composed rows in **descending** slot order (not the kernel's order) | **Killed** — 4 lines |
+| M19-4 | The commit records a position **one below** the token's | **SURVIVED** → gate repaired → **killed** (7 lines) |
+
+**M19-2 is the tier's finding, injected deliberately**: it is trap 39 exactly, and it is killed by
+the ordering assertion in section B (the ring must be unchanged after every pre-attention half)
+*and* by the value comparisons — which is what makes section B a check on the property rather than
+on its symptom.
+
+**M19-4 SURVIVED the whole of section C, and that is a gate defect worth recording.** Section C
+compares the chunk path against the same path at `count = 1`, so a mistake applied to *both* sides
+is invisible: the commit loop is the same code in both runs, so a wrong ring position was written
+identically twice and compared equal. Section C2 was comparing tokens only. The repair is to compare
+**the final state as well** in C2 — the one comparison whose other side is
+`run_layer_body_decoding`, the Tier-2 certified body, which does not share the chunk driver at all.
+M19-4 now fails on `decode body state: ring positions`. This is the second failure mode of the
+method (a gate whose *metric* cannot see the difference it certifies) rather than the first
+(a shared oracle), and it is the same shape as M9/M9b in Tier 1: the gate was green and wrong.
+
+**Item 18's accumulation decision, taken here because trap 38 required it.** The item-18 gate now
+runs with `executor.deterministic = true`, the same choice item 19 makes. It had been driving the
+default `atomicAdd` path deliberately, to surface trap 38 — and it did, but the consequence was a
+gate that failed roughly **one run in ten**, and never on the near-tie step itself: once the
+device's trajectory and the oracle's diverge, the oracle's *state* (the ring keys written in
+earlier steps) is no longer the device's, so a later `attn_proj` disagreement is a consequence of
+the divergence rather than a defect. Trap 38 says in as many words that every loop gate must state
+which accumulation it requires. The nondeterminism remains a **measurement** in the gate
+(`near_tie`, `selection_mismatch_steps`, `worst_selection_gap`, `drift`) and its recorded
+quantities are unchanged; it is no longer inferred from an intermittently red line.
+
 **The M9/M9b finding was the important one, and it contradicted a claim this plan's own gate report made.** Item 14's gate was reported as certifying the asymmetric clamp rule. It did not: every assertion it made was either *oracle-vs-oracle* (the `ClampMode` fork) or a **relative** comparison whose floor was the probe's peak of ~1600, while the entire asymmetric/symmetric difference is bounded by `silu(−limit)·limit` = `4.5e-3`. A kernel that clamped the gate symmetrically passed the gate completely — in both the standalone and the fused form. The claim was wrong, and review would not have caught it because the gate printed `PASS`.
 
 The repair is a **targeted comparison**: select only the entries where the two rules actually disagree (`gate < −limit`) and require the device to match the asymmetric oracle there, by an absolute margin. A `max_abs` over the whole vector cannot express this, because it is dominated by entries the two rules treat identically. Measured after repair: `vs asymmetric = 0.000000` / `0.000002`, `vs symmetric = 0.004540` — roughly 2000× separation, and each check trips only on its own kernel.
@@ -1242,4 +1368,5 @@ These are the specific things that will break this model if implemented naively.
 35. **`sink in the max` is a robustness property, not an observable one — do not mistake a passing output comparison for coverage of it.** The sink must be in the max so that `exp(sink − m) ≤ 1` when the sink dominates; otherwise the exponent is positive and can overflow. But when the sink dominates, the output is zero *either way*, so a gate cannot tell the two implementations apart from the result. Assert finiteness instead, and do not claim the max placement is verified. `[Tier 1]`
 36. **At position 0 every RoPE is the identity, for every base — so position 0 cannot test RoPE at all.** The angle is `pos · inv_freq`, which is `0` at `pos = 0` for every frequency, so `cos = 1, sin = 0` and both the forward rotation and its inverse leave the vector untouched **whichever table was passed**. A gate that only tests the first token is blind to the wrong base class (numeric theta or YaRN), to a rotation applied to the head instead of the tail, and to an omitted inverse rotation — all three at once. Two Tier-2 mutations demonstrated this: the wrong RoPE base and a deleted inverse RoPE each **passed at position 0** and failed from position 1 (`5.4e-2` and `47%` of peak). Sweep positions. Note this is a *gate-design* trap, not a graph trap: the graph is correct here, the test was not. `[Tier 2]`
 37. **A discrete selection cannot be checked against a continuous oracle's inputs — re-derive it from the device's own.** The MoE router's ids are the `top-6` of `sqrt(softplus(logit)) + bias`; a *near-tie* (6th and 7th within the ~`1.2e-3` by which the device's fp16 GEMV and an fp64 oracle disagree on the logits) is then legitimately ordered either way, and the ids differ while the weights match to `8e-3`. Item 17 initially required the ids to equal the oracle's and **8 of 257** HCA tokens failed for this reason alone. The honest test compares the **logits** peak-relative (where precision belongs) and the **selection rule** against the ids re-derived from the **device's own** logits (where the rule belongs), with a `1e-6` allowance for the fp32-vs-fp64 activation. A gate that conflates the two cannot say whether a disagreement is a rule error or a rounding difference. `[Tier 2]`
-38. **A serial decode is not bit-reproducible, and a reference must therefore be driven by the device's own discrete outputs *and* its own state — at every level, not just the top.** The default routed-expert path accumulates with `atomicAdd`, whose order across the six experts is undefined, so `moe_out` differs between two runs of the same binary by ~`1e-7`; over a 408-step loop that compounds, and any router step whose 6th and 7th candidates sit in the drift flips its expert set. Item 18 measured **0–2 such steps per run**, varying between runs, with a `moe_out` difference up to **`7.0e-3`** of peak — **above the `4e-3` tolerance**, i.e. a nondeterministic *failure* of an unconditioned comparison. Two consequences, both now built in: (i) the reference's combine is driven by the device's ids and weights (`routed_ids_override`) while the *rule* is asserted against the device's own logits, so a near-tie cannot masquerade as a defect and a rule error still cannot hide; (ii) a gate that measures the *loop* must compare accumulated **state** — whole rings, all committed entries, all positions — not only the step it just produced, because a per-step comparison is complete at the step level and therefore structurally blind to accumulation. Items 16 and 17 could not have seen any of this: they re-seed the residual every step, so their trajectory never accumulates. The deterministic alternative already in the pipeline (`deterministic_expert_accumulation_`) removes the amplification at its source; Gate 22's byte-exact prefix restore and item 19's `chunk ≡ serial` gate must both decide explicitly which accumulation they require. `[Tier 2]`
+38. **A serial decode is not bit-reproducible, and a reference must therefore be driven by the device's own discrete outputs *and* its own state — at every level, not just the top.** The default routed-expert path accumulates with `atomicAdd`, whose order across the six experts is undefined, so `moe_out` differs between two runs of the same binary by ~`1e-7`; over a 408-step loop that compounds, and any router step whose 6th and 7th candidates sit in the drift flips its expert set. Item 18 measured **0–2 such steps per run**, varying between runs, with a `moe_out` difference up to **`7.0e-3`** of peak — **above the `4e-3` tolerance**, i.e. a nondeterministic *failure* of an unconditioned comparison. Two consequences, both now built in: (i) the reference's combine is driven by the device's ids and weights (`routed_ids_override`) while the *rule* is asserted against the device's own logits, so a near-tie cannot masquerade as a defect and a rule error still cannot hide; (ii) a gate that measures the *loop* must compare accumulated **state** — whole rings, all committed entries, all positions — not only the step it just produced, because a per-step comparison is complete at the step level and therefore structurally blind to accumulation. Items 16 and 17 could not have seen any of this: they re-seed the residual every step, so their trajectory never accumulates. The deterministic alternative already in the pipeline (`deterministic_expert_accumulation_`) removes the amplification at its source; Gate 22's byte-exact prefix restore and item 19's `chunk ≡ serial` gate must both decide explicitly which accumulation they require. **Item 19 answered that for itself: requiring the deterministic path, so `chunk ≡ serial` can be an equality rather than a tolerance** — see item 19's gate result. **Item 18's own gate was then moved onto that same path**, because asserting against the atomic one made it fail about one run in ten; with the fixed order its residue on the oracle-vs-device selection counter is `2 of 408` steps at a **worst gap of exactly `0.0`** — exact ties whose *ids are reordered* (the positional comparison counts that, the selection values are equal), not drift. That is worth keeping distinct: a gap that is non-zero means a rule disagreement, and a gap that *grows* across steps means drift has returned. `[Tier 2]`
+39. **A chunk must not write its keys into the local ring as it goes — the write for the chunk's last token evicts the oldest key of its own first token's window.** The local ring has `C` slots and position `p` lives in slot `p mod C`. Query `q` attends `[q − C + 1, q]`. In a chunk spanning `[S, E]` with `E > S`, the write for `p` lands in the slot that held `p − C`; take `p = E` and `q = S` and `E − C ≥ S − C + 1` holds **whenever the chunk has more than one token**. So "run every token's pre-attention half, then every token's attention half" is not equivalent to serial at *any* chunk length above one — and it is the **local** ring, not the compressed path, even though the plan's original finding about `prefill_batched` was phrased entirely in terms of the compressor, the indexer and the MoE. The canonical fix is the reference's own shape: hold the chunk's keys in a separate per-forward buffer (*"not yet written to the SWA ring"* `[V paged_prefill.py:13-33]`), give each query a composed row-set of the pre-chunk ring rows in its window plus the chunk's own rows up to itself, and commit to the ring afterwards. **Order the composed rows by ring slot, not by position**: the decode path iterates slots `0 … C−1`, so for a wrapped window the kernel's summation order is a rotation of position order, and matching it is what makes `chunk ≡ serial` an equality (item 19 measured **0 differing values**, 130 tokens × 3 classes × 3 schedules) instead of a tolerance. A corollary worth stating separately, because it is easy to get wrong when writing the reference: **`chunk ≡ serial` must mean the same tokens one at a time, not the decode body's `step()`** — a chunk of one is the only length at which batching is absent, which is what makes the property well-posed. `[Tier 3]`

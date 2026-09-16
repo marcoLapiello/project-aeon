@@ -41,12 +41,22 @@
 // 8.6e-5, varying between runs, and a resulting `moe_out` difference up to
 // 7e-3 of peak (above the 4e-3 tolerance; it is what motivated the seam above).
 // Items 16 and 17 could not have seen this: both re-seed the residual from the
-// oracle, so their trajectory never accumulates. The pipeline already has a
-// deterministic alternative (`deterministic_expert_accumulation_`, per-expert GEMV
-// plus `v4_pipeline_accumulate_expert_kernel`); this gate deliberately drives the
-// **default** path, and the finding is recorded rather than engineered away,
-// because "byte-exact prefix reuse" and "chunked prefill ≡ serial" are later
-// gates that this property directly affects.
+// oracle, so their trajectory never accumulates.
+//
+// **Consequence taken, and why it is a decision rather than a workaround.** Driving
+// the atomic path made this gate fail roughly one run in ten, and not on the
+// near-tie step: once the device's trajectory and the oracle's diverge, the
+// oracle's *state* — the ring keys written in earlier steps — is no longer the
+// device's state, so a later `attn_proj` disagreement is a consequence of the
+// divergence rather than of a defect. A gate that is red one run in ten is not a
+// usable signal, and trap 38 says in as many words that every loop gate must state
+// which accumulation it requires. **This gate therefore requires the deterministic
+// accumulation** (`executor.deterministic = true`), the same choice item 19 made,
+// and reports the nondeterminism as a measurement — `near_tie`,
+// `selection_mismatch_steps`, `worst_selection_gap`, `drift` — instead of
+// inferring it from an intermittently red line. The pipeline's own
+// `deterministic_expert_accumulation_` removes the amplification at its source.
+// Item 18's *finding* is unchanged and is why the seam and the counters exist.
 //
 // 136 tokens is not a round number: HCA (ratio 128) commits its first compressed
 // entry at position 127, so a run that crosses an HCA boundary cannot be shorter
@@ -325,6 +335,25 @@ int main() {
     executor.loader = nullptr;   // synthetic payloads
     executor.scratch = &scratch;
     executor.stream = 0;
+    // **Which accumulation this gate requires, stated explicitly (trap 38).** The
+    // finding this gate produced is that the *default* routed-expert path is not
+    // bit-reproducible: `atomicAdd`'s order across the six experts is the
+    // scheduler's, so `moe_out` differs between runs of the same binary and a
+    // router near-tie eventually flips. The measurements are below and in the
+    // header (`0–2` such steps per run, `moe_out` up to `7.0e-3` of peak).
+    //
+    // That nondeterminism cannot be *both* the finding and an assertion this gate
+    // makes. Driving the atomic path here made the gate fail roughly one run in ten
+    // — not on the near-tie step itself, but later: once the device's trajectory
+    // and the oracle's diverge, the oracle's *state* (the ring keys written in past
+    // steps) no longer belongs to the device, and the next step's `attn_proj`
+    // disagreement is a consequence of the divergence, not of a defect. A gate that
+    // is red one run in ten is not a usable signal. So the gate now **requires the
+    // deterministic accumulation** — the same decision item 19 made, and the one
+    // trap 38 says every loop gate must take — and the nondeterminism is reported
+    // as a measurement (`near_tie`, `selection_mismatch`, `drift`) rather than
+    // inferred from a flaky red line.
+    executor.deterministic = true;
     for (uint32_t k = 0; k < kRoutedExperts; ++k) {
         executor.synthetic[k] = payloads[k].data();
         CHECK_HIP(hipMalloc(&executor.d_payload[k], aeon::core::AEON_SWIZZLED_EXPERT_BYTES));
@@ -774,10 +803,14 @@ int main() {
         ok &= check("C: the device's residual is its own (never re-seeded)",
                     drift_max > 0.0, "max|device - half(oracle)|=" + num(drift_max, 9));
 
-        // (iv) How often the loop's non-reproducibility was visible. The device's
-        //      MoE accumulation order varies between runs, so a router near-tie can
-        //      resolve differently; these two counters are the measurement of how
-        //      often that happened, rather than something to be rediscovered later.
+        // (iv) How often the oracle's own selection and the device's disagree.
+        //      With the deterministic accumulation this is no longer a drift
+        //      channel: the residue is **exact ties reordered**, which the
+        //      positional id comparison counts as a mismatch while the selection
+        //      *values* are identical — hence `worst gap = 0.0`. That is benign by
+        //      construction (the combine is driven by the device's own ids), and
+        //      the counter is kept as a measurement: a non-zero gap here would mean
+        //      a rule disagreement, and a gap that *grows* would mean drift.
         std::printf("  %-52s near_tie=%u\n",
                     "C: near-tie allowance in the router rule check", near_tie_steps);
         std::printf("  %-52s %u of %u, worst gap %.3e\n",

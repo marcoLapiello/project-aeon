@@ -125,9 +125,18 @@ public:
     }
 
     // Accumulate `Σ_k w_k · W2_k · clamped_swiglu(W1_k·x, W3_k·x)` into
-    // `moe_accum`, which already holds the shared expert's output. Must preserve
-    // the stream order: any work it enqueues runs after the shared expert.
+    // `moe_accum`, which already holds the shared expert's output.
+    //
+    // Both operands are passed explicitly: `expert_input` is this token's FFN
+    // RMSNorm output (so the executor never has to know which row of a batch
+    // workspace the token occupies) and `expert_weights` is the per-token routing
+    // weight vector the fused kernel scales by. That is what lets one body serve
+    // a single-token decode and a chunk of tokens without the supply system
+    // reaching into a shared scratch buffer. Must preserve the stream order: any
+    // work it enqueues runs after the shared expert.
     virtual void accumulate_routed(uint32_t layer_id, uint32_t position,
+                                   const half* expert_input,
+                                   const float* expert_weights,
                                    half* moe_accum) = 0;
 
     // Runs after the routed experts have been consumed, so the executor can
@@ -148,15 +157,17 @@ struct V4LayerBodyOutput {
 // the degenerate case `candidates <= index_topk` selects every candidate with no
 // padding.
 //
-// Note this is the one host-side sync left in the decode body. The plan requires
-// it to become on-device for chunked batched prefill; it is recorded here rather
-// than hidden, because a gate cannot see it and a future change must.
-inline void select_indexer_topk(V4Layer& layer, hipStream_t stream) {
-    const size_t candidate_count = layer.indexer_candidate_count_;
+// Note this is the one host-side sync left in the body. The plan requires it to
+// become on-device for chunked batched prefill; that is item 19's second half and
+// is recorded here rather than hidden, because it does not change any result and
+// therefore cannot be seen by the equivalence gate.
+inline void select_indexer_topk(const V4Layer& layer, const float* device_scores,
+                                int32_t* device_topk, size_t candidate_count,
+                                hipStream_t stream) {
     if (candidate_count == 0) return;
 
     std::vector<float> scores(candidate_count);
-    CHECK_HIP(hipMemcpyAsync(scores.data(), layer.d_indexer_scores,
+    CHECK_HIP(hipMemcpyAsync(scores.data(), device_scores,
                              candidate_count * sizeof(float),
                              hipMemcpyDeviceToHost, stream));
     CHECK_HIP(hipStreamSynchronize(stream));
@@ -180,45 +191,221 @@ inline void select_indexer_topk(V4Layer& layer, hipStream_t stream) {
                          });
         std::copy_n(order.begin(), topk, selected.begin());
     }
-    CHECK_HIP(hipMemcpyAsync(layer.d_indexer_topk_indices, selected.data(),
+    CHECK_HIP(hipMemcpyAsync(device_topk, selected.data(),
                              selected.size() * sizeof(int32_t),
                              hipMemcpyHostToDevice, stream));
     CHECK_HIP(hipStreamSynchronize(stream));
 }
 
-// Runs Steps 2.0 – 2.11 for **one layer and one token**.
+// How many compressed entries exist on or before `pos`. Every caller that used to
+// read `layer.compressed_entry_count_` after `record_position(pos)` reads this
+// instead, because a chunk advances the layer's counter to the chunk's *last*
+// token while an earlier token's attention must still see its own count. For a
+// single token the two are equal by definition, so the decode path is unchanged.
+inline uint32_t committed_entries_for(const V4Layer& layer, uint32_t pos, int32_t ratio) {
+    if (ratio <= 0 || !layer.state_layout().is_compressed()) return 0;
+    const int64_t capacity = static_cast<int64_t>(layer.state_layout().compressed_capacity);
+    return static_cast<uint32_t>(std::min<int64_t>(
+        capacity, (static_cast<int64_t>(pos) + 1) / static_cast<int64_t>(ratio)));
+}
+
+// -----------------------------------------------------------------------------
+// The per-token buffer view. **One body serves both a decode step and a chunk of
+// tokens**, and this is the seam that makes that literal rather than aspirational:
 //
-// On entry `scratch.d_res_in` (float, `hc_mult × hidden`) holds the four HC
-// residual streams. On return it holds the updated streams — the next layer's
-// input — and `scratch.d_res_out_half` holds the same values in fp16.
+//   * decode fills it from row 0 of `PipelineScratchBuffers`, which already has
+//     the right shape — every workspace array in it is a single 16-row tile,
+//     because the expert kernels read `ffn_norm_act`/`moe_accum` in 16-row WMMA
+//     tiles and the pipeline replicates row 0 to fill them;
+//   * a chunk fills it from row `r` of `V4LayerBodyBatchScratch`, where each token
+//     owns its own tile — so one token's padding can never clobber another's
+//     input.
+//
+// The four *state* buffers the indexer owns (query, weights, scores, selected
+// top-k) come from the layer on the decode path, which is where they already
+// lived, and from the batch workspace on the chunk path where they must be
+// per-token. Nothing else in the body distinguishes the two.
+// -----------------------------------------------------------------------------
+struct V4LayerBodyRow {
+    float* d_res_in{nullptr};
+    float* d_res_mid{nullptr};
+    half* d_res_in_half{nullptr};
+    half* d_res_mid_half{nullptr};
+    half* d_res_out_half{nullptr};
+
+    float* d_mixes_a{nullptr};
+    float* d_pre_a{nullptr};
+    float* d_post_a{nullptr};
+    float* d_comb_a{nullptr};
+    float* d_mixes_f{nullptr};
+    float* d_pre_f{nullptr};
+    float* d_post_f{nullptr};
+    float* d_comb_f{nullptr};
+
+    half* d_x_pre{nullptr};
+    half* d_x_norm{nullptr};
+    half* d_qa{nullptr};
+    half* d_qa_norm{nullptr};
+    half* d_q{nullptr};
+    half* d_kv{nullptr};
+    half* d_kv_norm_act{nullptr};
+    half* d_compressor_kv{nullptr};
+    half* d_compressor_score{nullptr};
+
+    half* d_indexer_query{nullptr};
+    half* d_indexer_weights_half{nullptr};
+    float* d_indexer_weights{nullptr};
+    half* d_indexer_compressor_kv{nullptr};
+    half* d_indexer_compressor_score{nullptr};
+    float* d_indexer_scores{nullptr};
+    int32_t* d_indexer_topk_indices{nullptr};
+
+    half* d_attn_out{nullptr};
+    half* d_z_lora{nullptr};
+    half* d_attn_proj{nullptr};
+
+    half* d_ffn_pre{nullptr};
+    half* d_ffn_norm_act{nullptr};
+
+    half* d_router_logits_half{nullptr};
+    float* d_router_logits{nullptr};
+    float* d_topk_weights{nullptr};
+    int32_t* d_topk_indices{nullptr};
+    int32_t* d_token_id{nullptr};
+
+    half* d_shared_gate{nullptr};
+    half* d_shared_up{nullptr};
+    half* d_shared_swiglu{nullptr};
+
+    half* d_moe_accum{nullptr};
+
+    // ---- Where this token's rotated key (which is also its value, trap 6) is
+    // written. Decode leaves these null and gets the ring slot for its own
+    // position; a chunk points them at its own key buffer, because **a chunk must
+    // not write the ring as it goes** — see the proof in `v4_layer_body_batch.hpp`.
+    half* d_local_key_write{nullptr};
+    half* d_local_value_write{nullptr};
+    int64_t* d_local_position_write{nullptr};
+
+    // ---- The local row-set attention reads, when it is not the ring itself.
+    // Ascending in position, so the attention kernel's summation order is the same
+    // whichever path built it. A chunk supplies this; decode leaves it null and
+    // the ring is read directly (so the decode path is bit-for-bit what it was
+    // before the batch workspace existed).
+    const half* d_composed_keys{nullptr};
+    const int64_t* d_composed_positions{nullptr};
+    int32_t composed_rows{0};
+};
+
+// The single-token row over `PipelineScratchBuffers` plus the layer's own indexer
+// state buffers. Every pointer is exactly what the pre-refactor body used, so the
+// decode path is byte-for-byte the same computation.
+inline V4LayerBodyRow decode_layer_body_row(PipelineScratchBuffers& scratch,
+                                            V4Layer& layer) {
+    V4LayerBodyRow row;
+    row.d_res_in = scratch.d_res_in;
+    row.d_res_mid = scratch.d_res_mid;
+    row.d_res_in_half = scratch.d_res_in_half;
+    row.d_res_mid_half = scratch.d_res_mid_half;
+    row.d_res_out_half = scratch.d_res_out_half;
+
+    row.d_mixes_a = scratch.d_mixes_a;
+    row.d_pre_a = scratch.d_pre_a;
+    row.d_post_a = scratch.d_post_a;
+    row.d_comb_a = scratch.d_comb_a;
+    row.d_mixes_f = scratch.d_mixes_f;
+    row.d_pre_f = scratch.d_pre_f;
+    row.d_post_f = scratch.d_post_f;
+    row.d_comb_f = scratch.d_comb_f;
+
+    row.d_x_pre = scratch.d_x_pre;
+    row.d_x_norm = scratch.d_x_norm;
+    row.d_qa = scratch.d_qa;
+    row.d_qa_norm = scratch.d_qa_norm;
+    row.d_q = scratch.d_q;
+    row.d_kv = scratch.d_kv;
+    row.d_kv_norm_act = scratch.d_kv_norm_act;
+    row.d_compressor_kv = scratch.d_compressor_kv;
+    row.d_compressor_score = scratch.d_compressor_score;
+
+    // The indexer query is RoPE'd in place into the layer's own buffer — the
+    // pre-refactor body copied the scratch buffer into it, which is a
+    // device-to-device copy of the value that is already there.
+    row.d_indexer_query = layer.d_indexer_query;
+    row.d_indexer_weights_half = scratch.d_indexer_weights;
+    row.d_indexer_weights = layer.d_indexer_weights;
+    row.d_indexer_compressor_kv = scratch.d_indexer_compressor_kv;
+    row.d_indexer_compressor_score = scratch.d_indexer_compressor_score;
+    row.d_indexer_scores = layer.d_indexer_scores;
+    row.d_indexer_topk_indices = layer.d_indexer_topk_indices;
+
+    row.d_attn_out = scratch.d_attn_out;
+    row.d_z_lora = scratch.d_z_lora;
+    row.d_attn_proj = scratch.d_attn_proj;
+
+    row.d_ffn_pre = scratch.d_ffn_pre;
+    row.d_ffn_norm_act = scratch.d_ffn_norm_act;
+
+    row.d_router_logits_half = scratch.d_router_logits_half;
+    row.d_router_logits = scratch.d_router_logits;
+    row.d_topk_weights = scratch.d_topk_weights;
+    row.d_topk_indices = scratch.d_topk_indices;
+    row.d_token_id = scratch.d_token_id;
+
+    row.d_shared_gate = scratch.d_shared_gate;
+    row.d_shared_up = scratch.d_shared_up;
+    row.d_shared_swiglu = scratch.d_shared_swiglu;
+
+    row.d_moe_accum = scratch.d_moe_accum;
+    return row;
+}
+
+// What the pre-attention half hands to the attention half.
+struct V4LayerBodyPre {
+    V4AttentionTraceRecord* trace{nullptr};
+    bool emitted_compressed{false};
+    uint32_t compressed_index{0};
+    uint32_t committed{0};   // compressed entries on or before this token
+};
+
+// Runs Steps 2.0 – 2.4.3 for **one token**: everything up to, but not including,
+// attention.
+//
+// On entry the row's `d_res_in` (float, `hc_mult × hidden`) holds the four HC
+// residual streams. On return the token's rotated key is in the local ring, the
+// compressor (and on CSA the indexer) has been fed, and a ratio boundary has
+// materialized its compressed entry.
+//
+// Stopping here is deliberately the wrong place to stop for a single-token
+// decode. The two halves are worth separating for exactly one reason: a chunk
+// must interleave them, because **all** of the chunk's keys have to be in the
+// ring before **any** of its queries attends, or an early query cannot see a late
+// key. Splitting the body here is what lets `run_layer_body_chunk` do that while
+// still running the same code as decode; `run_layer_body_decoding` below simply
+// calls this and then the attention half, which is why there is one body and not
+// two.
 //
 // The layer class is read from `layer.spec().attention_kind`: a Sliding layer
 // takes the local-only path and never touches the compressor or indexer tensors
 // (traps 4 and 33); CSA and HCA take the compressed path with the indexer on CSA
 // only.
-inline V4LayerBodyOutput run_layer_body_decoding(
+inline V4LayerBodyPre run_layer_body_pre_attention(
     V4Layer& layer,
-    PipelineScratchBuffers& scratch,
+    V4LayerBodyRow& scratch,
     const V4LayerBodyTables& tables,
     uint32_t token_id,
     uint32_t pos,
     hipStream_t stream,
-    V4RoutedExpertExecutor& experts,
     V4LayerBodyObserver& observer) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
     constexpr int HC = 4;
     constexpr int HC_DIM = HC * H;          // 16384
     constexpr int HC_MULT3 = HC * (2 + HC);// 24
-    constexpr int M_PAD = 16;
     constexpr int Q_LORA = kernel::DSV4_Q_LORA_RANK;
     constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
     constexpr int NUM_HEADS = kernel::DSV4_NUM_HEADS;
     constexpr int TOTAL_Q = NUM_HEADS * HEAD_DIM;
     constexpr int INDEXER_Q = kernel::DSV4_INDEX_N_HEADS * kernel::DSV4_INDEX_HEAD_DIM;
-    constexpr int O_LORA = kernel::DSV4_O_LORA_RANK;
-    constexpr int O_GROUPS = kernel::DSV4_O_GROUPS;
-    constexpr int TOT_LORA = kernel::DSV4_TOTAL_O_LORA_DIM;
-    constexpr int INTER_DIM = 2048;
 
     const bool uses_compressed_rope = layer.spec().attention_kind != V4AttentionKind::Sliding;
     const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
@@ -309,7 +496,8 @@ inline V4LayerBodyOutput run_layer_body_decoding(
             hipLaunchKernelGGL(
                 kernel::v4_gemv_fp16_kernel,
                 dim3(kernel::DSV4_INDEX_N_HEADS, 1), dim3(32), 0, stream,
-                scratch.d_x_norm, layer.d_indexer_weights_proj, scratch.d_indexer_weights, H);
+                scratch.d_x_norm, layer.d_indexer_weights_proj,
+                scratch.d_indexer_weights_half, H);
             hipLaunchKernelGGL(
                 kernel::v4_gemv_fp16_kernel,
                 dim3(coefficient * kernel::DSV4_INDEX_HEAD_DIM, 1), dim3(32), 0, stream,
@@ -351,7 +539,7 @@ inline V4LayerBodyOutput run_layer_body_decoding(
                 trace_copy(observer, attention_trace->indexer_query,
                            scratch.d_indexer_query, indexer_query_width);
                 trace_copy(observer, attention_trace->indexer_weights,
-                           scratch.d_indexer_weights, kernel::DSV4_INDEX_N_HEADS);
+                           scratch.d_indexer_weights_half, kernel::DSV4_INDEX_N_HEADS);
                 trace_copy(observer, attention_trace->indexer_compressor_kv,
                            scratch.d_indexer_compressor_kv, indexer_width);
                 trace_copy(observer, attention_trace->indexer_compressor_score,
@@ -363,8 +551,21 @@ inline V4LayerBodyOutput run_layer_body_decoding(
     // -----------------------------------------------------------------
     // D. RoPE forward & local KV cache persistence
     // -----------------------------------------------------------------
+    // Decode writes the ring slot for this position. A chunk has already pointed
+    // these at its own key buffer, because a chunk cannot write the ring until its
+    // queries are done: for a ring of `C` slots, the write for position `p` lands
+    // in slot `p mod C`, which held position `p − C` — and `p − C` is the *first*
+    // key of the window of every query in the chunk with a position below `p`.
+    // Writing the chunk's keys into the ring first therefore evicts keys that
+    // earlier queries in the same chunk still need, for any chunk length above
+    // one. `v4_layer_body_batch.hpp` carries the proof; trap 39 records it.
     const uint32_t local_slot = pos % layer.local_cache_capacity();
-    const size_t local_offset = static_cast<size_t>(local_slot) * HEAD_DIM;
+    if (scratch.d_local_key_write == nullptr) {
+        const size_t local_offset = static_cast<size_t>(local_slot) * HEAD_DIM;
+        scratch.d_local_key_write = layer.d_local_key_cache + local_offset;
+        scratch.d_local_value_write = layer.d_local_value_cache + local_offset;
+        scratch.d_local_position_write = layer.d_local_positions + local_slot;
+    }
 
     hipLaunchKernelGGL(
         kernel::v4_forward_rope_at_pos_wave32_kernel,
@@ -379,15 +580,15 @@ inline V4LayerBodyOutput run_layer_body_decoding(
         1, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2);
 
     // Key and value are the *same* row (trap 6). Both caches are written.
-    CHECK_HIP(hipMemcpyAsync(layer.d_local_value_cache + local_offset,
+    CHECK_HIP(hipMemcpyAsync(scratch.d_local_value_write,
                              scratch.d_kv_norm_act, HEAD_DIM * sizeof(half),
                              hipMemcpyDeviceToDevice, stream));
-    CHECK_HIP(hipMemcpyAsync(layer.d_local_key_cache + local_offset,
+    CHECK_HIP(hipMemcpyAsync(scratch.d_local_key_write,
                              scratch.d_kv_norm_act, HEAD_DIM * sizeof(half),
                              hipMemcpyDeviceToDevice, stream));
     {
         const int64_t absolute_position = static_cast<int64_t>(pos);
-        CHECK_HIP(hipMemcpyAsync(layer.d_local_positions + local_slot,
+        CHECK_HIP(hipMemcpyAsync(scratch.d_local_position_write,
                                  &absolute_position, sizeof(absolute_position),
                                  hipMemcpyHostToDevice, stream));
     }
@@ -408,6 +609,16 @@ inline V4LayerBodyOutput run_layer_body_decoding(
     }
 
     const int64_t absolute_position = static_cast<int64_t>(pos);
+
+    // Every compressed-row count is derived from `pos` rather than read off the
+    // layer, because a chunk advances the layer's counters to its *last* token
+    // while an earlier token must still see its own. For a single token the two
+    // are equal by construction.
+    bool emitted_compressed = false;
+    uint32_t emitted_index = 0;
+    const uint32_t committed = uses_compressed_rope
+        ? committed_entries_for(layer, pos, layer.spec().compression_ratio)
+        : 0u;
 
     if (uses_compressed_rope) {
         const int ratio = layer.spec().compression_ratio;
@@ -434,11 +645,8 @@ inline V4LayerBodyOutput run_layer_body_decoding(
                 kernel::DSV4_INDEX_N_HEADS, kernel::DSV4_INDEX_HEAD_DIM,
                 kernel::DSV4_INDEX_HEAD_DIM - kernel::DSV4_ROPE_DIM,
                 kernel::DSV4_ROPE_DIM / 2);
-            CHECK_HIP(hipMemcpyAsync(layer.d_indexer_query, scratch.d_indexer_query,
-                                     INDEXER_Q * sizeof(half),
-                                     hipMemcpyDeviceToDevice, stream));
             kernel::v4_half_to_float_n_kernel<<<1, 128, 0, stream>>>(
-                scratch.d_indexer_weights, layer.d_indexer_weights,
+                scratch.d_indexer_weights_half, scratch.d_indexer_weights,
                 kernel::DSV4_INDEX_N_HEADS);
 
             hipLaunchKernelGGL(
@@ -455,6 +663,8 @@ inline V4LayerBodyOutput run_layer_body_decoding(
         if ((pos + 1u) % static_cast<uint32_t>(ratio) == 0) {
             const int compressed_index = static_cast<int>(
                 (pos + 1u) / static_cast<uint32_t>(ratio) - 1u);
+            emitted_compressed = true;
+            emitted_index = static_cast<uint32_t>(compressed_index);
             hipLaunchKernelGGL(
                 kernel::v4_materialize_compressed_entry_kernel,
                 dim3(1), dim3(512), 0, stream,
@@ -489,17 +699,20 @@ inline V4LayerBodyOutput run_layer_body_decoding(
         // The indexer runs on CSA only. HCA attends every committed compressed
         // row and has no indexer tensors at all (trap 33).
         if (layer.spec().attention_kind == V4AttentionKind::CSA) {
-            if (layer.indexer_candidate_count_ != 0) {
+            if (committed != 0) {
                 hipLaunchKernelGGL(
                     kernel::v4_indexer_scores_kernel,
-                    dim3((layer.indexer_candidate_count_ + 255u) / 256u), dim3(256), 0, stream,
-                    layer.d_indexer_query, layer.d_indexer_weights, layer.d_indexer_key_cache,
-                    layer.d_indexer_scores, static_cast<int>(layer.indexer_candidate_count_),
+                    dim3((committed + 255u) / 256u), dim3(256), 0, stream,
+                    scratch.d_indexer_query, scratch.d_indexer_weights,
+                    layer.d_indexer_key_cache,
+                    scratch.d_indexer_scores, static_cast<int>(committed),
                     kernel::DSV4_INDEX_N_HEADS, kernel::DSV4_INDEX_HEAD_DIM,
                     1.0f / std::sqrt(static_cast<float>(kernel::DSV4_INDEX_HEAD_DIM)),
                     1.0f / std::sqrt(static_cast<float>(kernel::DSV4_INDEX_N_HEADS)));
             }
-            select_indexer_topk(layer, stream);
+            select_indexer_topk(layer, scratch.d_indexer_scores,
+                                scratch.d_indexer_topk_indices,
+                                static_cast<size_t>(committed), stream);
         }
 
         if (attention_trace != nullptr) {
@@ -522,8 +735,8 @@ inline V4LayerBodyOutput run_layer_body_decoding(
                        layer.d_compressed_positions,
                        layer.state_layout().compressed_capacity);
             attention_trace->compressor_partial_count = layer.compressor_partial_count_;
-            attention_trace->compressed_entry_count = layer.compressed_entry_count_;
-            attention_trace->indexer_candidate_count = layer.indexer_candidate_count_;
+            attention_trace->compressed_entry_count = committed;
+            attention_trace->indexer_candidate_count = committed;
 
             if (layer.spec().attention_kind == V4AttentionKind::CSA) {
                 trace_copy(observer, attention_trace->indexer_partial_kv,
@@ -543,40 +756,94 @@ inline V4LayerBodyOutput run_layer_body_decoding(
                            layer.d_indexer_positions,
                            layer.state_layout().compressed_capacity);
                 trace_copy(observer, attention_trace->indexer_scores,
-                           layer.d_indexer_scores, layer.indexer_candidate_count_);
+                           scratch.d_indexer_scores, committed);
                 trace_copy(observer, attention_trace->indexer_topk_indices,
-                           layer.d_indexer_topk_indices,
+                           scratch.d_indexer_topk_indices,
                            layer.state_layout().index_topk);
             }
         }
     }
 
+    V4LayerBodyPre pre;
+    pre.trace = attention_trace;
+    pre.emitted_compressed = emitted_compressed;
+    pre.compressed_index = emitted_index;
+    pre.committed = committed;
+    return pre;
+}
+
+// Steps 2.4.4 – 2.11 for **one token**: attention over the class's row-set,
+// followed by the output projection, the FFN and the residual.
+//
+// Splitting here is what lets a chunk write every key before any query runs. For
+// a single token the split is invisible: `run_layer_body_decoding` below calls
+// both halves back to back with nothing in between.
+inline V4LayerBodyOutput run_layer_body_attention_tail(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    const V4LayerBodyTables& tables,
+    uint32_t token_id,
+    uint32_t pos,
+    hipStream_t stream,
+    V4RoutedExpertExecutor& experts,
+    V4LayerBodyObserver& observer,
+    V4LayerBodyPre pre) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int HC = 4;
+    constexpr int HC_DIM = HC * H;          // 16384
+    constexpr int HC_MULT3 = HC * (2 + HC);// 24
+    constexpr int M_PAD = 16;
+    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
+    constexpr int NUM_HEADS = kernel::DSV4_NUM_HEADS;
+    constexpr int TOTAL_Q = NUM_HEADS * HEAD_DIM;
+    constexpr int O_LORA = kernel::DSV4_O_LORA_RANK;
+    constexpr int O_GROUPS = kernel::DSV4_O_GROUPS;
+    constexpr int TOT_LORA = kernel::DSV4_TOTAL_O_LORA_DIM;
+    constexpr int INTER_DIM = 2048;
+
+    V4AttentionTraceRecord* attention_trace = pre.trace;
+    const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
+    const int64_t absolute_position = static_cast<int64_t>(pos);
+
     // -----------------------------------------------------------------
     // E. Class-specific attention over the cached states
     // -----------------------------------------------------------------
+    // The local rows come either from the ring itself (decode) or from the
+    // caller's composed row-set (a chunk, whose own keys are not in the ring yet).
+    // In both cases the rows are handed to the kernel with the row count as the
+    // "capacity" and the positions alongside, so the kernel's own window filter —
+    // `local_start <= key_position <= current_position` — is satisfied by every
+    // row and the arithmetic is the same code with the same summation order.
+    const half* local_keys = scratch.d_composed_keys != nullptr
+        ? scratch.d_composed_keys : layer.d_local_key_cache;
+    const int64_t* local_positions = scratch.d_composed_positions != nullptr
+        ? scratch.d_composed_positions : layer.d_local_positions;
+    const int local_rows = scratch.composed_rows > 0
+        ? scratch.composed_rows : static_cast<int>(layer.local_cache_capacity());
+
     if (layer.spec().attention_kind == V4AttentionKind::Sliding) {
         hipLaunchKernelGGL(
             kernel::v4_cached_sliding_window_attn_wave32_kernel,
             dim3(NUM_HEADS), dim3(32), 0, stream,
-            scratch.d_q, layer.d_local_key_cache, layer.d_local_value_cache,
-            layer.d_local_positions, layer.d_attn_sink, scratch.d_attn_out,
-            pos, static_cast<int>(layer.local_cache_capacity()), kernel::DSV4_ATTN_SCALE);
+            scratch.d_q, local_keys, local_keys,
+            local_positions, layer.d_attn_sink, scratch.d_attn_out,
+            static_cast<int>(pos), local_rows, kernel::DSV4_ATTN_SCALE);
     } else {
         const bool uses_indexer = layer.spec().attention_kind == V4AttentionKind::CSA;
-        const int compressed_count = static_cast<int>(layer.compressed_entry_count_);
+        const int compressed_count = static_cast<int>(pre.committed);
         const int topk_count = uses_indexer
             ? std::min<int>(compressed_count, static_cast<int>(layer.state_layout().index_topk))
             : 0;
         hipLaunchKernelGGL(
             kernel::v4_cached_compressed_attention_wave32_kernel,
             dim3(NUM_HEADS), dim3(32), 0, stream,
-            scratch.d_q, layer.d_local_key_cache, layer.d_local_value_cache,
-            layer.d_local_positions, layer.d_attn_sink,
+            scratch.d_q, local_keys, local_keys,
+            local_positions, layer.d_attn_sink,
             layer.d_compressed_key_cache, layer.d_compressed_value_cache,
             layer.d_compressed_positions,
-            uses_indexer ? layer.d_indexer_topk_indices : nullptr,
+            uses_indexer ? scratch.d_indexer_topk_indices : nullptr,
             scratch.d_attn_out, absolute_position,
-            static_cast<int>(layer.local_cache_capacity()), compressed_count,
+            local_rows, compressed_count,
             topk_count, uses_indexer, kernel::DSV4_ATTN_SCALE);
     }
 
@@ -770,6 +1037,7 @@ inline V4LayerBodyOutput run_layer_body_decoding(
     // 2.10.3 — routed experts, supplied by the executor
     // -----------------------------------------------------------------
     experts.accumulate_routed(static_cast<uint32_t>(layer.layer_id), pos,
+                              scratch.d_ffn_norm_act, scratch.d_topk_weights,
                               scratch.d_moe_accum);
 
     if (attention_trace != nullptr) {
@@ -799,6 +1067,30 @@ inline V4LayerBodyOutput run_layer_body_decoding(
         scratch.d_res_in_half, scratch.d_res_in, HC_DIM);
 
     return output;
+}
+
+// The single-token layer body: the pre-attention half immediately followed by the
+// attention half, with nothing in between.
+//
+// This is the definition of "one body, not two". The chunked prefill path in
+// `v4_layer_body_batch.hpp` calls the *same two functions*; it simply calls the
+// first for every token in the chunk before it calls the second for any of them,
+// which is the only structural difference between a chunk and a sequence of
+// decode steps.
+inline V4LayerBodyOutput run_layer_body_decoding(
+    V4Layer& layer,
+    PipelineScratchBuffers& scratch,
+    const V4LayerBodyTables& tables,
+    uint32_t token_id,
+    uint32_t pos,
+    hipStream_t stream,
+    V4RoutedExpertExecutor& experts,
+    V4LayerBodyObserver& observer) {
+    V4LayerBodyRow row = decode_layer_body_row(scratch, layer);
+    const V4LayerBodyPre pre = run_layer_body_pre_attention(
+        layer, row, tables, token_id, pos, stream, observer);
+    return run_layer_body_attention_tail(
+        layer, row, tables, token_id, pos, stream, experts, observer, pre);
 }
 
 } // namespace aeon::core

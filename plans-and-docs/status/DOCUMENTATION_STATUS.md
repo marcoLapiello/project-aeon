@@ -38,12 +38,13 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 33 infrastructure/backend/text/kept-component/Tier-1/Tier-2 tests |
-| Legacy `ctest` | 35 (the 33 plus 2 gated parity anchors) |
+| Default `ctest` | 34 infrastructure/backend/text/kept-component/Tier-1/Tier-2/Tier-3 tests |
+| Legacy `ctest` | 35 (the 34 minus the Tier-3 gate, plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
 | Tier 1 | **COMPLETE — all 11 primitives certified, then mutation-tested.** RMSNorm, RoPE (both bases), MLA Q/KV, HC + Sinkhorn, attention + sink + softmax, compressor + APE, indexer + top-k, grouped output projection, MoE router, routed expert, shared expert. Four real findings: a transposed comb index in the plan, the indexer ReLU missing from the kernel, the plan's normalization-guard claim being wrong, and the combine-order claim describing only the unfused path. **Mutation testing then found two gate defects that review and a green suite had both missed** (see the plan's "Mutation testing" section): the clamp-rule gates could not see a symmetrically-clamped kernel, and the RMSNorm gate could not see a deleted `eps`. 10 mutations: 8 killed, 1 provably equivalent, 0 unclassified. |
 | Tier 2 | **Items 16–18 done — all three attention classes, and the serial loop.** `core/v4_layer_body.hpp` is the single layer body (Steps 2.0–2.11 for one token) and `reference/dsv4_oracle.hpp::layer_body` its composed fp64 reference, branching on the attention class exactly as the device does. Item 16 covers the Sliding class on real `layers.0` weights (`tests/test_v4_layer_body_oracle.cpp`); item 17 covers **CSA (ratio 4)** and **HCA (ratio 128)** on real `layers.2` / `layers.3` weights (`tests/test_v4_layer_body_compressed_oracle.cpp`), including the compressor, the APE-adjusted partial ring, the materialized compressed entry, the indexer and the row-set rule; item 18 (`tests/test_v4_layer_body_serial_oracle.cpp`) drives a three-layer stack for **136 tokens across 34 CSA boundaries and one HCA boundary** with the residual carried by the device itself, and compares the **whole accumulated state**. Every checkpoint within `~1e-3` of its own peak against a `4e-3` tolerance. **13 of 13 mutations killed** (4 wiring + 1 redundant in item 16; 5 in item 17; 3 in item 18). Item 16 found a defect **in its own oracle**; item 17 found that the router ids cannot be compared against an fp64 oracle's inputs (**trap 37**) and made the fp16 decode ~5× faster; item 18 found that the device's serial decode is **not bit-reproducible** (**trap 38**) and that a state-evolution error is **invisible to a per-step gate** (M18-2: 577 failures in item 18, zero in item 16). Next: item 19 (chunked batched prefill, gate `chunk ≡ serial`). |
+| Tier 3 | **Item 19 done as a structural gate; its two non-structural halves are open.** `core/v4_layer_body_batch.hpp` drives the *same* two half-bodies decode calls (`run_layer_body_pre_attention` / `run_layer_body_attention_tail`) and holds the chunk's keys **outside** the local ring, with a per-query composed row-set ordered by ring slot; `tests/test_v4_layer_body_chunk_oracle.cpp` requires **exact equality — 0 differing values** — over 130 tokens × three attention classes × three chunk schedules, comparing each token's residual, router logits, ids and weights plus the whole final state (ring keys/positions, all 32 CSA + 1 HCA committed entries, the compressor's partial ring), and ties the one-at-a-time run to the Tier-2 certified decode body so the equality is not circular. **The finding the plan had missed: the obvious chunking is wrong (trap 39)** — writing the chunk's keys into the local ring as it goes is not equivalent to serial at any chunk length above one, because the write for the chunk's last token evicts the oldest key of its own first token's window. That is the **local** ring, not the compressed path the plan's original finding blamed. **Trap 38 was answered explicitly**: the gate requires the deterministic MoE accumulation, which is why the equality is exact rather than a tolerance. **Open, and named as such:** chunked-prefill *throughput* (a separate gate by the plan's own rule — the composition is a per-query loop of device-to-device copies and the body is still per-token) and the indexer top-k's per-token host round-trip, which Part III forbids in a prefill but which changes no value, so no equivalence gate can see it. **4 of 4 mutations killed** — and **M19-4 survived the first sweep, which was a gate defect**: section C compares the chunk path against itself at a different chunk length, so a mistake applied to *both* sides (the commit position) was invisible; section C2 now compares the **final state** against the Tier-2 certified decode body, whose other side does not share the chunk driver. That is the method's second failure mode (a metric that cannot see the difference), the same shape as Tier 1's M9/M9b. Next: item 20 (long-context lifecycle). |
 
 ---
 
@@ -101,13 +102,21 @@ are done** — the single layer body (`core/v4_layer_body.hpp`) is gated against
 composed fp64 reference on real weights for **all three attention classes**: Sliding, CSA
 (ratio 4) and HCA (ratio 128), the last two including the compressor, the APE, the indexer
 and the row-set rule, and the serial loop carries the device's own residual across 34 CSA
-boundaries and one HCA boundary. What remains in the tier is the sequence path: item 19
-(chunked batched prefill over the same body, gate `chunk ≡ serial`) and item 20 (long-context
-lifecycle); then compare identical formatted inputs, intermediate checkpoints, and final logits
-against a trusted compatible reference before any placement work. The serial loop settled a
-property both remaining gates must respect: a decode step is **not bit-reproducible** (trap 38),
-so `chunk ≡ serial` and byte-exact prefix restore each have to state which MoE accumulation they
-require.
+boundaries and one HCA boundary. **Tier 3 item 19's structural gate is also done**:
+`core/v4_layer_body_batch.hpp` drives the same two half-bodies decode calls a chunk at a time,
+holding the chunk's keys outside the local ring and composing a per-query row-set, and
+`tests/test_v4_layer_body_chunk_oracle.cpp` requires **exact equality** (0 differing values)
+between a chunked run and the same tokens one at a time — across three attention classes, three
+schedules and the whole final state. Item 19's *throughput* half and the indexer top-k's host
+round-trip are open and named as such; neither is a correctness gap. What remains of the sequence
+path is **item 20** (long-context lifecycle), then item 21's comparison of identical formatted
+inputs, intermediate checkpoints, and final logits against a trusted compatible reference before
+any placement work. The last two gates settled two properties the remaining work must respect:
+a decode step is **not bit-reproducible** (trap 38), so `chunk ≡ serial` and byte-exact prefix
+restore each have to state which MoE accumulation they require — item 19 requires the
+deterministic one; and the local ring is **not reconstructible** from anything else (trap 39), so
+a prefix boundary older than the window must be handled by *replaying* the last `C` tokens
+rather than restoring a ring.
 
 Four gates are settled empirically, not by reading. **One is now closed; three remain:**
 

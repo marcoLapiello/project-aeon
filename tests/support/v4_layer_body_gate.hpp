@@ -226,23 +226,44 @@ public:
     // ARTIFACT mode: resolve each selected expert out of the model artifact.
     aeon::core::AeonModelLoader* loader{nullptr};
     // SYNTHETIC mode: when `synthetic[k]` is non-null it is used for slot k and
-    // the loader is ignored.
+    // the loader is ignored. The payloads are uploaded per call by this class.
     const uint8_t* synthetic[kRoutedExperts]{};
 
+    // Genuinely per-call scratch (the routed accumulate is serialized per token
+    // in both the decode path and the chunk path, so one set of buffers serves
+    // either).
     aeon::core::PipelineScratchBuffers* scratch{nullptr};
     hipStream_t stream{0};
     uint8_t* d_payload[kRoutedExperts]{};
     std::vector<int32_t> last_ids;
+    // The fused W2 kernel reads the per-expert routing weight *on the device*, so
+    // the deterministic path cannot hand it a host scalar. Allocated on first use.
+    float* d_unit_weight{nullptr};
+
+    // When true, the six experts are summed in a **fixed** order — one dispatch
+    // per expert, accumulated in slot order — instead of through the fused
+    // `atomicAdd` path. The fused path's order across experts is the scheduler's,
+    // so `moe_out` differs between two runs of the same binary by ~1e-7; that is
+    // the property trap 38 records. Item 18 deliberately drives the atomic path to
+    // surface it, and item 19's `chunk ≡ serial` gate needs the deterministic one
+    // or a byte-exact comparison between two runs of the *same* schedule would be
+    // meaningless. **Which accumulation a gate requires is a decision, not a
+    // default** — this flag is how a gate states it.
+    bool deterministic{false};
+
+    void on_routing_ready(uint32_t layer_id, uint32_t position,
+                          const std::vector<int32_t>& ids,
+                          const std::vector<float>& weights) override {
+        (void)layer_id;
+        (void)position;
+        (void)weights;
+        last_ids = ids;
+    }
 
     void accumulate_routed(uint32_t layer_id, uint32_t position,
-                           __half* moe_accum) override {
+                           const half* expert_input, const float* expert_weights,
+                           half* moe_accum) override {
         (void)position;
-
-        last_ids.assign(kRoutedExperts, 0);
-        CHECK_HIP(hipMemcpyAsync(last_ids.data(), scratch->d_topk_indices,
-                                 kRoutedExperts * sizeof(int32_t),
-                                 hipMemcpyDeviceToHost, stream));
-        CHECK_HIP(hipStreamSynchronize(stream));
 
         aeon::kernel::SwizzledW13ExpertPtrs w13{};
         aeon::kernel::SwizzledW2ExpertPtrs w2{};
@@ -262,17 +283,69 @@ public:
             w2.s2[k] = reinterpret_cast<const __half*>(base + aeon::core::AEON_W2_SCALE_OFFSET);
         }
 
-        // Mirrors the pipeline's default (atomic) accumulation exactly.
-        aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
-            scratch->d_ffn_norm_act, w13, scratch->d_swizzled_expert_hidden,
-            scratch->d_swizzled_moe_accum_f32, kHidden, kRoutedExperts,
-            2048, kHidden, 10.0f, stream);
-        CHECK_HIP(hipMemsetAsync(scratch->d_swizzled_counters, 0,
-                                 64 * sizeof(int32_t), stream));
-        aeon::kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
-            scratch->d_swizzled_expert_hidden, w2, scratch->d_topk_weights,
-            moe_accum, scratch->d_swizzled_moe_accum_f32, moe_accum,
-            scratch->d_swizzled_counters, kRoutedExperts, kHidden, 2048, stream);
+        if (!deterministic) {
+            // Mirrors the pipeline's default (atomic) accumulation exactly. One
+            // dispatch for all six experts; the shared expert is folded in as
+            // `initial_output`, which is the fused form the pipeline uses.
+            aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
+                expert_input, w13, scratch->d_swizzled_expert_hidden,
+                scratch->d_swizzled_moe_accum_f32, kHidden, kRoutedExperts,
+                2048, kHidden, 10.0f, stream);
+            CHECK_HIP(hipMemsetAsync(scratch->d_swizzled_counters, 0,
+                                     64 * sizeof(int32_t), stream));
+            aeon::kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
+                scratch->d_swizzled_expert_hidden, w2, expert_weights,
+                moe_accum, scratch->d_swizzled_moe_accum_f32, moe_accum,
+                scratch->d_swizzled_counters, kRoutedExperts, kHidden, 2048, stream);
+            return;
+        }
+
+        // Deterministic: one expert at a time, in slot order, so the sum is
+        // `Σ_k w_k · W2_k · swiglu(W1_k·x)` with a fixed reduction order. This is
+        // the same shape as the pipeline's own `deterministic_expert_accumulation_`
+        // path (per-expert GEMV plus `v4_pipeline_accumulate_expert_kernel`), and
+        // like that path its accumulator is fp16 — which is the point: it is a
+        // *reproducible* order, not a more accurate one.
+        half* expert_hidden = scratch->d_swizzled_expert_hidden;
+        half* expert_down = scratch->d_expert_down;   // [M_PAD * hidden]
+        float* expert_down_f32 = scratch->d_swizzled_moe_accum_f32;
+        if (d_unit_weight == nullptr) {
+            const float one = 1.0f;
+            CHECK_HIP(hipMalloc(&d_unit_weight, sizeof(float)));
+            CHECK_HIP(hipMemcpy(d_unit_weight, &one, sizeof(float), hipMemcpyHostToDevice));
+        }
+
+        for (uint32_t k = 0; k < kRoutedExperts; ++k) {
+            // The two dispatches index their weight structs by expert id, so each
+            // call is given a one-slot view of this expert.
+            aeon::kernel::SwizzledW13ExpertPtrs single13{};
+            aeon::kernel::SwizzledW2ExpertPtrs single2{};
+            single13.w1[0] = w13.w1[k];
+            single13.s1[0] = w13.s1[k];
+            single13.w3[0] = w13.w3[k];
+            single13.s3[0] = w13.s3[k];
+            single2.w2[0] = w2.w2[k];
+            single2.s2[0] = w2.s2[k];
+
+            aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
+                expert_input, single13, expert_hidden, expert_down_f32,
+                kHidden, 1, 2048, kHidden, 10.0f, stream);
+
+            const int32_t zero_counter = 0;
+            CHECK_HIP(hipMemcpyAsync(scratch->d_swizzled_counters, &zero_counter,
+                                     sizeof(int32_t), hipMemcpyHostToDevice, stream));
+            // `d_unit_weight` is a *device* 1.0: the kernel reads the routing
+            // weight from device memory, so passing a host scalar's address here
+            // is an illegal access, not a wrong number.
+            aeon::kernel::dispatch_aeon_moe_fused_w2_accum<8, 8, 4, 16>(
+                expert_hidden, single2, d_unit_weight, nullptr, expert_down_f32,
+                expert_down, scratch->d_swizzled_counters, 1, kHidden, 2048, stream);
+
+            const int blocks = (kHidden + 255) / 256;
+            aeon::kernel::v4_pipeline_accumulate_expert_kernel
+                <<<blocks, 256, 0, stream>>>(moe_accum, expert_down,
+                                             expert_weights[k], kHidden);
+        }
     }
 };
 

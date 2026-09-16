@@ -190,6 +190,18 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_layer_body_serial_oracle.cpp TIMEOUT 600)
 endif()
 
+# --- Tier-3 sequence: chunked batched prefill --------------------------------
+# Item 19. Drives the same layer body a chunk at a time and requires the result to
+# be bit-identical to the same tokens run one at a time, for three attention
+# classes and four chunk schedules. The chunk's keys are held in a per-chunk
+# buffer and a per-query row-set is composed from the ring plus that buffer,
+# because writing the chunk into the ring first evicts keys its own early queries
+# need (trap 39) — section B asserts the ring is untouched during a chunk.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_layer_body_chunk_oracle
+        SOURCES tests/test_v4_layer_body_chunk_oracle.cpp TIMEOUT 600)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate
