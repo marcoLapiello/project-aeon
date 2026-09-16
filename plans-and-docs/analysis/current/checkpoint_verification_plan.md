@@ -290,6 +290,14 @@ Pass/fail on C.1–C.3 with the failing element index and both values for any mi
 Confirmation that tier placement does not change a single bit — i.e. any numerical difference is
 attributable to the graph, never to the memory system.
 
+> **Status (2026-09-16).** **D.1 and D.3 are implemented** as the graph plan's Tier-4 item 21 gate,
+> `tests/test_v4_expert_tiering.cpp` — one expert delivered Cold / Hot / Warm, each compared
+> byte-for-byte against the mmapped container, with the cold payload checked both in the staging
+> slot and in the destination VRAM slot so a failure localises to the NVMe leg or the H2D leg
+> (5 of 5 mutations killed, each by a different check). **D.2 (concurrency) is not covered**: it
+> needs a forward pass streaming experts while the graph runs, and the rewritten graph has no caller
+> yet. It is named as uncovered in the gate and in the graph plan rather than implied to be done.
+
 ---
 
 ## 6. Failure triage

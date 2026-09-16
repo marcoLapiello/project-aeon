@@ -223,6 +223,22 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_layer_body_lifecycle.cpp TIMEOUT 600)
 endif()
 
+# --- Tier-4 integration: streaming / tiering ---------------------------------
+# Item 21. Gate: expert bytes bit-exact across Hot / Warm / Cold. This is the
+# first gate to drive `TieredExpertSupply` itself — the code that decides which
+# tier answers a request, which staging slot an I/O lands in, which host slot a
+# demotion writes to, and which stream a copy is enqueued on. The two existing
+# storage tests cover the legs in isolation (a standalone O_DIRECT read, and one
+# hand-driven H2D), so neither could see a defect in those decisions. Every leg
+# is compared against the mmapped container — an I/O path none of the three
+# produced — and each delivery's *tier* is asserted as well as its bytes, because
+# a silently dropped demotion would answer from Cold and pass a byte check while
+# measuring nothing.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_expert_tiering
+        SOURCES tests/test_v4_expert_tiering.cpp TIMEOUT 300)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate

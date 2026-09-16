@@ -1235,7 +1235,75 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > **What is NOT covered, named so it is not mistaken for coverage.** The real `index_topk = 512` — 260 tokens commit only 65 CSA entries, so a real top-k would select all of them and the selection would degenerate; the top-k is shrunk to 8 and the *window* is left at the model's own 128, which is the opposite trade from items 16–19. No checkpoint is compared against a reference at all, so this gate says nothing about precision — Tier 1 and items 16–18 own that. The routed experts are six synthetic payloads. Positions beyond `max_seq_len` are refused rather than exercised, so the gate measures the *refusal*, not what a clamped engine would do. And no tiering and no prefix restore (Tier 4 item 22).
 
 **Tier 4 — Integration (only after Tier 3 is fully green).**
-21. **Streaming / tiering.** Gate: expert bytes bit-exact across Hot/Warm/Cold.
+21. ~~**Streaming / tiering.** Gate: expert bytes bit-exact across Hot/Warm/Cold.~~ **DONE — see the result below.**
+
+> **Gate result (Tier 4, item 21) — CERTIFIED, and this is the first gate to drive `TieredExpertSupply` itself rather than a leg of it.**
+> `tests/test_v4_expert_tiering.cpp`; the default suite is **36 tests**. **29 checks, 0 failures**, in **0.75 s**.
+>
+> **What already existed, and why it was not this.** Two tests cover the storage legs in isolation:
+> `test_model_direct_io.cpp` proves a standalone `O_DIRECT` read equals the mmapped bytes (the NVMe
+> leg), and `test_dynamic_expert_pool.cpp` proves one hand-driven `hipMemcpy` into a VRAM slot is
+> bit-exact (the H2D leg). Neither drives `TieredExpertSupply`, which is the code that decides *which
+> tier answers a request, which staging slot an I/O lands in, which host slot a demotion writes to,
+> and which stream a copy is enqueued on*. A defect in any of those decisions is invisible to both,
+> and it presents as the checkpoint plan's triage entry **"identical artifact, different result on
+> reload"** — the one symptom that cannot be attributed to the graph.
+>
+> **The artifact's own dimensions, deliberately saturated.** The pool is 8 VRAM slots and 8 host
+> slots, and `ExpertRegistry` populates *every* Hot slot at construction (`populate_round_robin`), so
+> there is no free VRAM slot from the first request on: every cold miss must evict a resident. That is
+> the production steady state, and it is what makes the demotion and promotion legs reachable without
+> contriving one. The payload is `14 155 776` bytes = `3456` sectors = a **non-integral** `4` chunks
+> of the reader's `4 MiB`, so each expert is four io_uring requests and a chunk-offset or
+> per-request-length mistake is reachable.
+>
+> **One expert, three routes, one reference.** Expert `(layer 0, expert 1)` is delivered **Cold**
+> (io_uring `O_DIRECT` into a staging slot, then H2D on the cold SDMA stream), then **Hot** (a repeat
+> request that must move no bytes), then **Warm** (an LRU demotion by a D2H into a pinned host slot,
+> then a promotion back from that slot). Every leg is compared against the **mmapped** container
+> (`AeonModelLoader::get_expert_data`) — page cache, not the io_uring ring, and not any of the three
+> routes above. All three deliveries are **bit-identical to each other and to the artifact**: 0 bytes
+> differ of `14 155 776`, on every comparison.
+>
+> **The cold payload is checked twice, and that is what makes a failure diagnosable.** The staging
+> slot is compared *before* the H2D is read back, and the destination VRAM slot after, so the two legs
+> are separately observable. The mutation table below shows this working: M21-1 (the `O_DIRECT`
+> offset) is caught by the staging check, M21-2 (the wrong staging slot) by the resident check **with
+> the staging check still green**. That is not redundancy — it is the difference between a two-line
+> diagnosis and a bisection.
+>
+> **Each delivery's *tier* is asserted, not only its bytes.** The cold request must report four I/O
+> requests and a cold-miss count; the repeat request must claim no staging slot; the final request
+> must be answered from the host pool (`hits_warm` +1 with **no** additional cold miss). Without that,
+> a **silently dropped demotion** would send the expert back to Cold and the byte comparison would
+> pass while measuring the wrong tier entirely. That is the same failure mode as the capacity clamp in
+> `committed_entries_for` (item 20) and the survivor in M20-6, in a different container.
+>
+> **Two probe defects found and repaired during the sweep, both of the same family, plus a third
+> choice worth stating.** The warm pool is *not* empty in section E — section C's three cold misses
+> already demoted three residents into it — so absolute counts became deltas. And "the promotion
+> consumed its warm slot" could not be expressed as a warm-pool count at all: with VRAM saturated the
+> promotion also evicts a resident, and that eviction immediately fills a warm slot, so the two
+> cancel. The instrument is now the host slot itself, `registry.host_slots[warm_slot] == -1` — the
+> slot the promotion read from, returned to the pool — which is the fact rather than a proxy for it.
+> **A count that two effects move in opposite directions measures neither.** The third: the victim is
+> **predicted from `registry.hot_vram_lru.back()`** and the residents are enumerated **from the
+> catalog**, rather than re-deriving `populate_round_robin`'s loop order — the M20-6 lesson, applied
+> before it could bite.
+>
+> **What is NOT covered, named so it is not mistaken for coverage.**
+> **Concurrency — checkpoint plan Stage D.2.** Requests are dispatched and materialized one round at a
+> time. "No expert is read while partially written under concurrent access" is a separate property, it
+> needs a forward pass streaming experts while the graph runs, and the rewritten graph has no caller;
+> the overlap the supply path already implements is covered by the warm-tier A/B report and the supply
+> telemetry, not here. **The two staged warm sub-paths:** `TieredExpertSupply` prefers a direct H2D
+> from the pinned host slot and falls back to staging a copy through the arena only when
+> `HostExpertPool::is_slot_pinned` is false, and on this silicon `hipHostMalloc` succeeds — so only
+> the direct path runs. **The expert's numerics:** this gate never dequantizes; it compares the
+> *packed payload bytes*, which is the thing a tier can corrupt and a kernel cannot (Tier 1 and items
+> 14–18 own the rest). And **the eviction policy's quality** — the registry's LRU is exercised, but
+> whether it chooses *well* is item 22's and the routing-placement study's question.
+
 22. **Prefix cache manager.** Block table, cache key (tokens **+ non-token graph inputs**), matching, eviction; state pieces placed across tiers. Gate: **restore is byte-exact** with respect to never having evicted, and a candidate boundary outside the local window is detected rather than served stale (Part I §6.3 R3–R4).
     **This item now also gates item 19's throughput half**: the compressor's partial state is the one piece of §6.1's four still stored as a ring (`position % coefficient·ratio`), and that ring is what caps the chunk size at 8. Making it **position-addressed** is what allows a usable chunk (256–512), so the §6 layout contract should be treated as the prerequisite for prefill speed rather than as a Tier-4-optional refactor. It is also the piece a mid-ratio-window restore needs, which is the same requirement seen from the reuse side.
 23. **Generation loop.** Coherent output; logits agree with reference over several steps.
@@ -1259,6 +1327,7 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 | MoE combine accumulation order | Gate 14 | **Shared-vs-routed order is now settled** (routed sum, then `+= shared` `[V nvidia/model.py:1020-1031]`). The **intra-routed** slot order was measured at the item-14 gate: it is `atomicAdd`, yet 32 identical 6-expert runs are **bit-identical** and the sum matches the weighted per-expert sum to `max_rel < 5e-7`. **Partially settled** — bounded for one configuration on this silicon, not in general. |
 | Local-window reuse boundary behavior | **Half settled at Tier 3 item 20 (7.1); the prefix half stays open for Tier 4 item 22** | Whether a reused prefix whose boundary predates the local window must rebuild the ring, or whether compressed state fully covers attention. sglang tombstones such leaves; confirm the correct handling for our state rather than assuming. **Item 19 sharpened this**: the local ring cannot be reconstructed from anything else, so a prefix boundary older than the window means the ring must be *rebuilt by replaying the last `C` tokens*, not restored. That is a cost the reuse decision has to weigh, and it is the same constraint trap 39 describes from the batching side. **Item 20 settled the other half, by measurement**: within the declared context the compressed store **never evicts** — its capacity is exactly the context's own entry count, verified for both ratios — so a reused prefix's *compressed* state is always fully present and only the **local ring** is window-bounded and must be replayed (7.1(a)/(b)). It also showed the converse, which is the part that makes the refusal structural: a wrapped compressed store is invisible to the kernel's own position guard *and* to the committed count, so if the capacity were ever exceeded the engine would silently serve a sliding window of compressed entries rather than fail (trap 40). |
 | **Indexer top-k on-device** | item 19's other remaining half — **countable now, needs no baseline** | `select_indexer_topk` copies the candidate scores to the host and synchronizes the stream **twice** (once after the scores' D2H, once after the indices' H2D), once per token per CSA layer with non-empty candidates. Part III forbids per-token host synchronization in a prefill — *"any device→host copy inside the layer loop serializes the whole chunk"*. It changes no value, so the `chunk ≡ serial` gate cannot see it by construction, and it is not a correctness gap. The target is **zero**, and the count is derived from the schedule rather than measured — so unlike the throughput half this one needs neither a baseline nor a faster body. |
+| **Streaming under concurrency (checkpoint plan Stage D.2)** | Tier 4 item 21's remainder — **no gate yet** | "Run a forward pass while experts stream in; verify no expert is read while partially written, and that index positions stay valid under concurrent access." The item-21 gate drives `TieredExpertSupply` one round at a time, which is what byte-exactness needs; this property needs a forward pass streaming experts *while the graph runs*, and the rewritten graph has no caller. It is a **correctness** half that no existing gate covers — the overlap the supply path already implements is a *throughput* property, measured by the warm-tier A/B report and the supply telemetry, not this. Listed so a green item 21 is not read as covering it. |
 | **Chunked-prefill throughput** | **blocked — item 19's throughput half; unblocked by item 22's state contract** | The structural gate is green; speed is a separate gate by the plan's own rule. **It is blocked, not merely unmeasured.** (i) The chunk size is capped at **8** by the compressor's partial ring (`position % coefficient·ratio` into a fixed ring), so a usable chunk size needs the **position-addressed** partial state that Part I §6.2 requires and item 22 owns. (ii) Independently, a per-token body cannot show a chunk-size benefit at all: chunk 1 and chunk N run the same code the same number of times, so nothing amortizes. Batching the projections is the implementation step that would create a win to measure. `compose_local_rows` is a per-query loop of up to `C` device-to-device copies. Method when it is measurable: all experts of the resident layers held in VRAM, giving a **compute+composition floor** with storage verified at zero — never comparable to model throughput. |
 
 ### Anti-circularity rule
@@ -1430,6 +1499,32 @@ read `4` rather than `8`) and M20-6 dies for the right cause. **A passing assert
 inconsistent with the object under test is the same failure mode as M19-4 and M9/M9b: the gate was
 green and wrong.** Rebuilding the probe from the layer's own parameters is the repair, and it is
 cheaper to state than to notice.
+
+**Tier 4 item 21 mutations (2026-09-16, `gfx1100`, the tiering plumbing).** Five mutations, injected
+into `TieredExpertSupply`'s transfer plumbing rather than into the test — the `O_DIRECT` offset, the
+staging binding, the H2D destination, and both ends of the demotion / promotion pair. **All five
+killed, and each is killed by a *different* check, which is the property that matters: the gate
+localises a failure to a leg instead of only reporting that something is wrong.**
+
+| # | Mutation | Killed by |
+| :-- | :--- | :--- |
+| M21-1 | The cold `O_DIRECT` read starts one sector late | **The staging check** — `differ=13 441 457` of `14 155 776`; the NVMe leg is verified before the H2D, so the failure lands there first and then propagates to the host-slot and promotion checks |
+| M21-2 | The cold H2D uploads staging slot `0` instead of the request's own slot | **The resident check only** — `differ=13 435 889`, with the staging check **green**: the read was right and the copy was wrong |
+| M21-3 | The demotion D2H writes to the host slot *after* the reserved one | **The host-slot check** — `differ=13 432 258`; the promotion and section F inherit it |
+| M21-4 | The warm promotion reads the host slot *after* the reserved one | **The promotion check only** — `differ=13 433 802`; the D2H check stays green |
+| M21-5 | The cold H2D lands in the VRAM slot after the one the registry reserved | **The resident check** — `differ=13 434 043`; the warm chain inherits it |
+
+**M21-1 versus M21-2 is the useful pair, and so is M21-3 versus M21-4.** Both members of each pair
+corrupt the same delivery, and the *same line of the report* tells them apart: M21-1 fails the staging
+check because the bytes that came out of io_uring were already wrong, while M21-2 passes it because
+io_uring was right and the H2D took the wrong source; M21-3 fails the host-slot (D2H) check while
+M21-4 passes it and fails only the promotion (H2D) check. Verifying each copy at *both* ends is
+therefore not redundancy — it is what turns a two-line diagnosis into a bisection.
+
+*A note on the sweep tooling, so a reader is not misled.* The mutation script restores the header
+after each injection but does not rebuild, so the binary left in `build/bin` when the sweep ends is
+the last mutant. Three consecutive runs of it read `FAIL — 3 failed`, which is correct and is **not**
+a stability result; the unmutated source rebuilt cleanly and passed 3 of 3.
 
 **Item 18's accumulation decision, taken here because trap 38 required it.** The item-18 gate now
 runs with `executor.deterministic = true`, the same choice item 19 makes. It had been driving the
