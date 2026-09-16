@@ -643,6 +643,112 @@ inline std::vector<double> hc_post(const std::vector<double>& layer_out,
 }
 
 // ---------------------------------------------------------------------------
+// Step 3 — HC head reduction: the 4 residual streams collapse to one vector.
+//
+//   mixes  = hc_head_fn @ rmsnorm_without_weight(flatten(residual), rms_eps)  [hc_mult]
+//   pre[j] = sigmoid(mixes[j] · hc_head_scale + hc_head_base[j]) + hc_eps
+//   out[h] = Σ_j pre[j] · residual[j][h]                                      [hidden]
+//
+// `[V vllm/model_executor/kernels/mhc/triton.py  hc_head_reduce_triton_kernel]`
+//
+// It looks like Step 2.0's pre-mix and is deliberately not the same thing. Three
+// differences, each of which is a silent failure if got wrong:
+//
+//   * The RMSNorm has **no learned weight** — unlike 2.1's attention norm, and
+//     unlike anything else in the model. There is no `hc_head` norm tensor to
+//     load, so an implementation that multiplies by a weight is reading something
+//     that does not exist. `weighted_norm` below exists only so a gate can show
+//     the difference is material; nothing in the graph passes it.
+//   * `hc_head_scale` is a **scalar** — our checkpoint declares it `F32 [1]`,
+//     against `F32 [3]` for `hc_attn_scale`/`hc_ffn_scale`. It broadcasts over
+//     all `hc_mult` gates. Reading it as three entries (the shape the *layer*
+//     scales have) is the natural copy-paste error.
+//   * `hc_eps` is added **after** the sigmoid, as the pre-mix does and the
+//     post-mix does not.
+//
+// There is no Sinkhorn and no comb here: the head is a single contraction,
+// because after it there is no residual stream left to mix.
+//
+// The RMS is over the **flattened** `hc_mult · hidden` dimension, matching
+// `hc_mixes` above and the reference kernel (`sum_sq` accumulated over
+// `hc_mult * hidden_dim`). Per-stream RMS is a plausible misreading and is
+// measured by the gate.
+// ---------------------------------------------------------------------------
+
+struct HcHeadResult {
+    std::vector<double> mixes;    // [hc_mult], pre-scale
+    std::vector<double> pre_mix;  // [hc_mult], post-sigmoid (+ hc_eps)
+    std::vector<double> out;      // [hidden]
+};
+
+inline HcHeadResult hc_head_reduce(const std::vector<double>& residual,
+                                   size_t hc_mult, size_t hidden,
+                                   const double* head_fn,   // [hc_mult, hc_mult*hidden]
+                                   const double* head_base, // [hc_mult]
+                                   double head_scale,
+                                   double rms_eps,
+                                   double hc_eps,
+                                   bool weighted_norm = false,
+                                   const double* norm_weight = nullptr,
+                                   bool per_stream_rms = false) {
+    const size_t flat = hc_mult * hidden;
+    if (residual.size() != flat) {
+        throw std::invalid_argument("hc_head_reduce: residual is not hc_mult * hidden wide");
+    }
+
+    HcHeadResult result;
+    result.mixes.assign(hc_mult, 0.0);
+
+    if (!per_stream_rms) {
+        double sum_sq = 0.0;
+        for (size_t k = 0; k < flat; ++k) sum_sq += residual[k] * residual[k];
+        const double inv_rms = 1.0 / std::sqrt(sum_sq / static_cast<double>(flat) + rms_eps);
+
+        for (size_t j = 0; j < hc_mult; ++j) {
+            double dot = 0.0;
+            for (size_t k = 0; k < flat; ++k) {
+                const double w = (weighted_norm && norm_weight != nullptr) ? norm_weight[k] : 1.0;
+                dot += residual[k] * head_fn[j * flat + k] * w;
+            }
+            result.mixes[j] = dot * inv_rms;
+        }
+    } else {
+        // The misreading: an RMS per stream over `hidden`, applied to the flattened
+        // input before the projection. Kept computable so a gate can show it
+        // differs materially from the correct rule.
+        std::vector<double> scaled(flat, 0.0);
+        for (size_t j = 0; j < hc_mult; ++j) {
+            double sum_sq = 0.0;
+            for (size_t h = 0; h < hidden; ++h) {
+                const double v = residual[j * hidden + h];
+                sum_sq += v * v;
+            }
+            const double inv_rms = 1.0 / std::sqrt(sum_sq / static_cast<double>(hidden) + rms_eps);
+            for (size_t h = 0; h < hidden; ++h) scaled[j * hidden + h] = residual[j * hidden + h] * inv_rms;
+        }
+        for (size_t j = 0; j < hc_mult; ++j) {
+            double dot = 0.0;
+            for (size_t k = 0; k < flat; ++k) dot += scaled[k] * head_fn[j * flat + k];
+            result.mixes[j] = dot;
+        }
+    }
+
+    result.pre_mix.assign(hc_mult, 0.0);
+    for (size_t j = 0; j < hc_mult; ++j) {
+        result.pre_mix[j] = sigmoid(result.mixes[j] * head_scale + head_base[j]) + hc_eps;
+    }
+
+    result.out.assign(hidden, 0.0);
+    for (size_t h = 0; h < hidden; ++h) {
+        double acc = 0.0;
+        for (size_t j = 0; j < hc_mult; ++j) acc += result.pre_mix[j] * residual[j * hidden + h];
+        result.out[h] = acc;
+    }
+    return result;
+}
+
+
+// ---------------------------------------------------------------------------
 // Attention score + sink + softmax — Step 2.4.1
 //
 // `out[h][d] = Σ_j p_j · k[j][d] / l` with

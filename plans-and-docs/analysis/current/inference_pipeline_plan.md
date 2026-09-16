@@ -638,7 +638,7 @@ This is **Multi-head Latent Attention with a low-rank Q path and a single shared
 >
 > **D. The combine, measured on the device.** Driving the accumulation kernel the way the pipeline does gives `combined == routed + shared` to `1.4e-4`, and the two one-sided failure modes are excluded: distance from `routed + 2·shared` is `0.49` and from `routed`-only is `3.45`, so the shared contribution enters **exactly once**. `[corrected — Tier 1]` The plan asserted that "our 2.10.4 note is consistent with" routed-then-shared. It is not, in fp order terms: the pipeline passes the shared output as **`initial_output`** to the atomic W2 accumulation, so shared is folded in as an addend of the accumulate rather than added to a completed sum `[V v4_pipeline.hpp:1199-1206]`. That mirrors the reference's **own fused path**, where `shared_l1_weights`/`shared_l2_weights` are passed *into* the MoE kernel `[V model.py:722-732]` rather than the unfused `final_hidden_states += shared_output` `[V model.py:1024-1031]`. The term set is identical; only the rounding order differs, and our choice is one the reference itself makes. The plan's "order is fixed" claim is therefore true of the unfused path and should not be read as a constraint on ours.
 >
-> **One more precision observation, not covered by this gate.** The deterministic accumulation path stores its accumulator in **fp16** and rounds on every one of the six accumulation steps `[V v4_pipeline_ops.hpp:47-58]`, while the atomic path accumulates in fp32 and rounds once. The deterministic path is therefore strictly *less* accurate, which is the opposite of what the option name suggests. Recorded with the routed-expert open items; the `deterministic_expert_accumulation_` flag is not exercised by any Tier-1 gate.
+> **One more precision observation, not covered by this gate.** The deterministic accumulation path stores its accumulator in **fp16** and rounds on every one of the six accumulation steps `[V v4_pipeline_ops.hpp:47-58]`, while the atomic path accumulates in fp32 and rounds once. The deterministic path is therefore strictly *less* accurate, which is the opposite of what the option name suggests. Recorded with the routed-expert open items; the `deterministic_expert_accumulation_` flag is not exercised by any Tier-1 gate. **RESOLVED (2026-09-16) — the choice is no longer between two wrong options.** Both paths violated one of two binding requirements: the atomic one cannot fix a reduction order (trap 38) and the fp16 one violates §2.10.3. The replacement splits the accumulation in two — `aeon_moe_fused_w2_contrib_kernel` gives each expert its **own fp32 slice** (one writer per element, so determinism is structural rather than observed) and `v4_moe_accumulate_fixed_order_kernel` sums those slices in slot order in fp32 and rounds **once**. Measured on the model's own routing shape (one dominant expert plus five small ones summing to `routed_scaling_factor = 1.5`), the fp16 path's error is **3.43x** the fp32 path's, and the two paths differ by **4.02x** that path's error. The improvement is *not* the point — the point is that neither prior path had both properties, and every gate that needed reproducibility had to accept the less accurate one. `tests/test_v4_moe_accum_oracle.cpp`, **13 checks, 0 failures**.
 
 **2.10.5 — Combine**
 - **Order is fixed: routed sum first, shared expert added after.** The reference computes `final_hidden_states = experts(...)` and then `final_hidden_states += shared_output` `[V nvidia/model.py:1020-1031]` — i.e. `out = Σ_k weight_k · down_k`, then `out += shared`. `[corrected — Tier 1]` This describes the **unfused** path only. The reference also has a fused path that passes the shared expert's L1/L2 weights *into* the MoE kernel `[V model.py:722-732]`, and ours mirrors that one (shared is the `initial_output` of the atomic accumulation). The term set is identical; only the fp rounding order differs. Do not read "order is fixed" as a constraint on our implementation.
@@ -657,12 +657,59 @@ Layers 0 and 1 have **no compressor and no indexer** (`compress_ratios[0]=compre
 
 **Gate:** assert the branch explicitly — a Sliding layer must never read compressor/indexer tensors.
 
-### Step 3 — HC Head Reduction `[corrected — was missing]`
+### Step 3 — HC Head Reduction `[corrected — was missing]` `[DONE — gate below]`
 
 - The final state is 4 streams. Reduce to a single 4096 vector:
   `mixes = hc_head_fn @ rmsnorm_without_weight(flatten(x), rms_eps)`, then `pre[j] = sigmoid(mixes[j]·hc_head_scale + hc_head_base[j]) + hc_eps`, then `out[h] = Σ_j pre[j]·x[j,h]` `[V vllm kernels/mhc/triton.py hc_head_reduce_triton_kernel; V contract hc_head_fn F32 [4,16384], hc_head_base F32 [4], hc_head_scale F32 [1]]`.
 - **Ensure:** the head RMSNorm has **no learned weight** (unlike 2.1); `hc_head_scale` is a scalar `[1]` broadcasting over the 4 gates; `hc_eps` is added after the sigmoid.
 - **Gate:** matches reference; output is 4096.
+
+> **Gate result (Step 3) — CERTIFIED. No defect found in `hc_head_wave32_kernel`.**
+> `tests/test_v4_hc_head_oracle.cpp`; the default suite is **38 tests**. **25 checks, 0 failures.**
+>
+> **Why this one mattered more than its size suggests.** It was the **only graph op with no
+> code, no oracle and no gate**: `hc_head` did not appear anywhere in `reference/dsv4_oracle.hpp`
+> and nothing in `tests/` touched it. It is also the last operation before the LM head, so an
+> error in it produces plausibly-scaled logits and therefore fluent-looking garbage — the failure
+> mode that is hardest to attribute after the fact. The oracle grew `hc_head_reduce` for this gate.
+>
+> **The four ways it is not 2.0's pre-mix, each asserted as a discriminating check:**
+>  * the norm is **weightless** — asserted structurally (four candidate tensor names probed, none
+>    present, so an implementation that multiplies by a weight is reading something that does not
+>    exist) *and* by measurement (a supplied weight moves the output by **11x the gate's own
+>    noise floor**, so such an implementation would fail the comparison);
+>  * the RMS is over the **flattened** `hc_mult · hidden`, not per stream — measured at **33x the
+>    floor** on a residual whose streams differ in scale;
+>  * `hc_head_scale` is a **scalar `F32 [1]`** against `F32 [3]` for the layer scales, checked
+>    against the artifact rather than assumed;
+>  * there is **no Sinkhorn and no comb** — a single-stream residual must give `out == pre[3] · x[3]`
+>    **exactly** (`max_abs = 0.0`), which a mixture could not.
+>
+> **The instrument is the gate's own noise floor, not an arbitrary fraction of peak.** The kernel
+> matches the fp64 reference to `2.3e-4 … 4.3e-4` of peak on real embedding rows (the fp16 store
+> and nothing else), and every discriminator is required to exceed *that* floor by a margin —
+> a wrong reading only has to be *detectable through this gate* to be a real fork. Requiring a
+> large absolute delta would be an unrelated bar, because the projection is a 16 384-term sum whose
+> random signs average most changes out.
+>
+> **A property discovered while writing the gate, and it is worth carrying forward:** `mixes` is
+> **scale-invariant**. `mixes = (x·fn) · rsqrt(mean(x²) + eps)`, so scaling the residual by `k`
+> multiplies the dot by `k` and `1/rms` by `1/k`. No scaling of the input can saturate a sigmoid, and
+> the first version of this gate tried exactly that and failed. Saturation must be reached through
+> `base`. The corollary is asserted instead: `out` is degree-1 homogeneous. Both hold *exactly* at
+> `rms_eps = 0` (`2.2e-16`) and to the eps's own order at the real value (`3.0e-6` on `pre`) — so the
+> eps term is itself shown load-bearing rather than papered over.
+>
+> **HONEST LIMITATION.** The kernel keeps `pre` in shared memory and never writes it out, so `pre`
+> is not readable from the output. The eps placement is therefore pinned at the **oracle** level as a
+> closed form (`sigmoid → 0` gives exactly `hc_eps`; `sigmoid → 1` gives exactly `1 + hc_eps`), and
+> the gate *reports* that omitting the eps moves `out` by ~`1e-6` relative — two orders below one
+> fp16 ulp, so **no output comparison can discriminate it**. Same discipline as trap 35.
+>
+> **6 of 6 mutations killed**, and one of them proves why the saturation probe exists: **MHC-2 (the
+> dropped `hc_eps`) is caught *only* by the saturated-low line**, whose peak is `1.9e-6` and which
+> therefore needed an absolute floor rather than a peak-relative bound — the fourth appearance of
+> that lesson in this rewrite.
 
 ### Step 4 — Final RMSNorm + LM Head
 
@@ -832,6 +879,8 @@ True chunked batched prefill is a hard requirement, not an optimization. Without
 | 17 | Expert fetch | — | memory | Async, overlapped |
 | 18 | Dequantization | INT4 → fp16/bf16 | registers | Fused with matmul; signed −8 bias; **`[Tier 1]` zero point and nibble permutation both shown load-bearing** |
 | 19 | Expert matmul | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | Fused with dequant; **clamped SwiGLU (asymmetric)** |
+| 19b | **Routed-expert accumulation** | **fp32** | reduction | `aeon_moe_fused_w2_contrib_kernel` (one fp32 slice per expert — one writer per element, so determinism is structural) + `v4_moe_accumulate_fixed_order_kernel` (slot order, single rounding). Replaces both the `atomicAdd` path (no fixed order, trap 38) and the fp16 read-modify-write path (§2.10.3 violation); **gated, and 3.43x more accurate than the fp16 path on the model's own routing shape** |
+| 19b | **Routed-expert accumulation** | **fp32** | reduction | `aeon_moe_fused_w2_contrib_kernel` (one fp32 slice per expert — one writer per element) + `v4_moe_accumulate_fixed_order_kernel` (slot order, single rounding). Replaces both the `atomicAdd` path (no fixed order, trap 38) and the fp16 read-modify-write path (§2.10.3 violation); **gated, 3.43x more accurate than the fp16 path on the model's routing shape** |
 | 20 | Shared expert | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | Not quantized; same clamp; **`[Tier 1]` clamp is dormant at nominal activation scale** |
 | 21 | LM head | fp16/bf16 WMMA | `v_wmma_f32_16x16x16_f16` | fp32 accumulate; **separate matrix, not tied to embedding** |
 | 22 | Sampling | fp32 | reduction | Host-side acceptable |
@@ -1324,7 +1373,7 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 | **Indexer Hadamard rotation** | **SETTLED at Gate 11 — do not apply it** | Measured, not argued. A normalized Hadamard is orthogonal, so a **two-sided** rotation leaves scores identical (`3.6e-16`) and the top-k identical (`0 of 512`), while a **one-sided** rotation changes scores by `1.46` and flips `180 of 512` indices. The reference drops it in its fused path and labels it *"(logit-preserving)"*; its only purpose is conditioning values before an fp8 round-trip, and our indexer K is fp16. **Revisit if the indexer K store moves to fp8 — and then apply it to BOTH Q and K.** |
 | ~~`tid2eid` orientation~~ | **Resolved: `[vocab, 6]`** | Reference declares `(config.vocab_size, config.num_experts_per_tok)` `[V nvidia/model.py:820]`; still verify against our artifact at Gate 13. |
 | KV fp8/E4M3 round-trip required vs optional | Gates 9 / 10 | **Strengthened toward required:** the canonical compressor kernel applies bf16+FP8/UE8M0 at two store points `[V fused_compress_quant_cache.py:288-345]`, and the checkpoint card states `--kv-cache-dtype` resolves to `fp8_ds_mla`, *"the only layout these backends implement"* `[V checkpoint README]`. Still a gate, because bf16 is a supported alternative and the delta must be measured. |
-| MoE combine accumulation order | Gate 14 | **Shared-vs-routed order is now settled** (routed sum, then `+= shared` `[V nvidia/model.py:1020-1031]`). The **intra-routed** slot order was measured at the item-14 gate: it is `atomicAdd`, yet 32 identical 6-expert runs are **bit-identical** and the sum matches the weighted per-expert sum to `max_rel < 5e-7`. **Partially settled** — bounded for one configuration on this silicon, not in general. |
+| MoE combine accumulation order | Gate 14 | **Shared-vs-routed order is now settled** (routed sum, then `+= shared` `[V nvidia/model.py:1020-1031]`). The **intra-routed** slot order was measured at the item-14 gate: it is `atomicAdd`, yet 32 identical 6-expert runs are **bit-identical** and the sum matches the weighted per-expert sum to `max_rel < 5e-7`. **Partially settled** — bounded for one configuration on this silicon, not in general. **Resolved for our engine (2026-09-16):** the tension this row described is gone. `aeon_moe_fused_w2_contrib_kernel` + `v4_moe_accumulate_fixed_order_kernel` are fp32 **and** fixed-order, so neither the `atomicAdd` path (unfixed order, trap 38) nor the fp16 read-modify-write path (§2.10.3 violation) needs to be selected again. Gated by `tests/test_v4_moe_accum_oracle.cpp`, 4 of 6 mutations killed with 2 provably equivalent. The remaining question — whether *any* fixed order is equally acceptable — is answered: yes, by measurement (a reversed order changes no fp16 output). |
 | Local-window reuse boundary behavior | **Half settled at Tier 3 item 20 (7.1); the prefix half stays open for Tier 4 item 22** | Whether a reused prefix whose boundary predates the local window must rebuild the ring, or whether compressed state fully covers attention. sglang tombstones such leaves; confirm the correct handling for our state rather than assuming. **Item 19 sharpened this**: the local ring cannot be reconstructed from anything else, so a prefix boundary older than the window means the ring must be *rebuilt by replaying the last `C` tokens*, not restored. That is a cost the reuse decision has to weigh, and it is the same constraint trap 39 describes from the batching side. **Item 20 settled the other half, by measurement**: within the declared context the compressed store **never evicts** — its capacity is exactly the context's own entry count, verified for both ratios — so a reused prefix's *compressed* state is always fully present and only the **local ring** is window-bounded and must be replayed (7.1(a)/(b)). It also showed the converse, which is the part that makes the refusal structural: a wrapped compressed store is invisible to the kernel's own position guard *and* to the committed count, so if the capacity were ever exceeded the engine would silently serve a sliding window of compressed entries rather than fail (trap 40). |
 | **Indexer top-k on-device** | item 19's other remaining half — **countable now, needs no baseline** | `select_indexer_topk` copies the candidate scores to the host and synchronizes the stream **twice** (once after the scores' D2H, once after the indices' H2D), once per token per CSA layer with non-empty candidates. Part III forbids per-token host synchronization in a prefill — *"any device→host copy inside the layer loop serializes the whole chunk"*. It changes no value, so the `chunk ≡ serial` gate cannot see it by construction, and it is not a correctness gap. The target is **zero**, and the count is derived from the schedule rather than measured — so unlike the throughput half this one needs neither a baseline nor a faster body. |
 | **Streaming under concurrency (checkpoint plan Stage D.2)** | Tier 4 item 21's remainder — **no gate yet** | "Run a forward pass while experts stream in; verify no expert is read while partially written, and that index positions stay valid under concurrent access." The item-21 gate drives `TieredExpertSupply` one round at a time, which is what byte-exactness needs; this property needs a forward pass streaming experts *while the graph runs*, and the rewritten graph has no caller. It is a **correctness** half that no existing gate covers — the overlap the supply path already implements is a *throughput* property, measured by the warm-tier A/B report and the supply telemetry, not this. Listed so a green item 21 is not read as covering it. |
@@ -1500,8 +1549,7 @@ inconsistent with the object under test is the same failure mode as M19-4 and M9
 green and wrong.** Rebuilding the probe from the layer's own parameters is the repair, and it is
 cheaper to state than to notice.
 
-**Tier 4 item 21 mutations (2026-09-16, `gfx1100`, the tiering plumbing).** Five mutations, injected
-into `TieredExpertSupply`'s transfer plumbing rather than into the test — the `O_DIRECT` offset, the
+**Tier 4 item 21 mutations (2026-09-16, `gfx1100`, the tiering plumbing).** Five mutations, injectedinto `TieredExpertSupply`'s transfer plumbing rather than into the test — the `O_DIRECT` offset, the
 staging binding, the H2D destination, and both ends of the demotion / promotion pair. **All five
 killed, and each is killed by a *different* check, which is the property that matters: the gate
 localises a failure to a leg instead of only reporting that something is wrong.**
@@ -1525,6 +1573,68 @@ therefore not redundancy — it is what turns a two-line diagnosis into a bisect
 after each injection but does not rebuild, so the binary left in `build/bin` when the sweep ends is
 the last mutant. Three consecutive runs of it read `FAIL — 3 failed`, which is correct and is **not**
 a stability result; the unmutated source rebuilt cleanly and passed 3 of 3.
+
+**Step 3 `hc_head` mutations (2026-09-16, `gfx1100`, the head reduction).** Six mutations, injected
+into `hc_head_wave32_kernel`. **All six killed.**
+
+| # | Mutation | Result |
+| :-- | :--- | :--- |
+| MHC-1 | The RMS mean divides by `hc_mult x` the flattened dim (wrong normalisation) | **Killed** — 9 lines; every `B` comparison at `1.3e-2 … 3.6e-2` of peak |
+| MHC-2 | `hc_eps` dropped from the pre-mix | **Killed — by the saturated-low line alone**, where the peak is `1.9e-6` and the delta is `1.00` of peak |
+| MHC-3 | `hc_head_scale` ignored (the scalar scale not applied) | **Killed** — 7 lines |
+| MHC-4 | The combine rotates the residual streams | **Killed** — 4 lines, `B` at `2.3e-1` of peak, and both `C` rows |
+| MHC-5 | The projection reads the wrong `hc_head_fn` row | **Killed** — 7 lines |
+| MHC-6 | The head norm applies a weight (there is none in the artifact) | **Killed** — 7 lines |
+
+**MHC-2 is the one that justifies a probe.** The eps is a `1e-6` relative effect and is invisible in
+every ordinary comparison; it is observable **only** where the sigmoid saturates toward zero and the
+output lands at a peak of `1.9e-6`. That line needed an **absolute** floor, because a peak-relative
+bound on a quantity that has collapsed toward zero rejects a correct implementation — the fourth time
+this rewrite has recorded that lesson (RoPE's `cos` zero crossing, the dominated sink, the clamp
+differential, and now this).
+
+**Routed-expert accumulation mutations (2026-09-16, `gfx1100`, the fixed-order pair).** Six
+mutations, injected into `v4_moe_accumulate_fixed_order_kernel` and
+`aeon_moe_fused_w2_contrib_kernel`. **Four killed, two provably equivalent — and two of the four
+kill only after the gate was repaired.**
+
+| # | Mutation | Result |
+| :-- | :--- | :--- |
+| MM-1 | The reduce accumulates in fp16 (one rounding per expert) | **Killed** — the kernel's output becomes *identical* to the emulated fp16 chain, so the "the two paths are observably different" line fires |
+| MM-2 | The reduce sums in **reverse** slot order | **SURVIVED — provably equivalent** (see below) |
+| MM-3 | The shared expert is folded **post-hoc** rather than into the accumulator | **SURVIVED** → gate repaired → **killed** |
+| MM-4 | Every expert writes into expert 0's contribution slice | **Killed** — 6 lines; the pair-difference check goes to `0.000e+00` |
+| MM-5 | The routing weight is dropped from the contribution | **SURVIVED** → gate repaired → **killed** |
+| MM-6 | The `slice == 0` guard is dropped, so every lane writes the same element | **SURVIVED — provably equivalent** (see below) |
+
+**MM-3 and MM-5 were two different gate defects, and both are the M9/M9b failure mode.**
+
+*MM-3* was a **relative tolerance that could not see what it certified**. Section E compared the
+kernel against the fp32-accumulator form with a `3e-3`-of-peak bound, while the entire difference
+between the accumulator form and the post-hoc `+=` is `9.8e-4` of peak — *inside* the tolerance, so
+the mutation passed every line. The repair is the **targeted comparison** Tier 1 arrived at
+independently: the kernel must sit on the accumulator *side* of the fork, not merely be within
+tolerance of it. Measured after repair: `to accumulator = 0.0`, `to post-hoc = 9.8e-4`.
+
+*MM-5* was **anti-circularity violated by the gate's own fixture**. Every reference in the gate is an
+fp64 sum *of the kernel's own `contrib` values*, which is the right instrument for certifying the
+*accumulation* and the wrong one for certifying the *contribution* — a defect there is summed
+consistently and is invisible by construction. The repair certifies the contribution stage
+independently and in closed form: run the same kernel with **unit** routing weights to obtain
+`raw[k][h] = W2_k · activation_k`, then require `contrib[k][h] == weights[k] · raw[k][h]`. Measured
+worst error `5.5e-8`, i.e. exact. The projection arithmetic inside the shared
+`swizzled_w2_row_dot` remains Tier-1 item 14's and item 16's to certify; what is now certified here
+is that the routing weight is applied, once, to the right expert.
+
+**MM-2 and MM-6 are equivalent, and both classifications are supported rather than asserted.**
+*MM-2* reverses the summation order — but the requirement is a **fixed** order for determinism, not
+an ascending one, and fp32 carries ~11 bits more than the single fp16 store that follows, so no
+reordering of six terms changes the rounded result. Evidence: under MM-2 the gate is **fully green,
+including the eight-run determinism check**. *MM-6* lets all four slices of a row write the same
+element; they write the **same value**, because the `__shfl_xor` reduction runs over exactly those
+`LPR` lanes, and a same-value race yields identical bytes in any order. Evidence: the gate again
+stays green with determinism intact — had the four lanes held different values, the determinism
+check would have caught it, which is precisely what the check is for.
 
 **Item 18's accumulation decision, taken here because trap 38 required it.** The item-18 gate now
 runs with `executor.deterministic = true`, the same choice item 19 makes. It had been driving the

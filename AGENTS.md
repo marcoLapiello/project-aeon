@@ -69,7 +69,7 @@ Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
 
 `core/v4_layer_body.hpp` is the single layer body; decode, chunked prefill and every Tier-2/3 gate
 call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
-and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **36 tests** (legacy: 37).
+and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **38 tests** (legacy: 37).
 
 **Next: item 22's state layout.** The compressor's partial state is still a fixed ring, which caps
 `run_layer_body_chunk` at a chunk of 8 and thereby blocks item 19's throughput half; Part I §6.2

@@ -239,6 +239,30 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_expert_tiering.cpp TIMEOUT 300)
 endif()
 
+# --- Step 3: the HC head reduction -------------------------------------------
+# The one graph op that had no code, no oracle and no gate. `hc_head` collapses the
+# four residual streams to the single vector every downstream step reads, so an
+# error there produces plausibly-scaled logits and fluent-looking garbage. The
+# oracle grew `hc_head_reduce` for this gate; the norm's weightlessness, the
+# flattened RMS, the scalar scale and the post-sigmoid eps are each asserted as a
+# discriminating check rather than by construction.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_hc_head_oracle
+        SOURCES tests/test_v4_hc_head_oracle.cpp TIMEOUT 300)
+endif()
+
+# --- Routed-expert accumulation ----------------------------------------------
+# Replaces the tension between the two old paths: the atomic one cannot fix an
+# order (trap 38) and the fp16 read-modify-write one violates plan §2.10.3
+# ("accumulate in fp32"). The new pair writes one contribution per expert into its
+# own fp32 slice — one writer per element, so determinism is structural — then sums
+# in slot order and rounds once. The gate measures the fp16 path's error against
+# the same fp64 sum, so it asserts a property rather than a preference.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_moe_accum_oracle
+        SOURCES tests/test_v4_moe_accum_oracle.cpp TIMEOUT 300)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate
