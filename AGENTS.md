@@ -1,36 +1,36 @@
 # AGENTS.md — Project Aeon System & Agent Context
 
 ## 1. Project Purpose & High-Level Context
-**Project Aeon** is a high-performance, bare-metal Mixture-of-Experts (MoE) inference engine built from scratch in C++20 and native HIP for consumer AMD hardware (primarily RDNA3 / `gfx1100`, scalable across multi-GPU rigs).
-
-Aeon solves the memory wall for massive MoE models (e.g., DeepSeek-V4 architectures) on consumer workstations by combining:
-1. **Bare-metal RDNA3 execution**: Wave32 execution mode, AI Matrix Accelerators (WMMA), and direct HIP/AMDGCN instruction dispatch without CUDA or framework overhead.
-2. **Three-Tier Hierarchical Storage & Streaming**: VRAM (Hot LRU) $\leftarrow$ Host DDR (Warm pinned staging) $\leftarrow$ NVMe SSD (Cold asynchronous Direct I/O via Linux `io_uring` with 4KB sector alignment).
-3. **Double-Buffered Expert-Batched Prefill & Pipeline Parallelism**: Eliminating I/O latency stalls by overlapping compute with asynchronous DMA/storage transfers.
+**Project Aeon** is a bare-metal Mixture-of-Experts inference engine in C++20 and native HIP for
+consumer AMD RDNA3 (`gfx1100`), scalable across multi-GPU rigs. It attacks the memory wall for very
+large MoE models on consumer workstations with three mechanisms: **bare-metal RDNA3 execution**
+(Wave32, WMMA, direct HIP/AMDGCN dispatch — no CUDA, no framework overhead); a **three-tier
+hierarchy** (VRAM Hot ← host-DDR Warm ← NVMe Cold, via `io_uring` `O_DIRECT` at 4 KiB alignment);
+and **double-buffered expert-batched prefill** overlapped with asynchronous DMA/storage.
 
 ---
 
 ## 2. Documentation and References
-Use [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) for the current plan inventory, open gates, and historical-document boundaries. It is the navigation point; read it before any other planning document.
 
-**The project is rewriting its DeepSeek-V4 inference graph.** The storage, streaming, artifact-format, and kernel layers are kept; the graph that composes them is being rebuilt on branch `rewrite/graph-v2`. The specification is:
-- [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md): **the authority for graph semantics.** Evidence-tagged (`[V]`/`[?]`/`[I]`), cited step-by-step procedure with per-step gates, a reference hierarchy, and an anti-circularity rule. Every claim is cited or flagged unverified.
-- [Checkpoint & Artifact Integrity Plan](plans-and-docs/analysis/current/checkpoint_verification_plan.md): proves the **input** is sound (structural audit, prompt-encoder oracle, repack round-trip, streaming integrity) so a graph failure is a graph failure. Companion to the specification; it does not cover the graph.
+**Navigation — read this first.** [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md)
+owns the plan inventory, the document map (live / active / completed / superseded), the open gates,
+and the rules for historical documents. **This file does not duplicate that inventory.**
 
-Current execution records:
-- [Phase 2 Execution Plan](plans-and-docs/execution/active/PHASE_2_EXECUTION_PLAN.md): paused single-GPU Hot/Warm/Cold runtime and remaining cold-tier work.
-- [Native Text-In/Text-Out Plan](plans-and-docs/execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md): native frontend status and correctness gates.
-- [Routing Profile Study](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md): profiler contract and placement-study gates.
-- [Backend Generalization Execution Plan](plans-and-docs/execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md): descriptor-driven artifact and expert-supply boundary; manifest and second-backend gates.
-- [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md): authoritative silicon measurements. **Read its banner before comparing any `E2E` entry** — pre-rewrite model-path measurements are marked invalid.
+**The specification** for the DeepSeek-V4 graph rewrite on branch `rewrite/graph-v2` — the storage,
+streaming, artifact-format and kernel layers are kept; the graph that composes them is rebuilt:
+- [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) — **the
+  authority for graph semantics.** Evidence-tagged (`[V]`/`[?]`/`[I]`), cited step-by-step procedure
+  with per-step gates, a reference hierarchy, and the anti-circularity and mutation-testing rules.
+- [Checkpoint & Artifact Integrity Plan](plans-and-docs/analysis/current/checkpoint_verification_plan.md)
+  — proves the **input** is sound (structural audit, prompt-encoder oracle, repack round-trip,
+  streaming integrity), so that a graph failure is a graph failure. Companion to the specification;
+  it does not cover the graph.
+- [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md) — authoritative silicon
+  measurements. **Read its banner before comparing any `E2E` entry** — pre-rewrite model-path
+  measurements are marked invalid, and they describe a *different computation*, not a slower one.
 
-Superseded records (retained for chronology; do not execute):
-- [Model Correctness Execution Plan](plans-and-docs/execution/superseded/MODEL_CORRECTNESS_EXECUTION_PLAN.md): the staged in-place repair approach, replaced by the Inference Pipeline Plan.
-
-Completed execution records:
-- [Warm-Tier Repair and Supply Telemetry Plan](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md): persistent Warm ownership, asynchronous refill, and source-tier telemetry; see the [closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
-
-Completed plans and historical rationale remain available through the status index. Do not use an old checklist or review as current implementation evidence.
+Execution records (active, completed, superseded) are indexed in the status document. Do not use an
+old checklist or review as current implementation evidence.
 
 ### Local Reference Implementations
 The primary external source references are maintained as shallow, default-branch checkouts outside this repository. They are for source comparison only, not Aeon build or runtime dependencies:
@@ -46,82 +46,64 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 ---
 
 ## 3. Progress Tracking & State of Execution
-*Status: 2026-09-15, branch `rewrite/graph-v2`. Keep this summary current; put detailed measurements and historical execution notes in the linked documents.*
+*Status: 2026-09-16, branch `rewrite/graph-v2`.*
 
-### Present: the graph rewrite
-- [ ] **Rewrite the DeepSeek-V4 inference graph** from [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md). The storage, streaming, artifact, and kernel layers are **kept**; the graph that composes them is rebuilt. An audit found structural graph errors — a missing Hyper-Connections comb scale (`hc_scale[2]`), a missing compressor APE term (`score += ape[pos % ratio]`), and HCA layers running indexer selection they do not have — plus tests that could not catch them because they were circular.
-- [x] **Specification research complete (phases 0.1–0.2f).** The whole forward pass is re-cited against readable reference code with an evidence convention and a reference hierarchy: Hyper-Connections, MLA/sink, both RoPE bases, compressor window + APE + store quantization, indexer scope, router bias placement, attention composition (local + compressed row-sets), prompt encoding, embedding, LM head, sampling. 33 known traps recorded from the research; the Tier-1, Tier-2 and Tier-3 gates have since added seven more (34–40), each found by a gate rather than by review.
-- [x] **Build separated and gated.** CMake split into focused modules; `AEON_ENABLE_LEGACY_V4_GRAPH` (default OFF) gates every target that depends on the pre-rewrite graph, so the old tests cannot be compiled or run by accident.
-- [x] **Obsolete tests removed.** The pre-rewrite layer-schedule tests and the circular kernel checks were deleted; the two independent-oracle parity tests stay gated as tier-0 anchors. Default `ctest`: 35 tests; legacy: 37.
-- [x] **Step 0 — prompt encoding verified.** The artifact ships its own encoder plus four golden vectors; it is ported into `text/dsv4_prompt_encoder.{hpp,cpp}` and now reproduces all four **byte-for-byte** (was 1/4 before the port). One implementation: `Dsv4ChatFormatter` delegates to the encoder.
-- [x] **Tier 1 oracle harness + all eleven certified primitives — COMPLETE.** `reference/dsv4_oracle.hpp` is the host-only, fp64, kernel-free reference layer (RMSNorm, the two-class RoPE spec, dense projections, MLA, Hyper-Connections, attention + sink, the compressor + APE, the indexer + top-k + Hadamard, the grouped output projection, the MoE router, the swizzled W4A16 expert format + clamped SwiGLU, and the dense shared-expert FFN). `kernels/v4_norm.hpp`, `kernels/v4_rope.hpp`, and `kernels/v4_gemv.hpp` are kept primitives extracted so each can be gated on its own; `v4_attention.hpp` includes all three. Each gate runs the oracle's own self-checks first, states an explicit tolerance, and asserts discriminating properties rather than only closeness; gates 12–15 earn their results by construction — the grouped projection by perturbing one group and requiring the other seven to stay bit-identical, the router by showing all four of its traps load-bearing, the routed expert by showing the zero point, the nibble permutation and the asymmetric clamp each load-bearing before re-checking on real artifact bytes, and the shared expert by measuring the combine on the device. **Gate 14 partially settled** (32 identical 6-expert atomic accumulations are bit-identical; bounds one configuration, not the order in general). **Four real findings, none of which came from review:** a transposed comb index in this plan's 2.0 prose (trap 34); a **missing ReLU in `v4_indexer_scores_kernel`** (trap 11) that had survived a real-weight parity test because that test never called the kernel; the plan's claim that we implement the fused router normalization guard (we use a fourth form, `Σ+1e-20`, inert below a logit of −96); and the combine-order claim, which describes only the reference's *unfused* path while ours mirrors its fused one. Full detail in [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) §2.9–2.10.
-- [x] **Mutation testing of the Tier 1 gates.** For each certified property, the specific wrong variant was injected into the *kernel* and the gate required to go red. Ten mutations: **eight killed, one provably equivalent, zero unclassified.** Two gate defects were found that a green suite and code review had both missed — the clamp-rule gates could not see a symmetrically-clamped kernel (in either the standalone or the fused form), and the RMSNorm gate could not see a deleted `eps`. Both gates are repaired and both mutations now fail. This corrects a claim the item-14 gate report made: it is recorded in the plan, not quietly fixed. The equivalent mutation verifies trap 35 by experiment. Procedure recorded in the plan under "Mutation testing — the second rule".
-- [x] **Tier 2 item 16 — one full Sliding-class layer body, COMPLETE.** `core/v4_layer_body.hpp` is the single layer body (Steps 2.0–2.11, one token), `reference/dsv4_oracle.hpp::layer_sliding_body` was its composed fp64 reference, and `tests/test_v4_layer_body_oracle.cpp` gates the composition on the artifact's real `layers.0` weights across ten positions. Every checkpoint lands within `1.1e-3` of its own peak (the fp16 store and nothing else). Five wiring mutations: four killed, one shown redundant. The gate also found a defect **in its own oracle** — a fp16 tensor widened arithmetically instead of decoded, now fixed and guarded by a fixture check. Two findings recorded: **trap 36** (position 0 makes every RoPE the identity, so a single-token gate is blind to base class, rotation and its inverse) and the MoE accumulation clear being redundant. (Item 17 later generalized `layer_sliding_body` into `layer_body`; the same path and the same gate still cover the Sliding class.)
-- [x] **Tier 2 item 17 — the CSA and HCA layer classes, COMPLETE.** The same body, on the two compressed classes, which is where **trap 33** lives: only a ratio-4 (CSA) layer selects compressed rows through the indexer; a ratio-128 (HCA) layer has no indexer at all and attends every committed compressed row. `reference/dsv4_oracle.hpp::layer_body` is now one function covering all three classes (so the oracle mirrors the device's single structural branch), with the compressor state, the APE-adjusted partial ring, the materialization, the indexer and the merged local+compressed row-set. `tests/test_v4_layer_body_compressed_oracle.cpp` gates CSA and HCA on the artifact's real `layers.2` / `layers.3` weights, crossing ratio boundaries, comparing every named intermediate — the compressor projections, the APE-adjusted ring row, the materialized entry, the indexer scores and top-k, the row-set counts, `attn_proj`, `ffn_norm`, `moe_out` and `res_out`. `tests/support/v4_layer_body_gate.hpp` holds the scaffolding the two Tier-2 gates share. Full detail in [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) §Part V Tier 2.
-- [x] **Tier 2 item 18 — serial multi-token decode, COMPLETE.** `tests/test_v4_layer_body_serial_oracle.cpp` drives a three-layer stack in decode order (Sliding layer 0, CSA layer 2, HCA layer 3) for **136 tokens across 34 CSA boundaries and one HCA boundary**, with the two simplifications removed that both earlier tiers made. Nothing writes `d_res_in` from the oracle: layer L's output is layer L+1's input and the last layer's output is the next token's input, so the device's own state carries forward. And the reference is driven by the device's own **discrete** output as well as its state — a new `routed_ids_override` seam hands it the device's routed ids and weights, while the *rule* that produced them is asserted against the device's own logits (trap 37, generalized). Worst case per checkpoint over 408 layer-steps is `9.9e-4` of peak against a `4e-3` tolerance; the whole accumulated state is compared at the end (every local-ring slot, all 34 CSA + 1 HCA committed entries, every position, plus closed forms for the ring positions); the HCA entry materialized at position 127 is re-read at the end **bit-identical**; and the boundary entry is shown load-bearing in the final attention row-set (`26%` of peak). **A finding no earlier gate could reach: the device's serial decode is not bit-reproducible** — the default routed-expert path accumulates with `atomicAdd`, whose order across the six experts is undefined, and over 408 steps that drift compounds until a router near-tie flips its expert set. Measured at **0–2 such steps per run**, varying between runs, with a `moe_out` difference up to **`7.0e-3`** of peak — above the `4e-3` tolerance, i.e. a nondeterministic failure of an unconditioned comparison. Recorded as **trap 38** and left unengineered, because the prefix-restore and `chunk ≡ serial` gates must both decide explicitly which accumulation they require. See the gate result in [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) §Part V Tier 2.
-- [x] **Tier 3 item 19 — chunked batched prefill, COMPLETE as a structural gate.** `core/v4_layer_body_batch.hpp` drives the **same** two half-bodies decode calls (`run_layer_body_pre_attention` / `run_layer_body_attention_tail`, split out of the body so a chunk can write every key before any query attends), with `tests/test_v4_layer_body_chunk_oracle.cpp` gating it. The gate is **exact equality — 0 differing values** — over 130 tokens × three attention classes × three chunk schedules, comparing each token's residual, router logits, ids and routing weights plus the entire final state (ring keys and positions, all 32 CSA + 1 HCA committed compressed entries with positions, the compressor's partial ring), and it ties the one-at-a-time run to the Tier-2 certified decode body so the comparison is not circular. **A finding the plan's own finding had missed: the obvious chunking is wrong.** Writing the chunk's keys into the local ring as it goes is not equivalent to serial at **any** chunk length above one, because the write for the chunk's last token lands in the ring slot that held the oldest key of its own first token's window — and that is the *local* ring, not the compressed path the plan blamed. Recorded as **trap 39**; the fix (a per-chunk key buffer plus a per-query composed row-set, ordered by ring slot so both paths sum identical terms in identical order, committed to the ring afterwards) is the reference's own design. **Trap 38 was answered explicitly**: the gate requires the deterministic MoE accumulation, which is why the equality is exact rather than a tolerance — and item 18's own gate was moved onto that same deterministic path, because asserting against the atomic one made it fail roughly **one run in ten**, never on the near-tie step itself but later, once the device's trajectory and the oracle's had diverged. **4 of 4 mutations killed, one of which found a gate defect of its own**: M19-4 (commit the ring position one below the token's) survived because section C compares the chunk path against itself at a different length, so a mistake applied to *both* sides was invisible; section C2 now also compares the **final state** against the Tier-2 certified decode body. **Two halves of item 19 remain open and are named as such**: throughput (the composition is a per-query loop of device-to-device copies and the body is still per-token) and the indexer top-k's per-token host round-trip, which no equivalence gate can see because it changes no value. See [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) Part III.
-- [x] **Tier 3 item 20 — long-context lifecycle, COMPLETE.** `tests/test_v4_layer_body_lifecycle.cpp` runs a three-layer stack for **260 tokens at the model's own window (128)** — every earlier gate shrank the window (to 6, 10, 4) and named the shrinkage as uncovered — and compares against **closed forms and invariants rather than an fp64 oracle**, because items 16–18 already own the arithmetic: the ring's contents are *predicted* from the token count before they are read. **52 checks, 0 failures, 5.6 s.** The ring's slot assignment holds for all 384 slots (slot `s` holds the largest `p ≡ s (mod 128)`), the oldest surviving row is exactly `pos − 127`, an **unfilled** slot perturbs attention by **exactly `0.0`** while the oldest in-window row moves it by `26.9×` peak, the two stores are independent bit-exactly (each class's **first** compressed entry is byte-identical 256 steps later, with the local ring wrapping twice in between), and the row-set rule holds past the window (HCA reads every committed entry; CSA's 8-of-65 selection is a real selection, and swapping in a rejected candidate moves attention by `1.63`). **The finding is that the capacity refusal in `V4Layer::record_position` is load-bearing, not decorative (trap 40):** a wrapped compressed store is invisible to the kernel's own position guard *and* to the committed count — a hand-built wrapped store passes every guard and the count reads `4` for both — so only the positions' closed form distinguishes it, and the row-set would silently become "the newest `K`" instead of "every committed entry". A wrapped store requires a position past the declared context (`pos ≥ 1023` against a 512 context), which is exactly why it cannot arise by accident. **6 of 6 mutations killed**, and **M20-6 forced a repair of the gate's own probe** — section E had been querying an HCA store (capacity 4) with `ratio = 4`, so its count check passed on a mismatched pair; rebuilt at HCA's own ratio it is genuinely load-bearing. See [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) Part V Tier 3.
-- [x] **Why the gates use layers {0, 2, 3} and not layer 1** (now recorded in the gate headers, since the question comes up): the stack is *one layer per branch the body can take*, not a sample of the model. `compress_ratios = [0, 0, 4, 128, 4, 128, …]` with `num_hash_layers = 3`, so layer 0 is Sliding+hash, layer 2 is CSA+hash, layer 3 is HCA+biased. Layer 1 is the **second Sliding layer** — same attention class as layer 0 *and* a hash layer — so it adds no branch on either axis. The pair 2/3 is deliberate because it straddles both boundaries at once (last hash / first CSA, first biased / first HCA), which is what lets three layers cover three classes and both router branches.
-- [ ] **Next: item 22's state layout (it gates item 19's throughput half), then the rest of Tier 4.**
-      Item 19's structural gate (`chunk ≡ serial`, exact) is complete, but its **throughput half is
-      blocked rather than merely unmeasured**, and the blocker is a state-layout gap:
-      `run_layer_body_chunk` caps the chunk size at **8** because the compressor's partial state is
-      still written into a fixed ring (`position % coefficient·ratio`), so a longer chunk could let
-      a boundary read a different token's row. Part I §6.2 requires that state to be
-      **position-addressed** ("the reuse boundary must be allowed to fall mid-ratio-window"), and
-      §6.2/trap 24 named the retrofit as the expensive one — so **item 22's state contract is the
-      next real step for prefill speed** (a usable chunk of 256–512 is unreachable without it).
-      Independently, a per-token body cannot show a chunk-size benefit at all — chunk 1 and chunk 8
-      run the same code the same number of times — so **batched projections** are the other
-      prerequisite, and they are implementation rather than measurement. The compressor partial
-      state is also the one piece of §6.1's four still stored as a ring: the local ring is a ring by
-      design (item 20), the compressed store never evicts within the context (item 20), and only
-      this one blocks a capability.
-      Item 19's **other** half, the indexer top-k's per-token host round-trip, is **countable now
-      and needs no baseline** — `select_indexer_topk` makes **two** `hipStreamSynchronize` calls per
-      token per CSA layer with candidates, and the target is zero.
-      Method for the throughput number when it becomes measurable: hold every expert of the resident
-      layers in VRAM so transfer is zero, giving a **compute+composition floor** — reported as a
-      floor, never as model throughput, and only after **verifying** the zero by counting
-      host-to-device expert copies at load and requiring the count not to move during a timed region.
-      Then Tier 4 in the plan's own order: **item 21 streaming/tiering** (gate: expert bytes
-      bit-exact across Hot/Warm/Cold), **item 22 prefix cache manager** (gate: restore byte-exact,
-      and a boundary outside the local window detected rather than served stale), **item 23
-      generation loop** (coherent output; logits agree with reference over several steps). Three
-      properties the remaining gates must respect were settled by the last three items: a decode
-      step is **not bit-reproducible** (trap 38), so any byte-exact gate has to state which MoE
-      accumulation it requires — items 18 and 19 both require the deterministic one; the local ring
-      is **not reconstructible** (trap 39), so a prefix boundary older than the window must be
-      handled by *replaying* the last `C` tokens; and within the declared context the compressed
-      store **never evicts** (item 20), so only the local ring needs replaying — while an
-      out-of-range position must be **refused**, never clamped, because a wrapped compressed store
-      is undetectable from its contents (trap 40).
-- [ ] **Documentation discrepancy to resolve before scheduling Tier 4.** `DOCUMENTATION_STATUS.md` and earlier notes call "item 21" the comparison of identical formatted inputs, intermediate checkpoints and final logits against a **trusted compatible reference** (the patched-RDNA vLLM run the plan's reference-hierarchy note at §2 identifies as the candidate). The plan's own Part V numbers **Tier 4 item 21 as streaming/tiering** instead. The external-reference comparison is a real and separately-motivated gate, but as written it has no number in the plan's sequence — it must be given one (or named explicitly) before it is scheduled, rather than being silently inherited from an older numbering.
-- [x] **Tier 2 is CLOSED (items 16–18).** The layer body remains deliberately **not** wired into `core/v4_pipeline.hpp`: that file is the pre-rewrite graph, gated off, and the rewrite must not depend on it. The body takes its RoPE tables, an attention-trace observer, and a routed-expert executor as parameters, so the same code serves decode, batched prefill and the gates.
+**This section is an index, not a record.** One row per milestone, pointing at the document that owns
+the detail: the [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) (per-item gate results, traps 1–40, mutation
+tables, open unknowns), the [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) (plan inventory and document
+boundaries), and the [Performance Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md) (silicon measurements and its validity banner).
+**Do not restate a finding, gate result, tolerance, trap, or measurement here — link to it.** When a
+milestone transitions, change its row.
 
-### Superseded (retained for chronology, do not execute)
-- [Model Correctness Execution Plan](plans-and-docs/execution/superseded/MODEL_CORRECTNESS_EXECUTION_PLAN.md) — Stages 0–6 ran against the runtime and produced useful evidence (contract parsing, INT4 parity, CPU oracles, class-aware device state, serial dispatch), but the staged in-place approach could not catch the structural errors above. Its Stage 7 is not resumed.
+### The graph rewrite (active)
+Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 has not started.
 
-### Completed and still valid
-- [x] Phase 0–2 foundations: single-GPU runtime gates; lossless Safetensors-to-`.aeon` conversion with sector-aligned indexing and bit-exact verification; dynamic Hot/Warm/Cold storage, direct `io_uring`, asynchronous SDMA staging, residency management.
-- [x] Modular runtime ownership: pipeline operations, scratch, layer state, V4 model resources, and architecture-neutral `TieredExpertSupply`; V4 dense binding; opaque descriptor-driven payload storage; infrastructure/architecture/backend/platform source boundaries.
-- [x] Artifact and backend contracts: versioned manifest/sidecar validation, backend selection, swizzled-view guards.
-- [x] Native text front end: tokenizer, DSV4 formatting, EOS-aware generation, detokenization, `aeon_chat`, and resumable routing-profile aggregation.
-- [x] Stage 1 expert-kernel path: version-2 swizzled W4A16 artifacts, Wave32 GEMV, fused W1/W3 and W2 kernels, native conversion, and silicon validation. See the [implementation report](plans-and-docs/analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md).
-- [x] Warm-tier repair and supply telemetry: persistent Warm ownership, event-ordered refill, lazy/eager preload, transactional transfer cleanup, pinned fallback, source-tier JSONL telemetry, and controlled silicon A/B. See [the closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md).
+| Stage | State | Detail |
+| :--- | :--- | :--- |
+| Tier 0 — specification research (phases 0.1–0.2f) | done | plan §Tier 0 |
+| Step 0 — prompt encoding | done | plan §Step 0 |
+| Tier 1 — oracle harness + all 11 primitives | done, mutation-tested | plan §Tier 1 |
+| Tier 2 — items 16–18: layer body, all three attention classes, serial loop | **closed** | plan §Tier 2 |
+| Tier 3 — items 19–20: chunked prefill, long-context lifecycle | done *(item 19's throughput half blocked)* | plan §Tier 3 |
+| Tier 4 — items 21–23: streaming/tiering, prefix cache, generating loop | not started | plan §Tier 4 |
 
-### Paused work
-- [ ] **Phase 2 continuation:** broad cold-tier, storage-layout, placement, and latency-hiding work remains paused while the graph rewrite and the 35 GiB host-pressure tradeoff are characterized. The Phase 2 document remains the historical execution record for its completed spikes and open gates.
+`core/v4_layer_body.hpp` is the single layer body; decode, chunked prefill and every Tier-2/3 gate
+call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
+and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **35 tests** (legacy: 37).
+
+**Next: item 22's state layout.** The compressor's partial state is still a fixed ring, which caps
+`run_layer_body_chunk` at a chunk of 8 and thereby blocks item 19's throughput half; Part I §6.2
+requires position-addressed state for that *and* for mid-ratio-window reuse. Item 19's other half —
+the indexer top-k's per-token host round-trip, target zero — is countable today and needs no baseline.
+Reasoning and the full remaining sequence: plan item 19, item 22, and the open-unknowns table.
+
+**Needs a decision — a numbering conflict.** "Item 21" currently names two different gates: the plan's
+Tier 4 item 21 is streaming/tiering, while `plans-and-docs/status/DOCUMENTATION_STATUS.md` and older notes use it for the comparison
+against a **trusted compatible reference** (the patched-RDNA vLLM run). That comparison is a real,
+separately motivated gate but has **no number in the plan's sequence** — give it one before
+scheduling it.
+
+### Other states
+- **Superseded —** [Model Correctness Execution Plan](plans-and-docs/execution/superseded/MODEL_CORRECTNESS_EXECUTION_PLAN.md):
+  the staged in-place repair, replaced by the plan. Retained for chronology; do not execute.
+- **Completed and still valid —** Phase 0–2 foundations; modular runtime ownership; artifact and
+  backend contracts; native text front end; the Stage-1 expert-kernel path
+  ([report](plans-and-docs/analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md));
+  warm-tier repair and supply telemetry ([closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md)).
+- **Paused —** Phase 2 continuation (cold-tier, storage layout, placement, latency hiding), pending
+  the graph rewrite and the host-pressure tradeoff.
 
 ### Open gates
-- [ ] **Graph correctness:** the oracle harness, all eleven Tier-1 primitives, Tier 2 items 16–18 (the Sliding body, the CSA and HCA classes, and the serial loop), and Tier 3 item 19's structural gate (`chunk ≡ serial`, exact) are done. What remains of the sequence path is item 20 (long-context lifecycle) and item 19's two non-structural halves — its throughput gate and moving the indexer top-k on-device — then item 21's comparison against a trusted compatible reference before any placement work. Two properties the remaining gates must respect were settled by the last two: a decode step is **not bit-reproducible** (trap 38), so both `chunk ≡ serial` and byte-exact prefix restore have to state which MoE accumulation they require — item 19 requires the deterministic one; and the local ring is **not reconstructible** from anything else (trap 39), so a prefix boundary older than the window means item 20 must *replay* the last `C` tokens rather than restore a ring.
-- [ ] **Four measurement gates** (specified in the plan; settled on silicon, not by reading): ~~indexer Hadamard rotation~~ (**closed — do not apply it**); KV fp8/E4M3 vs bf16 storage delta; MoE routed-expert accumulation order (**partially settled**: 32 identical 6-expert `atomicAdd` accumulations are bit-identical and the sum matches the weighted per-expert sum to `max_rel < 5e-7`, which bounds one configuration but not the effect of the order in general); local-window prefix-reuse boundary behaviour. See the ledger banner for why pre-rewrite numbers cannot be compared.
-- [ ] **Cold-tier performance:** characterize cold-cache and steady-state behavior, reduce host-memory pressure, improve physical `.aeon` placement, and test whether the exposed just-in-time miss path needs a new scheduling or CPU-fallback design. The model-backed `>= 6.0 GB/s` target remains open.
-- [ ] **Swizzled full-model performance:** validate representative 43-layer generation under controlled Hot/Warm conditions, collect useful rocprof counters, and tune occupancy/register pressure beyond the isolated six-expert benchmarks. A residency invariant violation would produce invalid/stale results or a device memory fault rather than trigger an automatic fallback.
-- [ ] **Kernel quality:** the three audit-flagged gaps are now audited and certified at Tier 1 — the HC comb scale (the plan's prose was wrong, not the kernel), the compressor APE, and indexer scope — plus a fourth the gates found on their own, the indexer ReLU. Two more certified properties are structural rather than numeric: the grouped output projection's per-group reduction, shown load-bearing by perturbing one group and requiring the other seven to stay bit-identical; and the shared expert's combine, measured on the device to apply the shared contribution exactly once. What remains unprofiled or conservative: the batched prefill path, the ordered routed-expert path (note its fp16 accumulator, which is *less* accurate than the atomic path's fp32 one), and the fused atomic W2 path.
-- [ ] **Routing placement study:** collect representative profile and held-out corpora with the verified text contract, then evaluate frequency-informed placement against dynamic LRU.
-- [ ] **Backend specialization:** add an explicit backend factory, semantic dispatch, and a second working weight backend before introducing a universal V4 linear-dispatch abstraction.
-- [ ] **Phase 3:** multi-GPU pipeline parallelism and 1F1B scheduling remain future work.
+Pointers only; each is specified in the plan's "Open unknowns" table or the ledger.
+- **Graph correctness —** Tier 4 items 21–23 (see *Next* above).
+- **Measurement gates —** KV fp8/E4M3 vs bf16 storage; MoE routed-expert accumulation order
+  (partially settled); local-window prefix-reuse boundary (half settled by item 20). The indexer
+  Hadamard is **settled — do not apply it** (plan Gate 11).
+- **Kept infrastructure —** cold-tier characterization, physical `.aeon` placement, host-memory
+  pressure, the model-backed `>= 6.0 GB/s` target, kernel occupancy tuning, the routing placement
+  study, the explicit backend factory, and Phase 3 multi-GPU.
+- **Before comparing any number —** read the ledger banner: pre-rewrite model-path measurements
+  describe a *different computation*, not merely a slower one.
 
 ---
 
@@ -137,7 +119,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 1. **Incremental Micro-Steps**: Advance through small, verifiable steps. Never implement broad abstractions before underlying hardware primitives are verified on silicon.
 2. **Hardware-Grounded Verification**: Test and benchmark on physical hardware (`gfx1100`) at every step.
 3. **Commit Messages**: Follow standard conventional commits format (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `perf:`).
-4. **Maintenance of AGENTS.md**: Update the "Progress Tracking & State of Execution" section whenever milestones or micro-steps transition between Past, Present, and Future.
+4. **Maintenance of AGENTS.md — this file is an entrypoint, not a record.** §3 is an index: one row per milestone, each pointing at the document that owns the detail. **Do not restate gate results, tolerances, measurements, trap text, or mutation tables here** — they belong in the [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) and the [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md), and duplicating them is how this file drifts out of date. Update a row when a milestone transitions; add prose only if it is a *rule* (this section) or a *pointer* (§2).
 5. **The specification is authoritative**: For DeepSeek-V4 graph semantics, [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) governs. Do not implement a graph op from memory, from this file, or from an unsourced reference. If the plan lacks a citation for something being implemented, add the citation or tag it `[?]` first.
 6. **Anti-circularity**: a test must not compare a kernel against an oracle derived from that kernel's own helper — that proves self-consistency, not correctness. New graph tests compare against an independently written reference.
 7. **The legacy graph is gated**: `AEON_ENABLE_LEGACY_V4_GRAPH` (default `OFF`) controls the pre-rewrite graph, its tests, and its tools. Leave it off. Enable it only to re-derive a specific value from the old path, and never treat a green legacy run as coverage.
