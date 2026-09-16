@@ -1164,12 +1164,43 @@ differently rather than a routing bug. The cause is precision, not semantics: th
     composed row-set; the gate is **exact equality** (0 differing values) against the same tokens run
     one at a time, across three classes, three schedules, 130 tokens, and the whole final state, with
     the serial run itself tied to the Tier-2 decode body. **What remains of item 19 is its two
-    non-structural halves, both explicitly open:** (a) **throughput** — the composition is a
-    per-query loop of up to `C` device-to-device copies and needs to become one gather kernel, with
-    its own measurement, because the plan requires speed to be a separate gate; and (b) the
-    **indexer top-k's per-token host round-trip** in `select_indexer_topk`, which the plan forbids in
-    a prefill and which no equivalence gate can see because it changes no value. Neither is a
-    correctness gap; both are recorded rather than implied by the checkmark.
+    non-structural halves, both explicitly open — and the first of them is *blocked*, not merely
+    unmeasured.**
+
+    * **(a) Throughput — blocked on the chunk size, which is capped at 8.** `run_layer_body_chunk`
+      refuses a chunk longer than the compressor's partial ring, because
+      `v4_save_compressor_state_kernel` writes that state at `position % partial_capacity` into a
+      fixed ring of `coefficient · ratio` slots (**8** for CSA). Two tokens more than 8 apart inside
+      one chunk would therefore share a slot, and a boundary reading the earlier token's row would
+      silently get the later token's — so the guard throws rather than corrupt. This is Part I §6's
+      requirement not yet met: *"the reuse boundary must be allowed to fall mid-ratio-window"*
+      requires **position-addressed** partial state, which §6.2 and trap 24 named as the expensive
+      retrofit. **A usable chunk size (256–512) is unreachable until that state contract exists, and
+      the state contract is item 22's.** Second, and independent of the cap: **a per-token body
+      cannot show a chunk-size benefit at all.** Chunk 1 and chunk 8 execute the same code the same
+      number of times — the only difference is that keys are held outside the ring and each query
+      composes its own row-set — so nothing is amortized and tok/s can only be flat or worse.
+      Batching the projections is an *implementation* step, not a measurement one. So (a) needs
+      **both** the position-addressed partial state and batched projections before any speed number
+      means anything; measuring before them would report the cost of a body that is deliberately
+      per-token.
+      *Method, settled but not yet used:* hold every expert of the resident layers in VRAM so expert
+      transfer is zero, isolating compute + composition — a **floor**, never comparable to model
+      throughput, and one that must **verify** the zero (count host-to-device expert copies at load
+      and require the count not to move during a timed region) rather than assume it.
+    * **(b) The indexer top-k's per-token host round-trip** in `select_indexer_topk`, which the plan
+      forbids in a prefill and which no equivalence gate can see because it changes no value. It is
+      **two** `hipStreamSynchronize` calls (one after the scores' D2H, one after the indices' H2D),
+      once per token per CSA layer whose candidates are non-empty. Unlike (a) this half is
+      **countable now and needs no baseline**: the target is zero, and the count is derived from the
+      schedule rather than measured.
+
+    **Consequence for the sequence, and it is a sequencing correction:** *item 22's state layout is
+    the next real step for prefill speed, not item 19's measurement.* Item 19's structural gate is
+    complete and its throughput half cannot be closed first. The compressor partial state is also
+    the one piece of §6.1's four that is still a ring rather than position-addressed — the local ring
+    is a ring by design (item 20), the compressed store never evicts within the context (item 20),
+    and only this one blocks a capability.
 
 20. ~~**Long-context lifecycle** — ring reuse and boundary compression past context capacity.~~ **DONE — see the result below.** **Specified in 7.1.** The gate is **structural and at the real dimensions** — window `128`, ratios `4` and `128` — because every earlier gate shrank them (items 16–19 all note the shrinkage as uncovered), and it compares against **closed forms and invariants**, not an fp64 oracle, since items 16–18 already own the arithmetic on real weights:
     * **A — the local ring's slot assignment is predicted, not merely observed.** After a run longer than two windows, slot `s` must hold the largest position `p ≤ pos` with `p ≡ s (mod C)`, and `local_valid_count == min(pos+1, C)`. Nothing is compared to a reference: the ring's *contents* are stated in advance.
@@ -1206,6 +1237,7 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 **Tier 4 — Integration (only after Tier 3 is fully green).**
 21. **Streaming / tiering.** Gate: expert bytes bit-exact across Hot/Warm/Cold.
 22. **Prefix cache manager.** Block table, cache key (tokens **+ non-token graph inputs**), matching, eviction; state pieces placed across tiers. Gate: **restore is byte-exact** with respect to never having evicted, and a candidate boundary outside the local window is detected rather than served stale (Part I §6.3 R3–R4).
+    **This item now also gates item 19's throughput half**: the compressor's partial state is the one piece of §6.1's four still stored as a ring (`position % coefficient·ratio`), and that ring is what caps the chunk size at 8. Making it **position-addressed** is what allows a usable chunk (256–512), so the §6 layout contract should be treated as the prerequisite for prefill speed rather than as a Tier-4-optional refactor. It is also the piece a mid-ratio-window restore needs, which is the same requirement seen from the reuse side.
 23. **Generation loop.** Coherent output; logits agree with reference over several steps.
 
 **Do not build the streaming system before the numerics are correct.** Streaming bugs and numerical bugs produce identical symptoms, and debugging both at once is intractable.
@@ -1226,8 +1258,8 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 | KV fp8/E4M3 round-trip required vs optional | Gates 9 / 10 | **Strengthened toward required:** the canonical compressor kernel applies bf16+FP8/UE8M0 at two store points `[V fused_compress_quant_cache.py:288-345]`, and the checkpoint card states `--kv-cache-dtype` resolves to `fp8_ds_mla`, *"the only layout these backends implement"* `[V checkpoint README]`. Still a gate, because bf16 is a supported alternative and the delta must be measured. |
 | MoE combine accumulation order | Gate 14 | **Shared-vs-routed order is now settled** (routed sum, then `+= shared` `[V nvidia/model.py:1020-1031]`). The **intra-routed** slot order was measured at the item-14 gate: it is `atomicAdd`, yet 32 identical 6-expert runs are **bit-identical** and the sum matches the weighted per-expert sum to `max_rel < 5e-7`. **Partially settled** — bounded for one configuration on this silicon, not in general. |
 | Local-window reuse boundary behavior | **Half settled at Tier 3 item 20 (7.1); the prefix half stays open for Tier 4 item 22** | Whether a reused prefix whose boundary predates the local window must rebuild the ring, or whether compressed state fully covers attention. sglang tombstones such leaves; confirm the correct handling for our state rather than assuming. **Item 19 sharpened this**: the local ring cannot be reconstructed from anything else, so a prefix boundary older than the window means the ring must be *rebuilt by replaying the last `C` tokens*, not restored. That is a cost the reuse decision has to weigh, and it is the same constraint trap 39 describes from the batching side. **Item 20 settled the other half, by measurement**: within the declared context the compressed store **never evicts** — its capacity is exactly the context's own entry count, verified for both ratios — so a reused prefix's *compressed* state is always fully present and only the **local ring** is window-bounded and must be replayed (7.1(a)/(b)). It also showed the converse, which is the part that makes the refusal structural: a wrapped compressed store is invisible to the kernel's own position guard *and* to the committed count, so if the capacity were ever exceeded the engine would silently serve a sliding window of compressed entries rather than fail (trap 40). |
-| **Indexer top-k on-device** | item 19, remaining half | `select_indexer_topk` still copies the candidate scores to the host and synchronizes the stream, **once per CSA token**, which Part III forbids in a prefill ("no per-token host synchronization"). It changes no value, so the `chunk ≡ serial` gate cannot see it by construction, and it is not a correctness gap. It is a scheduling debt with a throughput gate of its own. |
-| **Chunked-prefill throughput** | item 19, remaining half | The structural gate is green; speed is a separate gate by the plan's own rule. `compose_local_rows` is a per-query loop of up to `C` device-to-device copies and the body still runs the HC/MLA/compressor/MoE per token rather than as batched matmuls. Neither is measured yet. |
+| **Indexer top-k on-device** | item 19's other remaining half — **countable now, needs no baseline** | `select_indexer_topk` copies the candidate scores to the host and synchronizes the stream **twice** (once after the scores' D2H, once after the indices' H2D), once per token per CSA layer with non-empty candidates. Part III forbids per-token host synchronization in a prefill — *"any device→host copy inside the layer loop serializes the whole chunk"*. It changes no value, so the `chunk ≡ serial` gate cannot see it by construction, and it is not a correctness gap. The target is **zero**, and the count is derived from the schedule rather than measured — so unlike the throughput half this one needs neither a baseline nor a faster body. |
+| **Chunked-prefill throughput** | **blocked — item 19's throughput half; unblocked by item 22's state contract** | The structural gate is green; speed is a separate gate by the plan's own rule. **It is blocked, not merely unmeasured.** (i) The chunk size is capped at **8** by the compressor's partial ring (`position % coefficient·ratio` into a fixed ring), so a usable chunk size needs the **position-addressed** partial state that Part I §6.2 requires and item 22 owns. (ii) Independently, a per-token body cannot show a chunk-size benefit at all: chunk 1 and chunk N run the same code the same number of times, so nothing amortizes. Batching the projections is the implementation step that would create a win to measure. `compose_local_rows` is a per-query loop of up to `C` device-to-device copies. Method when it is measurable: all experts of the resident layers held in VRAM, giving a **compute+composition floor** with storage verified at zero — never comparable to model throughput. |
 
 ### Anti-circularity rule
 
