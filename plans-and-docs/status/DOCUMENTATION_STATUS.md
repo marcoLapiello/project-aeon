@@ -38,12 +38,12 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 32 infrastructure/backend/text/kept-component/Tier-1/Tier-2 tests |
-| Legacy `ctest` | 34 (the 32 plus 2 gated parity anchors) |
+| Default `ctest` | 33 infrastructure/backend/text/kept-component/Tier-1/Tier-2 tests |
+| Legacy `ctest` | 35 (the 33 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
 | Tier 1 | **COMPLETE — all 11 primitives certified, then mutation-tested.** RMSNorm, RoPE (both bases), MLA Q/KV, HC + Sinkhorn, attention + sink + softmax, compressor + APE, indexer + top-k, grouped output projection, MoE router, routed expert, shared expert. Four real findings: a transposed comb index in the plan, the indexer ReLU missing from the kernel, the plan's normalization-guard claim being wrong, and the combine-order claim describing only the unfused path. **Mutation testing then found two gate defects that review and a green suite had both missed** (see the plan's "Mutation testing" section): the clamp-rule gates could not see a symmetrically-clamped kernel, and the RMSNorm gate could not see a deleted `eps`. 10 mutations: 8 killed, 1 provably equivalent, 0 unclassified. |
-| Tier 2 | **Items 16 and 17 done — all three attention classes.** `core/v4_layer_body.hpp` is the single layer body (Steps 2.0–2.11 for one token) and `reference/dsv4_oracle.hpp::layer_body` its composed fp64 reference, branching on the attention class exactly as the device does. Item 16 covers the Sliding class on real `layers.0` weights (`tests/test_v4_layer_body_oracle.cpp`); item 17 covers **CSA (ratio 4)** and **HCA (ratio 128)** on real `layers.2` / `layers.3` weights (`tests/test_v4_layer_body_compressed_oracle.cpp`), including the compressor, the APE-adjusted partial ring, the materialized compressed entry, the indexer and the row-set rule. Every checkpoint within `~2e-3` of its own peak. **10 of 10 mutations killed** (4 wiring + 1 redundant in item 16; 5 in item 17). Item 16 found a defect **in its own oracle**; item 17 found that the router ids cannot be compared against an fp64 oracle's inputs (**trap 37**) and made the fp16 decode ~5× faster. Next: item 18 (serial multi-token decode). |
+| Tier 2 | **Items 16–18 done — all three attention classes, and the serial loop.** `core/v4_layer_body.hpp` is the single layer body (Steps 2.0–2.11 for one token) and `reference/dsv4_oracle.hpp::layer_body` its composed fp64 reference, branching on the attention class exactly as the device does. Item 16 covers the Sliding class on real `layers.0` weights (`tests/test_v4_layer_body_oracle.cpp`); item 17 covers **CSA (ratio 4)** and **HCA (ratio 128)** on real `layers.2` / `layers.3` weights (`tests/test_v4_layer_body_compressed_oracle.cpp`), including the compressor, the APE-adjusted partial ring, the materialized compressed entry, the indexer and the row-set rule; item 18 (`tests/test_v4_layer_body_serial_oracle.cpp`) drives a three-layer stack for **136 tokens across 34 CSA boundaries and one HCA boundary** with the residual carried by the device itself, and compares the **whole accumulated state**. Every checkpoint within `~1e-3` of its own peak against a `4e-3` tolerance. **13 of 13 mutations killed** (4 wiring + 1 redundant in item 16; 5 in item 17; 3 in item 18). Item 16 found a defect **in its own oracle**; item 17 found that the router ids cannot be compared against an fp64 oracle's inputs (**trap 37**) and made the fp16 decode ~5× faster; item 18 found that the device's serial decode is **not bit-reproducible** (**trap 38**) and that a state-evolution error is **invisible to a per-step gate** (M18-2: 577 failures in item 18, zero in item 16). Next: item 19 (chunked batched prefill, gate `chunk ≡ serial`). |
 
 ---
 
@@ -96,14 +96,18 @@ research. None of these are current implementation evidence.
 ## 3. Open gates
 
 **Correctness (the active work).** Execute the plan: the oracle and gate harness are
-built, all eleven Tier-1 primitives are certified and mutation-tested, and **Tier 2 items 16
-and 17 are done** — the single layer body (`core/v4_layer_body.hpp`) is gated against the
+built, all eleven Tier-1 primitives are certified and mutation-tested, and **Tier 2 items 16–18
+are done** — the single layer body (`core/v4_layer_body.hpp`) is gated against the
 composed fp64 reference on real weights for **all three attention classes**: Sliding, CSA
 (ratio 4) and HCA (ratio 128), the last two including the compressor, the APE, the indexer
-and the row-set rule. What remains in the tier is serial multi-token decode across
-compressor boundaries (item 18), where the residual stops being re-seeded from the oracle;
-then compare identical formatted inputs, intermediate checkpoints, and final logits against a
-trusted compatible reference before any placement work.
+and the row-set rule, and the serial loop carries the device's own residual across 34 CSA
+boundaries and one HCA boundary. What remains in the tier is the sequence path: item 19
+(chunked batched prefill over the same body, gate `chunk ≡ serial`) and item 20 (long-context
+lifecycle); then compare identical formatted inputs, intermediate checkpoints, and final logits
+against a trusted compatible reference before any placement work. The serial loop settled a
+property both remaining gates must respect: a decode step is **not bit-reproducible** (trap 38),
+so `chunk ≡ serial` and byte-exact prefix restore each have to state which MoE accumulation they
+require.
 
 Four gates are settled empirically, not by reading. **One is now closed; three remain:**
 

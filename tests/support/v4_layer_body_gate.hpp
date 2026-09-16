@@ -1,13 +1,13 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// Shared fixture for the Tier-2 layer-body gates (items 16 and 17).
+// Shared fixture for the Tier-2 layer-body gates (items 16, 17 and 18).
 //
-// Both gates drive `core/v4_layer_body.hpp` on real device state and compare
+// All three gates drive `core/v4_layer_body.hpp` on real device state and compare
 // every checkpoint against `reference/dsv4_oracle.hpp`. What they share is the
 // scaffolding, not the assertions: the comparison basis, the checkpoint read
-// helpers, and the routed-expert seam. Duplicating that scaffolding between two
-// gates is how the two copies drift, so it lives here.
+// helpers, the artifact reads, and the routed-expert seam. Duplicating that
+// scaffolding between gates is how the copies drift, so it lives here.
 //
 // The routed-expert seam has two modes on purpose:
 //
@@ -15,10 +15,12 @@
 //     what item 16 does; that is the real thing and it costs ~3 s per token in
 //     page-in.
 //   * SYNTHETIC — payloads are encoded locally with the oracle's own
-//     `swizzled_encode` and uploaded once. Item 17 needs a 128-token HCA run,
-//     which the artifact store would make a multi-minute test; the routed-expert
-//     arithmetic itself is already certified by Tier-1 gates 13/15 and by item
-//     16, so the compressed gate spends its budget on the compressed path.
+//     `swizzled_encode` and uploaded once. Items 17 and 18 need runs long enough
+//     to cross compressor boundaries (128 tokens for one HCA entry; 136 for a
+//     readable one), which the artifact store would make a multi-minute test;
+//     the routed-expert arithmetic itself is already certified by Tier-1 gates
+//     13/15 and by item 16, so those gates spend their budget on the serial
+//     state and the compressed path.
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
@@ -31,6 +33,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -123,6 +126,90 @@ inline std::vector<double> read_float(hipStream_t stream, const float* device, s
                              hipMemcpyDeviceToHost, stream));
     CHECK_HIP(hipStreamSynchronize(stream));
     return std::vector<double>(host.begin(), host.end());
+}
+
+// -----------------------------------------------------------------------------
+// Fixture reads shared by the Tier-2 gates.
+// -----------------------------------------------------------------------------
+
+// One layer's weights out of the artifact, in the oracle's own struct. The
+// compressor pointers are left null on a Sliding layer and the indexer pointers
+// on HCA, which is what makes "a Sliding layer never reads them" and "HCA has no
+// indexer" structural rather than asserted.
+//
+// `tid2eid_row` is deliberately left null even on a hash layer: the *token's* row
+// has to be selected per step, and storing the table base here would silently
+// route every token with token 0's expert set.
+inline aeon::reference::LayerBodyWeights load_layer_weights(
+    const aeon::core::AeonModelLoader& loader, uint32_t layer_id) {
+    const std::string p = "layers." + std::to_string(layer_id) + ".";
+    const auto f16 = [&](const std::string& name) {
+        return reinterpret_cast<const uint16_t*>(loader.get_tensor(p + name).data);
+    };
+
+    aeon::reference::LayerBodyWeights w{};
+    w.hc_attn_fn = loader.get_data_ptr<float>(p + "hc_attn_fn");
+    w.hc_attn_base = loader.get_data_ptr<float>(p + "hc_attn_base");
+    w.hc_attn_scale = loader.get_data_ptr<float>(p + "hc_attn_scale");
+    w.hc_ffn_fn = loader.get_data_ptr<float>(p + "hc_ffn_fn");
+    w.hc_ffn_base = loader.get_data_ptr<float>(p + "hc_ffn_base");
+    w.hc_ffn_scale = loader.get_data_ptr<float>(p + "hc_ffn_scale");
+    w.attn_norm = f16("attn_norm.weight");
+    w.wq_a = f16("attn.wq_a.weight");
+    w.q_norm = f16("attn.q_norm.weight");
+    w.wq_b = f16("attn.wq_b.weight");
+    w.wkv = f16("attn.wkv.weight");
+    w.kv_norm = f16("attn.kv_norm.weight");
+    w.attn_sink = loader.get_data_ptr<float>(p + "attn.attn_sink");
+    w.wo_a = f16("attn.wo_a.weight");
+    w.wo_b = f16("attn.wo_b.weight");
+    w.ffn_norm = f16("ffn_norm.weight");
+    w.gate_weight = f16("ffn.gate.weight");
+    w.shared_w1 = f16("ffn.shared_experts.w1.weight");
+    w.shared_w3 = f16("ffn.shared_experts.w3.weight");
+    w.shared_w2 = f16("ffn.shared_experts.w2.weight");
+
+    if (layer_id < 3) {
+        w.gate_bias = nullptr;
+    } else {
+        w.gate_bias = loader.get_data_ptr<float>(p + "ffn.gate.bias");
+    }
+    w.tid2eid_row = nullptr;
+
+    if (loader.has_tensor(p + "attn.compressor.wkv.weight")) {
+        w.compressor_wkv = f16("attn.compressor.wkv.weight");
+        w.compressor_wgate = f16("attn.compressor.wgate.weight");
+        w.compressor_norm = f16("attn.compressor.norm.weight");
+        w.compressor_ape = loader.get_data_ptr<float>(p + "attn.compressor.ape");
+    }
+    if (loader.has_tensor(p + "attn.indexer.wq_b.weight")) {
+        w.indexer_wq_b = f16("attn.indexer.wq_b.weight");
+        w.indexer_weights_proj = f16("attn.indexer.weights_proj.weight");
+        w.indexer_compressor_wkv = f16("attn.indexer.compressor.wkv.weight");
+        w.indexer_compressor_wgate = f16("attn.indexer.compressor.wgate.weight");
+        w.indexer_compressor_norm = f16("attn.indexer.compressor.norm.weight");
+        w.indexer_compressor_ape =
+            loader.get_data_ptr<float>(p + "attn.indexer.compressor.ape");
+    }
+    return w;
+}
+
+// The hash table's row for one token, or null on a biased layer (layers >= 3).
+inline const int64_t* hash_row_for_token(const aeon::core::AeonModelLoader& loader,
+                                         uint32_t layer_id, uint32_t token) {
+    if (layer_id >= 3) return nullptr;
+    const int64_t* table = loader.get_data_ptr<int64_t>(
+        "layers." + std::to_string(layer_id) + ".ffn.gate.tid2eid");
+    return table + static_cast<size_t>(token) * kRoutedExperts;
+}
+
+// The committed-entry count the device reports for a position: `(pos+1)/ratio`,
+// capped by the compressed capacity.
+inline uint32_t committed_entries(const aeon::core::V4Layer& layer, uint32_t pos,
+                                  int64_t ratio) {
+    return static_cast<uint32_t>(std::min<int64_t>(
+        static_cast<int64_t>(layer.state_layout().compressed_capacity),
+        (static_cast<int64_t>(pos) + 1) / ratio));
 }
 
 // -----------------------------------------------------------------------------

@@ -66,12 +66,14 @@ using aeon::reference::RopeClass;
 using aeon::reference::RopeTableRef;
 
 using aeon::testgate::check;
+using aeon::testgate::committed_entries;
 using aeon::testgate::GateExpertExecutor;
 using aeon::testgate::kHeadDim;
 using aeon::testgate::kHcDim;
 using aeon::testgate::kHidden;
 using aeon::testgate::kRoutedExperts;
 using aeon::testgate::kTotalQ;
+using aeon::testgate::load_layer_weights;
 using aeon::testgate::num;
 using aeon::testgate::read_float;
 using aeon::testgate::report;
@@ -97,75 +99,6 @@ struct ClassRun {
     uint32_t index_topk;
     uint32_t tokens;
 };
-
-// Reads one layer's weights out of the artifact. The compressor pointers stay
-// null on a Sliding layer and the indexer pointers stay null on HCA, which is
-// what makes "a Sliding layer never reads them" and "HCA has no indexer"
-// structural rather than asserted.
-LayerBodyWeights load_weights(const aeon::core::AeonModelLoader& loader,
-                              uint32_t layer_id) {
-    const std::string p = "layers." + std::to_string(layer_id) + ".";
-    const auto f16 = [&](const std::string& name) {
-        return reinterpret_cast<const uint16_t*>(loader.get_tensor(p + name).data);
-    };
-
-    LayerBodyWeights w{};
-    w.hc_attn_fn = loader.get_data_ptr<float>(p + "hc_attn_fn");
-    w.hc_attn_base = loader.get_data_ptr<float>(p + "hc_attn_base");
-    w.hc_attn_scale = loader.get_data_ptr<float>(p + "hc_attn_scale");
-    w.hc_ffn_fn = loader.get_data_ptr<float>(p + "hc_ffn_fn");
-    w.hc_ffn_base = loader.get_data_ptr<float>(p + "hc_ffn_base");
-    w.hc_ffn_scale = loader.get_data_ptr<float>(p + "hc_ffn_scale");
-    w.attn_norm = f16("attn_norm.weight");
-    w.wq_a = f16("attn.wq_a.weight");
-    w.q_norm = f16("attn.q_norm.weight");
-    w.wq_b = f16("attn.wq_b.weight");
-    w.wkv = f16("attn.wkv.weight");
-    w.kv_norm = f16("attn.kv_norm.weight");
-    w.attn_sink = loader.get_data_ptr<float>(p + "attn.attn_sink");
-    w.wo_a = f16("attn.wo_a.weight");
-    w.wo_b = f16("attn.wo_b.weight");
-    w.ffn_norm = f16("ffn_norm.weight");
-    w.gate_weight = f16("ffn.gate.weight");
-    w.shared_w1 = f16("ffn.shared_experts.w1.weight");
-    w.shared_w3 = f16("ffn.shared_experts.w3.weight");
-    w.shared_w2 = f16("ffn.shared_experts.w2.weight");
-
-    if (layer_id < 3) {
-        w.gate_bias = nullptr;
-        // The token's *row* is selected per step; storing the table base here
-        // would silently route every token with token 0's expert set.
-        w.tid2eid_row = nullptr;
-    } else {
-        w.gate_bias = loader.get_data_ptr<float>(p + "ffn.gate.bias");
-        w.tid2eid_row = nullptr;
-    }
-
-    if (loader.has_tensor(p + "attn.compressor.wkv.weight")) {
-        w.compressor_wkv = f16("attn.compressor.wkv.weight");
-        w.compressor_wgate = f16("attn.compressor.wgate.weight");
-        w.compressor_norm = f16("attn.compressor.norm.weight");
-        w.compressor_ape = loader.get_data_ptr<float>(p + "attn.compressor.ape");
-    }
-    if (loader.has_tensor(p + "attn.indexer.wq_b.weight")) {
-        w.indexer_wq_b = f16("attn.indexer.wq_b.weight");
-        w.indexer_weights_proj = f16("attn.indexer.weights_proj.weight");
-        w.indexer_compressor_wkv = f16("attn.indexer.compressor.wkv.weight");
-        w.indexer_compressor_wgate = f16("attn.indexer.compressor.wgate.weight");
-        w.indexer_compressor_norm = f16("attn.indexer.compressor.norm.weight");
-        w.indexer_compressor_ape = loader.get_data_ptr<float>(p + "attn.indexer.compressor.ape");
-    }
-    return w;
-}
-
-// The committed-entry count the device reports for a position: `(pos+1)/ratio`,
-// capped by the compressed capacity.
-uint32_t committed_entries(const aeon::core::V4Layer& layer, uint32_t pos,
-                           int64_t ratio) {
-    return static_cast<uint32_t>(std::min<int64_t>(
-        static_cast<int64_t>(layer.state_layout().compressed_capacity),
-        (static_cast<int64_t>(pos) + 1) / ratio));
-}
 
 // -----------------------------------------------------------------------------
 // One class's run. Returns true if every check passed.
@@ -235,7 +168,7 @@ bool run_class(const ClassRun& run, aeon::core::AeonModelLoader& loader,
         CHECK_HIP(hipMalloc(&executor.d_payload[k], aeon::core::AEON_SWIZZLED_EXPERT_BYTES));
     }
 
-    LayerBodyWeights w = load_weights(loader, run.layer_id);
+    LayerBodyWeights w = load_layer_weights(loader, run.layer_id);
     for (uint32_t k = 0; k < kRoutedExperts; ++k) w.routed_payloads[k] = payloads[k].data();
 
     // Decode the six fixed payloads once. The routed-expert arithmetic is

@@ -179,6 +179,17 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_layer_body_compressed_oracle.cpp)
 endif()
 
+# --- Tier-2 composition: the serial loop --------------------------------------
+# Item 18. Items 16/17 both overwrite the device's residual with the oracle's
+# after every step, so they measure one layer's composition and are blind to what
+# a loop does. This drives a three-layer stack (Sliding, CSA, HCA) for 136 tokens
+# with the device carrying its own residual — across 34 CSA boundaries and one
+# HCA boundary — and compares the whole accumulated state, not just the step.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_layer_body_serial_oracle
+        SOURCES tests/test_v4_layer_body_serial_oracle.cpp TIMEOUT 600)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate

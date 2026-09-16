@@ -777,7 +777,7 @@ Build and certify in this order. Each item's gate must be green before the next 
 **Tier 2 — Composition.**
 16. ~~**One full layer, Sliding class.** Verify `res_out` for a single token.~~ **DONE.** `core/v4_layer_body.hpp` (the layer body, Steps 2.0–2.11, one token) + `reference/dsv4_oracle.hpp::layer_sliding_body` (the composed fp64 reference) + `tests/test_v4_layer_body_oracle.cpp`. Device `res_out` and every named intermediate match the oracle on the artifact's real `layers.0` weights, for ten positions (the local ring is shrunk to 6 so the wrap is exercised). Every checkpoint is within **`1.1e-3` of its own peak**, which is the fp16 store and nothing else. Three mutations killed, one equivalent; and the gate found **a defect in the oracle itself** — a fp16 tensor widened with `std::vector<double>(uint16_t*, …)`, which converts the bit pattern arithmetically (`0x3C00` → `15360`) instead of decoding it. See the gate result below. **Next: item 17.**
 17. ~~**Full layer, CSA class.** Then **HCA class**.~~ **DONE.** One body, all three classes. `reference/dsv4_oracle.hpp::layer_body` (generalized from `layer_sliding_body`, so the oracle mirrors the device's single structural branch) + `tests/test_v4_layer_body_compressed_oracle.cpp`, driving the artifact's real `layers.2` (CSA, ratio 4) and `layers.3` (HCA, ratio 128) weights across a sequence that crosses ratio boundaries. Every named intermediate matches — the compressor projections, the **APE-adjusted** partial ring row, the materialized compressed entry, the **indexer** scores and its top-k, the **row-set counts**, `attn_proj`, `ffn_norm`, `moe_out` and `res_out` — and the row-set rule itself (**trap 33**) is asserted directly: CSA reads the indexer-selected rows, HCA reads **every** committed compressed row and never touches the indexer. Five mutations, **all five killed**. See the gate result below. The shared gate scaffolding was extracted to `tests/support/v4_layer_body_gate.hpp`.
-18. **Serial multi-token decode.** Verify state evolution across compressor boundaries.
+18. ~~**Serial multi-token decode.** Verify state evolution across compressor boundaries.~~ **DONE.** `tests/test_v4_layer_body_serial_oracle.cpp` drives a three-layer stack — Sliding (layer 0), CSA (layer 2), HCA (layer 3) — for **136 tokens with the residual carried by the device itself**, across 34 CSA boundaries and one HCA boundary. It removes the simplification both earlier tiers made: nothing writes `d_res_in` from the oracle, and the reference is driven by the device's own residual trajectory *and* its own discrete expert selection. The whole accumulated state — every local-ring slot, every committed compressed entry, and every position — is compared at the end, and the boundary's entry is shown to survive bit-identical. **A finding items 16/17 structurally could not reach:** the device's serial decode is **not bit-reproducible** (the default MoE `atomicAdd` order is undefined, and a router near-tie amplifies the drift), which is recorded as trap 38 and matters directly for the byte-exact prefix-reuse gate. See the gate result below.
 
 > **Gate result (Tier 2, item 16) — CERTIFIED, and the gate found a defect in its own oracle.**
 > `tests/test_v4_layer_body_oracle.cpp`, **31 lines green**; the default suite is **31 tests**.
@@ -958,8 +958,101 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > compressed stores (Gates 9/10); and any tiering (the experts are synthetic and supplied
 > directly).
 
+> **Gate result (Tier 2, item 18) — CERTIFIED, and the gate found the first property in this
+> rewrite that only a serial loop can see.**
+> `tests/test_v4_layer_body_serial_oracle.cpp`; the default suite is **33 tests**.
+>
+> **The simplification this gate removes, stated exactly.** Items 16 and 17 both end every step
+> with a device→host round-trip back into the device: `to_half(oracle.res_out)` is written into
+> `scratch.d_res_in`. That is the right instrument for one layer's arithmetic — it makes the
+> comparison a *composition* measurement — and it also means the device's own output never
+> re-enters the device's own state. The loop is then a sequence of independent steps with a
+> fixed external input, so no error can accumulate and no state bug can express itself as drift.
+>
+> **What replaces it.** A three-layer stack in decode order — Sliding (layer 0), CSA (layer 2),
+> HCA (layer 3) — for **136 tokens**, with:
+> * the device's residual chain entirely its own. Layer L's output is layer L+1's input, and the
+>   last layer's output is the next token's input. Nothing writes `d_res_in` (or `d_res_in_half`)
+>   from the reference at any point.
+> * the reference driven by the device's own state *and* its own discrete output. The residual it
+>   is handed each step is read out of the device's buffers, and its MoE **combine** is driven by
+>   the device's own ids and weights through a new `routed_ids_override` seam. This is trap 37's
+>   principle generalized from the indexer to the router and to the state: a reference that
+>   supplies its own inputs measures input divergence and calls it a defect.
+> * 136 is not a round number. HCA (ratio 128) commits its first compressed entry at position
+>   **127**, so a run that crosses an HCA boundary has a hard floor of 129 tokens; the extra
+>   seven put the boundary behind the loop instead of at its end.
+>
+> **Worst case per checkpoint over 408 layer-steps, as a fraction of that checkpoint's own peak:**
+>
+> | checkpoint | worst |
+> | :--- | ---: |
+> | `x_norm` (attention RMSNorm) | `7.1e-4` |
+> | `kv_rot` (local ring row, every wrap) | `9.8e-4` |
+> | `attn_proj` (attention + inverse RoPE + grouped wo) | `9.9e-4` |
+> | `moe_out` (routed + shared) | `9.7e-4` |
+> | `res_out` (**the chained residual**) | `8.5e-4` |
+> | `router logits` | `9.8e-4` |
+> | `compressor partial row` (APE-adjusted, 34 wraps on CSA) | `9.8e-5` |
+>
+> Tolerance is `4e-3` of peak throughout — a **4× margin** over the measured floor, which is the
+> fp16 store and nothing else. (Item 17's `router logits` at `1.2e-3` is, with the reference now
+> driven by the device's logits rather than racing them, down at `9.8e-4`.)
+>
+> **C: the whole accumulated state, and closed forms that need no oracle at all.** At the end of
+> the run the gate compares *every* piece of state, not just the slot the last token wrote: the
+> whole local ring (`6.2e-4` / `8.1e-4` / `5.5e-4` of peak for the three layers), all **34**
+> committed CSA entries and the **1** HCA entry (`4.5e-4` / `2.0e-4`), and every position. The
+> positions are additionally checked against **closed forms**: slot *s* of a `capacity`-wide ring
+> must hold the largest written position congruent to *s*, which is asserted for both the local
+> ring and the compressor partial ring on all three layers, and the compressed entries must sit
+> at `(i+1)·ratio − 1`. Those four checks would be satisfied by nothing except a state that
+> evolved correctly. The HCA entry materialized at position 127 is then re-read at the end of the
+> loop and required to be **bit-identical** (`max|delta| = 0.0`) — the loop's state contract in
+> one line, and the line that a state recomputed or cleared per step would fail while passing
+> every per-step comparison. Finally, that entry is shown **load-bearing** in the final attention
+> row-set (dropping it moves `attn_out` by `26%` of peak).
+>
+> **A: the residual hand-back is pinned before the loop relies on it.** With the sublayer silent
+> (`post = 0`, `comb = I`) `hc_post` returns its input **exactly** (`0.0`), which is the property
+> the chain depends on; and the compressor ring's slot is shown to be `position mod capacity`
+> with the position recorded rather than the write count — the state-evolution contract, asserted
+> without any weights.
+>
+> **FINDING — the device's serial decode is not bit-reproducible, and this is the first thing in
+> the rewrite that could not have been found any other way.** The default routed-expert path
+> accumulates with `atomicAdd` (`aeon_moe_fused_w2_accum_kernel`), whose order across the six
+> experts is undefined, so two runs of the same binary differ by ~`1e-7` in `moe_out`. Over 408
+> sequential steps that drift compounds, and any router step whose 6th and 7th candidates sit
+> inside the drift lands on either side. This gate **measured 0–2 such steps per run** with a
+> worst selection-value gap of `8.6e-5`, varying between runs, and produced a `moe_out` difference
+> of up to **`7.0e-3`** of peak — above the `4e-3` tolerance. That is what the third check of
+> section C measures (`drift = 0.0313`, non-zero by construction) and what the
+> `routed_ids_override` seam neutralizes: the comparison is now arithmetic against the device's
+> own selection, while the selection *rule* is asserted separately against the device's own
+> logits — so a flaky near-tie cannot masquerade as a defect, and a rule error still cannot hide.
+> Items 16 and 17 are structurally blind to all of this: they re-seed the residual every step, so
+> their trajectory never accumulates and their near-ties are decided once. The pipeline already
+> carries a deterministic alternative (`deterministic_expert_accumulation_`, a per-expert GEMV
+> plus `v4_pipeline_accumulate_expert_kernel`); this gate deliberately drives the **default**
+> path, and the finding is recorded rather than engineered away, because Gate 22's
+> byte-exact prefix restore and item 19's `chunk ≡ serial` gate are both directly affected by it.
+> **Trap 38.**
+>
+> **What is NOT covered, named so it is not mistaken for coverage.** The real 128-token local
+> window and the real `index_topk = 512` (the window is shrunk to 4 and the top-k to 3, both
+> launch parameters — items 16/17 do the same); the routed experts' own arithmetic (synthetic
+> per-slot payloads, as in item 17 — Tier 1 and item 16 own it); any tiering; and the *batched*
+> path entirely (item 19).
+>
+> **A performance note.** 408 layer-steps, **3m21s**, registered with a 600-second timeout. The
+> cost is the oracle's fp64 matvecs, not the device; it is the price of comparing ~4 300
+> checkpoints against an independent reference, and it stays a single gate rather than being
+> traded for coverage.
+
 **Tier 3 — Sequence.**
 19. **Chunked batched prefill** with one shared layer body. Gate: chunk ≡ serial.
+
 20. **Long-context lifecycle** — ring reuse and boundary compression past context capacity.
 
 **Tier 4 — Integration (only after Tier 3 is fully green).**
@@ -1073,6 +1166,31 @@ mis-wiring: offsetting the saved position by one makes both the APE row (`pos % 
 ring slot (`pos % capacity`) different, and the gate reports **100% of peak** on exactly the two
 lines that exist to see it. **A mutation that does not compile is not a killed mutation.**
 
+**Tier 2 item 18 mutations (2026-09-16, `gfx1100`, the serial loop).** Three mutations, injected
+into `run_layer_body_decoding`'s position and state handling — the places a single-token gate
+cannot reach. **All three killed, and the first two are the point of the tier.**
+
+| # | Mutation | Result |
+| :-- | :--- | :--- |
+| M18-1 | The local ring stops rotating (every token writes slot 0) | **Killed by both gates** — item 16 from position 1 (45 lines, `kv_rot`/`attn_proj`/`res_out` at 100%/82%/61% of peak); the serial gate with 1485 lines |
+| M18-2 | `record_position` always told position 0 — the layer's state never advances | **Killed by the serial gate (577 lines); item 16 is COMPLETELY GREEN (0 failures)** |
+| M18-3 | The compressed entry materialized at window position 0 instead of the boundary | **Killed by the serial gate** — 539 lines, `partial_score`/`partial_kv`/`compressed entry` |
+
+**M18-2 is the strongest argument the tier has produced, and it is the reason the tier exists.**
+Telling the layer that every token is at position 0 corrupts the committed-entry count and the
+local valid count, so the compressed classes attend no rows at all after the first step — and
+**item 16 does not see it, at all**. That is not a gap in item 16's assertions: a Sliding layer
+has no compressed rows and its attention kernel takes `pos` as a launch parameter rather than
+reading the counter, so the quantity the mutation corrupts is *not in that gate's input space*.
+A per-step gate can only ever test the step it was handed. **State that fails to evolve is
+invisible to any comparison that re-seeds its input between steps** — which is precisely the
+structural blindness item 18 was added to remove, now demonstrated rather than asserted.
+
+**M18-1 killing both gates is the useful control**: it shows the two gates are not redundant in
+*either* direction. The ring rotation is visible per step (item 16) and catastrophic across the
+loop (item 18, 1485 lines); the position counter is visible only across the loop. Neither gate
+subsumes the other.
+
 **The M9/M9b finding was the important one, and it contradicted a claim this plan's own gate report made.** Item 14's gate was reported as certifying the asymmetric clamp rule. It did not: every assertion it made was either *oracle-vs-oracle* (the `ClampMode` fork) or a **relative** comparison whose floor was the probe's peak of ~1600, while the entire asymmetric/symmetric difference is bounded by `silu(−limit)·limit` = `4.5e-3`. A kernel that clamped the gate symmetrically passed the gate completely — in both the standalone and the fused form. The claim was wrong, and review would not have caught it because the gate printed `PASS`.
 
 The repair is a **targeted comparison**: select only the entries where the two rules actually disagree (`gate < −limit`) and require the device to match the asymmetric oracle there, by an absolute margin. A `max_abs` over the whole vector cannot express this, because it is dominated by entries the two rules treat identically. Measured after repair: `vs asymmetric = 0.000000` / `0.000002`, `vs symmetric = 0.004540` — roughly 2000× separation, and each check trips only on its own kernel.
@@ -1124,3 +1242,4 @@ These are the specific things that will break this model if implemented naively.
 35. **`sink in the max` is a robustness property, not an observable one — do not mistake a passing output comparison for coverage of it.** The sink must be in the max so that `exp(sink − m) ≤ 1` when the sink dominates; otherwise the exponent is positive and can overflow. But when the sink dominates, the output is zero *either way*, so a gate cannot tell the two implementations apart from the result. Assert finiteness instead, and do not claim the max placement is verified. `[Tier 1]`
 36. **At position 0 every RoPE is the identity, for every base — so position 0 cannot test RoPE at all.** The angle is `pos · inv_freq`, which is `0` at `pos = 0` for every frequency, so `cos = 1, sin = 0` and both the forward rotation and its inverse leave the vector untouched **whichever table was passed**. A gate that only tests the first token is blind to the wrong base class (numeric theta or YaRN), to a rotation applied to the head instead of the tail, and to an omitted inverse rotation — all three at once. Two Tier-2 mutations demonstrated this: the wrong RoPE base and a deleted inverse RoPE each **passed at position 0** and failed from position 1 (`5.4e-2` and `47%` of peak). Sweep positions. Note this is a *gate-design* trap, not a graph trap: the graph is correct here, the test was not. `[Tier 2]`
 37. **A discrete selection cannot be checked against a continuous oracle's inputs — re-derive it from the device's own.** The MoE router's ids are the `top-6` of `sqrt(softplus(logit)) + bias`; a *near-tie* (6th and 7th within the ~`1.2e-3` by which the device's fp16 GEMV and an fp64 oracle disagree on the logits) is then legitimately ordered either way, and the ids differ while the weights match to `8e-3`. Item 17 initially required the ids to equal the oracle's and **8 of 257** HCA tokens failed for this reason alone. The honest test compares the **logits** peak-relative (where precision belongs) and the **selection rule** against the ids re-derived from the **device's own** logits (where the rule belongs), with a `1e-6` allowance for the fp32-vs-fp64 activation. A gate that conflates the two cannot say whether a disagreement is a rule error or a rounding difference. `[Tier 2]`
+38. **A serial decode is not bit-reproducible, and a reference must therefore be driven by the device's own discrete outputs *and* its own state — at every level, not just the top.** The default routed-expert path accumulates with `atomicAdd`, whose order across the six experts is undefined, so `moe_out` differs between two runs of the same binary by ~`1e-7`; over a 408-step loop that compounds, and any router step whose 6th and 7th candidates sit in the drift flips its expert set. Item 18 measured **0–2 such steps per run**, varying between runs, with a `moe_out` difference up to **`7.0e-3`** of peak — **above the `4e-3` tolerance**, i.e. a nondeterministic *failure* of an unconditioned comparison. Two consequences, both now built in: (i) the reference's combine is driven by the device's ids and weights (`routed_ids_override`) while the *rule* is asserted against the device's own logits, so a near-tie cannot masquerade as a defect and a rule error still cannot hide; (ii) a gate that measures the *loop* must compare accumulated **state** — whole rings, all committed entries, all positions — not only the step it just produced, because a per-step comparison is complete at the step level and therefore structurally blind to accumulation. Items 16 and 17 could not have seen any of this: they re-seed the residual every step, so their trajectory never accumulates. The deterministic alternative already in the pipeline (`deterministic_expert_accumulation_`) removes the amplification at its source; Gate 22's byte-exact prefix restore and item 19's `chunk ≡ serial` gate must both decide explicitly which accumulation they require. `[Tier 2]`

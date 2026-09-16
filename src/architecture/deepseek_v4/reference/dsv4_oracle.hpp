@@ -1710,6 +1710,22 @@ struct LayerBodyWeights {
     // The six selected routed experts, swizzled W4A16 payloads.
     const uint8_t* routed_payloads[8]{};
 
+    // Gate seam: the device's own selection, when a gate supplies it. The
+    // selection is a **discrete** quantity, produced by a rule that is certified
+    // separately (Tier-1 gate 13, and the `routed ids and weights follow the rule`
+    // check in the Tier-2 gates). Driving the reference's combine with the
+    // device's own discrete output is what makes the numeric comparison an
+    // arithmetic comparison instead of a coincidence hunt, and it is the same
+    // principle trap 37 records for the indexer. It matters most in a serial loop:
+    // the device's MoE accumulation order is not reproducible, so its trajectory
+    // diverges from any fixed reference and a router near-tie can land on either
+    // side, which would make an unconditioned `moe_out` comparison flaky.
+    //
+    // When these are null — every caller except the serial-decode gate — the
+    // selection is the oracle's own, and nothing below changes.
+    const int32_t* routed_ids_override{nullptr};    // [top_k]
+    const float* routed_weights_override{nullptr};  // [top_k]
+
     // Optional: the same six experts already decoded. A gate that drives many
     // tokens over fixed payloads sets these so the swizzle walk happens once
     // instead of per token — the multi-token compressed gates would otherwise
@@ -2287,7 +2303,22 @@ inline LayerBodyResult layer_body(
 
     // -------------------------------------------------------------------
     // 2.10 — routed experts, then the shared expert.
+    //
+    // A gate may substitute the *device's* own selection here (see
+    // `routed_ids_override`); the term set and the arithmetic are unchanged, and
+    // the rule that produced the selection is certified by the caller. Every
+    // other caller leaves both null and gets the oracle's own selection.
     // -------------------------------------------------------------------
+    if (w.routed_ids_override != nullptr) {
+        out.routed_ids.assign(w.routed_ids_override,
+                              w.routed_ids_override + static_cast<size_t>(shape.top_k));
+    }
+    if (w.routed_weights_override != nullptr) {
+        out.routed_weights.assign(
+            w.routed_weights_override,
+            w.routed_weights_override + static_cast<size_t>(shape.top_k));
+    }
+
     out.routed_expert_outputs.resize(out.routed_ids.size());
     out.routed_sum.assign(hidden, 0.0);
     for (size_t k = 0; k < out.routed_ids.size(); ++k) {
