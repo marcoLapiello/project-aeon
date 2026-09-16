@@ -38,11 +38,12 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 30 infrastructure/backend/text/kept-component/Tier-1 tests |
-| Legacy `ctest` | 32 (the 30 plus 2 gated parity anchors) |
+| Default `ctest` | 31 infrastructure/backend/text/kept-component/Tier-1/Tier-2 tests |
+| Legacy `ctest` | 33 (the 31 plus 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
-| Tier 1 | **COMPLETE — all 11 primitives certified, then mutation-tested.** RMSNorm, RoPE (both bases), MLA Q/KV, HC + Sinkhorn, attention + sink + softmax, compressor + APE, indexer + top-k, grouped output projection, MoE router, routed expert, shared expert. Four real findings: a transposed comb index in the plan, the indexer ReLU missing from the kernel, the plan's normalization-guard claim being wrong, and the combine-order claim describing only the unfused path. **Mutation testing then found two gate defects that review and a green suite had both missed** (see the plan's "Mutation testing" section): the clamp-rule gates could not see a symmetrically-clamped kernel, and the RMSNorm gate could not see a deleted `eps`. 10 mutations: 8 killed, 1 provably equivalent, 0 unclassified. Next: Tier 2 — the layer body |
+| Tier 1 | **COMPLETE — all 11 primitives certified, then mutation-tested.** RMSNorm, RoPE (both bases), MLA Q/KV, HC + Sinkhorn, attention + sink + softmax, compressor + APE, indexer + top-k, grouped output projection, MoE router, routed expert, shared expert. Four real findings: a transposed comb index in the plan, the indexer ReLU missing from the kernel, the plan's normalization-guard claim being wrong, and the combine-order claim describing only the unfused path. **Mutation testing then found two gate defects that review and a green suite had both missed** (see the plan's "Mutation testing" section): the clamp-rule gates could not see a symmetrically-clamped kernel, and the RMSNorm gate could not see a deleted `eps`. 10 mutations: 8 killed, 1 provably equivalent, 0 unclassified. |
+| Tier 2 | **Item 16 done — one full Sliding-class layer body.** `core/v4_layer_body.hpp` (the single layer body, Steps 2.0–2.11 for one token) + `reference/dsv4_oracle.hpp::layer_sliding_body` (composed fp64 reference) + `tests/test_v4_layer_body_oracle.cpp`. Device `res_out` and every named intermediate match the oracle on real `layers.0` weights over ten positions, every checkpoint within `1.1e-3` of its own peak. 5 wiring mutations: 4 killed, 1 shown redundant. The gate also found a defect **in its own oracle** (fp16 widened arithmetically instead of decoded) and produced **trap 36**. Next: item 17 (CSA, then HCA). |
 
 ---
 
@@ -94,10 +95,13 @@ research. None of these are current implementation evidence.
 
 ## 3. Open gates
 
-**Correctness (the active work).** Execute the plan: build the independent oracle
-and gate harness first, then the Tier 1 primitives, then the layer body, then
-compare identical formatted inputs, intermediate checkpoints, and final logits
-against a trusted compatible reference before any placement work.
+**Correctness (the active work).** Execute the plan: the oracle and gate harness are
+built, all eleven Tier-1 primitives are certified and mutation-tested, and **Tier 2 item 16
+is done** — one full Sliding-class layer body (`core/v4_layer_body.hpp`) is gated against the
+composed fp64 reference on real weights. What remains in the tier is the CSA and HCA layer
+classes (item 17) and serial multi-token decode across compressor boundaries (item 18); then
+compare identical formatted inputs, intermediate checkpoints, and final logits against a
+trusted compatible reference before any placement work.
 
 Four gates are settled empirically, not by reading. **One is now closed; three remain:**
 

@@ -160,6 +160,16 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_shared_expert_oracle.cpp)
 endif()
 
+# --- Tier-2 composition: one full layer, versus the composed oracle ----------
+# Tier 1 certified the primitives; a layer fails in the wiring between them, so
+# this gate drives the layer body itself (`core/v4_layer_body.hpp`) on the
+# artifact's real layer-0 weights and compares `res_out` and every intermediate
+# checkpoint against the fp64 composition in `reference/dsv4_oracle.hpp`.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_layer_body_oracle
+        SOURCES tests/test_v4_layer_body_oracle.cpp)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate

@@ -1241,6 +1241,17 @@ inline double half_bits_to_double(uint16_t bits) {
     return sign != 0 ? -value : value;
 }
 
+// Widens a run of fp16 **bit patterns** to doubles. This is not the same
+// operation as constructing `std::vector<double>` from them: that converts each
+// `uint16_t` arithmetically, so a weight of ~0.045 becomes 15360 (its raw bit
+// pattern 0x3C00 read as a number). Anywhere this file consumes an fp16 tensor
+// it must come through here.
+inline std::vector<double> half_bits_to_doubles(const uint16_t* bits, size_t count) {
+    std::vector<double> out(count);
+    for (size_t i = 0; i < count; ++i) out[i] = half_bits_to_double(bits[i]);
+    return out;
+}
+
 // Exact fp16 bit pattern for 2^exponent. Scales in the synthetic fixtures are
 // restricted to powers of two so the encoder needs no fp32->fp16 rounding step:
 // a power of two is representable exactly, and its bits are trivial.
@@ -1488,6 +1499,434 @@ inline std::vector<double> dense_ffn(size_t intermediate, size_t hidden,
 
     return matvec(hidden, intermediate, hidden_act,
                   [&](size_t o, size_t i) { return w2[o * intermediate + i]; });
+}
+
+// ===========================================================================
+// Tier 2 — the Sliding-class layer body (Steps 2.0 … 2.11)
+// ===========================================================================
+//
+// This is not a new primitive. It is the *composition* the Tier-2 gate exists to
+// certify: Tier 1 proved each piece, and the failure mode of a layer is the
+// wiring between them, not the pieces.
+//
+// Written from the plan's Step 2 for a ratio-0 (Sliding) layer, in the order the
+// plan states, and built entirely from this file's primitives so that the
+// composition is the only new thing under test:
+//
+//   2.0    HC attention pre-mix + Sinkhorn            -> x_pre
+//   2.1    attention RMSNorm                          -> x_norm
+//   2.2    MLA Q path (q_lora -> q_norm -> wq_b -> per-head norm), KV path
+//   2.3    RoPE forward on q and kv, *sliding* base (theta 10000, plain)
+//   2.4.1  local sliding-window attention + sink
+//   2.3    inverse RoPE on the attention-output tail
+//   2.5    grouped wo_a [8,1024,4096] then wo_b [4096,8192]
+//   2.6    HC attention post-mix                      -> res_mid
+//   2.7    HC FFN pre-mix + Sinkhorn
+//   2.8    FFN RMSNorm
+//   2.9    router (hash on layers < 3, biased flat top-6 otherwise)
+//   2.10   routed experts + shared expert, clamped SwiGLU
+//   2.10.5 combine: routed sum first, then `+= shared`
+//   2.11   HC FFN post-mix                            -> res_out
+//
+// Deliberately absent, and that absence is itself a property the gate asserts:
+// the compressor, the indexer, and the compressed row-set. A Sliding layer must
+// never read those tensors (traps 4 and 33) — layers 0 and 1 have no compressor
+// and no indexer at all, and running one on them would read tensors the artifact
+// does not contain. There is no state for them in `SlidingKvRing` and no code
+// path here that could consult them.
+//
+// Ordering note, because it is the one place this composition is a *choice*.
+// Step 2.10.5 fixes the term set — `Σ_k w_k·down_k` plus the shared expert — but
+// the reference has two orderings of it: an unfused `final += shared` and a fused
+// form that passes the shared weights into the MoE kernel. Our engine mirrors the
+// fused form; this oracle writes the unfused `routed_sum + shared`. The term set
+// is identical and only the fp rounding order differs, so a gate comparing them
+// must allow the reassociation — it is not evidence of a defect.
+
+struct LayerBodyShape {
+    uint32_t hidden{4096};
+    uint32_t hc_mult{4};
+    uint32_t q_lora_rank{1024};
+    uint32_t num_heads{64};
+    uint32_t head_dim{512};
+    uint32_t rotary_dim{64};
+    uint32_t o_groups{8};
+    uint32_t o_lora_rank{1024};
+    uint32_t intermediate{2048};
+    uint32_t num_experts{256};
+    uint32_t top_k{6};
+    uint32_t local_capacity{128};
+
+    double eps{1e-6};            // every RMSNorm site in this graph
+    double routed_scaling{1.5};
+    double swiglu_limit{10.0};
+
+    uint32_t hc_dim() const noexcept { return hc_mult * hidden; }
+    uint32_t hc_mult3() const noexcept { return hc_mult * (2 + hc_mult); }
+    uint32_t total_q() const noexcept { return num_heads * head_dim; }
+    uint32_t group_dim() const noexcept { return (num_heads / o_groups) * head_dim; }
+    uint32_t total_o_lora() const noexcept { return o_groups * o_lora_rank; }
+    double attn_scale() const noexcept {
+        return 1.0 / std::sqrt(static_cast<double>(head_dim));
+    }
+};
+
+// One Sliding layer's tensors, exactly as the artifact stores them. fp16 tensors
+// are passed as their raw 16-bit patterns so the oracle reads the same bits the
+// kernel does, with no widening step that could hide an input rounding question.
+struct SlidingLayerWeights {
+    // Hyper-Connections — fp32 in the checkpoint.
+    const float* hc_attn_fn{nullptr};     // [hc_mult3, hc_dim]
+    const float* hc_attn_base{nullptr};   // [hc_mult3]
+    const float* hc_attn_scale{nullptr};  // [3]
+    const float* hc_ffn_fn{nullptr};      // [hc_mult3, hc_dim]
+    const float* hc_ffn_base{nullptr};    // [hc_mult3]
+    const float* hc_ffn_scale{nullptr};   // [3]
+
+    // Attention — fp16 (raw bits), except the sink which is fp32.
+    const uint16_t* attn_norm{nullptr};   // [hidden]
+    const uint16_t* wq_a{nullptr};        // [q_lora_rank, hidden]
+    const uint16_t* q_norm{nullptr};      // [q_lora_rank]
+    const uint16_t* wq_b{nullptr};        // [total_q, q_lora_rank]
+    const uint16_t* wkv{nullptr};         // [head_dim, hidden]
+    const uint16_t* kv_norm{nullptr};     // [head_dim]
+    const float* attn_sink{nullptr};      // [num_heads]
+    const uint16_t* wo_a{nullptr};        // [o_groups * o_lora_rank, group_dim]
+    const uint16_t* wo_b{nullptr};        // [hidden, total_o_lora]
+
+    // FFN — fp16, plus fp32 bias / an int64 hash table row.
+    const uint16_t* ffn_norm{nullptr};      // [hidden]
+    const uint16_t* gate_weight{nullptr};   // [num_experts, hidden]
+    const float* gate_bias{nullptr};        // [num_experts], null on hash layers
+    const int64_t* tid2eid_row{nullptr};    // [top_k], null on biased layers
+    const uint16_t* shared_w1{nullptr};     // [intermediate, hidden]
+    const uint16_t* shared_w3{nullptr};     // [intermediate, hidden]
+    const uint16_t* shared_w2{nullptr};     // [hidden, intermediate]
+
+    // The six selected routed experts, swizzled W4A16 payloads.
+    const uint8_t* routed_payloads[8]{};
+};
+
+// The local ring. Key and value are the **same** row (trap 6), but the graph
+// keeps two caches, so the oracle does too: an implementation that only wrote one
+// of them would otherwise pass unnoticed.
+struct SlidingKvRing {
+    uint32_t capacity{0};
+    uint32_t head_dim{0};
+    std::vector<double> keys;       // [capacity * head_dim], rotated
+    std::vector<double> values;     // [capacity * head_dim]
+    std::vector<int64_t> positions; // [capacity], -1 = never written
+
+    void reset(uint32_t cap, uint32_t dim) {
+        capacity = cap;
+        head_dim = dim;
+        keys.assign(static_cast<size_t>(cap) * dim, 0.0);
+        values.assign(static_cast<size_t>(cap) * dim, 0.0);
+        positions.assign(cap, -1);
+    }
+
+    void store(uint32_t slot, int64_t position, const std::vector<double>& row) {
+        const size_t at = static_cast<size_t>(slot) * head_dim;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            keys[at + d] = row[d];
+            values[at + d] = row[d];
+        }
+        positions[slot] = position;
+    }
+
+    // The rows attention reads: every written slot whose position lies in
+    // `[current_pos - (capacity - 1), current_pos]`, i.e. exactly
+    // `min(current_pos + 1, capacity)` keys. Slot order is *not* meaningful —
+    // the online softmax is order-invariant — so the rows are returned in slot
+    // order, which is also the order the kernel's loop uses.
+    std::vector<size_t> gather(int64_t current_pos) const {
+        std::vector<size_t> slots;
+        const int64_t first = std::max<int64_t>(
+            0, current_pos - static_cast<int64_t>(capacity) + 1);
+        for (uint32_t slot = 0; slot < capacity; ++slot) {
+            const int64_t p = positions[slot];
+            if (p >= first && p <= current_pos) slots.push_back(slot);
+        }
+        return slots;
+    }
+};
+
+struct LayerBodyResult {
+    // Hyper-Connections (attention sublayer)
+    std::vector<double> mixes_a;    // [hc_mult3]
+    std::vector<double> pre_a;      // [hc_mult]
+    std::vector<double> post_a;     // [hc_mult]
+    std::vector<double> comb_a;     // [hc_mult * hc_mult]
+    std::vector<double> x_pre;      // [hidden]
+
+    // MLA + attention
+    std::vector<double> x_norm;     // [hidden]
+    std::vector<double> q_lora;     // [q_lora_rank]
+    std::vector<double> q_lora_norm;// [q_lora_rank]
+    std::vector<double> q;          // [total_q] after the per-head norm
+    std::vector<double> q_rot;      // [total_q] after RoPE
+    std::vector<double> kv_norm;    // [head_dim]
+    std::vector<double> kv_rot;     // [head_dim] — the row written to the ring
+    std::vector<double> attn_out;   // [total_q] before inverse RoPE
+    std::vector<double> attn_inv;   // [total_q] after inverse RoPE
+    std::vector<double> z;          // [total_o_lora]
+    std::vector<double> attn_proj;  // [hidden]
+
+    // Hyper-Connections (FFN sublayer) + residual
+    std::vector<double> res_mid;    // [hc_dim]
+    std::vector<double> mixes_f;    // [hc_mult3]
+    std::vector<double> pre_f;      // [hc_mult]
+    std::vector<double> post_f;     // [hc_mult]
+    std::vector<double> comb_f;     // [hc_mult * hc_mult]
+    std::vector<double> ffn_pre;    // [hidden]
+
+    // FFN
+    std::vector<double> ffn_norm;   // [hidden]
+    std::vector<double> router_logits;   // [num_experts]
+    std::vector<int32_t> routed_ids;     // [top_k]
+    std::vector<double> routed_weights;  // [top_k]
+    std::vector<std::vector<double>> routed_expert_outputs; // [top_k][hidden]
+    std::vector<double> routed_sum;      // [hidden]
+    std::vector<double> shared_out;      // [hidden]
+    std::vector<double> moe_out;         // [hidden]
+
+    // Layer output
+    std::vector<double> res_out;    // [hc_dim]
+    uint32_t local_keys_read{0};    // how many ring rows attention actually read
+};
+
+// One full Sliding layer for one token. `residual` is `[hc_mult * hidden]` (the
+// four HC streams); `ring` is updated in place with the token's own rotated key
+// **before** attention reads it, exactly as step D does in the pipeline.
+inline LayerBodyResult layer_sliding_body(
+    const LayerBodyShape& shape,
+    const SlidingLayerWeights& w,
+    const RopeTableRef& rope,
+    uint32_t position,
+    const std::vector<double>& residual,
+    SlidingKvRing& ring) {
+    if (residual.size() != shape.hc_dim()) {
+        throw std::invalid_argument("dsv4_oracle: layer body residual has the wrong width");
+    }
+    if (ring.capacity != shape.local_capacity || ring.head_dim != shape.head_dim) {
+        throw std::invalid_argument("dsv4_oracle: layer body ring does not match the shape");
+    }
+
+    const size_t hidden = shape.hidden;
+    const size_t head_dim = shape.head_dim;
+    const size_t num_heads = shape.num_heads;
+    const auto f16 = [](const uint16_t* p, size_t index) {
+        return half_bits_to_double(p[index]);
+    };
+
+    const HcParams hc_params;
+
+    // -------------------------------------------------------------------
+    // 2.0 — HC attention pre-mix + Sinkhorn -> x_pre
+    // -------------------------------------------------------------------
+    LayerBodyResult out;
+    out.mixes_a = hc_mixes(
+        residual, shape.hc_mult3(),
+        [&](size_t m, size_t k) {
+            return static_cast<double>(w.hc_attn_fn[m * shape.hc_dim() + k]);
+        },
+        shape.hc_dim(), hc_params.rms_eps);
+
+    {
+        HcPreResult hc;
+        std::vector<double> scale(w.hc_attn_scale, w.hc_attn_scale + 3);
+        std::vector<double> base(
+            w.hc_attn_base, w.hc_attn_base + shape.hc_mult3());
+        hc_sinkhorn(out.mixes_a, scale, base, shape.hc_mult, hc_params, hc);
+        out.pre_a = std::move(hc.pre_mix);
+        out.post_a = std::move(hc.post_mix);
+        out.comb_a = std::move(hc.comb);
+    }
+    out.x_pre = hc_pre_combine(residual, out.pre_a, hidden);
+
+    // -------------------------------------------------------------------
+    // 2.1 — attention RMSNorm
+    // -------------------------------------------------------------------
+    out.x_norm = rmsnorm(out.x_pre, half_bits_to_doubles(w.attn_norm, hidden), shape.eps);
+
+    // -------------------------------------------------------------------
+    // 2.2 — MLA Q and KV paths
+    // -------------------------------------------------------------------
+    {
+        MlaQPath q = mla_q_path(
+            out.x_norm,
+            half_bits_to_doubles(w.q_norm, shape.q_lora_rank),
+            shape.q_lora_rank, num_heads, head_dim, shape.eps,
+            [&](size_t o, size_t i) { return f16(w.wq_a, o * hidden + i); },
+            [&](size_t o, size_t i) {
+                return f16(w.wq_b, o * shape.q_lora_rank + i);
+            });
+        out.q_lora = std::move(q.q_lora);
+        out.q_lora_norm = std::move(q.q_lora_norm);
+        out.q = std::move(q.q);
+
+        out.kv_norm = mla_kv_path(
+            out.x_norm,
+            half_bits_to_doubles(w.kv_norm, head_dim),
+            head_dim, shape.eps,
+            [&](size_t o, size_t i) { return f16(w.wkv, o * hidden + i); });
+    }
+
+    // -------------------------------------------------------------------
+    // 2.3 — RoPE forward (sliding base) on q (per head) and kv, then the ring
+    //       write. The token's own key is in the cache before attention runs.
+    // -------------------------------------------------------------------
+    out.q_rot = out.q;
+    for (size_t h = 0; h < num_heads; ++h) {
+        std::vector<double> row(out.q_rot.begin() + h * head_dim,
+                                out.q_rot.begin() + (h + 1) * head_dim);
+        rope_apply_tail(row, rope, position, /*inverse=*/false);
+        std::copy(row.begin(), row.end(), out.q_rot.begin() + h * head_dim);
+    }
+
+    out.kv_rot = out.kv_norm;
+    rope_apply_tail(out.kv_rot, rope, position, /*inverse=*/false);
+    ring.store(static_cast<uint32_t>(position) % shape.local_capacity,
+               static_cast<int64_t>(position), out.kv_rot);
+
+    // -------------------------------------------------------------------
+    // 2.4.1 — local sliding-window attention + sink. Ratio 0: local rows only.
+    // -------------------------------------------------------------------
+    const std::vector<double> sink(w.attn_sink, w.attn_sink + num_heads);
+
+    {
+        const std::vector<size_t> slots = ring.gather(static_cast<int64_t>(position));
+        out.local_keys_read = static_cast<uint32_t>(slots.size());
+
+        std::vector<double> keys(slots.size() * head_dim, 0.0);
+        for (size_t j = 0; j < slots.size(); ++j) {
+            std::copy(ring.keys.begin() + slots[j] * head_dim,
+                      ring.keys.begin() + (slots[j] + 1) * head_dim,
+                      keys.begin() + j * head_dim);
+        }
+        out.attn_out = attention_scores_sink(
+            out.q_rot, num_heads, head_dim, keys, slots.size(), sink,
+            shape.attn_scale());
+    }
+
+    // -------------------------------------------------------------------
+    // 2.3 (inverse) — rotate the attention output tail back, before 2.5.
+    // -------------------------------------------------------------------
+    out.attn_inv = out.attn_out;
+    for (size_t h = 0; h < num_heads; ++h) {
+        std::vector<double> row(out.attn_inv.begin() + h * head_dim,
+                                out.attn_inv.begin() + (h + 1) * head_dim);
+        rope_apply_tail(row, rope, position, /*inverse=*/true);
+        std::copy(row.begin(), row.end(), out.attn_inv.begin() + h * head_dim);
+    }
+
+    // -------------------------------------------------------------------
+    // 2.5 — grouped low-rank output projection, then wo_b
+    // -------------------------------------------------------------------
+    out.z = grouped_wo_a(
+        1, shape.o_groups, shape.o_lora_rank, shape.group_dim(), out.attn_inv,
+        [&](size_t wi) { return f16(w.wo_a, wi); });
+
+    out.attn_proj = matvec(
+        hidden, shape.total_o_lora(), out.z,
+        [&](size_t o, size_t i) { return f16(w.wo_b, o * shape.total_o_lora() + i); });
+
+    // -------------------------------------------------------------------
+    // 2.6 — HC attention post-mix -> res_mid
+    // -------------------------------------------------------------------
+    out.res_mid = hc_post(out.attn_proj, residual, out.post_a, out.comb_a, hidden);
+
+    // -------------------------------------------------------------------
+    // 2.7 — HC FFN pre-mix + Sinkhorn
+    // -------------------------------------------------------------------
+    out.mixes_f = hc_mixes(
+        out.res_mid, shape.hc_mult3(),
+        [&](size_t m, size_t k) {
+            return static_cast<double>(w.hc_ffn_fn[m * shape.hc_dim() + k]);
+        },
+        shape.hc_dim(), hc_params.rms_eps);
+    {
+        HcPreResult hc;
+        std::vector<double> scale(w.hc_ffn_scale, w.hc_ffn_scale + 3);
+        std::vector<double> base(
+            w.hc_ffn_base, w.hc_ffn_base + shape.hc_mult3());
+        hc_sinkhorn(out.mixes_f, scale, base, shape.hc_mult, hc_params, hc);
+        out.pre_f = std::move(hc.pre_mix);
+        out.post_f = std::move(hc.post_mix);
+        out.comb_f = std::move(hc.comb);
+    }
+    out.ffn_pre = hc_pre_combine(out.res_mid, out.pre_f, hidden);
+
+    // -------------------------------------------------------------------
+    // 2.8 — FFN RMSNorm
+    // -------------------------------------------------------------------
+    out.ffn_norm = rmsnorm(out.ffn_pre, half_bits_to_doubles(w.ffn_norm, hidden), shape.eps);
+
+    // -------------------------------------------------------------------
+    // 2.9 — router. Hash table on layers < 3 (no bias, no top-k); biased flat
+    //       top-6 otherwise.
+    // -------------------------------------------------------------------
+    out.router_logits = matvec(
+        shape.num_experts, hidden, out.ffn_norm,
+        [&](size_t o, size_t i) { return f16(w.gate_weight, o * hidden + i); });
+
+    if (w.tid2eid_row != nullptr) {
+        const std::vector<int64_t> row(
+            w.tid2eid_row, w.tid2eid_row + shape.top_k);
+        const RouterSelection sel =
+            router_hash(out.router_logits, row, shape.routed_scaling);
+        out.routed_ids = sel.ids;
+        out.routed_weights = sel.weights;
+    } else {
+        std::vector<double> bias;
+        if (w.gate_bias != nullptr) {
+            bias.assign(w.gate_bias, w.gate_bias + shape.num_experts);
+        }
+        const RouterSelection sel =
+            router_topk(out.router_logits, bias, shape.top_k, shape.routed_scaling);
+        out.routed_ids = sel.ids;
+        out.routed_weights = sel.weights;
+    }
+
+    // -------------------------------------------------------------------
+    // 2.10 — routed experts, then the shared expert.
+    // -------------------------------------------------------------------
+    out.routed_expert_outputs.resize(out.routed_ids.size());
+    out.routed_sum.assign(hidden, 0.0);
+    for (size_t k = 0; k < out.routed_ids.size(); ++k) {
+        const uint8_t* payload = w.routed_payloads[k];
+        if (payload == nullptr) {
+            throw std::invalid_argument(
+                "dsv4_oracle: layer body is missing a routed expert payload");
+        }
+        out.routed_expert_outputs[k] = expert_ffn(
+            payload, out.ffn_norm, shape.swiglu_limit);
+        for (size_t i = 0; i < hidden; ++i) {
+            out.routed_sum[i] += out.routed_weights[k] * out.routed_expert_outputs[k][i];
+        }
+    }
+
+    out.shared_out = dense_ffn(
+        shape.intermediate, hidden, out.ffn_norm,
+        half_bits_to_doubles(w.shared_w1,
+            static_cast<size_t>(shape.intermediate) * hidden),
+        half_bits_to_doubles(w.shared_w3,
+            static_cast<size_t>(shape.intermediate) * hidden),
+        half_bits_to_doubles(w.shared_w2,
+            static_cast<size_t>(hidden) * shape.intermediate),
+        shape.swiglu_limit);
+
+    // 2.10.5 — the term set is `routed_sum + shared`. See the ordering note.
+    out.moe_out.assign(hidden, 0.0);
+    for (size_t i = 0; i < hidden; ++i) {
+        out.moe_out[i] = out.routed_sum[i] + out.shared_out[i];
+    }
+
+    // -------------------------------------------------------------------
+    // 2.11 — HC FFN post-mix -> res_out, which is the next layer's res_in.
+    // -------------------------------------------------------------------
+    out.res_out = hc_post(out.moe_out, out.res_mid, out.post_f, out.comb_f, hidden);
+    return out;
 }
 
 } // namespace aeon::reference

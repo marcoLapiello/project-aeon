@@ -775,9 +775,80 @@ Build and certify in this order. Each item's gate must be green before the next 
 15. ~~**Shared expert** — separately.~~ **DONE.** `tests/test_v4_shared_expert_oracle.cpp`, 22 lines green. Structure checked against the artifact (F16, exact byte counts, present on every sampled layer), numerics on synthetic and real `layers.3` tensors (`2.1e-4` to `4.4e-4`), and the combine measured on the device to apply shared exactly once. **No defect found.** Two findings recorded: the clamp is **inert at the shared expert's nominal activation scale** (peaks `4.77`/`4.71` against a limit of `10`, no-clamp delta `0.0`) and engages only when scaled to 8×; and the pipeline folds shared into the accumulation as `initial_output`, which mirrors the reference's fused path rather than its unfused `+=` order. **Tier 1 is complete.**
 
 **Tier 2 — Composition.**
-16. **One full layer, Sliding class.** Verify `res_out` for a single token.
+16. ~~**One full layer, Sliding class.** Verify `res_out` for a single token.~~ **DONE.** `core/v4_layer_body.hpp` (the layer body, Steps 2.0–2.11, one token) + `reference/dsv4_oracle.hpp::layer_sliding_body` (the composed fp64 reference) + `tests/test_v4_layer_body_oracle.cpp`. Device `res_out` and every named intermediate match the oracle on the artifact's real `layers.0` weights, for ten positions (the local ring is shrunk to 6 so the wrap is exercised). Every checkpoint is within **`1.1e-3` of its own peak**, which is the fp16 store and nothing else. Three mutations killed, one equivalent; and the gate found **a defect in the oracle itself** — a fp16 tensor widened with `std::vector<double>(uint16_t*, …)`, which converts the bit pattern arithmetically (`0x3C00` → `15360`) instead of decoding it. See the gate result below. **Next: item 17.**
 17. **Full layer, CSA class.** Then **HCA class**.
 18. **Serial multi-token decode.** Verify state evolution across compressor boundaries.
+
+> **Gate result (Tier 2, item 16) — CERTIFIED, and the gate found a defect in its own oracle.**
+> `tests/test_v4_layer_body_oracle.cpp`, **31 lines green**; the default suite is **31 tests**.
+>
+> **What was built, and why it is structured this way.** The layer body is a new module
+> (`core/v4_layer_body.hpp`) rather than a copy of an existing loop. It is not wired into
+> `core/v4_pipeline.hpp`: that file is the **pre-rewrite** graph, gated off behind
+> `AEON_ENABLE_LEGACY_V4_GRAPH` and slated for deletion, so the rewrite must not acquire a
+> dependency on it. The body instead takes its model-level inputs (the two RoPE bases), an
+> **observer** (the attention trace) and a **routed-expert executor** (the whole tiered
+> supply system: index lookup, Hot/Warm/Cold promotion, prefetch, leases, staging) as
+> parameters. One body is then shared by decode, batched prefill and this gate, which is
+> what Part III requires — and the seam is what makes the gate possible at all, because it
+> lets the gate supply experts directly instead of standing up the storage system.
+>
+> **A: the oracle is pinned to a closed form.** `hc_post` with an identity comb and unit
+> post-mix reproduces `res[j][h] = res_in[j][h] + layer_out[h]` exactly (`0.0` differ), and
+> an asymmetric comb is shown to separate the contraction/output reading by `0.25`.
+>
+> **B: the composition, on real weights.** Ten tokens at positions 0–9 through one
+> `layers.0` Sliding layer, comparing `x_pre`, `x_norm`, `q_rot`, `kv_rot`, `attn_proj`,
+> `ffn_norm`, `moe_out` and `res_out`, plus exact equality of the six routed ids. Measured
+> worst case per checkpoint, as a fraction of that checkpoint's own peak:
+>
+> | checkpoint | worst error (× peak) |
+> | :--- | ---: |
+> | `x_pre` (HC attention pre-combine) | `4.9e-4` |
+> | `x_norm` (attention RMSNorm) | `8.9e-4` |
+> | `q_rot` (MLA + per-head norm + RoPE) | `2.0e-2` → `2.6e-3` of peak |
+> | `kv_rot` (single shared K=V row) | `1.6e-2` → `2.0e-3` of peak |
+> | `attn_proj` (attention + inverse RoPE + grouped wo) | `6.2e-2` → `2.3e-3` of peak |
+> | `ffn_norm` | `7.4e-2` → `1.1e-3` of peak |
+> | `moe_out` (routed + shared) | `5.0e-2` → `1.0e-3` of peak |
+> | `res_out` (the layer output) | `3.2e-2` → `1.1e-3` of peak |
+>
+> The tolerance is `3e-3` of peak, i.e. ~3× the measured floor. **The comparison basis is a
+> deliberate choice and it is not `max_rel`.** The chain stores every stage in fp16, so the
+> honest question is "how far off, as a fraction of this tensor's scale". `max_rel` is
+> dominated by elements sitting on its floored denominator on a tensor whose values span
+> three decades, which is why the raw `max_rel` column reads `2e-2` while the same data is
+> `2.6e-3` of peak. This is the third time in the rewrite that a relative tolerance was the
+> wrong instrument; prefer peak-relative whenever the quantity spans decades.
+>
+> **The routed ids are exact, by construction.** On a hash layer the ids come from the
+> artifact's own `tid2eid`, in table-column order, so a score-sorted or bias-applied router
+> cannot reproduce them.
+>
+> **C: the composition is load-bearing.** Four properties are shown to move the layer output
+> before any pass is trusted: the attention RMSNorm (`25%` of the q-lora peak when skipped —
+> measured at `q_lora`, not at `q`, because the per-head norm re-normalises and would damp
+> the difference to `2.7%`, too weak to catch a missing norm); the attention path itself
+> (`35%` of peak when zeroed); the shared expert's presence in the combine (item 15's
+> property, re-observed at layer scale); and the grouped projection's group-major layout
+> (`1.92` when read interleaved).
+>
+> **What is NOT covered, named so it is not mistaken for coverage.** The compressed classes
+> (item 17); the real 128-token local-window rollover (the ring is shrunk to 6 so the wrap
+> is reachable in ten tokens — a faithful mini-model, since the window length is a launch
+> parameter, but not the model's own window); and any tiering (the gate supplies experts
+> directly).
+>
+> **A defect the gate found in its own oracle, and how.** The oracle read every fp16 weight
+> through `std::vector<double>(fp16_bits, fp16_bits + n)` — which **converts** each
+> `uint16_t` arithmetically, so the `0.045` norm weight became `15360` (its bit pattern
+> `0x3C00` read as a number) and the layer's checkpoints came out at `3.5e4` where the device
+> said `0.096`. `half_bits_to_doubles` now does the decode, and a **fixture check** was added
+> that compares every host-side weight pointer against the device's uploaded copy — that is
+> the line that would have caught it in one run instead of three. The lesson is narrower than
+> "check your inputs": the failure was legible *only* because the report prints each
+> checkpoint's peak. An absolute or relative error alone could not distinguish "the oracle is
+> 3.5e4 out" from "the device is broken".
 
 **Tier 3 — Sequence.**
 19. **Chunked batched prefill** with one shared layer body. Gate: chunk ≡ serial.
@@ -835,6 +906,46 @@ Ten mutations were run across nine kernels (2026-09-15, `gfx1100`). **Eight were
 | M9 | `v4_pipeline_swiglu_clamp_kernel`: symmetric gate clamp | expert §B | **SURVIVED** → gate repaired → **killed** |
 | M9b | `aeon_swiglu_clamped` (fused W13): symmetric gate clamp | expert §C | **SURVIVED** → gate repaired → **killed** |
 
+**Tier 2 mutations (2026-09-16, `gfx1100`, layer body).** Five mutations were injected
+into the *layer body's wiring* — not into a kernel, because Tier 1 already owns the
+kernels and the thing a layer gate must be able to see is a mis-wiring. **Four were
+killed, one is redundant by construction.** 
+
+| # | Mutation (injected into `run_layer_body_decoding`) | Result |
+| :-- | :--- | :--- |
+| M16-1 | Sliding layer rotated with the **compressed** RoPE base | **Killed** — `q_rot`/`kv_rot`/`attn_proj`/`res_out` at `5.4e-2` of peak vs a `3e-3` tolerance |
+| M16-2 | Attention and FFN sublayers swap their HC parameter sets | **Killed** — `x_pre` at **100%** of peak, from position 0 |
+| M16-3 | FFN pre-mix reads `pre_a` instead of `pre_f` | **Killed** — `ffn_norm` at `61%` of peak |
+| M16-4 | Inverse RoPE on the attention output **omitted** (trap 8) | **Killed** — `attn_proj` at `47%` of peak |
+| M16-5 | MoE accumulation buffer **not cleared** before the shared expert | **SURVIVED — redundant, not a gate defect** (see below) |
+
+**M16-1 and M16-4 exposed the same real limitation, and it is now trap 36.** Both mutations
+pass at **position 0** and fail from position 1 on. At position 0 the rotation angle is
+`0 · inv_freq = 0` for *every* frequency and *every* base, so `cos = 1, sin = 0` and both
+the forward and inverse rotation are the identity regardless of which table was used. A gate
+that samples only the first token is therefore **blind to every RoPE question there is** —
+the base class, the rotation, and its inverse. The multi-position sweep is not padding; it
+is the only thing that makes those three properties observable.
+
+**M16-5 survived, and the honest classification is "provably redundant", not "equivalent
+mutation hiding a defect".** Removing the clear changes nothing because the shared expert's
+W2 GEMV **writes** row 0 of the accumulation buffer before the routed accumulate reads it,
+and the remaining `M_PAD − 1` rows that the clear covers are never read from that buffer.
+The experiment is the gate itself: under the mutation, **ten consecutive tokens run with no
+clear anywhere** and every one of them still matches, so the stale content demonstrably
+cannot reach the output. This is recorded rather than repaired, because there is no assertion
+to strengthen — the clear is simply not load-bearing. (It is also not free: it clears sixteen
+rows where one is consumed. Left as-is; it is a kernel-inventory question, not a semantics
+one.)
+
+**Procedure note for the next tier.** Two of the five mutations were only visible *after*
+position 0, and one of those was in the plan's own trap list while the other was in the
+gate's own reference implementation. The pattern worth carrying forward: **choose mutation
+data that reaches every branch the property lives in** — a position sweep for anything
+RoPE-shaped, a scaled activation for anything clamp-shaped (item 14's lesson), a
+low-RMS input for anything epsilon-shaped (M1's lesson). And **print the peak**: the oracle
+defect in item 16 was legible only because the report showed each checkpoint's own scale.
+
 **The M9/M9b finding was the important one, and it contradicted a claim this plan's own gate report made.** Item 14's gate was reported as certifying the asymmetric clamp rule. It did not: every assertion it made was either *oracle-vs-oracle* (the `ClampMode` fork) or a **relative** comparison whose floor was the probe's peak of ~1600, while the entire asymmetric/symmetric difference is bounded by `silu(−limit)·limit` = `4.5e-3`. A kernel that clamped the gate symmetrically passed the gate completely — in both the standalone and the fused form. The claim was wrong, and review would not have caught it because the gate printed `PASS`.
 
 The repair is a **targeted comparison**: select only the entries where the two rules actually disagree (`gate < −limit`) and require the device to match the asymmetric oracle there, by an absolute margin. A `max_abs` over the whole vector cannot express this, because it is dominated by entries the two rules treat identically. Measured after repair: `vs asymmetric = 0.000000` / `0.000002`, `vs symmetric = 0.004540` — roughly 2000× separation, and each check trips only on its own kernel.
@@ -884,3 +995,4 @@ These are the specific things that will break this model if implemented naively.
 33. **Only CSA (ratio 4) layers have an indexer. HCA (ratio 128) layers attend *all* committed compressed rows with no selection.** The width is `active_topk_width ≥ seq_len/ratio` (capped at 8192) `[V sparse_mla.py:252-260; V cache_utils.py:938]`. Running an indexer on a ratio-128 layer reads `attn.indexer.*` tensors that **do not exist** in the checkpoint — only ratio-4 layers carry them. The three classes are: ratio 0 = local only, ratio 4 = local + indexer top-512, ratio 128 = local + all compressed. `[Tier 0.2f]`
 34. **The HC comb's flat index is `8 + 4·contraction + output` — contraction first.** The comb's **first** axis is the incoming residual stream being contracted; its **second** axis is the outgoing stream. Evidenced by the reference expansion `torch.einsum("...ij,...ih->...jh", comb_res_mix, residual)` — the comb's first axis is summed against the residual's stream axis `[V mhc/torch.py:96-108]`. This module's 2.0 prose previously stated the opposite, and the correction was made at Tier 1 only because the gate computed both readings: the kernel matches the einsum to `4.0e-4`, the transposed reading is off by `0.52`. **A transposed comb is still doubly stochastic and still produces plausible residuals**, so no closeness test can detect it. Note also that both 2.0 and 2.7 use comb indices, and 2.7 was already right — when the two disagree, that is the signal to re-read the reference. `[Tier 1]`
 35. **`sink in the max` is a robustness property, not an observable one — do not mistake a passing output comparison for coverage of it.** The sink must be in the max so that `exp(sink − m) ≤ 1` when the sink dominates; otherwise the exponent is positive and can overflow. But when the sink dominates, the output is zero *either way*, so a gate cannot tell the two implementations apart from the result. Assert finiteness instead, and do not claim the max placement is verified. `[Tier 1]`
+36. **At position 0 every RoPE is the identity, for every base — so position 0 cannot test RoPE at all.** The angle is `pos · inv_freq`, which is `0` at `pos = 0` for every frequency, so `cos = 1, sin = 0` and both the forward rotation and its inverse leave the vector untouched **whichever table was passed**. A gate that only tests the first token is blind to the wrong base class (numeric theta or YaRN), to a rotation applied to the head instead of the tail, and to an omitted inverse rotation — all three at once. Two Tier-2 mutations demonstrated this: the wrong RoPE base and a deleted inverse RoPE each **passed at position 0** and failed from position 1 (`5.4e-2` and `47%` of peak). Sweep positions. Note this is a *gate-design* trap, not a graph trap: the graph is correct here, the test was not. `[Tier 2]`
