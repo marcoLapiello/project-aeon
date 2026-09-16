@@ -24,13 +24,15 @@
 // "identical artifact, different result on reload" (checkpoint plan §6, failure
 // triage).
 //
-// The route each tier takes, and where a defect would live:
+// The route each tier takes:
 //
 //   * **Cold** — `dispatch` submits `O_DIRECT` reads into a `PrefetchStagingArena`
 //     slot, `materialize` waits for every completion and then enqueues the H2D on
-//     the cold SDMA stream. The payload is 13 555 776 bytes, which is **not** a
-//     multiple of the reader's 4 MiB chunk, so each expert is four I/O requests;
-//     a chunk-offset or per-request-length mistake is a plausible bug.
+//     the cold SDMA stream. The payload is 14 155 776 bytes = 3456 sectors, i.e.
+//     `3.375` of the reader's 4 MiB chunks, so `submit_read_chunks` splits each
+//     expert into **four** requests and the last one is short. That is the
+//     reader's intended behaviour, and it means the multi-request path is the one
+//     exercised here rather than a single full-size request.
 //   * **Warm** — the registry's LRU victim is written to a host slot by a D2H on
 //     the demotion stream, and a later promotion uploads it back from that pinned
 //     slot. The demotion destination is chosen by `reserve_warm_destination` and
@@ -40,18 +42,22 @@
 //     staging slot or enqueue a copy.
 //
 // The reference is the **mmapped** expert container (`AeonModelLoader::
-// get_expert_data`), which is a different I/O path from `O_DIRECT` (page cache,
-// not the io_uring ring) and a different route to VRAM than any of the three
-// above. Every tier is therefore compared against something none of them produced.
+// get_expert_data`). This is the same file at the same offsets, reached by a
+// different mechanism: `mmap` faults in page-cache pages, where the supply path
+// reads through `io_uring` with `O_DIRECT` and bypasses the cache. The *content*
+// is therefore identical by construction — it is the file — while the *route*
+// into the comparison is one no tier under test used. That is what lets it serve
+// as the authority: the tiers are checked against the file's own bytes, not
+// against each other, so agreement cannot be produced by a shared mistake.
 //
 // What is asserted:
 //
 //   A. PRECONDITIONS, BEFORE ANY TRANSFER — the artifact's own format descriptor;
-//      that the payload is an exact sector multiple and a non-integral number of
-//      I/O chunks; that the registry saturates VRAM at construction (so every
-//      cold miss must evict a resident, which is the production steady state and
-//      not a warm-up convenience); and that the reference is **not vacuous** —
-//      two different experts' bytes differ, so a comparison can fail.
+//      that the payload is a whole number of sectors and is read as four
+//      requests; that the registry saturates VRAM at construction (so every cold
+//      miss must evict a resident, which is the production steady state and not a
+//      warm-up convenience); and that the reference is **not vacuous** — two
+//      different experts' bytes differ, so a comparison can fail.
 //   B. HOT — the residents the registry claims are the artifact's bytes, filled
 //      here by an `O_DIRECT` read, compared against the mmap path.
 //   C. COLD — three experts requested at once, each a `COLD_MISS` with four I/O
@@ -373,7 +379,7 @@ struct TieringGate {
                         std::to_string(format.num_layers) + " experts=" +
                         std::to_string(format.experts_per_layer));
 
-        assert_that("A: the payload is sector-aligned and a non-integral chunk count",
+        assert_that("A: the payload is sector-aligned and is read as four requests",
                     kPayloadBytes % format.sector_size == 0 && direct_chunks == 4,
                     std::to_string(kPayloadBytes) + "B = " +
                         std::to_string(kPayloadBytes / format.sector_size) + " sectors, " +
