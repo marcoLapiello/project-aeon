@@ -205,6 +205,24 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_layer_body_chunk_oracle.cpp TIMEOUT 600)
 endif()
 
+# --- Tier-3 sequence: the long-context lifecycle ------------------------------
+# Item 20. Every earlier layer-body gate shrinks the local window (to 6, 10, 4)
+# and the index top-k so a wrap fits in a short run, and each names the shrinkage
+# as uncovered. This one runs at the model's own window (128) for 260 tokens —
+# long enough to reuse the ring twice — and asserts *closed forms and invariants*
+# rather than comparing checkpoints against an fp64 reference: the ring's
+# contents are predicted from the token count, the two stores must be
+# bit-identical under each other's writes, and the compressed capacity is shown to
+# be exactly what the declared context produces. Section E demonstrates why the
+# refusal to take a position past capacity is load-bearing rather than decorative
+# (trap 40): a wrapped compressed ring is invisible to the kernel's own position
+# guard, so it would silently turn HCA's "every committed row" into "the newest
+# K". No OPENMP: with no fp64 oracle there is nothing to spread over cores.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_layer_body_lifecycle
+        SOURCES tests/test_v4_layer_body_lifecycle.cpp TIMEOUT 600)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate

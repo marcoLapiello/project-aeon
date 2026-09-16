@@ -63,6 +63,16 @@
 // than 129 tokens, and eight more are needed before the boundary is behind the
 // loop rather than at its end.
 //
+// **Why the stack is {0, 2, 3} and not layer 1.** It is one layer per branch the
+// body can *take*, not a sample of the model. The artifact's classes are
+// `compress_ratios = [0, 0, 4, 128, 4, 128, …]` with `num_hash_layers = 3`, so
+// layer 0 is Sliding+hash, layer 2 is CSA+hash and layer 3 is HCA+biased. Layer 1
+// is the *second* Sliding layer — same attention class as layer 0 and also a hash
+// layer — so it adds no branch on either axis: same code, different weights. The
+// pair 2/3 is chosen because it straddles both boundaries at once (2 = last hash
+// and first CSA; 3 = first biased and first HCA), which is what lets three layers
+// cover three classes and both router branches.
+//
 // What is asserted:
 //
 //   A. ORACLE SELF-CHECK — a closed form for the residual hand-back and the
