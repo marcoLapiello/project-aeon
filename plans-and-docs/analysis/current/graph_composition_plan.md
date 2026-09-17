@@ -359,8 +359,18 @@ them. That is the entire driver.
 
 ## 6. The definitive gap list
 
-Numbered, with the owner and the gate that will certify it. **G1–G5 block the first coherent
-text-in/text-out run.** G6–G14 block what comes after it, in the order they are listed.
+Numbered, with the owner, the gate that will certify it, and the phase that retires it. **The
+classification below is by phase, not by importance, because a first draft of this section split
+the list into "blocks coherence" and "after" and put G9 — the oracle P2's gate *is* — in the second
+group. That was wrong, and the contradiction was visible in P2's own gate line. Anything retired at
+or before P4 is a prerequisite of the first coherent run:**
+
+| Retired in | Gaps | What they are |
+| :--- | :--- | :--- |
+| **P1–P4 — the first coherent run** | **G1, G2, G3, G5, G9** | the host, the driver, the sampler, the binding, and the oracle the driver's gate needs |
+| P5 — diagnostics under tiering | G4, G14 | observer and telemetry wiring; aids, not prerequisites |
+| P6 — chunked prefill | G6, G7, G8 | batched embedding, on-device top-k, the chunk driver |
+| P7 — session state | G10, G11, G12, G13 | the session aggregate, registry, cold store, and R4 |
 
 | # | Missing | Why it is required | Where it goes | Certified by |
 | :-- | :--- | :--- | :--- | :--- |
@@ -383,6 +393,47 @@ Two items are **explicitly not gaps**, and are listed here so they are not mista
 *the routed-expert executor* (built and gated — item 23's first seam, `core/v4_expert_executor.hpp`)
 and *the layer body* (Tier 2/3, certified on real weights).
 
+### 6.1 How many of the 14 are actually new work — seven are lifts
+
+The count "14 gaps" reads as "14 subsystems". It is not, and the difference matters enough to write
+down, because it is the difference between a lost project and an unfinished one. **Seven of the
+fourteen gaps are code that already exists and runs in the pre-rewrite graph** and has to be lifted
+into the rewrite, not invented:
+
+| Gap | Status | Evidence it is a lift, not new work |
+| :--- | :--- | :--- |
+| G1 | **lift** | `V4Pipeline::initialize` (`core/v4_pipeline.hpp:259`) does steps 1–15 today, including the Hot and Warm preload |
+| G2 | **lift + compose** | the 43-call loop and the head stage both exist in `V4Pipeline::step` (`:460`, head at `:1257-1292`); what changes is that the loop must call the **new** body |
+| G4 | **lift** | `V4Pipeline::begin_attention_trace` / `queue_trace_copy` (`:2121`, `:2114`) implement the observer the body now declares |
+| G5 | **rebind** | `tools/aeon_chat.cpp` is complete and works — against `V4Pipeline::generate_until_stop`. Only its engine pointer changes |
+| G10 | **lift** | `V4PipelineStateSnapshot` (`:59`) is already `current_seq_len` + a vector of layer snapshots |
+| G14 | **lift** | `enable_expert_timing` / `collect_expert_timing` (`:150`, `:2239`) and the supply telemetry wiring all exist |
+| G3 | **half-lift** | the GPU argmax pair exists (`kernels/v4_attention.hpp:193,236`); temperature / top-k / top-p and the seam are new |
+
+**Genuinely new work: G6 (batched embedding — small), G7 (on-device indexer top-k — kernel work),
+G8 (the chunk driver over the certified chunk body), G9 (the model-level oracle), G11–G13 (session
+registry, cold store, R4).** That is a bounded, named list, and none of it is a research question.
+
+### 6.2 Why the gaps were invisible until now — a blind spot in the process, not bad luck
+
+This is worth stating plainly, because the same shape will reappear otherwise.
+
+The inference pipeline plan's Part V is an **earning order for primitives**: certify an op, then a
+layer class, then a layer, then a sequence. It has a gate at every step, and every gate passed. But
+**no gate in Tiers 1–3 had "the model produces a token" as its subject** — that subject was item 23,
+the *last* item of Tier 4. So during the whole of the rewrite's tiers the new code had a fine-grained
+signal at the op and layer level and **no end-to-end signal at all**, and 41 of 43 tests green with
+zero end-to-end runs is a perfectly consistent state rather than a contradiction.
+
+The consequence is the sentence that has been repeated as "we are ready for item 23": item 23 was
+not a step, it was **the whole composition, deferred to one slot at the end**, with the host, the
+driver, the sampler, the binding and the oracle all implicit in it. The count of what that slot
+contained was never taken until it was asked for, and the answer was 14.
+
+**What changes from here**, and it is one rule, not a process: *every phase in §7 ends in something
+that runs.* P1 does not end in a certified kernel, it ends in real logits from real weights. P2 ends
+in a token. P4 ends in text. A phase whose gate is another component's gate is not a phase.
+
 ---
 
 ## 7. Build phases
@@ -395,24 +446,36 @@ is the plan's earning order applied to composition: `P0` is already green, so it
 *Spent. The first end seam is closed.*
 
 ### P1 — the head stage
-**Build:** `V4Graph::head_stage` — HC head reduction, final RMSNorm, LM head, fp32 logits readback.
+**Build:** `V4Graph::head_stage` — HC head reduction, final RMSNorm, LM head, fp32 logits readback,
+plus the minimal host subset it needs (steps 1–9 of §5.1: loader → config → spec → contract → budget →
+resources → scratch → streams). **No pools, no registry, no experts** — P1 must not drag in the
+tiering, and it does not need to, because the head stage reads only `embed.weight`,
+`hc_head_fn/base/scale`, `norm.weight` and `head.weight`.
 **Uses:** `hc_head_wave32_kernel`, `v4_rmsnorm_wave32_kernel`, `v4_gemv_fp16_vec8_kernel`,
 `V4ModelResources`, `PipelineScratchBuffers`.
 **Gate:** against a small independent head oracle (`hc_head_reduce` + `rmsnorm` + `matvec`, composed
 explicitly for this gate), on the artifact's real `hc_head_fn/base/scale`, `norm.weight`,
 `head.weight` and `embed.weight`, at ≥ 3 token ids including two non-zero positions. Measured
-peak-relative, at the ~`3e-3`-of-peak floor the layer gates established.
-**Unblocks:** the first logits from real weights. *Nothing may depend on G2 before this is green.*
+peak-relative, at the ~`3e-3`-of-peak floor the layer gates established. **The embedding is part
+of this gate** (plan Step 1: the row is broadcast to 4 HC streams and they must be byte-identical),
+which is what makes P1 the first phase that converts a token id into logits rather than into an
+intermediate.
+**Unblocks:** real logits from real weights, checked end-to-end at the head. *Nothing may depend on
+P2 before this is green.*
 
 ### P2 — the 43-layer driver
-**Build:** `V4Graph::forward_token` = embed + the 43-call loop + P1's head.
+**Build:** `V4Graph::forward_token` = embed + the 43-call loop + P1's head, and the rest of the host
+(steps 10–15 of §5.1: 43 layers, pools, registry, staging, supply, executor, Hot/Warm preload).
 **Uses:** `run_layer_body_decoding`, `V4ModelHost` (G1) — so **G1 and G2 land together**, since the
 loop cannot run without the host and the host is useless without the loop.
-**Gate:** **G9 first** — write `model_body` and require the device logits to match it on a short
-token sequence (≥ 4 tokens so RoPE, the ring wrap and a router near-tie are all reachable; trap 36).
-Tolerance: peak-relative on the logits; the *rule* checks (router ids, row-set counts) asserted
-separately against the device's own values, per trap 37.
-**Unblocks:** numerics. Everything after this is served by a graph that is arithmetically correct.
+**Gate:** **the oracle is the first thing written, not the last** (G9 is a prerequisite of this phase,
+not a follow-up to it — §6's classification now says so). Write `model_body` — embed → 43 ×
+`layer_body` → `hc_head_reduce` → `rmsnorm` → LM head — and require the device logits to match it on a
+short token sequence (≥ 4 tokens so RoPE, the ring wrap and a router near-tie are all reachable;
+trap 36). Tolerance: peak-relative on the logits; the *rule* checks (router ids, row-set counts)
+asserted separately against the device's own values, per trap 37.
+**Unblocks:** numerics. Everything after this is served by a graph that is arithmetically correct,
+and for the first time the new code produces a **token**, not an intermediate.
 
 ### P3 — the sampler and its seam
 **Build:** `core/v4_sampler.hpp`; argmax at `T=1, top_p=1` first (the artifact's own defaults at
@@ -500,6 +563,9 @@ countable today, target zero), streaming under concurrency (P5), and the KV-prec
 ## 10. One-line summary of the state
 
 Every **layer-level** op is built and certified. The **model-level** composition is what is missing:
-the host that owns the parts (G1), the driver that orders them (G2), the sampler with its seam (G3),
-and the binding that makes it text-in/text-out (G5). The plan's premise was true at the layer and
-false at the ends; item 23's first seam closed one end, and P1–P4 close the rest.
+the host that owns the parts (G1), the driver that orders them (G2), the **oracle the driver's gate
+compares against** (G9), the sampler (G3), and the binding that makes it text-in/text-out (G5) —
+those five, and only those five, separate the tree from the first coherent run. The plan's premise
+was true at the layer and false at the ends; item 23's first seam closed one end, and P1–P4 close the
+rest. Six of the fourteen gaps are lifts of code that already runs in the pre-rewrite graph (§6.1),
+so the remaining work is bounded and named rather than open.
