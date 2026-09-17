@@ -25,6 +25,11 @@ streaming, artifact-format and kernel layers are kept; the graph that composes t
   — proves the **input** is sound (structural audit, prompt-encoder oracle, repack round-trip,
   streaming integrity), so that a graph failure is a graph failure. Companion to the specification;
   it does not cover the graph.
+- [Graph Composition Plan](plans-and-docs/analysis/current/graph_composition_plan.md) — **the
+  composition**: one ordered text-in/text-out path, every step mapped to the component that
+  implements it and where it lives, and the definitive list of what does not exist yet. Owns the
+  graph's build phases (P1–P7) and the acceptance criterion. It consumes the specification and
+  re-derives nothing.
 - [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md) — authoritative silicon
   measurements. **Read its banner before comparing any `E2E` entry** — pre-rewrite model-path
   measurements are marked invalid, and they describe a *different computation*, not a slower one.
@@ -71,24 +76,19 @@ Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
 call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
 and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **41 tests** (legacy: 43, which adds exactly the two gated real-weight parity tests).
 
-**Next: item 23's driver — the model head and the 43-layer stack.** Item 23 has begun: its
-first seam, the production routed-expert executor (`core/v4_expert_executor.hpp`), is built and
-gated (`tests/test_v4_expert_executor.cpp`, 12 checks, 5/5 mutations killed), and the gate found
-two real defects in it plus trap 41. What remains is the model head (`hc_head` → final norm →
-LM head), the 43-layer driver, the sampler with its logit-processor seam, and the engine
-assembly. It is the only thing that unblocks anything: the first real multi-turn test, the
-server, and 22b's measurements. Everything else is
-substrate that already exists (the layout, `restore_state`, and the accounting —
-`MemoryBudgetEngine::attention_state_memory()`, which sums all 43 layers) or policy that cannot be
-designed before a graph runs. `V4Layer::restore_state` exists and R3 is certified, but **session swap
-does not need R4**: a session resumed at its own last position restores a ring covering exactly the
-window. R4 (declining a boundary that predates it) and the manager proper — key, block table,
-matching, eviction — are **22b**, blocked on item 23. Remaining open halves: the **indexer top-k's
-per-token host round-trip** in `select_indexer_topk`, target zero, countable today and needing no
-baseline; and item 19(a)'s **batched projections**, which are now the whole of the prefill-throughput
-half — the compressor-ring chunk cap that was said to block it was measured to be false and removed (a
-chunk of 16 is bit-identical to serial). Reasoning and the full sequence: plan items 19, 22, 23 and the
-open-unknowns table.
+**Next: the graph's model-level composition, specified in the** [Graph Composition Plan](plans-and-docs/analysis/current/graph_composition_plan.md). Item 23's first seam,
+the production routed-expert executor (`core/v4_expert_executor.hpp`), is built and gated
+(`tests/test_v4_expert_executor.cpp`, 12 checks, 5/5 mutations killed), and the gate found two real
+defects in it plus trap 41. What reconnaissance established is that the plan's premise holds at the
+*layer* and fails at the *ends*: every layer-level op is built and certified, but the model-level
+composition has no code. Missing: the **engine assembly** (loader → config → contract → budget →
+resources → 43 layers → scratch → streams → pools → registry → staging → supply → executor, plus
+the Hot/Warm preload — today only `V4Pipeline::initialize`, which is behind the legacy gate), the
+**43-layer driver and head stage** (`run_layer_body_decoding` is per *layer*; nothing calls `hc_head`
+→ final norm → LM head outside the legacy `step()`), the **sampler with its non-deferrable
+logit-processor seam** (only argmax exists), and the **end-to-end binding** — `tools/aeon_chat.cpp`
+is a legacy target. One body, one accumulation, one assembly; the composition plan owns the ordered
+list, the phases and their gates.
 
 **Needs a decision — a numbering conflict.** "Item 21" currently names two different gates: the plan's
 Tier 4 item 21 is streaming/tiering, while `plans-and-docs/status/DOCUMENTATION_STATUS.md` and older notes use it for the comparison
