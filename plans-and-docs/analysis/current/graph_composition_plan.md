@@ -775,7 +775,7 @@ Two constants in `memory_budget.hpp` are not measurements:
 Both are folded into item 1's work rather than fixed now, because the correct form of the batch term
 depends on the chunk size this phase chooses. (The rest of the budget audit landed on 2026-09-17 —
 uploaded-dense accounting, usable-VRAM planning, and the host cap — and is recorded in
-[PERFORMANCE_LEDGER](../status/PERFORMANCE_LEDGER.md) **M28b**, which also carries the
+[PERFORMANCE_LEDGER](../status/PERFORMANCE_LEDGER.md) **M28**, which also carries the
 before/after VRAM measurement: **`21.99 GiB → 23.76 GiB`** of the card, `675 → 809` Hot slots.)
 
 ### P7 — session swap

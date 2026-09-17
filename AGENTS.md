@@ -93,7 +93,7 @@ What is the capital of France?  ->  The capital of France is **Paris**.
 EOS-reached, 43 layers, on the artifact's real weights through Hot/Warm/Cold — the plan's acceptance
 criterion, and the same sentence the pre-rewrite graph produced.
 
-**A resource-accounting correction landed with P4 (ledger M28b).** The budget reserved
+**A resource-accounting correction landed with P4 (ledger M28).** The budget reserved
 `dense_file_size()` — the whole container — while the graph uploads only what the contract
 enumerates, so **1.957 GiB** was reserved for VRAM never touched (`embed.weight`, read from the host
 mmap, and the unused `mtp.*` draft head). Reserving it cost 148 Hot expert slots. The budget now

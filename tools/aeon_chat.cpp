@@ -303,6 +303,28 @@ int main(int argc, char** argv) {
                 std::cout << "Note: --deterministic-experts is inert; the rewrite always "
                              "accumulates in fixed fp32 order\n";
             }
+            // The reply is decoded with special tokens intact, so the thinking
+            // markers survive into `reply.text`. Two distinct outcomes need two
+            // distinct reports, and the difference is not "does `reply.text`
+            // differ from the stripped view": when the token cap cuts the model
+            // off before it closes its reasoning there is no marker at all, and
+            // `strip_thinking` then returns the text unchanged — the same shape a
+            // non-thinking reply has. The observable is the *closing marker*,
+            // which exists exactly when the model finished thinking.
+            const std::string thinking_end =
+                engine.tokenizer().decode({engine.tokenizer().thinking_end_token_id()});
+            const bool thinking_finished = !thinking_end.empty() &&
+                reply.text.find(thinking_end) != std::string::npos;
+            if (thinking_finished) {
+                std::cout << "--- Reply, thinking included ---\n"
+                          << reply.text << "\n"
+                          << "--- Visible reply ---\n";
+            } else if (options.thinking_mode) {
+                std::cout << "--- Reply, thinking requested but never closed (the "
+                             "generation hit the token cap mid-reasoning) ---\n"
+                          << reply.text << "\n"
+                          << "--- End of truncated reply ---\n";
+            }
         }
         std::cout << visible << std::endl;
         return 0;
