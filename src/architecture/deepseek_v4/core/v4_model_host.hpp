@@ -166,6 +166,29 @@ public:
                 layer_specs_[static_cast<size_t>(layer)], loader_, context_capacity_);
         }
 
+        // Every dense tensor the contract enumerates has been uploaded by this
+        // point — `resources_` binds the model-level ones and the loop above binds
+        // the per-layer ones — and the only dense read left on the request path is
+        // `embed.weight` in `embed_token`. The pages the uploads faulted in are
+        // therefore dead weight that competes for host RAM with the **pinned** Warm
+        // pool, which the kernel cannot reclaim or swap.
+        //
+        // Released here, before the Warm preload rather than after it, because the
+        // preload is where host pressure peaks: it fills up to `warm_host_bytes` of
+        // unevictable memory while the released pages would still be resident. The
+        // step touches only the experts container, so nothing below re-reads dense.
+        if (runtime_cfg.release_dense_pages_after_upload) {
+            last_released_dense_bytes_ = loader_.release_dense_pages_except("embed.weight");
+            // Reported here rather than with the residency summary below, so the
+            // figure appears before the preload instead of after it.
+            if (verbose_ && last_released_dense_bytes_ > 0) {
+                std::printf(
+                    "[Host] Released %.2f GiB of dense-container page cache after upload "
+                    "(only embed.weight stays resident)\n",
+                    static_cast<double>(last_released_dense_bytes_) / (1024.0 * 1024.0 * 1024.0));
+            }
+        }
+
         initialize_experts(runtime_cfg);
 
         if (verbose_) {
@@ -263,6 +286,11 @@ public:
     const ExpertRegistry& registry() const noexcept { return registry_; }
     UnifiedVRAMExpertPool& vram_pool() noexcept { return vram_pool_; }
     const SupplyTelemetry& telemetry() const noexcept { return telemetry_; }
+
+    // Dense-container page-cache residency dropped after the uploads, in bytes (0
+    // when the runtime was configured not to release). Reported rather than
+    // inferred: `madvise` is a hint, so the only figure worth printing is this one.
+    size_t released_dense_bytes() const noexcept { return last_released_dense_bytes_; }
 
     // Host read access, for building an oracle: `embed.weight` is reached through
     // `resources().host_embed_table` (a pointer into the container), while
@@ -511,6 +539,7 @@ private:
     std::vector<V4LayerSpec> layer_specs_;
     MemoryBudgetReport budget_;
     uint32_t context_capacity_{0};
+    size_t last_released_dense_bytes_{0};
 
     V4DeviceStreams streams_;
     V4ModelResources resources_;

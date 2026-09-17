@@ -172,6 +172,49 @@ public:
         return experts_direct_fd_;
     }
 
+    // Drop this process's residency of the dense mapping, keeping one named
+    // tensor's span.
+    //
+    // The mapping is `MAP_SHARED` and read-only, so the pages it faulted in are
+    // **clean and file-backed**: releasing them returns the memory to the page
+    // cache's free pool without a writeback, and the file stays the backing store,
+    // so any later read simply faults the page in again from disk. Nothing is
+    // lost and no pointer is invalidated — `data` stays valid for every tensor.
+    //
+    // The reason to do it at all: after the device has its copies, those pages are
+    // dead weight competing for host RAM with the pinned Warm pool, which cannot be
+    // reclaimed. Only one dense tensor is read per token (`embed.weight`, by
+    // `V4Graph::embed_token`), so that span is the only one worth keeping resident.
+    //
+    // `MADV_DONTNEED` operates on whole pages, so the kept span is widened outward
+    // to page boundaries — a tensor sharing a page with a released neighbour keeps
+    // that page. Returns the bytes whose residency was dropped.
+    size_t release_dense_pages_except(const std::string& keep_tensor) const {
+        if (!dense_mmap_base_ || dense_mmap_base_ == MAP_FAILED) return 0;
+        const auto it = dense_tensors_.find(keep_tensor);
+        if (it == dense_tensors_.end()) {
+            throw std::runtime_error(
+                "AeonModelLoader: cannot keep an unknown tensor resident: " + keep_tensor);
+        }
+
+        const uint8_t* base = dense_mmap_base_;
+        const size_t total = dense_file_size_;
+        const long page_size = ::sysconf(_SC_PAGESIZE);
+        const size_t alignment = page_size > 0 ? static_cast<size_t>(page_size) : 4096;
+
+        const size_t keep_begin = static_cast<size_t>(it->second.data - base);
+        const size_t keep_end = keep_begin + static_cast<size_t>(it->second.byte_size);
+        if (keep_end > total) {
+            throw std::runtime_error(
+                "AeonModelLoader: the kept tensor extends beyond the dense container");
+        }
+        const size_t keep_first_page = (keep_begin / alignment) * alignment;
+        const size_t keep_last_page = ((keep_end + alignment - 1) / alignment) * alignment;
+
+        return drop_residency(base, keep_first_page) +
+               drop_residency(base + keep_last_page, total - keep_last_page);
+    }
+
     uint32_t num_layers() const { return num_layers_; }
     uint32_t experts_per_layer() const { return experts_per_layer_; }
 
@@ -433,6 +476,13 @@ private:
             }
         }
         return entries.size();
+    }
+
+    // Advice is a hint: a failure (or a zero-length range) is not an error, so the
+    // caller learns the true released size rather than an assumption about it.
+    static size_t drop_residency(const uint8_t* address, size_t length) {
+        if (length == 0) return 0;
+        return ::madvise(const_cast<uint8_t*>(address), length, MADV_DONTNEED) == 0 ? length : 0;
     }
 
     std::string model_dir_;

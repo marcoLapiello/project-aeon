@@ -23,15 +23,24 @@ namespace aeon::core {
 constexpr size_t VRAM_HEADROOM_SAFETY_BYTES = 300ULL * 1024ULL * 1024ULL; // 300 MB
 
 // Host RAM the engine will never plan to use, held back for the OS and for this
-// process's own non-expert footprint (the mmapped containers' page cache, the
-// tokenizer, the graph, and the ~13 GiB of resident dense weights that the
-// embedding lookup and every oracle read touch through the mmap).
+// process's own non-expert footprint (the graph, the tokenizer, the pinned
+// transport staging arena, and whatever the dense container still holds in page
+// cache).
 //
 // It replaces a percentage cap (`0.70 * total`, i.e. 43.84 GiB here), which had
 // two defects: it never accounted for memory *already in use*, so a 43.84 GiB
 // Warm allocation on a machine with 30 GiB resident would swap; and it moved with
 // the machine's RAM size rather than with what the process needs. A fixed reserve
 // is the honest statement of "the engine may have everything else".
+//
+// A previous revision of this comment justified the reserve with "the ~13 GiB of
+// resident dense weights that the embedding lookup and every oracle read touch
+// through the mmap". That was wrong twice over. Only `embed.weight` (0.99 GiB) is
+// touched per token — every other dense tensor is uploaded once and never read
+// again — and those pages are now released outright after the uploads
+// (`AeonModelLoader::release_dense_pages_except`, driven by
+// `release_dense_pages_after_upload`). The reserve is not sized around dense
+// residency, and it never was.
 constexpr size_t HOST_RAM_RESERVED_BYTES = 10ULL * 1024ULL * 1024ULL * 1024ULL; // 10 GiB
 
 constexpr size_t PIPELINE_SCRATCH_BYTES      = 100ULL * 1024ULL * 1024ULL; // ~100 MB activation scratch
@@ -47,6 +56,16 @@ struct AeonRuntimeConfig {
     // Allocate the configured Warm capacity without requiring a synchronous
     // startup fill. This remains enabled by default for compatibility.
     bool preload_warm_host{true};
+
+    // After the dense uploads finish, release this process's residency of the
+    // container's pages, keeping only `embed.weight`. The pages are clean and
+    // file-backed, so the kernel may reclaim them anyway; releasing them
+    // deterministically keeps the host footprint from depending on when the
+    // reclaim happens to run, which matters because the Warm pool is pinned and
+    // cannot be reclaimed at all. Zero VRAM cost. Set false to keep every dense
+    // page resident, which is what a caller reading the container host-side after
+    // initialization wants.
+    bool release_dense_pages_after_upload{true};
 
     // Diagnostic A/B control. The production default keeps asynchronous refill enabled.
     bool enable_warm_refill{true};

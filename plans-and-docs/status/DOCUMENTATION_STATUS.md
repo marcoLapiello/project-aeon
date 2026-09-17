@@ -68,6 +68,7 @@ reference code; every remaining unknown names the gate that settles it.
 | [graph_composition_plan.md](../analysis/current/graph_composition_plan.md) | **The composition.** One ordered text-in/text-out path, every step mapped to the component that implements it with its file, and the definitive list of what does not exist yet. Owns the graph's build phases (P1–P7) and the acceptance criterion. Consumes the plan; re-derives nothing. |
 | [checkpoint_verification_plan.md](../analysis/current/checkpoint_verification_plan.md) | **Checkpoint & artifact integrity.** Validates the input: structural audit, the prompt-encoder oracle (the artifact ships its own encoder + golden vectors), repack round-trip, streaming integrity. Deliberately does **not** compare against the original FP4 checkpoint — the graph is the goal, and the artifact is swappable. |
 | [deepseek_v4_flash_architecture.md](../analysis/current/deepseek_v4_flash_architecture.md) | Orientation overview of the model family. Not authoritative — defer to the plan. |
+| [HOST_MEMORY_PRESSURE_INVESTIGATION.md](../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) | **Open investigation.** Why a large Warm tier never finishes loading on a `62.62 GiB` host. Records the hypotheses that were **refuted** (so they are not retried), the dense-page release that was kept, and the one measurement that would split the problem. No root cause yet. |
 
 ### Execution records (`execution/`)
 
@@ -157,6 +158,15 @@ Four gates are settled empirically, not by reading. **One is closed, one is now 
 host-memory pressure, the model-backed `>= 6.0 GB/s` target, kernel occupancy
 tuning, the placement study, the explicit backend factory, and Phase 3 multi-GPU
 all remain open and are unaffected by the correctness rewrite.
+
+**Host-memory pressure is now an active investigation, not a parked one.** A Warm tier of `45 GiB`
+does not finish `initialize()` on the `62.62 GiB` host, and the dense mapping's page cache — the
+leading hypothesis — was released outright (`13.68 GiB`, verified) **without fixing it**, so the
+cause is still unidentified. The refuted hypotheses, the one kept change, and the measurement that
+would split the problem are recorded in
+[HOST_MEMORY_PRESSURE_INVESTIGATION.md](../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md).
+The practical ceiling observed so far is `≈40 GiB` Warm, and it is reproducible only from a freshly
+booted host.
 
 ---
 
