@@ -3,6 +3,7 @@
 #include "platform/rdna3/device.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 #include "architecture/deepseek_v4/core/memory_budget.hpp"
+#include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 
 #include <cassert>
@@ -24,7 +25,10 @@ int main() {
     auto model_cfg = aeon::core::DeepSeekV4Config::load_from_json(config_path);
     aeon::core::AeonModelLoader loader;
     loader.open_model(aeon_model_dir);
-    const size_t dense_weights_bytes = loader.dense_file_size();
+    // What the graph uploads, not the container's file size — the same basis
+    // production uses (`V4ModelHost`). The container also holds the host-resident
+    // `embed.weight` and the unused `mtp.*` draft head.
+    const size_t dense_weights_bytes = aeon::core::V4ModelContract::uploaded_dense_bytes(model_cfg);
 
     // -------------------------------------------------------------------------
     // Test 1: Hard Feasibility Gate with Over-Budget Context Length

@@ -411,3 +411,79 @@ explicit comparison key and pass the entry gate.
 - **Correctness / service**: both revisions produced `[227, 300, 227, 300, 227, 300, 227, 300]`; current full build and CTest `20/20` passed
 - **Conclusion / next gate**: The manifest and source-layout refactor showed no measurable decode regression in this matched run; repeat measurements remain required for a performance claim
 - **Evidence**: `bench_full_model`, current staged tree, isolated worktree at `1c03eb7`
+
+---
+
+## 5. Post-rewrite section — opened at the first end-to-end gate (2026-09-17)
+
+The banner above says a post-rewrite section opens "when the new graph reaches its first
+end-to-end gate". That gate is the composition plan's **P4** — one conversation in, text out, through
+the rebuilt graph — and this section is it. **Nothing here is comparable to anything in §4.** The
+pre-rewrite entries measured a different computation (banner), and they were also measured on
+different contexts, prompts, slot counts and instrumentation. The only thing the two sections share
+is the silicon and the artifact.
+
+What this section *can* be compared against is the **same 9-token output sequence** recorded in M26,
+and the coincidence is worth stating as an observation rather than a claim: the rebuilt graph
+reproduces it token for token on the same prompt. That is a cross-check, not a proof — two graphs can
+agree on a path and differ elsewhere, which is exactly why the Tier 1–3 gates exist and why the
+ledger's own banner refuses to call the old numbers "slow" rather than "different".
+
+### M28: The rebuilt graph produces text — first end-to-end gate
+- **Run**: `2026-09-17`; branch `rewrite/graph-v2`, P4; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon (`model_dense.aeon` 15.7 GB + `model_experts_swizzled.aeon` 145 GB), 43 layers
+- **Class / comparison key**: `E2E / e2e-rewrite-43L-text` — **a new key**; do not pool with `native-text` (M21–M22, M25–M26) or with `e2e-43L-A/B`
+- **Platform**: `baseline`, Device 0 only; RX 7900 XTX, ROCm 7.2.2, `gfx1100`, Wave32
+- [x] **Invalidate for comparison** | **Reason**: single run, `n=1`, and the first measurement of this graph; the numbers below are a correctness-gate reading, not a performance claim
+- **Workload / configuration**: conversation `What is the capital of France?` rendered by the canonical encoder (`Dsv4PromptEncoder`, `Dsv4ThinkingMode::Chat`) to **11 prompt tokens**; context **256**; **675 Hot / 0 Warm** slots (the budget allocates no warm tier at this context); sampling at the artifact's own policy (`do_sample=true, T=1.0, top_p=1.0`), seed `1234`; acceptance run capped at 24 new tokens; single run
+- **Metrics**:
+  | Quantity | Value |
+  | :--- | ---: |
+  | Init / assembly | `7.3 s` |
+  | TTFT | `4,487 ms` |
+  | Decode throughput | `2.7 tok/s` |
+  | Decode step | `~370 ms` (43 layers, unbatched, one token at a time) |
+- **Correctness / service**: acceptance run produced **9 tokens, stop `eos`**, text `The capital of France is **Paris**.`; the first four generated ids are `[671, 6102, 294, 8760]`; the gate's logits check measured **129,251 of 129,280** logits differing between the single-turn and the three-message context; routed experts were delivered through the production `V4TieredExpertExecutor` on the real 145 GB container — **Hot + Cold only**, since the budget allocates 675 Hot slots and no Warm tier at this context, so every miss is served cold (`--` for per-tier counts: this gate does not instrument the supply, which is P5's subject)
+- **Conclusion / next gate**: the plan's acceptance criterion is met — text in, text out, through the rebuilt graph on real weights — with correctness held by P1–P4 (`34/34`, `34/34`, `57/57`, `28/28` checks) and `7/7`, `6/6 + 1`, `5/5`, `5/5` mutations killed; **`2.7 tok/s` is not a throughput result** (no batching, no warm tier, single-token decode) and is superseded once P6 lands. Next gate: **P5**, tiering under pressure through the graph
+- **Evidence**: `tests/test_v4_engine.cpp` (`P4: 28 checks, 0 failures`), `scripts/mutate_engine.py`, `tools/aeon_chat.cpp` (default build)
+
+### M28b: Memory-budget correction — 22 → 24 GiB of the card, and why it was 22
+
+Same run, same commit, measured while auditing the engine's resource accounting. The user observed
+the inference job holding only `22/24 GiB`; the audit confirmed it and found the cause, so this pair
+of measurements is the before/after.
+
+- **Measurement method**: `rocm-smi --showpids`, which is PID-resolved. Note that
+  `rocm-smi --showmeminfo` **numbers the devices differently** and reported `0.03 GiB` for the device
+  the job was actually on — the first two attempts at this measurement read the wrong card because of
+  it. Use `--showpids` for per-process VRAM.
+- **The defect**: the budget reserved `dense_weights_bytes = loader.dense_file_size()` — the whole
+  container — while the graph uploads only the tensors the contract enumerates. Two sets are never
+  placed on the device: `embed.weight` (`1,059,061,760 B`, read from the **host** mmap by
+  `embed_token`) and the unused `mtp.*` DSpark draft head (`1,041,848,220 B` across 69 tensors,
+  deferred by §9). Together `2,100,909,980 B = 1.957 GiB` reserved for VRAM that was never touched.
+- **Also corrected in the same change**: VRAM is now planned against `min(free, total)` rather than
+  the card's nominal total (a display GPU or a shared card would have been over-committed); and the
+  host cap moved from `0.70 × total_ram` (`43.84 GiB`) to `total_ram − 10 GiB` (`52.62 GiB`), because
+  a percentage never accounts for memory already in use.
+- **Metrics**: context `256`, artifact and prompt as M28.
+
+  | Quantity | before | after |
+  | :--- | ---: | ---: |
+  | Dense reserved | `15,744,996,344 B` (container) | `13,643,885,660 B` (uploaded) |
+  | Hot VRAM expert slots | `675` | `809` (`+134`, `+19.9%`) |
+  | **VRAM held (`--showpids`)** | **`23,614,160,896 B = 21.99 GiB`** | **`25,509,986,304 B = 23.76 GiB`** |
+  | Card utilization | `91.7%` | `99.1%` |
+
+- **Correctness / service**: output unchanged and coherent on the same workload (a longer prompt
+  returned prose; the acceptance prompt still returns `The capital of France is **Paris**.`); the two
+  directly-affected tests (`test_dynamic_expert_pool`, `test_v4_model_contract`) pass, and
+  `uploaded_dense_bytes` reproduces the measured upload exactly. The audit also found that
+  `V4ModelContract` **omitted `norm.weight`** (`8,192 B`) even though `V4ModelResources` uploads it —
+  now added, so a checkpoint missing it fails validation instead of throwing at upload.
+- **Conclusion / next gate**: the card is now filled to `99.1%` and the remaining ~`230 MiB` is the
+  deliberate `300 MiB` safety headroom plus allocator fragmentation. Two literals remain and are
+  recorded as P6 open items rather than fixed here: the flat `PIPELINE_SCRATCH_BYTES = 100 MiB`
+  (real decode scratch is `4.68 MiB`; the batch scratch, `11.09 MiB` at 16 tokens, is **not budgeted
+  at all**) and the staging line's literal `12`. Next gate: **P5**.
+- **Evidence**: `src/architecture/deepseek_v4/core/memory_budget.hpp`,
+  `V4ModelContract::uploaded_dense_bytes`, `aeon_chat --verbose`, `rocm-smi --showpids`

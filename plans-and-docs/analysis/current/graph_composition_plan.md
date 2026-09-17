@@ -34,6 +34,14 @@ following holds — measured, not asserted:
 
 **Not** part of the criterion: throughput, batching, prefix reuse, tool use, MTP. Those are §9.
 
+> **Status at P4 (2026-09-17).** Clause 1 is met and measured: `aeon_chat` in the **default** build
+> takes `What is the capital of France?` and returns `The capital of France is **Paris**.`, EOS-reached,
+> through the rebuilt graph on the artifact's real weights. Clauses 2–5 are what the Tier 1–3 gates and
+> P1–P4 measure between them. Clause 1's *second* half — "a reply that is a reply to *that* prompt" — is
+> the part no gate may assert, so `tests/test_v4_engine.cpp` prints the text rather than judging it and
+> asserts the machine-checkable stand-in (the history changes the model's own distribution; §7 P4).
+> Throughput is not claimed and is not part of the criterion.
+
 ### 1.1 What is already known about reaching text
 
 The **shell** has already produced coherent text once — through the *pre-rewrite* graph:
@@ -82,16 +90,16 @@ flowchart TD
 | # | Step | Where it runs | Certification |
 | :-- | :--- | :--- | :--- |
 | A1 | Conversation → prompt text (thinking mode, reasoning effort, tool sections, conditional BOS) | host | **Step 0 — 4/4 golden vectors** |
-| A2 | Prompt text → token ids | host | `test_dsv4_tokenizer` |
-| A3 | Autoregressive loop, stop conditions | host | `test_text_generation` |
+| A2 | Prompt text → token ids | host | `test_dsv4_tokenizer`; **bound by P4** |
+| A3 | Autoregressive loop, stop conditions | host | `test_text_generation`; **bound to the graph by P4** |
 | B1 | Token id → embedding row (`embed.weight` F16 [129280,4096]), broadcast to the 4 HC streams, widened fp32; token id uploaded for hash routing | device | plan Step 1 specifies the gate (4 streams byte-identical); **no test exists yet** |
 | B2 | The 43-layer loop (§2.3) | device | **Tier 2 items 16–18** per layer; **P2** as a 43-call chain on real weights |
 | B3 | 4 streams → one 4096 vector, weightless RMS + `hc_head_fn/base/scale`, `hc_eps` after the sigmoid | device | **Step 3 gate — 25 checks, 6/6 mutations** |
 | B4 | Final RMSNorm with the learned `norm.weight` | device | **Tier 1 item 5** (weighted form) |
 | B5 | `logits = head.weight @ h` → [129280], fp32 accumulate, head is **not** tied to the embedding | device | inventory only — **no standalone gate exists**; certified by P1 and P2 |
 | B6 | Logit-processor seam → temperature / top-k / top-p → token | device + 4 B host | **P3 gate — 57 checks, 0 failures, 6/6 mutations; `core/v4_sampler.hpp`** |
-| C1 | Token id → text | host | `test_dsv4_tokenizer` |
-| C2 | Stop on EOS / max tokens / context limit | host | `test_text_generation` |
+| C1 | Token id → text | host | `test_dsv4_tokenizer`; **bound by P4** |
+| C2 | Stop on EOS / max tokens / context limit | host | `test_text_generation`; **bound to the graph by P4** |
 
 ### 2.3 One layer, ×43 (`run_layer_body_decoding`, `core/v4_layer_body.hpp:1080`)
 
@@ -144,7 +152,7 @@ that owns the claim, in the inference pipeline plan.
 | A1 | `Dsv4PromptOptions` (thinking mode, `reasoning_effort`, BOS) | `text/dsv4_prompt_encoder.hpp:79` | exists |
 | A1 | `Dsv4ChatFormatter` (basic skeleton) | `text/dsv4_chat_formatter.hpp:29` | exists, superseded by the encoder for the canonical path |
 | A2, C1 | `Dsv4Tokenizer::encode` / `decode` / `added_token_text` | `text/dsv4_tokenizer.hpp:11` | exists, certified |
-| A3, C2 | `text::generate_token_ids`, `GenerationOptions`, `GenerationResult`, `StopReason`, `TokenStep` | `infrastructure/text/text_generation.hpp:10-38` | exists, certified standalone — **not yet bound to the new graph** |
+| A3, C2 | `text::generate_token_ids`, `GenerationOptions`, `GenerationResult`, `StopReason`, `TokenStep` | `infrastructure/text/text_generation.hpp:10-38` | exists, certified standalone — **bound to the new graph by P4** (`core/v4_engine.hpp`) |
 
 ### 3.2 Engine substrate (host + device)
 
@@ -241,6 +249,18 @@ dimension constants. The item-23 executor gate reuses the same fixture style
 (`tests/test_v4_expert_executor.cpp`), and `tests/test_v4_expert_tiering.cpp:196-345` is the
 reference recipe for standing the whole tiered supply up.
 
+### 3.7 The rewrite's own modules (built by P1–P4)
+
+These did not exist when this plan was written; they are the composition itself, and each is
+inventoried here so §5.2's "one composition, written once" claim can be checked against the tree:
+
+| Module | What it owns | Gate |
+| :--- | :--- | :--- |
+| `core/v4_model_host.hpp` | **what is resident** — all 15 steps of §5.1 | P1 (steps 1–9), P2 (10–15) |
+| `core/v4_graph.hpp` | **what happens in order** — `embed_token` → 43 × `run_layer` → head | P1 (head), P2 (loop) |
+| `core/v4_sampler.hpp` | the decision — the seam and the sampler | P3 |
+| `core/v4_engine.hpp` | the text binding — render, drive, detokenize | P4 |
+
 ---
 
 ## 4. Where the three tiers enter the graph
@@ -331,14 +351,16 @@ Step 13 is the only part with real mass, and the tiering gate already drives its
 | `core/v4_sampler.hpp` | the logit-processor seam and the sampler (argmax now; temperature / top-k / top-p on the fp32 logits). | `v4_attention.hpp` argmax pair |
 | `core/v4_engine.hpp` | binds text: tokenizer + prompt encoder + `generate_token_ids` + `V4Graph` + detokenizer + the session/state boundary. | the three above, `infrastructure/text/text_generation.hpp` |
 
-**Built as of P3:** `core/v4_model_host.hpp` (all 15 steps of §5.1), `core/v4_graph.hpp` (the head
-stage and the 43-layer loop) and `core/v4_sampler.hpp` (the seam, the transforms, the generator and
-the device argmax path). The pools, the registry, the staging arena, the supply and the executor
-went into `v4_model_host.hpp` rather than into new files, and the loop went into `v4_graph.hpp`'s
-`run_layer` / `forward_token` — which is why the split was drawn where it was: the host is *what is
-resident*, the graph is *what happens in order*, and P2 needed both ends of that division to be the
-same two files. P3 then went where the plan said: a **separate** file, because sampling is not a
-model operation — the graph ends at logits and never learns how a token was chosen.
+**Built as of P4:** `core/v4_model_host.hpp` (all 15 steps of §5.1), `core/v4_graph.hpp` (the head
+stage and the 43-layer loop), `core/v4_sampler.hpp` (the seam, the transforms, the generator and
+the device argmax path) and `core/v4_engine.hpp` (the text binding). The pools, the registry, the
+staging arena, the supply and the executor went into `v4_model_host.hpp` rather than into new files,
+and the loop went into `v4_graph.hpp`'s `run_layer` / `forward_token` — which is why the split was
+drawn where it was: the host is *what is resident*, the graph is *what happens in order*, and P2
+needed both ends of that division to be the same two files. P3 then went where the plan said: a
+**separate** file, because sampling is not a model operation — the graph ends at logits and never
+learns how a token was chosen. P4 is the last of the four and the smallest: it owns no arithmetic at
+all, only the order in which the four existing components are handed to each other.
 
 `v4_model_host.hpp` and `v4_graph.hpp` are the split that keeps the files small and the concerns
 separate: the host is *what is resident*, the graph is *what happens in order*. The streaming
@@ -379,7 +401,7 @@ or before P4 is a prerequisite of the first coherent run:**
 | **P1 — done** | G1 *(steps 1–9 of 15)*, half of G2 *(the head stage)* | `core/v4_model_host.hpp`, `core/v4_graph.hpp`; 34 checks, 5/5 mutations |
 | **P2 — done** | the rest of G1 and G2, and G9 | the pools/supply/executor, the 43-layer loop, and `reference::model_body`; 34 checks, 5/5 mutations |
 | **P3 — done** | G3 | the sampler and the logit-processor seam, `core/v4_sampler.hpp`; 57 checks, 6/6 mutations |
-| **P4 — the first coherent run** | G5 | the text binding, `core/v4_engine.hpp`, and `aeon_chat` off the legacy graph |
+| **P4 — done** | G5 | the text binding (`core/v4_engine.hpp`) and `aeon_chat` off the legacy graph; 28 checks, 7/7 mutations |
 | P5 — diagnostics under tiering | G4, G14 | observer and telemetry wiring; aids, not prerequisites |
 | P6 — chunked prefill | G6, G7, G8 | batched embedding, on-device top-k, the chunk driver |
 | P7 — session state | G10, G11, G12, G13 | the session aggregate, registry, cold store, and R4 |
@@ -390,7 +412,7 @@ or before P4 is a prerequisite of the first coherent run:**
 | **G2** | **The 43-layer driver + head composition (`V4Graph`).** | `run_layer_body_decoding` is per *layer*; nothing calls it 43 times, and nothing calls `hc_head` → norm → LM head. **Done (P1 + P2)** — the head stage in P1, the 43-call loop in P2 (`run_layer` / `forward_token`). | `core/v4_graph.hpp` | **P2 gate** vs `reference` `model_body` (see G9) |
 | **G3** | **The sampler with a logit-processor seam.** `temperature`, `top_k`, `top_p`, RNG, and a hook that may mask/bias the fp32 logits *before* sampling. | Plan Step 5 + §6.4: structured output and tool-call JSON are logit masks, so the seam is **non-deferrable**; only argmax exists today. **Done (P3)** — `core/v4_sampler.hpp`, `V4Sampler` + the pure `sampler_ops`, with `V4SplitMix64`. | `core/v4_sampler.hpp` | **P3 gate**: seeded replay + mask + `T→0` + the untruncated default, and the **ordering** of the seam asserted by what the processor sees |
 | **G4** | **A real `V4LayerBodyObserver` for the new graph.** | The body takes an observer; the only production one lived inside `V4Pipeline`. The null one runs but leaves no diagnostic path. | `core/v4_graph.hpp` (observer adapter) | none needed; must not perturb the hot path (assert identical output traced vs null) |
-| **G5** | **The end-to-end binding + a non-legacy CLI.** `generate_token_ids` bound to `V4Graph`, and `aeon_chat` re-targeted off the legacy graph. | Criterion 1 is *one command, conversation in, text out*. Today that command only exists behind the legacy flag. | `core/v4_engine.hpp`, `tools/aeon_chat.cpp`, `cmake/AeonInfrastructure.cmake` | **P4 gate**: the coherence run, plus a multi-turn context run |
+| **G5** | **The end-to-end binding + a non-legacy CLI.** `generate_token_ids` bound to `V4Graph`, and `aeon_chat` re-targeted off the legacy graph. | Criterion 1 is *one command, conversation in, text out*. Today that command only exists behind the legacy flag. **Done (P4)** — `core/v4_engine.hpp`, and `aeon_chat` moved into the default build. | `core/v4_engine.hpp`, `tools/aeon_chat.cpp`, `cmake/AeonInfrastructure.cmake` | **P4 gate**: the acceptance run, plus the binding identity, the stop conditions and the history-matters check |
 | **G6** | **Batched token embedding (gather + broadcast).** | Decode uses 4 small H2D copies of the row. A prefill chunk needs a gather over the chunk's ids on the device. | `core/v4_graph.hpp` prep | item-19-style `chunk ≡ serial` on the embedding stage |
 | **G7** | **On-device indexer top-k.** `select_indexer_topk` does one D2H + sync and one H2D + sync per CSA token. | Part III forbids per-token host sync in a prefill. Changes no value, so no equivalence gate can see it. Target is **zero syncs**. | `kernels/v4_attention.hpp` | a sync counter in the body (countable now, needs no baseline) |
 | **G8** | **The chunked-prefill driver over the new host.** `run_layer_body_chunk` is certified; nothing calls it. | Prefill is mandatory for daily use (Part III). | `core/v4_graph.hpp` (`forward_chunk`) | the item-19 equality gate re-run through the new host |
@@ -417,7 +439,7 @@ into the rewrite, not invented:
 | G1 | **lift** | `V4Pipeline::initialize` (`core/v4_pipeline.hpp:259`) does steps 1–15 today, including the Hot and Warm preload |
 | G2 | **lift + compose** | the 43-call loop and the head stage both exist in `V4Pipeline::step` (`:460`, head at `:1257-1292`); what changes is that the loop must call the **new** body |
 | G4 | **lift** | `V4Pipeline::begin_attention_trace` / `queue_trace_copy` (`:2121`, `:2114`) implement the observer the body now declares |
-| G5 | **rebind** | `tools/aeon_chat.cpp` is complete and works — against `V4Pipeline::generate_until_stop`. Only its engine pointer changes |
+| G5 | **rebind** | `tools/aeon_chat.cpp` was complete and works — against `V4Pipeline::generate_until_stop`. Only its engine pointer changed — **done in P4**, and it now points at `V4Engine` |
 | G10 | **lift** | `V4PipelineStateSnapshot` (`:59`) is already `current_seq_len` + a vector of layer snapshots |
 | G14 | **lift** | `enable_expert_timing` / `collect_expert_timing` (`:150`, `:2239`) and the supply telemetry wiring all exist |
 | G3 | **half-lift** | the GPU argmax pair exists (`kernels/v4_attention.hpp:193,236`); temperature / top-k / top-p and the seam were new — **done in P3** |
@@ -425,6 +447,10 @@ into the rewrite, not invented:
 **Genuinely new work: G6 (batched embedding — small), G7 (on-device indexer top-k — kernel work),
 G8 (the chunk driver over the certified chunk body), G9 (the model-level oracle), G11–G13 (session
 registry, cold store, R4).** That is a bounded, named list, and none of it is a research question.
+
+Of the seven lifts, **G1, G2, G3, G5, G9 are now spent** (P1–P4). What remains is the diagnostics
+lifts (G4, G14, both P5) and the new work above — so the *new* work is now the larger half, which is
+the honest reading of where the rewrite stands rather than a flattering one.
 
 ### 6.2 Why the gaps were invisible until now — a blind spot in the process, not bad luck
 
@@ -580,11 +606,68 @@ nothing, sort nothing, and read back four bytes — and that the fast path is **
 an implementation that always widened would be correct and 259 KB slower per token with no other
 symptom.
 
-### P4 — the text-in/text-out run
-**Build:** `core/v4_engine.hpp`; `aeon_chat` re-bound; the target moves out of the legacy cmake gate.
-**Gate:** the acceptance criterion. One prompt in, text out; then a multi-turn conversation, whose
-turn 2 must be coherent with turn 1 (which is what makes the KV/compressed state observable rather
-than merely written). Re-run the whole default suite: no legacy binary counts as coverage.
+### P4 — the text-in/text-out run ✅
+**Built:** `core/v4_engine.hpp` — `V4Engine`, which is a **binding and not a pipeline**: it owns the
+host, the graph, the sampler, the tokenizer and the encoder, renders with the encoder, drives
+`text::generate_token_ids`, and the step it hands that loop is exactly `V4Graph::forward_token` →
+`V4Sampler::select`. Also `V4GenerationPolicy` (`generation_config.json` read, not assumed) and the
+pure `strip_thinking`. `tools/aeon_chat.cpp` is re-bound to the engine and **moved out of
+`cmake/AeonLegacyGraph.cmake` into the default build** — text-in/text-out cannot be a legacy-only
+target when it *is* the acceptance criterion. And `scripts/mutate_engine.py`.
+
+**Gate: 28 checks, 0 failures, ~110 s.** The plan's criterion, split into what a gate may assert and
+what it must only print:
+
+* **the engine is the binding** — `chat`'s token sequence equals a loop written **in the gate** that
+  drives `graph.forward_token` and `sampler.select` directly and computes every position itself
+  (section A). A binding that skipped the reset, mis-positioned a token, fed the wrong prompt or
+  reseeded wrongly cannot pass it.
+* **the reply is text** — non-empty, valid UTF-8, and equal to `tokenizer.decode(ids minus EOS)`
+  recomputed independently (section B).
+* **it is deterministic** — the same call twice gives the same ids and the same text; at `T=5` a
+  different seed differs; and the **greedy path ignores the seed entirely**, 3 of 3 (section C). That
+  last one is the control that makes the others statements about *sampling* rather than about the
+  generator being called.
+* **the history is in the context** — the same user turn after a prior exchange changes the model's
+  own distribution: **129251 of 129280** logits differ (section D). The gate compares *logits* rather
+  than the drawn token on purpose, and says so in its own output: at `T=1` both contexts drew `671`,
+  so a token comparison would have been the weaker instrument that happened to pass.
+* **stop conditions** — `max_new_tokens` of 1 and of 6 honoured, the stop reason consistent with the
+  sequence, a context-filling prompt **refused**, and a position at capacity **thrown** rather than
+  wrapped (trap 40, through the graph this time).
+* **the artifact's policy is read** — `do_sample=true, T=1.0, top_p=1.0`, its EOS is the tokenizer's,
+  and `do_sample=false` maps to the sampler's greedy path (section F).
+* **`strip_thinking` is a pure function** of the decoded string, pinned on hand-built text with a
+  double marker (section G).
+
+**And the criterion itself, which the gate prints because it must not pretend to judge it:**
+
+```text
+  prompt   : What is the capital of France?
+  reply    : The capital of France is **Paris**.
+  tokens   : 9, stop: eos, TTFT 4487 ms, 2.7 tok/s
+  context  : 256 tokens, prompt 11
+```
+
+EOS-reached, coherent, and it is the **same sentence the pre-rewrite graph produced** — which §1.1
+recorded as evidence that coherence is reachable by this architecture at this quantization, and which
+is now produced by the rebuilt graph instead. The gate's green line means exactly what sections A–G
+say and no more; the human judgement is the one above.
+
+**Cost, and it is the third distinct shape of the three graph gates.** ~110 s: 7.3 s of assembly
+(paid **once**, not per section), ~12 s for section A's generation *plus its independent replay*, and
+the rest in the seven further generations plus the 24-token acceptance run at 2.7 tok/s. P2's gate was
+180 s of *reference*; P3's was 8 s of *transform*; this one is a minute and a half of **device**, and
+it is irreducible without changing what is being measured — a text-in/text-out run has to run the
+model, and the model costs what it costs. The honest note is that 2.7 tok/s at 43 layers is a
+*correctness* number from a single-token decode path with no batching and no warm tier; throughput is
+P6's and the ledger's, explicitly not this gate's.
+
+**Not covered, named so it is not mistaken for coverage:** throughput (P6), tiering under pressure
+(P5), prefix reuse and session swap (P7 — every turn here re-prefills from position 0), and any claim
+about *quality* beyond the one prompt printed above. Multi-turn coherence is measured as "the history
+changes the distribution", which is the strongest machine-checkable form; whether the prose is good is
+not a gate.
 
 ### P5 — tiering on the live path
 **Build:** nothing new — the host already routes through the supply. What is added is the
@@ -601,6 +684,99 @@ lists as item 21's `Stage D.2` remainder — streaming while the graph runs.
 **Gate:** the item-19 equality gate re-run through the new host (`chunk ≡ serial`, exact), then —
 separately — throughput, whose blocker was measured false and whose real work is batched
 projections (`G7` and the projection batching are its own phase).
+
+#### P6 reconnaissance — 2026-09-17, measured before the phase starts
+
+Recorded here, not implemented, so P6 begins from measurements rather than from an inherited
+constant. Everything below was read or computed from the tree at `6b999bd` + the uncommitted budget
+audit; nothing here changes behaviour.
+
+**The rewrite has no prefill path.** `V4Engine::chat` renders the prompt and drives
+`text::generate_token_ids`, whose step is `V4Graph::forward_token` — **one token, one position, one
+call**. Prompt tokens go through the identical path as generated tokens. The measured TTFT of
+`4,487 ms` for an 11-token prompt is `~410 ms × 11`, i.e. serial, and it is not a bug: G8 is listed
+as unbuilt and this is the phase that builds it.
+
+**Two batch scratch types exist, and the host allocates neither.**
+
+| Type | Cap | Allocated by | Used by |
+| :--- | ---: | :--- | :--- |
+| `PipelineBatchScratchBuffers` (`v4_pipeline_scratch.hpp:334`) | 16 | `V4Pipeline` (legacy) | the pre-rewrite graph only |
+| `V4LayerBodyBatchScratch` (`v4_layer_body_batch.hpp:99`) | 16 | **nobody** | the item-19 gate only |
+
+So `M = 16` inside `PipelineScratchBuffers` is a decode-path allocation sized for a batch path the
+rewrite does not have yet. The consequence is that the budget's single scratch line is wrong in both
+directions:
+
+| | Bytes | MiB |
+| :--- | ---: | ---: |
+| `PIPELINE_SCRATCH_BYTES` (reserved) | 104,857,600 | 100.00 |
+| real decode scratch (`PipelineScratchBuffers`) | 4,903,616 | 4.68 |
+| **real batch scratch (16 tokens)** | **11,630,400** | **11.09** |
+
+The reservation over-counts decode by ~95 MiB **and does not cover the prefill scratch at all**.
+Two of the batch scratch's eleven MiB are `ffn_norm_act_` and `moe_accum_`, each carrying an extra
+`kMPad = 16` multiplier **on top of** `rows = 16` — 2 MiB apiece. P6 must therefore reserve
+**two derived lines** (decode + batch), not one literal. See the open item below.
+
+**The staging arena is decode-shaped.** `TOTAL_STAGING_SLOTS = NUM_BUFFERS (2) ×
+EXPERTS_PER_HORIZON (6) = 12` — *double-buffer one token's top-6*. A 16-token chunk routes to up to
+`16 × 6 = 96` expert requests per layer, which is 8 waves against 12 slots.
+
+**But the arena is not what breaks it, and this is the finding that matters.** The expert seam is
+strictly **per token**: `V4RoutedExpertExecutor::accumulate_routed(layer_id, position, expert_input,
+expert_weights, moe_accum)` takes *one* token's FFN-norm row and *one* token's six weights, and
+`run_layer_body_chunk` loops `for row … run_layer_body_attention_tail(...)`. The executor therefore
+sees **six experts at a time**, and `6 ≤ 12`, so the tiering stays correct. What follows is the
+opposite of a correctness bug and worse than one: **the chunk batches attention and leaves the MoE
+serialized per token.**
+
+That matters because prefill is expert-bound, not attention-bound:
+
+- `6 experts × 14,155,776 B × 43 layers = 3.65 GB` of weights streamed **per token**;
+- at the measured `~6.3 GB/s` `O_DIRECT` (`PERFORMANCE_LEDGER` M1) that is `≈ 0.58 s/token`;
+- the attention half of a token is tens of milliseconds.
+
+So chunked prefill wired the way the seam exists today would amortize roughly **5%** of the work.
+The honest statement is that P6 is **not** "call `run_layer_body_chunk`".
+
+**What P6 must build, then** — each item is a decision, not a mechanical step:
+
+1. **The chunk driver** (G8) plus allocating `V4LayerBodyBatchScratch`: the 11.09 MiB that is
+   currently unaccounted for in the budget.
+2. **A chunk-wide expert dispatch.** The seam needs a batch form (`on_routing_ready` /
+   `accumulate_routed` over `C` tokens) so a chunk's `6C` requests are **issued as a set** rather
+   than one token at a time. This is an interface change to the thing the plan calls "the image of
+   one token", and it is the item that actually unlocks prefill throughput.
+3. **Sizing the staging arena from the chunk size**, which is a real tradeoff rather than a bigger
+   constant: `2 × 6 × C = 192` slots at `C = 16` is **2.72 GB of pinned host RAM**. Slots recycle
+   once the payload is resident in VRAM, so 192 is an upper bound rather than a requirement — but
+   the current design binds one slot per request **for the request's whole lifetime**, so the
+   reservation would approach it. The number must be derived from chunk size and the latency/
+   bandwidth product, never hardcoded (see the open item below).
+4. **Deduplicating experts within a chunk.** 16 tokens draw ~96 requests from 256 experts, so
+   collisions are likely and every hit saves a full 14 MB fetch. This also changes what "distinct
+   requests" means for item 21's reuse measurement (P2 measured **767 of 1032** for *decode*).
+5. **A deliberate chunk size.** `kMaxTokens = 16` is currently inherited from the workspace, and it
+   bounds both the batch scratch and the staging demand. A 1000-token prompt is then 63 chunks with
+   no cross-chunk expert reuse and no prefix cache (P7). Raising it is a memory decision (the
+   in-code note says so) and it should be made openly rather than inherited.
+
+**Open item added by this reconnaissance — the budget's scratch and staging lines are literals.**
+Two constants in `memory_budget.hpp` are not measurements:
+
+- `PIPELINE_SCRATCH_BYTES = 100 MiB`, a fixed literal. It should be derived from
+  `PipelineScratchBuffers` (decode) **plus** a batch term for the configured chunk size, so the
+  reservation cannot drift from the allocations and so prefill is not silently un-budgeted.
+- the staging line writes `12` as a literal instead of `PrefetchStagingArena::TOTAL_STAGING_SLOTS`.
+  If `NUM_BUFFERS` ever changed, the budget and the arena's real allocation would disagree with no
+  error. It must use the arena's own constant, and after P6, the chunk-derived value.
+
+Both are folded into item 1's work rather than fixed now, because the correct form of the batch term
+depends on the chunk size this phase chooses. (The rest of the budget audit landed on 2026-09-17 —
+uploaded-dense accounting, usable-VRAM planning, and the host cap — and is recorded in
+[PERFORMANCE_LEDGER](../status/PERFORMANCE_LEDGER.md) **M28b**, which also carries the
+before/after VRAM measurement: **`21.99 GiB → 23.76 GiB`** of the card, `675 → 809` Hot slots.)
 
 ### P7 — session swap
 **Build:** G10–G12. G13 only when matching exists.
@@ -637,6 +813,14 @@ that bind *composition* specifically:
 
 **In scope for this document:** the base decoder, serially, coherently, through the three tiers.
 
+**Reached at P4, 2026-09-17:** the acceptance criterion's first and third clauses are met — one
+command takes a conversation and returns text, through the rebuilt graph, with the routed experts
+delivered by the tiered supply. Clause 2 (mathematically correct microsteps) is what the Tier 1–3
+gates and P1–P4 measure; clause 4 (no duplication) is §5.2's one composition; clause 5 (nothing
+unnecessary) is the kernel inventory. **Throughput is explicitly not part of the criterion and is
+not claimed**: the acceptance run measures 2.7 tok/s, which is a correctness number from an
+unbatched single-token decode with the warm tier unallocated.
+
 **Deferred, and named so it is not an implicit "later":**
 
 | Deferred | Why | Revisits when |
@@ -657,22 +841,27 @@ countable today, target zero), streaming under concurrency (P5), and the KV-prec
 
 ## 10. One-line summary of the state
 
-As of **P3 the graph decides a token**: `core/v4_model_host.hpp` builds the whole assembly (all 15
-steps of §5.1, including the pools, the registry, the tiered supply and the production executor),
+As of **P4 the graph speaks**: `core/v4_model_host.hpp` builds the whole assembly (all 15 steps of
+§5.1, including the pools, the registry, the tiered supply and the production executor),
 `core/v4_graph.hpp` runs `embed_token` → 43 × `run_layer_body_decoding` → `hc_head` → final norm →
-LM head, and `core/v4_sampler.hpp` turns those logits into a token behind a **logit-processor seam**.
-**34 checks, 0 failures, 5 of 5 mutations killed** for the graph (every layer's `res_out` and the
-head's three checkpoints agree with `reference::model_body` at the ~`1e-3`-of-peak floor the
-single-layer gates established, 160 of 160 biased-layer router steps reproduce the model's own top-6
-rule, and `forward_token` reproduces the gate's own per-layer loop with **0 differing of 517 120**
-fp16 logits, with the 1032 expert requests going through Hot/Warm/Cold on the artifact's real 145 GB
-container). **57 checks, 0 failures, 6 of 6 mutations killed** for the sampler, whose whole gate costs
-**8.1 s** — the cheap one, by design, because Step 5's requirements are properties of a *transform*
-and can be pinned on hand-built vectors against an fp64 reference, with no model in the loop at all.
+LM head, `core/v4_sampler.hpp` turns those logits into a token behind a **logit-processor seam**, and
+`core/v4_engine.hpp` binds the tokenizer, the prompt encoder and the generation loop to them — so
+`aeon_chat` now takes a conversation and returns text **in the default build**.
 
-What still separates the tree from the first coherent run is the **text binding** (G5) — **P4**:
-`core/v4_engine.hpp` and `aeon_chat` off the legacy graph. Until its gate is green the graph decides a
-token but does not speak. The plan's premise was true at the layer and false at the ends; item 23's
-first seam closed one end, P1 the other's composition, P2 the middle that made them a graph, and P3
-the decision that ends it. Six of the fourteen gaps were lifts of code that already runs in the
-pre-rewrite graph (§6.1), so the remaining work is bounded and named rather than open.
+| Phase | Gate |
+| :--- | :--- |
+| P1 — the head end | 34 checks, 5/5 mutations |
+| P2 — the 43-layer driver | 34 checks, 5/5 mutations; 0 differing of 517 120 fp16 logits |
+| P3 — the sampler and its seam | 57 checks, 6/6 mutations + one named equivalent |
+| P4 — the text-in/text-out run | 28 checks, 7/7 mutations |
+
+`What is the capital of France?` → `The capital of France is **Paris**.`, EOS-reached, 43 layers, on
+the artifact's real weights — **the same sentence the pre-rewrite graph produced** (§1.1), now
+produced by the rebuilt graph.
+
+Every gate was mutation-tested before it was trusted, and two of them found the *gate* defective
+rather than the code: P2's first logits instrument assumed a scale it should not have (trap 42), and
+P3's first ordering assertion passed on both the correct and the wrong ordering (trap 44). Six of the
+fourteen gaps were lifts of code that already runs in the pre-rewrite graph (§6.1) and five of those
+are now spent, so what remains — chunked prefill, tiering under pressure, session swap — is named,
+bounded, and none of it is a research question.

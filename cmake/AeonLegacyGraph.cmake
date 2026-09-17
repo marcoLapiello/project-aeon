@@ -26,14 +26,10 @@ endif()
 message(STATUS "Project Aeon: legacy V4 graph ENABLED — these targets test the pre-rewrite graph")
 
 # --- Legacy tools ------------------------------------------------------------
-# Native text-in/text-out CLI driven by the old pipeline.
-aeon_add_executable(aeon_chat
-    SOURCES
-        tools/aeon_chat.cpp
-        src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
-        src/architecture/deepseek_v4/text/dsv4_chat_formatter.cpp
-        src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp
-        src/infrastructure/text/text_generation.cpp)
+# `aeon_chat` was here until P4, when the composition plan's G5 re-bound it to the
+# rewritten engine and moved it into the default build (cmake/AeonInfrastructure.cmake).
+# Text-in/text-out cannot be a legacy-only target: it is the plan's acceptance
+# criterion. What remains below are tools that genuinely re-derive old values.
 
 # Stage 0 evidence: model contract and dense tensor inventory.
 aeon_add_executable(aeon_model_contract SOURCES tools/aeon_model_contract.cpp)

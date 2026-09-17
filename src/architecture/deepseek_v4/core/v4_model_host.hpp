@@ -131,8 +131,15 @@ public:
         layer_specs_ = V4ModelSpec::resolve_layers(config_);
         V4ModelContract::validate(config_, loader_);
 
+        // The budget is sized against the bytes the graph actually **uploads**, not
+        // the container's file size: `embed.weight` stays host-side and the unused
+        // `mtp.*` draft head is never read, and together those are 1.957 GiB the
+        // old file-size reservation over-counted. Reserving them cost 148 Hot
+        // expert slots (675 instead of 823 at context 256). The contract is the
+        // authority on the uploaded set — the same table that validates the
+        // artifact — so the budget cannot drift from what is placed on the device.
         budget_ = MemoryBudgetEngine::evaluate(
-            runtime_cfg, config_, loader_.dense_file_size(), expert_format);
+            runtime_cfg, config_, V4ModelContract::uploaded_dense_bytes(config_), expert_format);
         if (!budget_.is_feasible) {
             throw std::runtime_error(
                 "V4ModelHost: the memory budget rejected this configuration: " +

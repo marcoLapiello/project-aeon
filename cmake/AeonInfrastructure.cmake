@@ -401,6 +401,50 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_sampler.cpp TIMEOUT 900)
 endif()
 
+# --- The text binding (P4) ----------------------------------------------------
+# The composition plan's fourth build phase and the plan's **acceptance
+# criterion**: one command takes a conversation and returns text. `core/v4_engine.hpp`
+# binds the four components that already ran — the artifact tokenizer, the canonical
+# prompt encoder, `text::generate_token_ids` and `V4Graph` — plus `V4Sampler`, and the
+# artifact's own sampling policy read from `generation_config.json`.
+#
+# The gate is the acceptance run and it is honest about what it can and cannot see.
+# Coherence is not machine-checkable, so the gate asserts what *is*: the engine is
+# exactly `forward_token` + `select` (an independent replay of the loop), the reply
+# is text (non-empty, decodable, valid UTF-8), a second call is bit-identical, a
+# longer conversation gives a different reply than the same user turn alone (so the
+# history is genuinely in the context), and every stop reason is reachable. It also
+# prints the generated text, because the one claim a human has to judge is the one
+# the gate is not entitled to assert.
+#
+# Where model-backed, it builds the host once and reuses it across sections: the
+# assembly is ~8 s and there is no reason to pay it six times.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_engine
+        SOURCES
+            tests/test_v4_engine.cpp
+            src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
+            src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp
+            src/infrastructure/text/text_generation.cpp
+        TIMEOUT 1800)
+endif()
+
+# --- The text-in/text-out CLI -------------------------------------------------
+# `aeon_chat` was a **legacy** target (cmake/AeonLegacyGraph.cmake) until P4. The
+# acceptance criterion is one command, and a command that exists only behind
+# `AEON_ENABLE_LEGACY_V4_GRAPH` cannot meet it. It is re-bound to `V4Engine` and
+# built by default, so the default build contains a way to run the model.
+#
+# It links the text sources because the engine drives them: the tokenizer, the
+# canonical prompt encoder (Step 0's port, not the superseded chat formatter) and
+# the certified generation loop.
+aeon_add_executable(aeon_chat
+    SOURCES
+        tools/aeon_chat.cpp
+        src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
+        src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp
+        src/infrastructure/text/text_generation.cpp)
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate

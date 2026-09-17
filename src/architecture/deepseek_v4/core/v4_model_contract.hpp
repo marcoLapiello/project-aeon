@@ -46,7 +46,14 @@ public:
             {"hc_head_base", "F32", {config.hc_mult}},
             {"hc_head_fn", "F32", {config.hc_mult, config.hc_mult * config.hidden_size}},
             {"hc_head_scale", "F32", {1}},
-            {"head.weight", "F16", {config.vocab_size, config.hidden_size}}
+            {"head.weight", "F16", {config.vocab_size, config.hidden_size}},
+            // The final RMSNorm's learned weight. It was missing from this list
+            // even though `V4ModelResources::initialize` uploads it, so a
+            // checkpoint without it would have passed `validate()` and then thrown
+            // at upload with a less specific message. Found by the P4 budget
+            // audit: summing this table disagreed with the measured upload by
+            // exactly this tensor's 8,192 bytes.
+            {"norm.weight", "F16", {config.hidden_size}}
         };
     }
 
@@ -102,6 +109,50 @@ public:
             requirements.push_back({prefix + "attn.compressor.wkv.weight", "F16", {config.head_dim, config.hidden_size}});
         }
         return requirements;
+    }
+
+    // Byte size of one required tensor, from its declared dtype and shape.
+    static size_t requirement_bytes(const V4TensorRequirement& requirement) {
+        size_t elements = 1;
+        for (int64_t dimension : requirement.shape) {
+            if (dimension < 0) {
+                throw std::invalid_argument(
+                    "V4ModelContract: negative dimension for " + requirement.name);
+            }
+            elements *= static_cast<size_t>(dimension);
+        }
+        return elements * dtype_size(requirement.dtype);
+    }
+
+    // The bytes the graph actually **uploads to VRAM**.
+    //
+    // This is what the memory budget must reserve, and it is deliberately not
+    // `AeonModelLoader::dense_file_size()`. The container holds two things the
+    // graph never places on the device:
+    //
+    //   * `embed.weight` — 1,059,061,760 B. The embedding lookup reads the
+    //     **host** mmap (`V4ModelResources::host_embed_table`, and `embed_token`
+    //     copies one row per token), so no device copy of the table exists.
+    //   * the `mtp.*` DSpark draft head — 1,041,848,220 B across 69 tensors,
+    //     unused and deferred (composition plan §9). It is excluded automatically,
+    //     because this function enumerates the *contract*, and the contract lists
+    //     only what the graph binds.
+    //
+    // Together those are 1.957 GiB that the old file-size reservation over-counted.
+    // Reserving them cost 148 Hot VRAM expert slots (675 instead of 823 at context
+    // 256), which is the whole reason for this function.
+    static size_t uploaded_dense_bytes(const DeepSeekV4Config& config) {
+        size_t total = 0;
+        for (const auto& requirement : model_tensor_requirements(config)) {
+            if (requirement.name == "embed.weight") continue;  // host-resident
+            total += requirement_bytes(requirement);
+        }
+        for (const auto& layer : V4ModelSpec::resolve_layers(config)) {
+            for (const auto& requirement : layer_tensor_requirements(config, layer)) {
+                total += requirement_bytes(requirement);
+            }
+        }
+        return total;
     }
 
 private:

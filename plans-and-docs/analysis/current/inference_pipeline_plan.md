@@ -802,6 +802,15 @@ Layers 0 and 1 have **no compressor and no indexer** (`compress_ratios[0]=compre
 - Token ID → text.
 - Host-side.
 
+> **Built (P4, 2026-09-17)** — but with a correction to *where* it lives. The detokenization is the
+> artifact tokenizer's, as above, and `V4Engine` calls it; what the engine adds is only the **EOS
+> strip and the thinking strip**, both pure functions of the decoded string (`strip_thinking` is
+> exposed publicly so it can be tested with no model — the gate pins it on hand-built text with a
+> double marker). The engine does **not** own the tokenizer, and it does not decide what a user may
+> see: it returns the decoded text and leaves the judgement to the caller. The gate's clause is that
+> the reply equals `tokenizer.decode(ids minus EOS)` recomputed independently, which is what makes
+> "the reply is the model's text" a statement about the detokenizer rather than about a byte copy.
+
 ### Step 7 — KV / compressed state update `[corrected]`
 
 - **`[corrected]` There is one shared KV head, and key and value are the same tensor.** A single 512-wide row is stored per position, not a K and a V `[V config num_key_value_heads=1; V ds4]`.
@@ -1664,11 +1673,44 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > logits. The contrast with P2's 180 s gate is the point: Step 5's requirements are properties of a
 > *transform*, and a transform can be pinned exactly without a composition around it.
 >
-> Not covered, named there: the text binding (P4), the artifact's sampling *policy* (a `config.json`
-> fact the engine reads and passes in), and throughput. What remains of item 23 is therefore **one**
-> thing — the text binding — and the fp32 host softmax over 129280 logits is the plan's accepted first
-> implementation, with the greedy and untruncated paths asserted to allocate nothing, sort nothing and
-> read back four bytes.
+> **P4 of the composition plan is done (2026-09-17) — the graph speaks, and item 23 is closed.** The
+> last gap was the **binding**: `core/v4_engine.hpp` renders the conversation with the canonical
+> encoder, drives `text::generate_token_ids`, and the step it hands that loop is exactly
+> `V4Graph::forward_token` → `V4Sampler::select`. It is a binding and not a pipeline — no forward pass,
+> no sampling rule, no template, no tokenizer, two lines of substance — and the artifact's own
+> `generation_config.json` (`do_sample = true, T = 1.0, top_p = 1.0`) is **read** rather than assumed.
+> `tools/aeon_chat.cpp` is re-bound to it and **moved out of `cmake/AeonLegacyGraph.cmake` into the
+> default build**, because text-in/text-out *is* the plan's acceptance criterion and an acceptance
+> criterion cannot live behind a flag that is off by default.
+>
+> `tests/test_v4_engine.cpp` — **28 checks, 0 failures, ~110 s**. The criterion is split into what a
+> gate may assert and what it must only print, and the split is the gate's own header: coherence is
+> **not machine-checkable**, so the gate asserts the binding (`chat` equals a loop written *in the
+> gate* that drives `forward_token` and `select` directly and computes every position itself), the
+> text (non-empty, valid UTF-8, equal to `tokenizer.decode(ids minus EOS)` recomputed independently),
+> determinism (same call twice identical; at `T=5` a different seed differs; and the **greedy path
+> ignores the seed entirely**, the control that makes the others statements about sampling), the stop
+> conditions (1 and 6 honoured, a context-filling prompt **refused**, a position at capacity
+> **thrown** rather than wrapped), the policy read, and `strip_thinking` as a pure function. The
+> history claim is made on the **logits** — 129 251 of 129 280 differ — because at `T=1` both contexts
+> happened to draw the same token, so a token comparison would have been the weaker instrument that
+> passed.
+>
+> **And the criterion itself, printed because the gate must not pretend to judge it:**
+>
+> ```text
+>   prompt   : What is the capital of France?
+>   reply    : The capital of France is **Paris**.
+>   tokens   : 9, stop: eos, TTFT 4487 ms, 2.7 tok/s
+> ```
+>
+> EOS-reached, coherent, 43 layers, on the artifact's real weights through Hot/Warm/Cold — **the same
+> sentence the pre-rewrite graph produced** (§1.1 of the composition plan), now produced by the
+> rebuilt graph. **Item 23's three seams are therefore closed**: the routed-expert executor, the
+> 43-layer driver, and the text binding. What remains of Part V is not item 23 but Tier 4's remaining
+> items — 21's `Stage D.2` concurrency (P5), 22b and R4 (P7) — and the throughput work, which the plan
+> keeps a separate gate. `2.7 tok/s` is not a throughput claim: it is an unbatched single-token decode
+> with the warm tier unallocated, and the ledger owns that number's proper measurement.
 
 **Do not build the streaming system before the numerics are correct.** Streaming bugs and numerical bugs produce identical symptoms, and debugging both at once is intractable.
 

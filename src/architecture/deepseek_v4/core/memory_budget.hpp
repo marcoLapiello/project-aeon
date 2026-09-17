@@ -21,7 +21,19 @@ namespace aeon::core {
 
 // Constant safety margins & architectural parameters
 constexpr size_t VRAM_HEADROOM_SAFETY_BYTES = 300ULL * 1024ULL * 1024ULL; // 300 MB
-constexpr double HOST_RAM_MAX_RATIO         = 0.70;                       // 70% cap (~43-45 GB) to leave comfortable room for OS
+
+// Host RAM the engine will never plan to use, held back for the OS and for this
+// process's own non-expert footprint (the mmapped containers' page cache, the
+// tokenizer, the graph, and the ~13 GiB of resident dense weights that the
+// embedding lookup and every oracle read touch through the mmap).
+//
+// It replaces a percentage cap (`0.70 * total`, i.e. 43.84 GiB here), which had
+// two defects: it never accounted for memory *already in use*, so a 43.84 GiB
+// Warm allocation on a machine with 30 GiB resident would swap; and it moved with
+// the machine's RAM size rather than with what the process needs. A fixed reserve
+// is the honest statement of "the engine may have everything else".
+constexpr size_t HOST_RAM_RESERVED_BYTES = 10ULL * 1024ULL * 1024ULL * 1024ULL; // 10 GiB
+
 constexpr size_t PIPELINE_SCRATCH_BYTES      = 100ULL * 1024ULL * 1024ULL; // ~100 MB activation scratch
 
 struct AeonRuntimeConfig {
@@ -55,6 +67,12 @@ struct MemoryBudgetReport {
     // Hardware limits
     size_t total_vram_bytes{0};
     size_t free_vram_bytes{0};
+
+    // What the plan is actually sized against: `min(free_vram, total_vram)`.
+    // Planning against `total_vram` ignores VRAM another process already holds,
+    // which on a card running a display server (or shared with another job) is
+    // memory the engine cannot have.
+    size_t usable_vram_bytes{0};
     size_t total_host_ram_bytes{0};
     size_t max_allowed_host_ram_bytes{0};
 
@@ -104,11 +122,12 @@ struct MemoryBudgetReport {
             << "  Hardware Environment:\n"
             << "    - Total VRAM           : " << (double)total_vram_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Free VRAM (at init)  : " << (double)free_vram_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Usable VRAM (planned): " << (double)usable_vram_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Total Host RAM       : " << (double)total_host_ram_bytes / (1024 * 1024 * 1024) << " GB\n"
-            << "    - Max Allowed Host RAM : " << (double)max_allowed_host_ram_bytes / (1024 * 1024 * 1024) << " GB (70% safety cap)\n"
+            << "    - Max Allowed Host RAM : " << (double)max_allowed_host_ram_bytes / (1024 * 1024 * 1024) << " GB (total - 10 GiB reserved)\n"
             << "--------------------------------------------------------------------------------\n"
-            << "  VRAM Allocation Breakdown:\n"
-            << "    - Dense Model Weights  : " << (double)vram_dense_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "  VRAM Allocation Breakdown (dense is what is uploaded, not the container):\n"
+            << "    - Dense (uploaded)     : " << (double)vram_dense_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Local K/V state      : " << (double)vram_local_kv_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Compressed K/V state : " << (double)vram_compressed_kv_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Compressor state     : " << (double)vram_compressor_state_bytes / (1024 * 1024 * 1024) << " GB\n"
@@ -216,6 +235,10 @@ public:
 
         report.total_vram_bytes = total_vram;
         report.free_vram_bytes  = free_vram;
+        // Plan against what this process can actually allocate. `total_vram` is the
+        // card's nominal capacity; `free_vram` is what is left for us, and the
+        // smaller of the two is the only defensible planning basis.
+        report.usable_vram_bytes = std::min(free_vram, total_vram);
 
         // 2. Query physical Host memory
         struct sysinfo si;
@@ -226,7 +249,9 @@ public:
         }
 
         report.total_host_ram_bytes       = static_cast<size_t>(si.totalram) * si.mem_unit;
-        report.max_allowed_host_ram_bytes = static_cast<size_t>(report.total_host_ram_bytes * HOST_RAM_MAX_RATIO);
+        report.max_allowed_host_ram_bytes = report.total_host_ram_bytes > HOST_RAM_RESERVED_BYTES
+            ? report.total_host_ram_bytes - HOST_RAM_RESERVED_BYTES
+            : 0;
 
         // 3. Validate Context Length against model architecture
         if (runtime_cfg.context_size == 0) {
@@ -280,13 +305,13 @@ public:
         // Calculate max viable context size for this GPU using the same layout.
         const size_t non_attention_required = report.vram_dense_bytes + report.vram_scratch_bytes +
                                                report.vram_headroom_bytes + report.vram_min_active_bytes;
-        if (total_vram > non_attention_required) {
+        if (report.usable_vram_bytes > non_attention_required) {
             size_t low = 0;
             size_t high = static_cast<size_t>(model_cfg.max_position_embeddings);
             while (low < high) {
                 const size_t midpoint = low + (high - low + 1) / 2;
                 const auto candidate = attention_state_memory(model_cfg, static_cast<uint32_t>(midpoint));
-                if (non_attention_required + candidate.total_bytes() <= total_vram) {
+                if (non_attention_required + candidate.total_bytes() <= report.usable_vram_bytes) {
                     low = midpoint;
                 } else {
                     high = midpoint - 1;
@@ -296,18 +321,20 @@ public:
         }
 
         // 6. Hard Feasibility Gate Evaluation
-        if (baseline_vram_needed > total_vram) {
+        if (baseline_vram_needed > report.usable_vram_bytes) {
             report.is_feasible = false;
             std::ostringstream err_oss;
             err_oss << "VRAM capacity exceeded: Required baseline "
-                    << (double)baseline_vram_needed / (1024 * 1024 * 1024) << " GB, but device has only "
-                    << (double)total_vram / (1024 * 1024 * 1024) << " GB.";
+                    << (double)baseline_vram_needed / (1024 * 1024 * 1024) << " GB, but only "
+                    << (double)report.usable_vram_bytes / (1024 * 1024 * 1024) << " GB is usable"
+                    << " (of " << (double)total_vram / (1024 * 1024 * 1024)
+                    << " GB total, " << (double)free_vram / (1024 * 1024 * 1024) << " GB free).";
             report.rejection_reason = err_oss.str();
             return report;
         }
 
         // 7. Calculate Hot VRAM Expert Pool capacity
-        size_t remaining_for_experts = total_vram - (report.vram_dense_bytes +
+        size_t remaining_for_experts = report.usable_vram_bytes - (report.vram_dense_bytes +
                                                      report.vram_kv_bytes +
                                                      report.vram_scratch_bytes +
                                                      report.vram_headroom_bytes);
