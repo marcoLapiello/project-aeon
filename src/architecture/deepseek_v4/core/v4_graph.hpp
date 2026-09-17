@@ -9,7 +9,7 @@
 // dispatch of something already written, already certified, and named in the
 // plan's Step list.
 //
-// P1 builds the **head end** of the graph — the last three ops of the forward pass,
+// P1 built the **head end** of the graph — the last three ops of the forward pass,
 // which turn the model's four residual streams into logits:
 //
 //    Step 1   token id -> embedding row, expanded across the `hc_mult` streams
@@ -17,17 +17,27 @@
 //    Step 4   final RMSNorm — the one with a learned weight
 //    Step 5   LM head — a separate [129280, 4096] matrix, not the embedding
 //
-// The 43-layer loop between them is P2's, and it is the only thing missing
-// between `forward_head` and a model forward pass. That is why `forward_head` is
-// named for what it is rather than `forward_token`: it takes a real token id and
-// produces real logits from the real head, but it has no layers in it, so calling
-// it a forward pass would be the kind of naming this rewrite is meant to stop.
+// P2 adds what sits between them: **the 43-layer loop**. `run_layer` is the loop
+// body — one call to `run_layer_body_decoding`, which chains the residual itself
+// (the body ends by writing `d_res_in` from its own `d_res_out`), which is why the
+// driver is three lines and why no layer is special-cased: the attention-class
+// branch lives inside the body, and the routed experts live behind the executor.
+// `forward_token` is that loop with the embedding in front and the head behind.
 //
-// What P1 must not drag in. The head stage reads four tensors — `embed.weight`,
-// `hc_head_fn` / `base` / `scale`, `norm.weight`, `head.weight` — so it needs the
-// host's steps 1–9 and none of the tiering. The expert pools, the registry and the
-// executor are P2's, and adding them here before the loop exists would be exactly
-// the "build it because it is easy" this plan forbids.
+// Why `run_layer` is public rather than buried in the loop. The gate that
+// certifies this phase must observe each step's *inputs and outputs*, not only the
+// token it produces: a 43-layer fp64 reference that free-runs accumulates fp16
+// rounding drift against the device, and by the head that drift can flip a router
+// near-tie and make two trajectories diverge for reasons that are not defects.
+// The serial-decode gate settled this — feed the reference the **device's own**
+// per-step residual and routing. So the loop body is exposed, `forward_token`
+// calls it 43 times, and the gate can assert the two are the same computation.
+//
+// What P2 must not drag in. The head stage reads four tensors and the loop reads
+// the layers the host built; the sampler (P3), the text binding (P4) and the
+// observer that would trace a real forward pass (P5) are none of its business.
+// The observer seam exists and defaults to the null one, because the body requires
+// it, and populating it is a separate phase.
 //
 // Precision. `hc_head` and the final RMSNorm both store fp16, and the LM head
 // accumulates in fp32 and stores fp16 (plan Part I §1: the head is fp16, the
@@ -158,6 +168,55 @@ public:
         return head_stage(stream);
     }
 
+    // --- Step 2 — the 43-layer loop ------------------------------------------
+
+    // One layer, one token: the graph's unit of composition. It does three things
+    // and nothing else — hand the layer body its own layer, the model's RoPE
+    // tables and the host's expert executor, and hand back the body's return value
+    // (the routed selection, which the body already brings to the host).
+    //
+    // It does not advance the residual, write a position, or pick a branch. The
+    // body chains `d_res_in` from its own `d_res_out` at the end of the layer, so
+    // the next layer's `run_layer` reads exactly what this one produced; the body
+    // records the position itself; and the attention-class branch is one
+    // `attention_kind` read inside the body, in one place. A driver that repeated
+    // any of those would be a second body, which is what the plan forbids.
+    V4LayerBodyOutput run_layer(uint32_t layer_id, uint32_t token_id, uint32_t position,
+                                hipStream_t stream) {
+        const V4LayerBodyTables tables = host_.tables();
+        return run_layer_body_decoding(
+            host_.layer(layer_id), host_.scratch(), tables, token_id, position, stream,
+            host_.executor(), observer_);
+    }
+
+    // The whole forward pass for one token at one position: the embedding, 43
+    // calls to `run_layer`, then the head. Returns the device logits, fp16 and
+    // `[vocab_size]`, exactly as `head_stage` leaves them.
+    //
+    // The layering is deliberate: the embedding enters the first layer through
+    // `d_res_in`, and every later layer's input is the previous layer's output
+    // because the body chained it. `num_layers()` is the model's own count, so a
+    // 43-layer checkpoint runs 43 times with no constant in this file.
+    const half* forward_token(uint32_t token_id, uint32_t position, hipStream_t stream) {
+        embed_token(token_id, stream);
+
+        const uint32_t layers = host_.num_layers();
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            (void)run_layer(layer, token_id, position, stream);
+        }
+
+        const half* logits = head_stage(stream);
+
+        // The token boundary, and it is a precondition rather than an
+        // implementation detail (trap 41): a lease grants no ordering, so it has to
+        // be held for as long as compute reading that slot may be in flight.
+        // Sampling must read the logits back, so the caller has a compute-stream
+        // boundary here for free — that is what makes this release safe.
+        host_.release_expert_leases();
+
+        return logits;
+    }
+
     // --- read access, for the gate and for whatever runs above -----------------
 
     const float* residual() const noexcept { return host_.scratch().d_res_in; }
@@ -170,6 +229,11 @@ public:
 
 private:
     V4ModelHost& host_;
+
+    // The body requires an observer; a real one that traces a forward pass is P5's
+    // (composition plan G4). The null observer copies nothing, so the hot path is
+    // the arithmetic and nothing else.
+    V4NullLayerBodyObserver observer_;
 };
 
 } // namespace aeon::core

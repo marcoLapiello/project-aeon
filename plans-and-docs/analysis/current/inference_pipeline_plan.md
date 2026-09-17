@@ -1590,6 +1590,35 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > B3. The Step-3 gate's coverage is *consumed*, not duplicated.
 >
 > **A new trap, found twice in one gate run — see trap 42.**
+>
+> **P2 of the composition plan is done (2026-09-17) — the graph produces a token.** `V4ModelHost`
+> now builds the whole assembly (`core/v4_model_host.hpp`: all 15 steps of the composition plan's
+> §5.1, including the Hot VRAM pool, the staging arena, the registry with its Hot/Warm preload, the
+> tiered supply and the production `V4TieredExpertExecutor`), and `V4Graph` runs `embed_token` →
+> 43 × `run_layer_body_decoding` → `hc_head` → final norm → LM head. `reference/dsv4_oracle.hpp`
+> gained **G9** — `model_body`, with `model_embed` and `model_head` — written **before** the driver,
+> as the phase required, and pinned by two closed-form self-checks.
+>
+> `tests/test_v4_graph_body.cpp` — **34 checks, 0 failures, 5 of 5 mutations killed.** Two independent
+> statements, because they are different defects. (1) *The composition is arithmetically right:* every
+> one of the 172 layer-steps' `res_out`, and the head's three checkpoints, match the fp64 reference at
+> `7.4e-4 … 1.3e-3` of peak — the same floor the single-layer gates established, now held across 43
+> layers — with the device's argmax equal to the reference's at all four tokens and **160 of 160
+> biased-layer router steps reproducing the model's own top-6 rule** applied to the device's own
+> logits (trap 37). (2) *The driver is the loop it claims to be:* `forward_token` reproduced the
+> gate's own 43 calls to `run_layer` plus the head with **0 differing of 517 120** fp16 logits.
+>
+> The reference is re-seeded from the device's per-step residual and its MoE combine is driven by the
+> device's selection — item 18's method, without which 43 layers of fp16 drift would make the
+> comparison measure divergence rather than arithmetic. Real experts went through Hot/Warm/Cold from
+> the 145 GB container: **767 of 1032 requests were distinct `(layer, expert)` pairs**. **Trap 43**
+> records what the gate cost and why the obvious optimisation does not pay.
+>
+> Not covered, named there: the local ring wrap (needs more than `sliding_window = 128` tokens, which
+> at 43 layers is tens of thousands of expert fetches — the real-scale state gate and the serial-decode
+> gate own the ring), HCA compression (its first entry is at position 127; CSA *is* exercised, it
+> commits at position 3), and the sampler, the text binding, the observer and tiering under load
+> (P3/P4/P5). What remains of item 23 is therefore the sampler and the text binding.
 
 **Do not build the streaming system before the numerics are correct.** Streaming bugs and numerical bugs produce identical symptoms, and debugging both at once is intractable.
 
@@ -2008,3 +2037,7 @@ These are the specific things that will break this model if implemented naively.
 42. **A dot product's error scales with the magnitudes of its *terms*, not with the magnitude of its *result* — so a comparison in units of the result's own precision is the wrong instrument for any projection whose output spans decades.** The LM head is a 4096-term fp16-input, fp32-accumulate dot, and its 129280 outputs span about two decades. An accumulation error is proportional to `Σ|terms|`; for a row that cancels, that sum is orders of magnitude larger than the result. The fp16 quantum, meanwhile, shrinks *with* the result. The consequence: an elementwise check of the form "is each logit the fp16 rounding of the true value?" reports a large disagreement on a **correct** stage — the P1 gate's first run measured **42.9%** of 517120 elements differing against an assumed floor of ~0.2%. The same mistake appeared a second time inside that gate, as "each logit within 2 fp16 ulps of an fp32 dot": the true worst case is **10.2 ulps**, on a cancelling row, and the ulp count is meaningless there.
 
     The right instruments are two, and together they *decide* whether a residual is precision or a defect rather than asserting it: (a) bound the absolute error by the accumulation's own scale, `γ_K · Σ|terms|` with `γ_K = K·u/(1−K·u)` — measured **0.102× the bound**; and (b) require the disagreement with the fp64 oracle to equal what the fp32 accumulation *predicts* — measured **39.453% predicted, 39.453% measured**, i.e. the device follows the fp32 accumulation exactly. A wiring defect is orders of magnitude out, so the strong-but-wrong instrument was not merely over-strict, it was uninformative; the correct pair is both tighter and self-explaining. This is the plan's recurring lesson (`cos` near a zero crossing, the dominated sink, the clamp differential, the `rms_eps` floor, `hc_eps` saturation) in its costliest form yet, because the quantity that collapses here is the *output* of the most expensive op in the graph rather than a scalar in a probe. `[Item 23 / P1]`
+
+43. **A model-level gate's cost is the reference, not the device — and the expensive-looking part of the reference is not the expensive part.** P2's gate compares the assembled 43-layer graph against an fp64 `model_body` on the artifact's real dense weights and real routed experts. Its first run took **5 minutes**, and the *same* 172 layer-steps cost the device **1.6 s** (section D measures exactly that pass). The cost was the fp64 reference materialising each real expert's three matrices as `double` — 200 MB per matrix, **600 MB per expert** — so the decode is **memory-bound**, and the per-element swizzle address arithmetic that reads as the expensive part is not: hoisting the address and the shared fp16 scale out of the inner loop (verified bit-identical to the retained per-element form over **201 M values**) bought only **`1.4x`**, and the walk stayed ~0.1 s per expert. The obvious *structural* fix — decode each expert once and reuse it across tokens — was then measured rather than assumed, and does not pay either: **767 of 1032 requests were already distinct `(layer, expert)` pairs**, so a perfect cross-token cache would return `1.35x`.
+
+    The same shape as trap 42 — the instrument's cost was attributed by inspection and the attribution was wrong — with the extra twist that here the temptation is to optimise the *code that looks slow* rather than the code that is. The gate keeps both numbers in its own output (a per-section timing and the reuse count) so that the next person to find it slow can see where the time went before touching it. `[Item 23 / P2]`

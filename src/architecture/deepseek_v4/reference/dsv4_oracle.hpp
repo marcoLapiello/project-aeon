@@ -1430,6 +1430,29 @@ struct SwizzledDecodeOptions {
 };
 
 // Reads the payload back into a row-major `[rows, columns]` double matrix.
+//
+// The walk is structured the way the *address* is structured rather than the way
+// the element is. Two facts about `swizzled_address` make hoisting it safe:
+//
+//   * `packed_word` and `storage_slot` depend on the column only through its
+//     **group of 32** (`word_in_group = (column % 32) / 8`, and the group is what
+//     picks `iteration`/`slice`). So they are constant across a group, and a
+//     per-element call recomputes eight integer divisions to rediscover the same
+//     four-byte word;
+//   * the fp16 scale at `storage_slot` is shared by all 32 weights of the group,
+//     so the per-element form converts the same two bytes 32 times.
+//
+// **The measured gain is ~1.4x, not the order of magnitude the hoisting suggests,
+// and that is worth recording rather than leaving as an assumption**: this walk is
+// bounded by writing `rows * columns` doubles (200 MB per matrix, 600 MB per
+// expert), so it is memory-bound and the divisions were never the constraint. The
+// per-element form is kept below as `swizzled_decode_reference` and the P2 gate
+// asserts the two agree over real payloads — the change is a contraction, not a
+// reimplementation.
+//
+// The loop is parallel over rows: each writes `weights[row * columns ...]` and
+// reads only the const payload, so the split is over disjoint output. (The file's
+// other heavy walks, `matvec` and `grouped_wo_a`, are guarded the same way.)
 inline std::vector<double> swizzled_decode(const uint8_t* payload, SwizzledKind kind,
                                            SwizzledDecodeOptions options = {}) {
     if (payload == nullptr) {
@@ -1437,7 +1460,55 @@ inline std::vector<double> swizzled_decode(const uint8_t* payload, SwizzledKind 
     }
     const SwizzledShape shape = swizzled_shape(kind);
     std::vector<double> weights(shape.weight_count(), 0.0);
+    const int groups = shape.columns / 32;
 
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (shape.rows >= 8)
+#endif
+    for (int row = 0; row < shape.rows; ++row) {
+        double* out_row = weights.data() + static_cast<size_t>(row) * shape.columns;
+        const int row_block = row / shape.rows_per_wave;
+        const int row_in_block = row % shape.rows_per_wave;
+
+        for (int group = 0; group < groups; ++group) {
+            const int iteration = group / shape.lanes_per_row;
+            const int slice = group % shape.lanes_per_row;
+            const int lane = row_in_block * shape.lanes_per_row + slice;
+            const size_t storage =
+                (static_cast<size_t>(row_block) * static_cast<size_t>(shape.iterations()) +
+                 static_cast<size_t>(iteration)) * 32u + static_cast<size_t>(lane);
+
+            const double scale = half_bits_to_double(load_le_u16(
+                payload + shape.scale_offset + storage * sizeof(uint16_t)));
+            const uint8_t* word_base =
+                payload + shape.packed_offset + storage * 4u * sizeof(uint32_t);
+            double* out_group = out_row + static_cast<size_t>(group) * 32;
+
+            for (int j = 0; j < 32; ++j) {
+                const int nibble = options.permute_nibbles
+                    ? swizzled_nibble_slot(j)
+                    : ((group * 32 + j) % 8);
+                const uint32_t word =
+                    load_le_u32(word_base + static_cast<size_t>(j / 8) * sizeof(uint32_t));
+                const int value = static_cast<int>((word >> (4 * nibble)) & 0xFu);
+                const double quantized = options.signed_zero_point
+                    ? static_cast<double>(value - 8)
+                    : static_cast<double>(value);
+                out_group[j] = quantized * scale;
+            }
+        }
+    }
+    return weights;
+}
+
+// The per-element form, kept only so a gate can prove the hoisted decoder above
+// is value-identical on real payloads. It is the original implementation,
+// character for character, and is not on any production path.
+inline std::vector<double> swizzled_decode_reference(const uint8_t* payload,
+                                                     SwizzledKind kind,
+                                                     SwizzledDecodeOptions options = {}) {
+    const SwizzledShape shape = swizzled_shape(kind);
+    std::vector<double> weights(shape.weight_count(), 0.0);
     for (int row = 0; row < shape.rows; ++row) {
         for (int column = 0; column < shape.columns; ++column) {
             SwizzledAddress address = swizzled_address(shape, row, column);
@@ -1447,10 +1518,8 @@ inline std::vector<double> swizzled_decode(const uint8_t* payload, SwizzledKind 
             const uint32_t word = load_le_u32(payload + shape.packed_offset +
                                               address.packed_word * sizeof(uint32_t));
             const int nibble = static_cast<int>((word >> (4 * address.nibble)) & 0xFu);
-
             const double scale = half_bits_to_double(load_le_u16(
                 payload + shape.scale_offset + address.storage_slot * sizeof(uint16_t)));
-
             const double quantized = options.signed_zero_point
                 ? static_cast<double>(nibble - 8)
                 : static_cast<double>(nibble);
@@ -2499,6 +2568,187 @@ inline LayerBodyResult layer_body(
     // -------------------------------------------------------------------
     out.res_out = hc_post(out.moe_out, out.res_mid, out.post_f, out.comb_f, hidden);
     return out;
+}
+
+// ===========================================================================
+// Model level — the composition (composition plan G9)
+// ===========================================================================
+//
+// `layer_body` above is one layer; this is the thing the composition plan's P2
+// gate needs and the tree has never had: **the whole forward pass in fp64** —
+// embed -> 43 x `layer_body` -> `hc_head` -> final RMSNorm -> LM head.
+//
+// It is deliberately thin. Every op it sequences is already certified, and it
+// introduces no arithmetic of its own beyond the embedding gather and the head
+// chain, both of which are the *same* primitives the device composes:
+//
+//   * the embedding row is broadcast across the `hc_mult` streams, because the
+//     model's Hyper-Connections dimension enters as `hc_mult x hidden` with the
+//     identical row in every stream (Step 1);
+//   * the head is exactly `hc_head_reduce` -> `rmsnorm` -> `matvec`, which is the
+//     order `core/v4_graph.hpp::head_stage` dispatches its three kernels in.
+//
+// The oracle is written **before** the driver that is checked against it, which
+// is the plan's own rule: an oracle written after the implementation is written
+// to agree with it. Nothing here is derived from the device.
+//
+// Two things this deliberately does NOT do, named so a green comparison is not
+// read as more than it is:
+//
+//   * it does not decide the routed selection. `LayerBodyWeights` carries the
+//     `routed_ids_override`/`routed_weights_override` seam, and a gate checking a
+//     loop must drive this with the **device's** own selection, exactly as the
+//     serial-decode gate does (trap 37). Left null, it uses its own rule.
+//   * it does not model the KV tiering, the sampler or the text front end. Those
+//     are P3/P4/P5.
+
+struct ModelBodyShape {
+    uint32_t hidden{4096};
+    uint32_t hc_mult{4};
+    uint32_t vocab{129280};
+    double rms_eps{1e-6};
+    double hc_eps{1e-6};
+
+    uint32_t hc_dim() const noexcept { return hc_mult * hidden; }
+};
+
+// The four model-level tensors the head reads, plus the embedding table. All
+// fp16 except the three `hc_head` tensors, which are fp32 — the same split the
+// artifact stores and `V4ModelResources` uploads.
+struct ModelBodyWeights {
+    const uint16_t* embed{nullptr};       // [vocab, hidden]
+    const uint16_t* final_norm{nullptr};  // [hidden]
+    const uint16_t* lm_head{nullptr};     // [vocab, hidden]
+    const float* hc_head_fn{nullptr};     // [hc_mult, hc_mult*hidden]
+    const float* hc_head_base{nullptr};   // [hc_mult]
+    const float* hc_head_scale{nullptr};  // [1] — a scalar, not three entries
+};
+
+// One `LayerKvState` per layer. `local_capacity` is the layer's own local ring
+// capacity (the device's `V4LayerStateLayout::local_capacity`), so the oracle's
+// ring wraps exactly where the device's does.
+struct ModelBodyState {
+    std::vector<LayerKvState> layers;
+
+    void reset(const std::vector<LayerBodyShape>& shapes, uint32_t local_capacity) {
+        layers.assign(shapes.size(), LayerKvState{});
+        for (size_t layer = 0; layer < shapes.size(); ++layer) {
+            layers[layer].reset(shapes[layer], local_capacity);
+        }
+    }
+};
+
+struct ModelBodyResult {
+    std::vector<double> residual;     // [hc_dim] — the last layer's output
+    std::vector<double> hc_head_out;  // [hidden]
+    std::vector<double> head_norm;    // [hidden]
+    std::vector<double> logits;       // [vocab]
+};
+
+// Step 1 — the embedding lookup, expanded identically across the streams. The
+// broadcast is the model's own shape (plan Step 1), not a convenience: an
+// implementation that wrote one row and left the others stale is wrong at every
+// position after the first, and this is the closed form it has to match.
+inline std::vector<double> model_embed(const ModelBodyShape& shape,
+                                       const ModelBodyWeights& weights,
+                                       uint32_t token_id) {
+    if (weights.embed == nullptr) {
+        throw std::invalid_argument("dsv4_oracle: model body is missing the embedding table");
+    }
+    if (token_id >= shape.vocab) {
+        throw std::out_of_range("dsv4_oracle: embedding token id is outside the vocabulary");
+    }
+    const std::vector<double> row =
+        half_bits_to_doubles(weights.embed + static_cast<size_t>(token_id) * shape.hidden,
+                             shape.hidden);
+    std::vector<double> residual(shape.hc_dim(), 0.0);
+    for (uint32_t stream = 0; stream < shape.hc_mult; ++stream) {
+        std::copy(row.begin(), row.end(),
+                  residual.begin() + static_cast<size_t>(stream) * shape.hidden);
+    }
+    return residual;
+}
+
+// Steps 3–5 — `hc_head` -> final RMSNorm -> LM head, in the order the device
+// dispatches them. Takes the residual explicitly so a gate can feed it either the
+// oracle's own trajectory or the device's, which is what makes the head check
+// independent of where the residual came from.
+inline ModelBodyResult model_head(const ModelBodyShape& shape,
+                                  const ModelBodyWeights& weights,
+                                  const std::vector<double>& residual) {
+    if (weights.hc_head_fn == nullptr || weights.hc_head_base == nullptr ||
+        weights.hc_head_scale == nullptr || weights.final_norm == nullptr ||
+        weights.lm_head == nullptr) {
+        throw std::invalid_argument("dsv4_oracle: model body is missing a head tensor");
+    }
+    if (residual.size() != shape.hc_dim()) {
+        throw std::invalid_argument("dsv4_oracle: model head residual has the wrong width");
+    }
+
+    ModelBodyResult out;
+    out.residual = residual;
+    // `hc_head_fn` / `base` / `scale` are fp32 in the checkpoint, so they are
+    // widened here the same way `LayerBodyWeights`' fp32 HC tensors are: the
+    // oracle reads the artifact's bits and does all of its arithmetic in double.
+    const std::vector<double> head_fn(
+        weights.hc_head_fn,
+        weights.hc_head_fn + static_cast<size_t>(shape.hc_mult) * shape.hc_dim());
+    const std::vector<double> head_base(
+        weights.hc_head_base, weights.hc_head_base + shape.hc_mult);
+    const HcHeadResult head = hc_head_reduce(
+        residual, shape.hc_mult, shape.hidden,
+        head_fn.data(), head_base.data(),
+        static_cast<double>(weights.hc_head_scale[0]),
+        shape.rms_eps, shape.hc_eps);
+    out.hc_head_out = head.out;
+    out.head_norm = rmsnorm(out.hc_head_out,
+                            half_bits_to_doubles(weights.final_norm, shape.hidden),
+                            shape.rms_eps);
+    out.logits = matvec(
+        shape.vocab, shape.hidden, out.head_norm,
+        [&](size_t o, size_t i) {
+            return half_bits_to_double(weights.lm_head[o * shape.hidden + i]);
+        });
+    return out;
+}
+
+// The whole forward pass for one token: `residual_in` -> 43 x `layer_body` ->
+// the head. `residual_in` is passed in rather than derived from `token_id`
+// because a gate that re-seeds the reference from the device's per-layer residual
+// (the serial-decode gate's method, and the only way a 43-layer comparison stays
+// tight) hands it the device's value; a caller that wants the model's own
+// trajectory passes `model_embed(...)`.
+//
+// `layer_ropes[l]` is the **class's** base for layer `l` (plain for Sliding,
+// YaRN-on-compressed otherwise), so the caller resolves the branch and the oracle
+// does not re-derive it. `state` is advanced in place: the caller owns one
+// `LayerKvState` per layer, which is what makes the model-level state a sequence
+// of tokens rather than a single step.
+inline ModelBodyResult model_body(const ModelBodyShape& model,
+                                  const ModelBodyWeights& model_weights,
+                                  const std::vector<LayerBodyShape>& layer_shapes,
+                                  const std::vector<LayerBodyWeights>& layer_weights,
+                                  const std::vector<RopeTableRef>& layer_ropes,
+                                  uint32_t position,
+                                  const std::vector<double>& residual_in,
+                                  ModelBodyState& state) {
+    if (layer_shapes.size() != layer_weights.size() ||
+        layer_shapes.size() != layer_ropes.size() ||
+        layer_shapes.size() != state.layers.size()) {
+        throw std::invalid_argument("dsv4_oracle: model body graph is inconsistent");
+    }
+    if (residual_in.size() != model.hc_dim()) {
+        throw std::invalid_argument("dsv4_oracle: model body residual has the wrong width");
+    }
+
+    std::vector<double> residual = residual_in;
+    for (size_t layer = 0; layer < layer_shapes.size(); ++layer) {
+        LayerBodyResult result = layer_body(
+            layer_shapes[layer], layer_weights[layer], layer_ropes[layer],
+            position, residual, state.layers[layer]);
+        residual = std::move(result.res_out);
+    }
+    return model_head(model, model_weights, residual);
 }
 
 } // namespace aeon::reference

@@ -348,6 +348,36 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_graph_head.cpp TIMEOUT 900)
 endif()
 
+# --- The 43-layer driver (P2) -------------------------------------------------
+# The composition plan's second build phase: `forward_token` = embedding ->
+# 43 x `run_layer` -> head, on the artifact's real dense weights, real embedding
+# and real head, with real routed experts delivered through the production
+# `V4TieredExpertExecutor` (Hot/Warm/Cold, leases, staging, O_DIRECT). This is the
+# first phase whose output is a **token** rather than an intermediate.
+#
+# Two independent statements, because they are different defects. (1) The
+# composition is arithmetically right: every layer's `res_out`, and the head's
+# three checkpoints, are compared against `reference::model_body` — the fp64
+# oracle this phase adds, written before the driver and pinned by closed-form
+# self-checks. (2) The driver is the loop it claims: `forward_token` must produce
+# the same 129280 fp16 logits, bit for bit, as the gate's own 43 calls to
+# `run_layer` plus the head.
+#
+# The reference is re-seeded from the *device's* per-step residual and its MoE
+# combine is driven by the *device's* selection — the serial-decode gate's method,
+# which is the only way a 43-layer comparison stays tight instead of measuring
+# accumulated fp16 drift. The selection is checked separately against the device's
+# own router logits, per trap 37.
+#
+# Not covered, and named in the file: the local ring wrap (needs >128 tokens), HCA
+# compression (first entry at position 127), the sampler, the text binding, the
+# observer and tiering under load. OPENMP is on because the reference is fp64 over
+# 43 layers; without it the oracle, not the device, would be the whole cost.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_graph_body
+        SOURCES tests/test_v4_graph_body.cpp TIMEOUT 1800 OPENMP)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate
