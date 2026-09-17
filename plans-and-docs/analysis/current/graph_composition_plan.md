@@ -89,7 +89,7 @@ flowchart TD
 | B3 | 4 streams → one 4096 vector, weightless RMS + `hc_head_fn/base/scale`, `hc_eps` after the sigmoid | device | **Step 3 gate — 25 checks, 6/6 mutations** |
 | B4 | Final RMSNorm with the learned `norm.weight` | device | **Tier 1 item 5** (weighted form) |
 | B5 | `logits = head.weight @ h` → [129280], fp32 accumulate, head is **not** tied to the embedding | device | inventory only — **no standalone gate exists**; certified by P1 and P2 |
-| B6 | Logit-processor seam → temperature / top-k / top-p → token | device + 4 B host | **none — does not exist** |
+| B6 | Logit-processor seam → temperature / top-k / top-p → token | device + 4 B host | **P3 gate — 57 checks, 0 failures, 6/6 mutations; `core/v4_sampler.hpp`** |
 | C1 | Token id → text | host | `test_dsv4_tokenizer` |
 | C2 | Stop on EOS / max tokens / context limit | host | `test_text_generation` |
 
@@ -331,12 +331,14 @@ Step 13 is the only part with real mass, and the tiering gate already drives its
 | `core/v4_sampler.hpp` | the logit-processor seam and the sampler (argmax now; temperature / top-k / top-p on the fp32 logits). | `v4_attention.hpp` argmax pair |
 | `core/v4_engine.hpp` | binds text: tokenizer + prompt encoder + `generate_token_ids` + `V4Graph` + detokenizer + the session/state boundary. | the three above, `infrastructure/text/text_generation.hpp` |
 
-**Built as of P2:** `core/v4_model_host.hpp` (all 15 steps of §5.1) and `core/v4_graph.hpp` (the head
-stage and the 43-layer loop). The pools, the registry, the staging arena, the supply and the
-executor went into `v4_model_host.hpp` rather than into new files, and the loop went into
-`v4_graph.hpp`'s `run_layer` / `forward_token` — which is why the split was drawn where it was: the
-host is *what is resident*, the graph is *what happens in order*, and P2 needed both ends of that
-division to be the same two files.
+**Built as of P3:** `core/v4_model_host.hpp` (all 15 steps of §5.1), `core/v4_graph.hpp` (the head
+stage and the 43-layer loop) and `core/v4_sampler.hpp` (the seam, the transforms, the generator and
+the device argmax path). The pools, the registry, the staging arena, the supply and the executor
+went into `v4_model_host.hpp` rather than into new files, and the loop went into `v4_graph.hpp`'s
+`run_layer` / `forward_token` — which is why the split was drawn where it was: the host is *what is
+resident*, the graph is *what happens in order*, and P2 needed both ends of that division to be the
+same two files. P3 then went where the plan said: a **separate** file, because sampling is not a
+model operation — the graph ends at logits and never learns how a token was chosen.
 
 `v4_model_host.hpp` and `v4_graph.hpp` are the split that keeps the files small and the concerns
 separate: the host is *what is resident*, the graph is *what happens in order*. The streaming
@@ -376,7 +378,8 @@ or before P4 is a prerequisite of the first coherent run:**
 | :--- | :--- | :--- |
 | **P1 — done** | G1 *(steps 1–9 of 15)*, half of G2 *(the head stage)* | `core/v4_model_host.hpp`, `core/v4_graph.hpp`; 34 checks, 5/5 mutations |
 | **P2 — done** | the rest of G1 and G2, and G9 | the pools/supply/executor, the 43-layer loop, and `reference::model_body`; 34 checks, 5/5 mutations |
-| **P2–P4 — the first coherent run** | the rest of G1 and G2, plus G3, G5, G9 | the pools/supply/executor, the 43-layer loop, the sampler, the binding, and the oracle the driver's gate needs |
+| **P3 — done** | G3 | the sampler and the logit-processor seam, `core/v4_sampler.hpp`; 57 checks, 6/6 mutations |
+| **P4 — the first coherent run** | G5 | the text binding, `core/v4_engine.hpp`, and `aeon_chat` off the legacy graph |
 | P5 — diagnostics under tiering | G4, G14 | observer and telemetry wiring; aids, not prerequisites |
 | P6 — chunked prefill | G6, G7, G8 | batched embedding, on-device top-k, the chunk driver |
 | P7 — session state | G10, G11, G12, G13 | the session aggregate, registry, cold store, and R4 |
@@ -385,7 +388,7 @@ or before P4 is a prerequisite of the first coherent run:**
 | :-- | :--- | :--- | :--- | :--- |
 | **G1** | **The engine assembly / `V4ModelHost`.** Steps 1–15 of §5.1, including the Hot/Warm preload. | Nothing constructs the graph. This is the single largest genuine absence. **Done (P1 + P2)** — steps 1–9 in P1, 10–15 (pools, registry, staging, supply, executor, preload) in P2. | `core/v4_model_host.hpp` | assert the assembly's own invariants: contract passes, `registry.invariants_hold()`, `hot_vram_slots` residents, warm slots as budgeted, and one cold miss decrements `cold_nvme_slots` |
 | **G2** | **The 43-layer driver + head composition (`V4Graph`).** | `run_layer_body_decoding` is per *layer*; nothing calls it 43 times, and nothing calls `hc_head` → norm → LM head. **Done (P1 + P2)** — the head stage in P1, the 43-call loop in P2 (`run_layer` / `forward_token`). | `core/v4_graph.hpp` | **P2 gate** vs `reference` `model_body` (see G9) |
-| **G3** | **The sampler with a logit-processor seam.** `temperature`, `top_k`, `top_p`, RNG, and a hook that may mask/bias the fp32 logits *before* sampling. | Plan Step 5 + §6.4: structured output and tool-call JSON are logit masks, so the seam is **non-deferrable**; only argmax exists today. | `core/v4_sampler.hpp` | deterministic-seed replay + mask-applied/mask-cleared fork on real logits |
+| **G3** | **The sampler with a logit-processor seam.** `temperature`, `top_k`, `top_p`, RNG, and a hook that may mask/bias the fp32 logits *before* sampling. | Plan Step 5 + §6.4: structured output and tool-call JSON are logit masks, so the seam is **non-deferrable**; only argmax exists today. **Done (P3)** — `core/v4_sampler.hpp`, `V4Sampler` + the pure `sampler_ops`, with `V4SplitMix64`. | `core/v4_sampler.hpp` | **P3 gate**: seeded replay + mask + `T→0` + the untruncated default, and the **ordering** of the seam asserted by what the processor sees |
 | **G4** | **A real `V4LayerBodyObserver` for the new graph.** | The body takes an observer; the only production one lived inside `V4Pipeline`. The null one runs but leaves no diagnostic path. | `core/v4_graph.hpp` (observer adapter) | none needed; must not perturb the hot path (assert identical output traced vs null) |
 | **G5** | **The end-to-end binding + a non-legacy CLI.** `generate_token_ids` bound to `V4Graph`, and `aeon_chat` re-targeted off the legacy graph. | Criterion 1 is *one command, conversation in, text out*. Today that command only exists behind the legacy flag. | `core/v4_engine.hpp`, `tools/aeon_chat.cpp`, `cmake/AeonInfrastructure.cmake` | **P4 gate**: the coherence run, plus a multi-turn context run |
 | **G6** | **Batched token embedding (gather + broadcast).** | Decode uses 4 small H2D copies of the row. A prefill chunk needs a gather over the chunk's ids on the device. | `core/v4_graph.hpp` prep | item-19-style `chunk ≡ serial` on the embedding stage |
@@ -417,7 +420,7 @@ into the rewrite, not invented:
 | G5 | **rebind** | `tools/aeon_chat.cpp` is complete and works — against `V4Pipeline::generate_until_stop`. Only its engine pointer changes |
 | G10 | **lift** | `V4PipelineStateSnapshot` (`:59`) is already `current_seq_len` + a vector of layer snapshots |
 | G14 | **lift** | `enable_expert_timing` / `collect_expert_timing` (`:150`, `:2239`) and the supply telemetry wiring all exist |
-| G3 | **half-lift** | the GPU argmax pair exists (`kernels/v4_attention.hpp:193,236`); temperature / top-k / top-p and the seam are new |
+| G3 | **half-lift** | the GPU argmax pair exists (`kernels/v4_attention.hpp:193,236`); temperature / top-k / top-p and the seam were new — **done in P3** |
 
 **Genuinely new work: G6 (batched embedding — small), G7 (on-device indexer top-k — kernel work),
 G8 (the chunk driver over the certified chunk body), G9 (the model-level oracle), G11–G13 (session
@@ -530,14 +533,52 @@ the file and asserted bit-identical over 201 M values) bought only `1.4x`; the d
 expert. The lesson is the same shape as trap 42's: **the instrument's cost was attributed by
 measurement, and the obvious suspect was wrong.**
 
-### P3 — the sampler and its seam
+### P3 — the sampler and its seam ✅
+**Built:** `core/v4_sampler.hpp` — `V4Sampler` (the seam, the configuration, the generator, and the
+device workspace for the certified argmax pair) over a set of pure host functions
+(`sampler_ops`: `apply_temperature`, `apply_top_k`, `apply_top_p`, `softmax_in_place`, `argmax_of`,
+`sample_from_probs`) plus `V4SplitMix64`, and `scripts/mutate_sampler.py`. The decision itself is
+one routine, `V4Sampler::decide`, on host fp32 logits: **seam → temperature → top-k → top-p →
+softmax → decide**. `select` is the device-bound entry point and widens only when the host has work
+to do.
 
-**Build:** `core/v4_sampler.hpp`; argmax at `T=1, top_p=1` first (the artifact's own defaults at
-which sampling is untruncated), then temperature / top-k / top-p on fp32 logits, with the
-logit-processor hook in front.
-**Gate:** seeded replay is bit-identical; a mask that sets one logit to `-inf` removes that token
-from the support; `T→0` converges to the argmax path; the untruncated defaults reproduce the
-argmax token. **The seam is asserted to exist, not merely to be present.**
+**Gate: 57 checks, 0 failures, 8.1 s; 6 of 6 mutations killed, plus one named equivalent.** The
+plan's four clauses, each measured rather than asserted:
+
+* **seeded replay is bit-identical** — the same seed over 64 draws gives the same token sequence,
+  `reseed` restores it, a different seed differs, and an *untruncated `T=1` draw is not a disguised
+  argmax* (that last one is what stops every determinism check above from being vacuous);
+* **a mask removes a token from the support** — its probability is exactly `0`, not merely small,
+  because the mask writes `-inf`; it is never drawn in 200 draws; the remaining mass stays at 1; a
+  single survivor is decided under all 64 seeds; and an empty support (or an *infinite* promotion,
+  which has no probability either) is **refused**, not answered with index 0;
+* **`T→0` converges to the argmax path** — 64 of 64 draws at `T = 1e-6` equal the argmax, which is
+  also what the greedy branch returns, so the switch is the limit rather than a special case beside
+  the sampler;
+* **the untruncated defaults reproduce the argmax token** — see the reading recorded in the gate
+  header; the default configuration is the deterministic one, its decision is the **certified device
+  argmax**, and at `top_k=0, top_p=1` the support is the whole vocabulary.
+
+**The seam is asserted to exist, not merely to be present** — and the *ordering* is asserted by what
+the processor **sees**, because that is the only thing that discriminates it: with `top_k = 3` and
+`T = 0.5` installed, a first-running seam still sees all eight finite logits at their raw values. The
+gate's first attempt at this check was "a promoted token survives `top_k = 1`", which passes on
+**both** orderings and therefore proves nothing — see **trap 44**.
+
+**Cost, and it is the opposite of P2's.** The whole gate is 8.1 s and 7.8 s of that is the one section
+that builds the model host: the pure sections — the generator, the transforms against an
+independently written fp64 reference for the softmax and the nucleus, the seam, determinism — run in
+**0.00 s** on hand-built vectors and need no model at all. That is the plan's "a sampler gate should
+be cheap" taken literally, and it is what a gate for a *transform* looks like as opposed to P2's gate
+for a *composition*.
+
+**Not covered, named so it is not mistaken for coverage:** the text binding (P4 — the gate never
+encodes or decodes a token), the artifact's own sampling *policy* (a `config.json` fact the engine
+reads and passes in), and throughput. The host-side fp32 softmax over 129280 logits is the plan's
+accepted first implementation; what is asserted is that the *greedy* and *untruncated* paths allocate
+nothing, sort nothing, and read back four bytes — and that the fast path is **observable**, because
+an implementation that always widened would be correct and 259 KB slower per token with no other
+symptom.
 
 ### P4 — the text-in/text-out run
 **Build:** `core/v4_engine.hpp`; `aeon_chat` re-bound; the target moves out of the legacy cmake gate.
@@ -616,17 +657,22 @@ countable today, target zero), streaming under concurrency (P5), and the KV-prec
 
 ## 10. One-line summary of the state
 
-As of **P2 the graph produces a token**: `core/v4_model_host.hpp` builds the whole assembly (all 15
-steps of §5.1, including the pools, the registry, the tiered supply and the production executor) and
+As of **P3 the graph decides a token**: `core/v4_model_host.hpp` builds the whole assembly (all 15
+steps of §5.1, including the pools, the registry, the tiered supply and the production executor),
 `core/v4_graph.hpp` runs `embed_token` → 43 × `run_layer_body_decoding` → `hc_head` → final norm →
-LM head. **34 checks, 0 failures, 5 of 5 mutations killed**: every layer's `res_out` and the head's
-three checkpoints agree with `reference::model_body` at the ~`1e-3`-of-peak floor the single-layer
-gates established, 160 of 160 biased-layer router steps reproduce the model's own top-6 rule, and
-`forward_token` reproduces the gate's own per-layer loop with **0 differing of 517 120** fp16 logits.
-The 1032 expert requests went through Hot/Warm/Cold on the artifact's real 145 GB container.
+LM head, and `core/v4_sampler.hpp` turns those logits into a token behind a **logit-processor seam**.
+**34 checks, 0 failures, 5 of 5 mutations killed** for the graph (every layer's `res_out` and the
+head's three checkpoints agree with `reference::model_body` at the ~`1e-3`-of-peak floor the
+single-layer gates established, 160 of 160 biased-layer router steps reproduce the model's own top-6
+rule, and `forward_token` reproduces the gate's own per-layer loop with **0 differing of 517 120**
+fp16 logits, with the 1032 expert requests going through Hot/Warm/Cold on the artifact's real 145 GB
+container). **57 checks, 0 failures, 6 of 6 mutations killed** for the sampler, whose whole gate costs
+**8.1 s** — the cheap one, by design, because Step 5's requirements are properties of a *transform*
+and can be pinned on hand-built vectors against an fp64 reference, with no model in the loop at all.
 
-What still separates the tree from the first coherent run is the **sampler** (G3) and the **text
-binding** (G5) — **P3–P4**. The plan's premise was true at the layer and false at the ends; item 23's
-first seam closed one end, P1 the other's composition, and P2 the middle that made them a graph.
-Six of the fourteen gaps were lifts of code that already runs in the pre-rewrite graph (§6.1), so the
-remaining work is bounded and named rather than open.
+What still separates the tree from the first coherent run is the **text binding** (G5) — **P4**:
+`core/v4_engine.hpp` and `aeon_chat` off the legacy graph. Until its gate is green the graph decides a
+token but does not speak. The plan's premise was true at the layer and false at the ends; item 23's
+first seam closed one end, P1 the other's composition, P2 the middle that made them a graph, and P3
+the decision that ends it. Six of the fourteen gaps were lifts of code that already runs in the
+pre-rewrite graph (§6.1), so the remaining work is bounded and named rather than open.

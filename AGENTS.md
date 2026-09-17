@@ -54,7 +54,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 *Status: 2026-09-17, branch `rewrite/graph-v2`.*
 
 **This section is an index, not a record.** One row per milestone, pointing at the document that owns
-the detail: the [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) (per-item gate results, traps 1–43, mutation
+the detail: the [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) (per-item gate results, traps 1–44, mutation
 tables, open unknowns), the [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) (plan inventory and document
 boundaries), and the [Performance Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md) (silicon measurements and its validity banner).
 **Do not restate a finding, gate result, tolerance, trap, or measurement here — link to it.** When a
@@ -70,26 +70,37 @@ Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
 | Tier 1 — oracle harness + all 11 primitives | done, mutation-tested | plan §Tier 1 |
 | Tier 2 — items 16–18: layer body, all three attention classes, serial loop | **closed** | plan §Tier 2 |
 | Tier 3 — items 19–20: chunked prefill, long-context lifecycle | done *(item 19's throughput half blocked)* | plan §Tier 3 |
-| Tier 4 — items 21–23: streaming/tiering, prefix cache, generating loop | item 21 done; item 22's restore half (R3) done; 23 in progress — expert-executor seam (item 23 step 1), graph head end (P1) and 43-layer driver (P2) built | plan §Tier 4 / [Graph Composition Plan](plans-and-docs/analysis/current/graph_composition_plan.md) |
+| Tier 4 — items 21–23: streaming/tiering, prefix cache, generating loop | item 21 done; item 22's restore half (R3) done; 23 in progress — expert-executor seam (item 23 step 1), graph head end (P1), 43-layer driver (P2) and sampler (P3) built | plan §Tier 4 / [Graph Composition Plan](plans-and-docs/analysis/current/graph_composition_plan.md) |
 
 `core/v4_layer_body.hpp` is the single layer body; decode, chunked prefill and every Tier-2/3 gate
 call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
-and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **43 tests** (legacy: 45, which adds exactly the two gated real-weight parity tests).
+and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **44 tests** (legacy: 46, which adds exactly the two gated real-weight parity tests).
 
-**Next: P3 — the sampler and its seam.** P0 (the routed-expert executor), P1 (the head end) and
-**P2 (the 43-layer driver) are green**, so the graph now produces a **token**: `V4ModelHost` builds the
-whole assembly (`core/v4_model_host.hpp` — loader → config → spec → contract → budget → resources →
+**Next: P4 — the text-in/text-out run.** P0 (the routed-expert executor), P1 (the head end),
+**P2 (the 43-layer driver) and P3 (the sampler) are green**, so `V4ModelHost` builds the whole
+assembly (`core/v4_model_host.hpp` — loader → config → spec → contract → budget → resources →
 scratch → streams → 43 layers → Hot/Warm expert pools → registry → staging → tiered supply →
-production `V4TieredExpertExecutor`), and `V4Graph` runs `embed_token` → 43 × `run_layer_body_decoding`
-→ `hc_head` → final norm → LM head. `tests/test_v4_graph_body.cpp` — **34 checks, 0 failures, 5/5
-mutations killed** — compares every layer's `res_out` and the head's three checkpoints against the
-new `reference::model_body` (G9, written before the driver), and requires `forward_token` to
-reproduce the gate's own per-layer loop with **0 differing of 517 120** fp16 logits.
+production `V4TieredExpertExecutor`), `V4Graph` runs `embed_token` → 43 × `run_layer_body_decoding`
+→ `hc_head` → final norm → LM head (**34 checks, 0 failures, 5/5 mutations killed**, with
+`forward_token` reproducing the gate's own per-layer loop at **0 differing of 517 120** fp16 logits),
+and `core/v4_sampler.hpp` turns those logits into a token behind a **logit-processor seam**
+(**57 checks, 0 failures, 6/6 mutations killed, plus one named equivalent** — the plan's
+not-deferrable hook, and the gate asserts the seam's *position* in the order, not merely its
+presence).
 
-What P3 adds is the logit-processor seam and the sampler (`core/v4_sampler.hpp`); P4 then binds the
-tokenizer, the prompt encoder and the detokenizer and re-targets `aeon_chat` off the legacy graph,
-which is the first **text-in/text-out** run. Until P3's gate is green the graph ends at logits, and
-until P4's it does not speak. The full ordered list and each phase's gate are in the composition plan.
+What P4 adds is the binding: the tokenizer, the prompt encoder, `generate_token_ids` and the
+detokenizer (`core/v4_engine.hpp`), with `aeon_chat` re-targeted off the legacy graph — which is the
+first **text-in/text-out** run and the plan's acceptance criterion. Until its gate is green the graph
+decides a token but does not speak. The full ordered list and each phase's gate are in the
+composition plan.
+
+**A trap found at P3, and it is about evidence rather than arithmetic — see trap 44.** The gate had to
+assert that the seam runs *before* the truncations, and the first check written for it — "a promoted
+token survives `top_k = 1`" — passes on **both** orderings, so it was a passing check that
+discriminated nothing. It was replaced by what the processor **sees**, the only discriminating
+observable. The general form: **for an ordering claim, assert an observable of the moved step, not a
+downstream consequence both orderings produce.** The sweep is what found it, which is why the sweep
+runs before the gate is trusted.
 
 **A cost trap found at P2, worth knowing before touching a model-level gate.** The new gate takes
 ~3 minutes, and essentially all of it is the *reference*, not the device: the same 172 layer-steps
@@ -98,6 +109,9 @@ cost the device 1.6 s. The fp64 reference materialises each real expert's three 
 looks expensive is not (hoisting it bought `1.4x`). The reuse measurement is in the gate: 767 of
 1032 requests were distinct `(layer, expert)` pairs, so caching decoded experts cannot pay either.
 The same shape as trap 42: **attribute an instrument's cost by measurement, not by inspection.**
+The contrast with P3's gate is the useful part: it costs **8.1 s**, of which the model contributes
+7.8 — because Step 5's requirements are properties of a *transform*, and a transform can be pinned
+exactly against an fp64 reference on hand-built vectors, with no model in the loop at all.
 
 **Two items are explicit non-goals for the near term** and are named so they are not mistaken for
 gaps: the prefix **matcher** (22b) and **R4**. Session swap needs neither.

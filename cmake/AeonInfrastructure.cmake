@@ -378,6 +378,29 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_graph_body.cpp TIMEOUT 1800 OPENMP)
 endif()
 
+# --- The sampler and its seam (P3) --------------------------------------------
+# The composition plan's third build phase. The graph ends at logits; this decides
+# a token, and it owns the **logit-processor seam** the plan calls non-deferrable
+# (structured output and tool-call JSON are logit masks, §6.4) — which is why the
+# gate asserts the seam *exists*, not merely that a `sampling` function does.
+#
+# The gate's clauses, each measured rather than asserted: seeded replay is
+# bit-identical; a mask that sets one logit to `-inf` removes that token from the
+# support (probability exactly zero, never drawn); `T->0` converges to the argmax
+# path; the untruncated defaults reproduce the argmax token. The seam's *ordering*
+# is pinned too, by a promotion that must survive `top_k = 1`.
+#
+# Cheap on purpose, and it says why: the pure sections (the generator, the
+# transforms, the seam, determinism) run on hand-built vectors against an
+# independently written fp64 reference and need no model at all. The device
+# section drives the certified argmax pair, and one section closes the seam on the
+# artifact's own logits via `V4Graph::forward_token`. OPENMP is deliberately off —
+# there is no fp64 oracle here to parallelise.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_sampler
+        SOURCES tests/test_v4_sampler.cpp TIMEOUT 900)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate

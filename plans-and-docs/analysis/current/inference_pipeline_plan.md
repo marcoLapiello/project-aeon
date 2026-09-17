@@ -784,6 +784,19 @@ Layers 0 and 1 have **no compressor and no indexer** (`compress_ratios[0]=compre
 - Sample or take argmax.
 - **Kernel:** reduction plus sampling. Host-side is acceptable for a first implementation.
 
+> **Built (P3, 2026-09-17) — `core/v4_sampler.hpp`; gate 57 checks, 0 failures, 6/6 mutations.** The
+> seam mutates host fp32 logits in place (a mask writes `-INFINITY`, so an excluded token's
+> probability is *exactly* zero), and the order is `seam → temperature → top-k → top-p → softmax →
+> decide` with the ordering asserted by what the processor **sees** rather than by a downstream
+> consequence — the first check written for it passed on both orderings, which is **trap 44**. The
+> artifact's `do_sample = true, T=1, top_p=1` is read from `generation_config.json` by the engine and
+> passed in (P4): the *sampler's* shipped default is the deterministic one, which is the plan's
+> "argmax at `T=1, top_p=1` first" taken literally, and at `top_k=0, top_p=1` the support is the whole
+> vocabulary. Softmax is fp32 (accumulated in fp64); the *decision* is host-side, which this bullet
+> permits, but the **greedy, seam-free path widens nothing and reads back four bytes** through the
+> certified argmax pair — and that property is asserted, because an implementation that always widened
+> would be correct and 259 KB slower per token with no other symptom.
+
 ### Step 6 — Detokenization
 
 - Token ID → text.
@@ -1619,6 +1632,43 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > gate own the ring), HCA compression (its first entry is at position 127; CSA *is* exercised, it
 > commits at position 3), and the sampler, the text binding, the observer and tiering under load
 > (P3/P4/P5). What remains of item 23 is therefore the sampler and the text binding.
+>
+> **P3 of the composition plan is done (2026-09-17) — the graph decides a token.** The
+> [graph composition plan](graph_composition_plan.md) built the sampler as its own component rather
+> than as a tail of the graph, because sampling is not a model operation: `core/v4_graph.hpp` ends at
+> logits and never learns how a token was chosen. `core/v4_sampler.hpp` is `V4Sampler` (the seam, the
+> configuration, the generator, and the device workspace for the certified argmax pair) over a set of
+> **pure host functions** — `sampler_ops`: temperature, top-k, top-p, the fp32 softmax, the argmax
+> rule, the categorical draw — plus a written-out `V4SplitMix64`. One decision routine, `decide`,
+> ordered **seam → temperature → top-k → top-p → softmax → decide**; `select` is the device-bound
+> entry point and widens only when the host has work to do.
+>
+> `tests/test_v4_sampler.cpp` — **57 checks, 0 failures, 8.1 s; 6 of 6 mutations killed, plus one
+> named equivalent.** The plan's four clauses are measured, not asserted: the seeded replay is
+> bit-identical *and* an untruncated `T=1` draw is shown **not** to be a disguised argmax, which is
+> what keeps every determinism check above it from being vacuous; a mask writes `-inf`, so the
+> excluded token's probability is exactly `0` and it is never drawn in 200 draws, while an empty
+> support — or an *infinite* promotion, which has no probability either — is **refused** rather than
+> answered with index 0; `T→0` converges to the argmax in 64 of 64 draws; and the untruncated defaults
+> reproduce the **certified device argmax**. Widening fp16→fp32 is exact, so the device argmax and the
+> host argmax are asserted **equal** rather than close, which is what makes "the sampler reproduces
+> the device argmax" strong instead of a tolerance.
+>
+> **The seam is asserted to exist *and* to be in the right place — and the first assertion written for
+> the second half passed on both the correct and the wrong ordering.** See **trap 44**.
+>
+> The gate is the cheap one, and it is meant to be. The pure sections — the generator, the transforms
+> against an independently written fp64 reference for the softmax and the nucleus, the seam, the
+> determinism — run in **0.00 s** on hand-built vectors and need no model at all; **7.8 of the 8.1 s**
+> is the single section that builds the host to close the seam on `V4Graph::forward_token`'s own
+> logits. The contrast with P2's 180 s gate is the point: Step 5's requirements are properties of a
+> *transform*, and a transform can be pinned exactly without a composition around it.
+>
+> Not covered, named there: the text binding (P4), the artifact's sampling *policy* (a `config.json`
+> fact the engine reads and passes in), and throughput. What remains of item 23 is therefore **one**
+> thing — the text binding — and the fp32 host softmax over 129280 logits is the plan's accepted first
+> implementation, with the greedy and untruncated paths asserted to allocate nothing, sort nothing and
+> read back four bytes.
 
 **Do not build the streaming system before the numerics are correct.** Streaming bugs and numerical bugs produce identical symptoms, and debugging both at once is intractable.
 
@@ -2041,3 +2091,9 @@ These are the specific things that will break this model if implemented naively.
 43. **A model-level gate's cost is the reference, not the device — and the expensive-looking part of the reference is not the expensive part.** P2's gate compares the assembled 43-layer graph against an fp64 `model_body` on the artifact's real dense weights and real routed experts. Its first run took **5 minutes**, and the *same* 172 layer-steps cost the device **1.6 s** (section D measures exactly that pass). The cost was the fp64 reference materialising each real expert's three matrices as `double` — 200 MB per matrix, **600 MB per expert** — so the decode is **memory-bound**, and the per-element swizzle address arithmetic that reads as the expensive part is not: hoisting the address and the shared fp16 scale out of the inner loop (verified bit-identical to the retained per-element form over **201 M values**) bought only **`1.4x`**, and the walk stayed ~0.1 s per expert. The obvious *structural* fix — decode each expert once and reuse it across tokens — was then measured rather than assumed, and does not pay either: **767 of 1032 requests were already distinct `(layer, expert)` pairs**, so a perfect cross-token cache would return `1.35x`.
 
     The same shape as trap 42 — the instrument's cost was attributed by inspection and the attribution was wrong — with the extra twist that here the temptation is to optimise the *code that looks slow* rather than the code that is. The gate keeps both numbers in its own output (a per-section timing and the reuse count) so that the next person to find it slow can see where the time went before touching it. `[Item 23 / P2]`
+
+44. **An assertion that passes on the correct and the wrong implementation alike is not evidence — and it is indistinguishable from a passing assertion.** P3's gate has to assert that the logit-processor seam runs *before* the temperature and the truncations, not merely that it runs. The first check written for that was **"a token promoted by the seam survives `top_k = 1`"** — and it passes on **both** orderings: a promotion above the threshold is retained whether the truncation ran before it or after it. It was decoration that read as coverage.
+
+    The replacement asks the only discriminating question — what the processor **sees** — and that splits the two cleanly: with `top_k = 3` and `T = 0.5` installed, a first-running seam still sees all eight finite logits at their raw maximum (`8 of 8 finite`, `4.250`), while a last-running seam sees three, scaled (`3 of 8`, `8.500`). The general form: **for an ordering claim, assert an observable of the moved step, not a downstream consequence that both orderings produce.** This is the mutation rule reached from the other side — the rule says a gate that prints PASS is not evidence until a wrong variant has been shown to fail it; this says the *sweep is the instrument that tells you which of your assertions can do that*, and it must be run before the gate is trusted rather than after.
+
+    Its converse surfaced in the same sweep and belongs in the same breath, because a sweep that cannot tell the two apart produces false confidence in one direction and wasted repair in the other. `SP-7` changes the nucleus's boundary test from `accumulated >= top_p` to `>`. The two differ only when the running mass lands *exactly* on the threshold — a measure-zero event no configuration of the gate reaches — so they are **behaviourally identical**, the gate is *right* to pass, and the sweep reports it as a **named equivalent** rather than as a survivor to be repaired or a kill to be counted. `[Item 23 / P3]`
