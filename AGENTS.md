@@ -70,25 +70,30 @@ Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
 | Tier 1 — oracle harness + all 11 primitives | done, mutation-tested | plan §Tier 1 |
 | Tier 2 — items 16–18: layer body, all three attention classes, serial loop | **closed** | plan §Tier 2 |
 | Tier 3 — items 19–20: chunked prefill, long-context lifecycle | done *(item 19's throughput half blocked)* | plan §Tier 3 |
-| Tier 4 — items 21–23: streaming/tiering, prefix cache, generating loop | item 21 done; item 22's restore half (R3) done; 23 not started | plan §Tier 4 |
+| Tier 4 — items 21–23: streaming/tiering, prefix cache, generating loop | item 21 done; item 22's restore half (R3) done; 23 in progress — its expert-executor seam and the graph's head end are built | plan §Tier 4 / [Graph Composition Plan](plans-and-docs/analysis/current/graph_composition_plan.md) |
 
 `core/v4_layer_body.hpp` is the single layer body; decode, chunked prefill and every Tier-2/3 gate
 call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
-and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **41 tests** (legacy: 43, which adds exactly the two gated real-weight parity tests).
+and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **42 tests** (legacy: 44, which adds exactly the two gated real-weight parity tests).
 
-**Next: the graph's model-level composition, specified in the** [Graph Composition Plan](plans-and-docs/analysis/current/graph_composition_plan.md). Item 23's first seam,
-the production routed-expert executor (`core/v4_expert_executor.hpp`), is built and gated
-(`tests/test_v4_expert_executor.cpp`, 12 checks, 5/5 mutations killed), and the gate found two real
-defects in it plus trap 41. What reconnaissance established is that the plan's premise holds at the
-*layer* and fails at the *ends*: every layer-level op is built and certified, but the model-level
-composition has no code. Missing: the **engine assembly** (loader → config → contract → budget →
-resources → 43 layers → scratch → streams → pools → registry → staging → supply → executor, plus
-the Hot/Warm preload — today only `V4Pipeline::initialize`, which is behind the legacy gate), the
-**43-layer driver and head stage** (`run_layer_body_decoding` is per *layer*; nothing calls `hc_head`
-→ final norm → LM head outside the legacy `step()`), the **sampler with its non-deferrable
-logit-processor seam** (only argmax exists), and the **end-to-end binding** — `tools/aeon_chat.cpp`
-is a legacy target. One body, one accumulation, one assembly; the composition plan owns the ordered
-list, the phases and their gates.
+**Next: P2 — the 43-layer driver, the phase that makes the graph produce a token.** The sequencing is
+owned by the [Graph Composition Plan](plans-and-docs/analysis/current/graph_composition_plan.md);
+P0 (the routed-expert executor) and **P1 (the head end)** are green. P1 delivered the host's first
+nine assembly steps (`core/v4_model_host.hpp`) and the tail of the forward pass
+(`core/v4_graph.hpp`: embedding expansion → `hc_head` → final norm → LM head), gated by
+`tests/test_v4_graph_head.cpp` — **34 checks, 5/5 mutations killed** — so the graph now turns a token
+id into oracle-checked logits on the artifact's real weights.
+
+What P2 adds is the loop between the embedding and that head: steps 10–15 of the assembly (expert
+pools, registry, staging, supply, the `V4TieredExpertExecutor`, the Hot/Warm preload), the 43 calls
+to `run_layer_body_decoding`, and `reference/dsv4_oracle.hpp::model_body` — the model-level fp64
+oracle the driver's gate compares against, which is written **first**, not last. Until that gate is
+green the graph is two certified ends with nothing verified in between, and the phases after it
+(sampler, text binding, tiering under load, chunked prefill, session swap) are all still open. The
+full ordered list, the gap inventory and each phase's gate are in the composition plan.
+
+**Two items are explicit non-goals for the near term** and are named so they are not mistaken for
+gaps: the prefix **matcher** (22b) and **R4**. Session swap needs neither.
 
 **Needs a decision — a numbering conflict.** "Item 21" currently names two different gates: the plan's
 Tier 4 item 21 is streaming/tiering, while `plans-and-docs/status/DOCUMENTATION_STATUS.md` and older notes use it for the comparison

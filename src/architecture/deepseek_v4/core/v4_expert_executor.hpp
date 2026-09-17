@@ -78,6 +78,7 @@
 // trades correctness for the schedule.
 // -----------------------------------------------------------------------------
 
+#include "architecture/deepseek_v4/core/v4_device_streams.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
@@ -148,7 +149,10 @@ struct V4RoutedExpertScratch {
     }
 };
 
-// The four streams the executor interacts with.
+// The four streams the executor interacts with live in `core/v4_device_streams.hpp`,
+// owned by the host and borrowed here — one definition, because this class's
+// capacity fallback has to drain exactly the streams that carry expert traffic and
+// a second definition of "the streams" is a way to hand it the wrong set.
 //
 // `compute` is where the expert kernels run and where the per-transfer staging
 // events are awaited. The other three carry the storage traffic (warm and cold
@@ -157,12 +161,6 @@ struct V4RoutedExpertScratch {
 // fallback that drained only `compute` would release leases without freeing
 // anything, and the next dispatch would fail with the registry's own
 // "no reclaimable Hot VRAM slot" error.
-struct V4ExpertExecutorStreams {
-    hipStream_t compute{nullptr};
-    hipStream_t sdma{nullptr};
-    hipStream_t sdma_cold{nullptr};
-    hipStream_t demotion{nullptr};
-};
 
 // The production executor. Borrows everything it needs; owns only its bookkeeping.
 class V4TieredExpertExecutor final : public V4RoutedExpertExecutor {
@@ -173,7 +171,7 @@ public:
         PrefetchStagingArena& staging,
         ExpertRegistry& registry,
         V4RoutedExpertScratch& scratch,
-        const V4ExpertExecutorStreams& streams,
+        const V4DeviceStreams& streams,
         float swiglu_limit
     )
         : supply_(supply),
@@ -369,7 +367,7 @@ private:
     PrefetchStagingArena& staging_;
     ExpertRegistry& registry_;
     V4RoutedExpertScratch& scratch_;
-    V4ExpertExecutorStreams streams_;
+    V4DeviceStreams streams_;
     float swiglu_limit_{10.0f};
 
     uint32_t current_layer_{0};

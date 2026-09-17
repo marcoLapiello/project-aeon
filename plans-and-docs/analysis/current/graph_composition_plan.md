@@ -331,6 +331,11 @@ Step 13 is the only part with real mass, and the tiering gate already drives its
 | `core/v4_sampler.hpp` | the logit-processor seam and the sampler (argmax now; temperature / top-k / top-p on the fp32 logits). | `v4_attention.hpp` argmax pair |
 | `core/v4_engine.hpp` | binds text: tokenizer + prompt encoder + `generate_token_ids` + `V4Graph` + detokenizer + the session/state boundary. | the three above, `infrastructure/text/text_generation.hpp` |
 
+**Built as of P1:** `core/v4_model_host.hpp` (steps 1–9 of 15) and `core/v4_graph.hpp` (the head
+stage: B1, B3, B4, B5). Steps 10–15 of the host and B2's 43-layer loop are P2's, and they belong to
+these same two files rather than new ones — the loop goes in `V4Graph::forward_token`, and the
+pools/registry/supply/executor go in the host, which is why the split was drawn here.
+
 `v4_model_host.hpp` and `v4_graph.hpp` are the split that keeps the files small and the concerns
 separate: the host is *what is resident*, the graph is *what happens in order*. The streaming
 system enters only through the host, which constructs the executor — the graph never learns which
@@ -367,15 +372,16 @@ or before P4 is a prerequisite of the first coherent run:**
 
 | Retired in | Gaps | What they are |
 | :--- | :--- | :--- |
-| **P1–P4 — the first coherent run** | **G1, G2, G3, G5, G9** | the host, the driver, the sampler, the binding, and the oracle the driver's gate needs |
+| **P1 — done** | G1 *(steps 1–9 of 15)*, half of G2 *(the head stage)* | `core/v4_model_host.hpp`, `core/v4_graph.hpp`; 34 checks, 5/5 mutations |
+| **P2–P4 — the first coherent run** | the rest of G1 and G2, plus G3, G5, G9 | the pools/supply/executor, the 43-layer loop, the sampler, the binding, and the oracle the driver's gate needs |
 | P5 — diagnostics under tiering | G4, G14 | observer and telemetry wiring; aids, not prerequisites |
 | P6 — chunked prefill | G6, G7, G8 | batched embedding, on-device top-k, the chunk driver |
 | P7 — session state | G10, G11, G12, G13 | the session aggregate, registry, cold store, and R4 |
 
 | # | Missing | Why it is required | Where it goes | Certified by |
 | :-- | :--- | :--- | :--- | :--- |
-| **G1** | **The engine assembly / `V4ModelHost`.** Steps 1–15 of §5.1, including the Hot/Warm preload. | Nothing constructs the graph. This is the single largest genuine absence. | `core/v4_model_host.hpp` | assert the assembly's own invariants: contract passes, `registry.invariants_hold()`, `hot_vram_slots` residents, warm slots as budgeted, and one cold miss decrements `cold_nvme_slots` |
-| **G2** | **The 43-layer driver + head composition (`V4Graph`).** | `run_layer_body_decoding` is per *layer*; nothing calls it 43 times, and nothing calls `hc_head` → norm → LM head. | `core/v4_graph.hpp` | **P2 gate** vs `reference` `model_body` (see G9) |
+| **G1** | **The engine assembly / `V4ModelHost`.** Steps 1–15 of §5.1, including the Hot/Warm preload. | Nothing constructs the graph. This is the single largest genuine absence. **Steps 1–9 are built (P1)**; 10–15 (pools, registry, staging, supply, executor, preload) are P2's. | `core/v4_model_host.hpp` | assert the assembly's own invariants: contract passes, `registry.invariants_hold()`, `hot_vram_slots` residents, warm slots as budgeted, and one cold miss decrements `cold_nvme_slots` |
+| **G2** | **The 43-layer driver + head composition (`V4Graph`).** | `run_layer_body_decoding` is per *layer*; nothing calls it 43 times, and nothing calls `hc_head` → norm → LM head. **The head composition is built (P1)** — `embed_token` → `head_stage` → `forward_head`; the 43-call loop is P2's. | `core/v4_graph.hpp` | **P2 gate** vs `reference` `model_body` (see G9) |
 | **G3** | **The sampler with a logit-processor seam.** `temperature`, `top_k`, `top_p`, RNG, and a hook that may mask/bias the fp32 logits *before* sampling. | Plan Step 5 + §6.4: structured output and tool-call JSON are logit masks, so the seam is **non-deferrable**; only argmax exists today. | `core/v4_sampler.hpp` | deterministic-seed replay + mask-applied/mask-cleared fork on real logits |
 | **G4** | **A real `V4LayerBodyObserver` for the new graph.** | The body takes an observer; the only production one lived inside `V4Pipeline`. The null one runs but leaves no diagnostic path. | `core/v4_graph.hpp` (observer adapter) | none needed; must not perturb the hot path (assert identical output traced vs null) |
 | **G5** | **The end-to-end binding + a non-legacy CLI.** `generate_token_ids` bound to `V4Graph`, and `aeon_chat` re-targeted off the legacy graph. | Criterion 1 is *one command, conversation in, text out*. Today that command only exists behind the legacy flag. | `core/v4_engine.hpp`, `tools/aeon_chat.cpp`, `cmake/AeonInfrastructure.cmake` | **P4 gate**: the coherence run, plus a multi-turn context run |
@@ -439,13 +445,47 @@ in a token. P4 ends in text. A phase whose gate is another component's gate is n
 ## 7. Build phases
 
 Each phase is one step, ends in one gate, and does not start while the previous gate is red. This
-is the plan's earning order applied to composition: `P0` is already green, so it is spent.
+is the plan's earning order applied to composition: `P0` and `P1` are green, so they are spent.
 
 ### P0 — the routed-expert executor ✅
 `core/v4_expert_executor.hpp`, `tests/test_v4_expert_executor.cpp` — 12 checks, 5/5 mutations.
 *Spent. The first end seam is closed.*
 
-### P1 — the head stage
+### P1 — the head stage ✅
+**Built:** `core/v4_model_host.hpp` (the assembly's steps 1–9), `core/v4_graph.hpp` (`embed_token` +
+`head_stage` + `forward_head`), `tests/test_v4_graph_head.cpp`, `scripts/mutate_graph_head.py`.
+Also `core/v4_device_streams.hpp` and `infrastructure/hip_check.hpp`: the four-stream type and the
+`CHECK_HIP` macro had each reached multiple near-identical definitions, and P1 needed both, so they
+got one canonical home instead of an eighth copy. The executor now borrows the host's streams —
+the one place where two definitions of "the streams" would have been a correctness hazard, since
+its capacity fallback must drain exactly the set that carries expert traffic.
+
+**Gate: 34 checks, 0 failures, 12.5 s; 5 of 5 mutations killed**, each by a different line.
+Measured on the artifact's own weights: `hc_head_out` `2.3e-4 … 4.3e-4` of peak, `head_norm`
+`3.8e-4 … 4.6e-4`, the chained logits `3.3e-4 … 4.0e-4`, and the device within **0.102×** of the
+theoretical fp32 accumulation bound on the LM head. All four probe tokens give the oracle's argmax
+and top-8 values.
+
+**The coverage is consumed, not duplicated.** It does not re-certify `hc_head_wave32_kernel` —
+the Step-3 gate owns it with its own 6-of-6 sweep — and it needed no new oracle, because
+`hc_head_reduce` + `rmsnorm` + `matvec` compose into exactly the instrument this stage needs.
+The isolate-then-chain structure is what made that work: B3 feeds the oracle the kernel's own
+`hc_head_out` and B4 its own `head_norm`, so the skip-the-norm mutation fails B3 alone and the
+head-reads-pre-norm mutation fails B4 alone. Two mutations, two different lines, no bisection.
+
+**One finding, recorded as trap 42 because it cost two gate runs.** The gate's first instrument for
+the logits was elementwise against the fp16 rounding of the true value, assuming a ~0.2% floor; it
+measured **42.9%** on a correct stage. A dot product's error scales with the magnitude of its
+*terms*, not of its *result*, so for a cancelling row the error far exceeds the result's own fp16
+quantum — no wording of that check can work. The replacements are quantitative and tighter: the
+error within `γ_K · Σ|terms|` (measured `0.102×` the bound), and the disagreement with the fp64
+oracle required to equal what the fp32 accumulation *predicts* (`39.453%` vs `39.453%`).
+
+`[V]` **Not covered, named so it is not mistaken for coverage:** the 43 layers (P2 — the residual
+here is an embedding, not a layer trajectory), the sampler, and any tiering. The gate also does not
+re-derive Step 3's `hc_head` properties; it consumes them.
+
+### P2 — the 43-layer driver
 **Build:** `V4Graph::head_stage` — HC head reduction, final RMSNorm, LM head, fp32 logits readback,
 plus the minimal host subset it needs (steps 1–9 of §5.1: loader → config → spec → contract → budget →
 resources → scratch → streams). **No pools, no registry, no experts** — P1 must not drag in the
@@ -562,10 +602,12 @@ countable today, target zero), streaming under concurrency (P5), and the KV-prec
 
 ## 10. One-line summary of the state
 
-Every **layer-level** op is built and certified. The **model-level** composition is what is missing:
-the host that owns the parts (G1), the driver that orders them (G2), the **oracle the driver's gate
-compares against** (G9), the sampler (G3), and the binding that makes it text-in/text-out (G5) —
-those five, and only those five, separate the tree from the first coherent run. The plan's premise
-was true at the layer and false at the ends; item 23's first seam closed one end, and P1–P4 close the
-rest. Six of the fourteen gaps are lifts of code that already runs in the pre-rewrite graph (§6.1),
-so the remaining work is bounded and named rather than open.
+Every **layer-level** op is built and certified, and as of P1 the graph's **head end runs on real
+weights** (`core/v4_model_host.hpp` + `core/v4_graph.hpp`: token id → embedding → `hc_head` → final
+norm → LM head → logits; 34 checks, 5/5 mutations killed). What still separates the tree from the
+first coherent run is the 43-layer loop between the embedding and the head, plus the rest of the
+host it needs (G1 steps 10–15), the oracle the driver's gate compares against (G9), the sampler
+(G3) and the text binding (G5) — **P2–P4**. The plan's premise was true at the layer and false at
+the ends; item 23's first seam closed one end, and P1 closed the other end's composition. Six of the
+fourteen gaps are lifts of code that already runs in the pre-rewrite graph (§6.1), so the remaining
+work is bounded and named rather than open.

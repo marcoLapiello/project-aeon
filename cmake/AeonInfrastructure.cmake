@@ -325,6 +325,29 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_expert_executor.cpp TIMEOUT 900)
 endif()
 
+# --- The graph's head end (P1) ------------------------------------------------
+# The composition plan's first build phase: the host that owns the parts, and the
+# three ops at the tail of the forward pass — `hc_head` -> final RMSNorm -> LM head,
+# fed by the device-side embedding expansion.
+#
+# Scope, stated because a green line here is easy to over-read. It does NOT
+# re-certify `hc_head_wave32_kernel` (tests/test_v4_hc_head_oracle.cpp owns that,
+# with 6 of 6 mutations killed); it drives the *device* expansion that gate builds
+# on the host, and it composes the two ops nothing has ever run — the final norm
+# and the LM head. It is not a forward pass: P1 has no layers, so the residual the
+# head consumes is an embedding rather than a 43-layer trajectory.
+#
+# The instrument for the logits is elementwise against the fp16-rounded oracle, not
+# a peak-relative bound alone: at 129280 elements a peak-relative bound hides every
+# small logit. A wrong norm or a transposed head moves most of the vector, so the
+# count of elements differing from the true value's fp16 rounding is a strong
+# check with a measurable floor (~0.2%, from the fp32-vs-fp64 accumulation gap
+# straddling a rounding boundary) rather than an arbitrary tolerance.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_graph_head
+        SOURCES tests/test_v4_graph_head.cpp TIMEOUT 900)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate
