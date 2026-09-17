@@ -258,6 +258,26 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_state_restore.cpp TIMEOUT 600)
 endif()
 
+# --- Real-scale state: window 128 AND index_topk 512, together ----------------
+# The plan records that no gate has run the model's own window and its own
+# index_topk at the same time: items 16-19 shrink both, and item 20 runs the real
+# window with index_topk shrunk to 8. One CSA layer is run for 2200 tokens -
+# deliberately past position 2048, because below that a CSA layer commits fewer
+# than 512 candidates and select_indexer_topk takes its degenerate "take all"
+# path. Section A asserts the selection is *strict* (550 candidates, 512 slots,
+# all filled, distinct, in range), so "the top-k was exercised" is a measurement
+# rather than an assumption. The assertion is the restore contract at real scale:
+# the state is snapshotted mid-run (during the reference run, so it is provably
+# the reference's own), restored after a reset, and the continuation must be
+# bit-identical to the uninterrupted run. Determinism is structural - no fp64
+# oracle, fixed-order accumulation, raw fp16 bit comparison. HCA is deliberately
+# not the layer here: it has the real window but no indexer at all (trap 33), so
+# it cannot exercise index_topk.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_real_scale_state
+        SOURCES tests/test_v4_real_scale_state.cpp TIMEOUT 900)
+endif()
+
 # --- Step 3: the HC head reduction -------------------------------------------
 # The one graph op that had no code, no oracle and no gate. `hc_head` collapses the
 # four residual streams to the single vector every downstream step reads, so an

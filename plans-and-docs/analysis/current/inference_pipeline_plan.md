@@ -1342,7 +1342,59 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 >
 > **A second, smaller gate-side defect, also worth recording because it looked like a kernel bug.** The first version of the value pattern was `(d % 11) - 5` computed on a `uint32_t` — *unsigned* arithmetic, which wraps to ~4.3e9 for `d % 11 < 5`, after which `__float2half` saturated **exactly those entries** to `+inf` while the rest of the vector was correct. The symptom was maximally misleading: the output was `+inf` at precisely the entries the pattern made "negative", which reads as a sign-handling defect in the attention kernel. It was a probe bug, and the production kernel was never involved.
 >
-> **What is NOT covered, named so it is not mistaken for coverage.** The real `index_topk = 512` — 260 tokens commit only 65 CSA entries, so a real top-k would select all of them and the selection would degenerate; the top-k is shrunk to 8 and the *window* is left at the model's own 128, which is the opposite trade from items 16–19. No checkpoint is compared against a reference at all, so this gate says nothing about precision — Tier 1 and items 16–18 own that. The routed experts are six synthetic payloads. Positions beyond `max_seq_len` are refused rather than exercised, so the gate measures the *refusal*, not what a clamped engine would do. And no tiering and no prefix restore (Tier 4 item 22).
+> **What is NOT covered, named so it is not mistaken for coverage.** The real `index_topk = 512` — 260 tokens commit only 65 CSA entries, so a real top-k would select all of them and the selection would degenerate; the top-k is shrunk to 8 and the *window* is left at the model's own 128, which is the opposite trade from items 16–19, and **is now closed by the real-scale state gate below** (one CSA layer, 2200 tokens, 550 candidates against 512 slots). No checkpoint is compared against a reference at all, so this gate says nothing about precision — Tier 1 and items 16–18 own that. The routed experts are six synthetic payloads. Positions beyond `max_seq_len` are refused rather than exercised, so the gate measures the *refusal*, not what a clamped engine would do. And no tiering and no prefix restore (Tier 4 item 22).
+
+> ### Real-scale state gate — the model's own window and its own `index_topk`, together (2026-09-17)
+>
+> The plan had recorded one gap in so many words — *"the real 128-token window with
+> `index_topk = 512`"* has never run — because items 16–19 shrink both and item 20 runs the
+> real window with the top-k shrunk to 8. `tests/test_v4_real_scale_state.cpp` closes it:
+> **one CSA layer (`layers.2`), 2200 tokens, the real window (128) and the real
+> `index_topk` (512), nothing shrunk.** **40 checks, 0 failures, 22 s, 852 MB host.**
+>
+> **Why 2200 tokens and not a few hundred — the part that is easy to get wrong.**
+> `index_topk = 512` is **nominal until there are more than 512 candidates.** A CSA layer
+> commits one compressed entry per `ratio = 4` tokens, so below position 2048
+> `select_indexer_topk` takes its degenerate branch — *"candidates <= index_topk selects every
+> candidate with no padding"* — and a gate claiming to exercise the top-k would in fact be
+> exercising `take all`. Section A therefore **asserts the selection is strict**, and at the
+> last token it reads **512 of 550 candidates, all slots filled, distinct, in range, 38
+> excluded**. Raising the token count and raising the top-k are not independent choices: doing
+> one without the other produces a gate that looks harder and tests the same thing.
+>
+> **The assertion is the restore contract at real scale, and the instrument is run-vs-run.**
+> No fp64 oracle (Tier 1 and items 16–18 own the arithmetic). The state is **snapshotted
+> mid-run, during the reference run itself**, so the state being restored is provably the
+> reference's own rather than a second prefix run's; the layer is reset, the snapshot restored,
+> and 100 further tokens are required to be **bit-identical** to the uninterrupted run, with the
+> final state byte-identical across all fourteen pieces and four counters. **0 differing
+> values.** At the point of the restore the ring (128) has wrapped 17 times, 525 boundaries have
+> been crossed, and the compressor's partial ring is mid-window. Determinism is structural —
+> fixed-order accumulation (trap 38, stated in the gate), no tolerance, raw fp16 bit comparison.
+>
+> **A gate defect the mutation sweep found, and the repair — the most useful part of this.**
+> **6 of 6 mutations killed**, but only after a repair. **RZ-5** (dropping
+> `compressed_entry_count_` in the restore) **survived the first sweep**, and the reason is a
+> real property of the code rather than a defect: `record_position` **recomputes all four
+> counters from the position on every token**, so a counter lost by the restore is overwritten
+> by the first token of the continuation and the run-vs-run comparison *cannot* see it. The
+> rewrite never reads `compressed_entry_count_` either — `v4_layer_body.hpp:201` records that
+> callers use `committed_entries_for(pos)` instead, which is derived from `pos`. The counter is
+> therefore **not load-bearing for a continuation**, which is why RZ-5 is equivalent *for this
+> comparison and not in general* — it is a real gap in the state contract, invisible to any
+> gate that only advances tokens. The repair is a **snapshot round trip with no token in
+> between** (`restore` → `snapshot` → compare), which is the only place a dropped counter is
+> visible precisely because nothing has advanced yet; it kills RZ-5 and, as a side effect,
+> catches all four missing-piece mutations earlier and more legibly. **The lesson is not "add
+> more checks": it is that a state-contract gate must test the contract, and the contract is
+> the snapshot, not only what the snapshot goes on to produce.**
+>
+> **Not covered, named so it is not mistaken for coverage.** The other 42 layers — this is one
+> layer at real scale, not the stack (item 23). HCA is deliberately *not* the layer here: it has
+> the real window but **no indexer at all** (trap 33), so it cannot exercise `index_topk`.
+> Throughput, and the indexer top-k's per-token host round-trip in `select_indexer_topk` — which
+> at this scale is the dominant cost of the gate and changes no value, so this gate cannot see
+> it (item 19's second half). The routed-expert arithmetic (synthetic payloads).
 
 **Tier 4 — Integration (only after Tier 3 is fully green).**
 21. ~~**Streaming / tiering.** Gate: expert bytes bit-exact across Hot/Warm/Cold.~~ **DONE — see the result below.**

@@ -69,7 +69,7 @@ Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
 
 `core/v4_layer_body.hpp` is the single layer body; decode, chunked prefill and every Tier-2/3 gate
 call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
-and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **39 tests** (legacy: 41).
+and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **40 tests** (legacy: 41).
 
 **Next: item 23's driver — assembling the 43-layer stack.** It is the only thing that unblocks
 anything: the first real multi-turn test, the server, and 22b's measurements. Everything else is
