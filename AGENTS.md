@@ -71,15 +71,19 @@ Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
 call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
 and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **39 tests** (legacy: 41).
 
-**Next: item 22's second half (R4), or item 23's driver.** `V4Layer::restore_state` now exists and R3
-is certified, so the prefix cache can *materialize* state; what it cannot yet do is **decide** — there
-is no cache key, no block table, and no detection of a reuse boundary that predates the local window
-(R4, trap 22). Remaining open halves: the **indexer top-k's per-token host round-trip** in
-`select_indexer_topk`, target zero, countable today and needing no baseline; and item 19(a)'s
-**batched projections**, which are now the whole of the prefill-throughput half — the compressor-ring
-chunk cap that was said to block it was measured to be false and removed (a chunk of 16 is
-bit-identical to serial). The 43-layer stack has still **never been assembled**: that is item 23's
-driver. Reasoning and the full sequence: plan items 19, 22, 23 and the open-unknowns table.
+**Next: item 23's driver — assembling the 43-layer stack.** It is the only thing that unblocks
+anything: the first real multi-turn test, the server, and 22b's measurements. Everything else is
+substrate that already exists (the layout, `restore_state`, and the accounting —
+`MemoryBudgetEngine::attention_state_memory()`, which sums all 43 layers) or policy that cannot be
+designed before a graph runs. `V4Layer::restore_state` exists and R3 is certified, but **session swap
+does not need R4**: a session resumed at its own last position restores a ring covering exactly the
+window. R4 (declining a boundary that predates it) and the manager proper — key, block table,
+matching, eviction — are **22b**, blocked on item 23. Remaining open halves: the **indexer top-k's
+per-token host round-trip** in `select_indexer_topk`, target zero, countable today and needing no
+baseline; and item 19(a)'s **batched projections**, which are now the whole of the prefill-throughput
+half — the compressor-ring chunk cap that was said to block it was measured to be false and removed (a
+chunk of 16 is bit-identical to serial). Reasoning and the full sequence: plan items 19, 22, 23 and the
+open-unknowns table.
 
 **Needs a decision — a numbering conflict.** "Item 21" currently names two different gates: the plan's
 Tier 4 item 21 is streaming/tiering, while `plans-and-docs/status/DOCUMENTATION_STATUS.md` and older notes use it for the comparison

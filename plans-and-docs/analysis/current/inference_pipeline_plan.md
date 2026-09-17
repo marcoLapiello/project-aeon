@@ -272,7 +272,7 @@ Hyper-Connections and the residual stream are **per-token and recomputed** for n
 
   The home for an inactive session is the **NVMe cold tier, not warm RAM**. Warm RAM is the *expert* tier: the expert container is `155.8 GB` against a typical consumer's 32–128 GB of DDR, so it is already over-subscribed; it is on the decode critical path; and inactive session state is touched **once per swap**, not once per token. It must not compete with experts for it. An inactive session is written on **eviction / swap-out, not per turn**, so steady-state operation puts no stream on the SSD at all. A **capacity cap in GiB** on the session store is required — the engine must know when to refuse or evict rather than fill the disk — but the *policy* is deferred (§6.5).
   `[I]` **Our own constraint makes this concrete:** the store uses the `O_DIRECT` path at 4096-byte sector granularity, so the state block size should be sector-aligned (or an exact multiple/divisor of a sector), otherwise session spill to NVMe cannot use the existing direct-I/O path and will need an extra bounce buffer. Warm RAM may serve as a transient **staging/bounce** buffer for that copy — which the alignment requirement may need regardless — but it is a staging area, never a store.
-- **R6.** What is required **now** is the *layout contract* above, the **session aggregate** (43 layer states + position + non-token inputs), its **restore**, a **residency seam**, and **R4**. The manager proper — block table, cache key, matching, eviction, tier placement — is deferred until the graph runs end to end. See §6.5.
+- **R6.** What is **settled** is more than this section previously credited, and what remains is smaller. The *layout contract* (R1/R2) and **byte-exact restore** (R3) exist; the **state accounting** also exists — `V4LayerStateLayout::total_device_bytes()` per layer, and `MemoryBudgetEngine::attention_state_memory()` which sums all 43 layers and `evaluate()` binary-searches the largest context that fits VRAM. The **session aggregate** is largely written too: the legacy graph has `V4PipelineStateSnapshot` (`current_seq_len` + `std::vector<V4LayerStateSnapshot>`), so this is a **lift into the rewrite, not a new type** — what it genuinely lacks is the **non-token inputs**, which today exist only as `dsv4_prompt_encoder` parameters. Everything else — a session **registry**, a **residency seam**, and **R4** — has no consumer until the graph runs end to end (item 23). See §6.5.
 
 #### 6.4 Non-deferrable consequences for tool use
 
@@ -291,7 +291,7 @@ The requirements above split along one line, and the plan did not previously dra
 | :--- | :--- | :--- |
 | Which | R1 (separately addressable), R2 (mid-window restore), R3 (byte-exact restore), R4 (window-bounded local state) | the store's placement and cap, block granularity, cache-key contents, matching, eviction |
 | Why | forced by the architecture: the state *is* four pieces, the compressor *does* have a window | parameters of a load that has not been applied yet |
-| Status | R1/R2 exist in `V4LayerStateLayout`; **R3 certified**; R4 not built | deliberately undesigned |
+| Status | R1/R2 exist in `V4LayerStateLayout`; the accounting exists (`total_device_bytes` / `attention_state_memory`); **R3 certified**; the aggregate is a lift of the legacy `V4PipelineStateSnapshot` | deliberately undesigned |
 
 **Two mechanisms are conflated under "prefix caching", and only one is needed soon.**
 
@@ -311,10 +311,19 @@ tree before there is a graph to serve would be designing against an assumption.
 `N` tokens, what actually varies turn to turn, how many sessions a card holds — and that stack has
 never been assembled (item 23). A block size chosen now would be a guess with a number attached.
 
-**Design-independent, therefore required now:** the state layout (exists), the **session aggregate**
-(43 layer states + position + non-token inputs — the legacy graph has only a bare
-`std::vector<V4LayerStateSnapshot>`; the rewrite needs its own, with the fields a session actually is),
-**restore** (exists), a **residency seam** whose first implementation is VRAM-only, and **R4**.
+**What actually remains — and it is less than this section first implied.** The layout, the byte-exact
+restore and the **accounting** all exist:
+`MemoryBudgetEngine::attention_state_memory()` already sums all 43 layers, and `evaluate()` already
+binary-searches the largest context that fits. The **session aggregate** is largely written as well —
+`V4PipelineStateSnapshot` in the legacy graph is position + all layer states — so it is a **lift into
+the rewrite**, not a new type; what it genuinely lacks is the **non-token inputs**, which exist today
+only as `dsv4_prompt_encoder` parameters and must become part of a session.
+
+Everything else — a session **registry**, a **residency seam**, and **R4** — has **no consumer until
+the graph runs end to end (item 23)**, and building it first would be designing against an assumption.
+In particular **R4 is not needed for session swap**: a session resumed at its own last position restores
+a ring covering exactly `[N−C+1, N]`, so nothing is stale. R4 fires only for an *edited* prefix or a
+*matched* boundary shorter than the entry — both **22b**.
 
 ---
 
@@ -1406,10 +1415,10 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > whether it chooses *well* is item 22's and the routing-placement study's question.
 
 22. **Session state and the reuse manager.** This was framed as *"Prefix cache manager. Block table, cache key, matching, eviction"* — the **enterprise** mechanism (vLLM's paged blocks, sglang's radix tree). It is **re-scoped** along the line §6.5 draws, because matching is not what the near-term goal needs:
-    * **22a — session swap.** A session aggregate, identity, `restore_state`, **R4**, and a residency seam whose first implementation is VRAM-only. This is what makes *"old context does not pass prefill again"* true for a multi-turn conversation, and it needs **no cache key, no block table and no matching** — the state that is wanted is known by identity, because it is the same conversation continuing.
-    * **22b — the manager proper.** Block table, cache key (tokens **+ non-token inputs**), matching, eviction, and the cold-tier session store with its GiB cap (§6.3 R5). **Blocked on item 23**, not merely unstarted: its parameters (state bytes per `N` tokens, what varies per turn, sessions-per-card) are measurements of an assembled graph, and no such graph has run.
+    * **22a — session swap.** A session aggregate, identity, `restore_state`, and a residency seam whose first implementation is VRAM-only. This is what makes *"old context does not pass prefill again"* true for a multi-turn conversation, and it needs **no cache key, no block table and no matching** — the state that is wanted is known by identity, because it is the same conversation continuing. **Most of it already exists:** `restore_state` is certified (R3), the accounting is `MemoryBudgetEngine::attention_state_memory()`, and the aggregate is the legacy `V4PipelineStateSnapshot` lifted into the rewrite with the **non-token inputs** added (`dsv4_prompt_encoder` has them today only as call parameters). The **registry** and the **seam** have no consumer until item 23. **R4 is not part of this**: resuming a session at its own last position restores a ring that already covers the window, so nothing is stale — R4 fires only for an edited prefix or a matched boundary shorter than the entry, which is 22b.
+    * **22b — the manager proper.** Block table, cache key (tokens **+ non-token inputs**), matching, eviction, the cold-tier session store with its GiB cap (§6.3 R5), and **R4** (declining a boundary that predates the window). **Blocked on item 23**, not merely unstarted: its parameters (state bytes per `N` tokens, what varies per turn, sessions-per-card) are measurements of an assembled graph, and no such graph has run.
 
-    Gate for **22a**: restore is byte-exact with respect to never having evicted (**R3 — certified**), and a candidate boundary outside the local window is detected rather than served stale (**R4 — not started**).
+    Gate for **22a**: restore is byte-exact with respect to never having evicted (**R3 — certified**).
     **Status (2026-09-17): R3 certified; R4 not started; 22b not designed, deliberately.**
     This item also previously carried *"This item now also gates item 19's throughput half"*, on the grounds
     that the compressor's partial ring capped the chunk at 8. **That is no longer part of this item:**
