@@ -302,6 +302,29 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_moe_accum_oracle.cpp TIMEOUT 300)
 endif()
 
+# --- The graph's routed-expert executor (item 23, first step) -----------------
+# `V4RoutedExpertExecutor` is the layer body's seam onto the storage system. Until
+# this step it had no runtime implementation at all: the only implementations were
+# test fixtures and the pre-rewrite `V4Pipeline`'s inline blocks, so the production
+# path — supply, promotion, prefetch, leases, staging, then the fused kernels — had
+# never run.
+#
+# The gate holds the kernels fixed and removes storage from one side, so it
+# certifies the one thing the executor adds: that the supply path hands the kernels
+# the artifact's own bytes for the expert the router selected. The arithmetic is
+# Tier 1 item 14/15, item 16 and the item-19b accumulation pair; re-deriving an
+# oracle for it here would be a second reference for an already-certified quantity.
+# Bit-identity is the right instrument because the only difference between the two
+# runs is where the bytes came from.
+#
+# The pool is deliberately too small for the leases one token accumulates, so the
+# executor's capacity fallback (drain, then release) is exercised rather than
+# assumed away, and the bit-identity assertion is what shows it is value-neutral.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_expert_executor
+        SOURCES tests/test_v4_expert_executor.cpp TIMEOUT 900)
+endif()
+
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written
 # independently of the code under test. They are promoted out of the legacy gate

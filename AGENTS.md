@@ -69,10 +69,15 @@ Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
 
 `core/v4_layer_body.hpp` is the single layer body; decode, chunked prefill and every Tier-2/3 gate
 call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
-and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **40 tests** (legacy: 41).
+and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **41 tests** (legacy: 43, which adds exactly the two gated real-weight parity tests).
 
-**Next: item 23's driver — assembling the 43-layer stack.** It is the only thing that unblocks
-anything: the first real multi-turn test, the server, and 22b's measurements. Everything else is
+**Next: item 23's driver — the model head and the 43-layer stack.** Item 23 has begun: its
+first seam, the production routed-expert executor (`core/v4_expert_executor.hpp`), is built and
+gated (`tests/test_v4_expert_executor.cpp`, 12 checks, 5/5 mutations killed), and the gate found
+two real defects in it plus trap 41. What remains is the model head (`hc_head` → final norm →
+LM head), the 43-layer driver, the sampler with its logit-processor seam, and the engine
+assembly. It is the only thing that unblocks anything: the first real multi-turn test, the
+server, and 22b's measurements. Everything else is
 substrate that already exists (the layout, `restore_state`, and the accounting —
 `MemoryBudgetEngine::attention_state_memory()`, which sums all 43 layers) or policy that cannot be
 designed before a graph runs. `V4Layer::restore_state` exists and R3 is certified, but **session swap

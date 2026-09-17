@@ -1531,6 +1531,47 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > commits an entry.
 23. **Generation loop.** Coherent output; logits agree with reference over several steps.
 
+> **Progress (2026-09-17) — the graph's first seam is built and gated: the production
+> routed-expert executor.** Reconnaissance for item 23 found the plan's premise mostly
+> true and drew its boundary precisely: every layer-level piece exists and is certified,
+> but **item 23 had two end seams with no runtime code at all**. `V4RoutedExpertExecutor`
+> — the interface the layer body calls for the routed experts — had implementations only
+> inside test fixtures and inlined in the pre-rewrite `V4Pipeline`. The first is now
+> `core/v4_expert_executor.hpp`: supply dispatch, `materialize`, per-transfer staging
+> events, `ExpertRegistry` leases, the fused W13 + SwiGLU dispatch, the W2 **contribution**
+> dispatch and the fixed-order fp32 reduce, with the shared expert folded in as the
+> accumulator's initial value.
+>
+> `tests/test_v4_expert_executor.cpp` — **12 checks, 0 failures**, **5 of 5 mutations
+> killed**. The instrument deliberately does not re-certify arithmetic (Tier 1 items
+> 14/15, item 16 and the item-19b accumulation pair own it): it holds the kernels fixed and
+> removes only storage from one side, so the comparison is **bit-identity** between the
+> supply-delivered run and a direct-from-mmap run over a two-layer CSA+HCA stack, twelve
+> steps, `moe_out`, the chained residual, the ids and the routed weights. Non-vacuity is
+> asserted in-gate by pointing one slot at a different expert and requiring the comparison
+> to move (`49 122` elements of `49 152`).
+>
+> **Two real defects in the executor, both found by the gate rather than by review.**
+> (1) *Completed transfers were never reaped.* The registry publishes a slot when the
+> transfer's completion event is **queried**, and nothing else performs that query; without
+> a reap the finished operations stay pending forever, so once the pool saturates no slot is
+> reclaimable and the registry throws *"no reclaimable Hot VRAM slot is available"* — which
+> is how the gate failed on its second token. (2) *The capacity fallback could not free
+> anything.* Draining the compute stream releases the readers, but a slot is reclaimable
+> only once the copies out of and into it have also completed, so the fallback must drain
+> the streams that carry expert traffic, not only the one that reads it. Its release was
+> otherwise decorative.
+>
+> **The gate's own first failure was a test defect, and it is the same lesson as M20-6.**
+> The direct-payload reference adapter selected its payload set by a *depth counter the
+> driver never set*, so layer 3's expert lookups went into layer 2's container and the
+> report read as a delivery mismatch. It now selects by `layer_id`, which every hook already
+> receives — removing the piece of state that could go stale instead of maintaining it.
+>
+> **Not yet built: the second half of item 23.** The model head (`hc_head` → final norm →
+> LM head) and the 43-layer driver, the sampler with its logit-processor seam, and the
+> engine assembly. Each is its own step with its own gate, per the earning order.
+
 **Do not build the streaming system before the numerics are correct.** Streaming bugs and numerical bugs produce identical symptoms, and debugging both at once is intractable.
 
 ### Open unknowns — settle at the named gate, do not assume now
@@ -1942,3 +1983,5 @@ These are the specific things that will break this model if implemented naively.
 39. **A chunk must not write its keys into the local ring as it goes — the write for the chunk's last token evicts the oldest key of its own first token's window.** The local ring has `C` slots and position `p` lives in slot `p mod C`. Query `q` attends `[q − C + 1, q]`. In a chunk spanning `[S, E]` with `E > S`, the write for `p` lands in the slot that held `p − C`; take `p = E` and `q = S` and `E − C ≥ S − C + 1` holds **whenever the chunk has more than one token**. So "run every token's pre-attention half, then every token's attention half" is not equivalent to serial at *any* chunk length above one — and it is the **local** ring, not the compressed path, even though the plan's original finding about `prefill_batched` was phrased entirely in terms of the compressor, the indexer and the MoE. The canonical fix is the reference's own shape: hold the chunk's keys in a separate per-forward buffer (*"not yet written to the SWA ring"* `[V paged_prefill.py:13-33]`), give each query a composed row-set of the pre-chunk ring rows in its window plus the chunk's own rows up to itself, and commit to the ring afterwards. **Order the composed rows by ring slot, not by position**: the decode path iterates slots `0 … C−1`, so for a wrapped window the kernel's summation order is a rotation of position order, and matching it is what makes `chunk ≡ serial` an equality (item 19 measured **0 differing values**, 130 tokens × 3 classes × 3 schedules) instead of a tolerance. A corollary worth stating separately, because it is easy to get wrong when writing the reference: **`chunk ≡ serial` must mean the same tokens one at a time, not the decode body's `step()`** — a chunk of one is the only length at which batching is absent, which is what makes the property well-posed. `[Tier 3]`
 
 40. **A compressed-entry ring's wrap is silent: every populated slot records a position `≤` the query position, so no position guard can detect eviction.** Entry `i` lives in slot `i mod K`; after a wrap the slot's occupant is a *newer* entry whose recorded position is still perfectly legal, so a guard of the form `compressed_positions[i] ≤ current_position` — which our attention kernel has — cannot distinguish a live row from one whose predecessor was overwritten. The row-set then becomes a sliding window over compressed entries (the newest `K`) instead of every committed entry, and attention simply forgets its long-range context without raising anything. The capacity is derived so this is unreachable within the declared context (`K = ceil(max_seq/ratio)` is exactly what that context produces, and the reference asserts `active_topk_width ≥ max_seq_len // ratio` `[V sparse_mla.py:158-170, 259]`), and our engine refuses a position at or beyond capacity `[V v4_layer.hpp:211-216]`. **That refusal is the only mechanism distinguishing "all committed entries" from "the newest `K`", so it must not be relaxed to a clamp or a modulo** — a clamp would be *worse* here, because the reference's own `tl.minimum(num_compressed, max_compressed_tokens)` `[V sparse_mla.py:405]` truncates to the **oldest** `K` entries while a ring keeps the newest, and the two differ by a large fraction of `attn_out`'s peak (item 20 measures it on a hand-built wrapped store). `[Tier 3]`
+
+41. **An expert-pool lease protects a slot from being *chosen* as an eviction victim — it grants no ordering, and the ordering the runtime needs is the one that overwrites the slot, not the one that reads it.** `ExpertRegistry::reserve_vram_destination` skips candidates with `lease_count != 0`, so a lease is a *selection* exclusion. The dangerous pair is therefore **the incoming expert's H2D overwriting a slot while the outgoing expert's kernel is still reading it** — *not* the demotion D2H, because a demotion and a kernel both only read and two readers cannot conflict. The incoming upload is ordered against the demotion (`wait_for_demotion_dependency` → the SDMA stream) and against **nothing else**: it never waits for the compute stream. So releasing a lease as soon as the layer's kernels are *enqueued* rather than *completed* lets a later miss land an H2D on a slot the W2 kernel has not finished reading, and the kernel multiplies against a mixture of two experts — a plausible number from wrong weights, with nothing recording that it became wrong. The safety property is a timing property of the caller: **hold the lease for as long as compute work that reads the slot may be in flight.** Holding longer is only a capacity cost, so the runtime takes the safe side (release at the token boundary, where the graph already has a compute-stream boundary for sampling) and handles the capacity explicitly with a self-enforcing fallback: when the outstanding leases would leave fewer than a layer's worth of reclaimable slots, drain **every** stream that carries expert traffic, reap, then release. (Draining only the compute stream frees nothing, because the slot is still held by a pending demotion or upload — the second defect the item-23 executor gate found.) The correct *early*-release protocol, if it is ever wanted for throughput, is a compute-boundary event recorded at release and awaited by every subsequent upload into a reclaimed slot; it belongs to this supply path and needs its own gate. `[Item 23]`

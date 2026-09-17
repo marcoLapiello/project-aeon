@@ -38,7 +38,7 @@ reference code; every remaining unknown names the gate that settles it.
 | :--- | :--- |
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Build gate | `AEON_ENABLE_LEGACY_V4_GRAPH` — **OFF by default** |
-| Default `ctest` | 40 infrastructure/backend/text/kept-component/Tier-1/Tier-2/Tier-3/Tier-4/Step-3 tests |
+| Default `ctest` | 41 infrastructure/backend/text/kept-component/Tier-1/Tier-2/Tier-3/Tier-4/Step-3/item-23 tests |
 | Legacy `ctest` | 41 (the 39 plus the 2 gated parity anchors) |
 | Research | Phases 0.1–0.2f complete; the whole forward pass is re-cited |
 | Step 0 | **Verified** — the artifact's own encoder is ported and matches all 4 golden vectors byte-for-byte |
