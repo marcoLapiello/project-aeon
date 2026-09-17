@@ -36,6 +36,17 @@ A `[V]` tag is only valid if the cited source is authoritative for **RDNA 3 + th
 | 3 | `aeon-references/ds4` @ `6289c51` | **Executable cross-check** (RDNA, full CPU graph) | model identity — it serves multiple families; comments are not proof of which graph a path belongs to |
 | 4 | our own kernels / format layer | storage layout, swizzle | numerical correctness (circular — see Part V) |
 
+**What this hierarchy is, and what it is not.** It ranks sources by authority over **graph semantics** —
+op order, formulas, tensor layout. It says **nothing** about *serving or memory architecture*, and the
+plan previously let that gap import enterprise assumptions without naming them. The reference engines'
+cache managers (vLLM's paged blocks, sglang's radix tree) solve a **multi-tenant datacenter** problem
+where the KV pool is shared across users and lives in the VRAM/unified memory of hardware we do not
+target. They are **informative, not prescriptive**. Use them to establish what *this model* requires —
+R1–R4 below are model-intrinsic and are correctly derived from that agreement — and then derive the
+*mechanism* against our own constraint: one consumer GPU, **one resident session**, host RAM already
+over-subscribed by experts. A design that is correct for them is not thereby correct for us, and the
+converse holds too.
+
 **Platform caveat (mandatory):** upstream vLLM's DeepSeek-V4 ROCm path is gated on `_ON_GFX950` (MI350/CDNA4) and its quant config accepts only `fp8` / `deepseek_v4_fp8` / Quark-MXFP4-OCP `[V vllm/platforms/rocm.py:226, vllm/models/deepseek_v4/quant_config.py:142-165]`. There is **no `rdna`/`gfx11` path** in that tree `[V grep]`. Our checkpoint is `compressed-tensors`/`pack-quantized`/int4 `[V config.json]`, which does not match. Therefore upstream vLLM is a **graph-semantics reference only** — never cite it for storage, kernels, or batching.
 
 > **Correction to the caveat above — a patched RDNA reference *does* exist.** The checkpoint card
@@ -172,7 +183,7 @@ RDNA 3 (gfx1100) provides:
 - **Warm (host RAM):** the full expert set, or the most probable subset based on activation profiling.
 - **Cold (SSD):** the full expert set, memory-mapped or read on demand.
 
-**Streaming rule:** experts move cold → warm → hot. The dense backbone and KV cache never leave VRAM. The expert index file maps every expert to its exact byte position, enabling direct seeks without reading the whole shard.
+**Streaming rule:** experts move cold → warm → hot. The dense backbone and the **resident session's** KV/state never leave VRAM; a *non-resident* session's state is swapped to the cold tier (§6.3 R5, §6.5). The expert index file maps every expert to its exact byte position, enabling direct seeks without reading the whole shard.
 
 **Future optimization:** activation probability profiling. Track which experts fire for which token distributions, and bias allocation so that high-probability experts live in faster tiers. This is a scheduling optimization, not a correctness requirement — implement it only after the pipeline is numerically correct.
 
@@ -255,8 +266,13 @@ Hyper-Connections and the residual stream are **per-token and recomputed** for n
 - **R2.** Each piece is addressed by **absolute position** and is restorable at any token boundary, including mid-ratio-window (requires persisting partial state).
 - **R3.** A **restore must be byte-exact** with respect to never having evicted the state. This is a gate, not an aspiration.
 - **R4.** The engine must **detect** when a candidate reuse boundary is outside the local window and handle it explicitly (rebuild the local ring; never serve a stale one).
-- **R5.** All pieces must be **movable across VRAM / host / NVMe**. Long-lived prefix state belongs in warm/cold tier; the existing DMA + `io_uring` staging path should be reused rather than adding a second one. `[I]` **Our own constraint makes this concrete:** cold-tier reads are `O_DIRECT` at 4096-byte sector granularity, so the state block size should be chosen to be sector-aligned (or an exact multiple/divisor of a sector), otherwise state eviction to NVMe cannot use the existing direct-I/O path and will need an extra bounce buffer. This is a synthesis of the reference designs with our tiering rules, not something taken directly from a reference.
-- **R6.** The state manager is **deferred to Tier 4**; only the *layout contract* above is required now.
+- **R5.** A **resident** session's state stays in VRAM; only an **inactive** session's state leaves it. This requirement was previously written as *"all pieces must be movable across VRAM / host / NVMe"*, which reads as **splitting one live session across tiers** and so contradicts §3's *"the KV cache never leaves VRAM"*. Two different objects were being conflated, and naming them settles it:
+  - the state of the session **currently being served** is the working set. It lives in VRAM and does not leave it (Vision §4.A, §3 above). Restore (R3) moves it VRAM→VRAM.
+  - the state of a session that is **not** being served may leave VRAM — but the resident set is **one session at a time** (§6.5), so what leaves is a *whole session*, not a slice of a live one.
+
+  The home for an inactive session is the **NVMe cold tier, not warm RAM**. Warm RAM is the *expert* tier: the expert container is `155.8 GB` against a typical consumer's 32–128 GB of DDR, so it is already over-subscribed; it is on the decode critical path; and inactive session state is touched **once per swap**, not once per token. It must not compete with experts for it. An inactive session is written on **eviction / swap-out, not per turn**, so steady-state operation puts no stream on the SSD at all. A **capacity cap in GiB** on the session store is required — the engine must know when to refuse or evict rather than fill the disk — but the *policy* is deferred (§6.5).
+  `[I]` **Our own constraint makes this concrete:** the store uses the `O_DIRECT` path at 4096-byte sector granularity, so the state block size should be sector-aligned (or an exact multiple/divisor of a sector), otherwise session spill to NVMe cannot use the existing direct-I/O path and will need an extra bounce buffer. Warm RAM may serve as a transient **staging/bounce** buffer for that copy — which the alignment requirement may need regardless — but it is a staging area, never a store.
+- **R6.** What is required **now** is the *layout contract* above, the **session aggregate** (43 layer states + position + non-token inputs), its **restore**, a **residency seam**, and **R4**. The manager proper — block table, cache key, matching, eviction, tier placement — is deferred until the graph runs end to end. See §6.5.
 
 #### 6.4 Non-deferrable consequences for tool use
 
@@ -266,6 +282,39 @@ Because the cache key must include non-token graph inputs, and because agent wor
 - **A logit-processor seam at sampling** — constrained/structured output (tool-call JSON) is a mask applied to the logits before sampling. If sampling is a closed argmax with no hook, adding constraints later means touching the pipeline.
 
 Everything else about tool use (schema formatting, parser, turn orchestration) is genuinely deferrable.
+
+#### 6.5 What is in scope now, and what must wait for a running graph
+
+The requirements above split along one line, and the plan did not previously draw it:
+
+| | **Model-intrinsic** — know it exactly, build it | **Serving policy** — needs measurement |
+| :--- | :--- | :--- |
+| Which | R1 (separately addressable), R2 (mid-window restore), R3 (byte-exact restore), R4 (window-bounded local state) | the store's placement and cap, block granularity, cache-key contents, matching, eviction |
+| Why | forced by the architecture: the state *is* four pieces, the compressor *does* have a window | parameters of a load that has not been applied yet |
+| Status | R1/R2 exist in `V4LayerStateLayout`; **R3 certified**; R4 not built | deliberately undesigned |
+
+**Two mechanisms are conflated under "prefix caching", and only one is needed soon.**
+
+| | **Session swap** | **Prefix matching** |
+| :--- | :--- | :--- |
+| Question | "restore session 7" | "find the longest computed prefix of these *new* tokens" |
+| Needs | session identity + `restore_state` | hashing, block table, radix search, eviction |
+| Pays when | always — a multi-turn conversation, or an agent loop extending its own context | **different** sessions share a prefix: a common system prompt, or a sub-agent forked from a parent |
+
+The near-term goal is **session swap**. Turn `N+1` is turn `N`'s state plus a delta, so the state that
+is wanted is known **by identity** — there is nothing to search for, and therefore no key, no block
+table and no matching. Matching is *not* worthless to us (the sub-agent fork is a genuine consumer
+workload, where a child's prefix *is* its parent's context), but it is not first, and building a radix
+tree before there is a graph to serve would be designing against an assumption.
+
+**Why the manager waits.** Its inputs are measurements of a running 43-layer stack — state bytes per
+`N` tokens, what actually varies turn to turn, how many sessions a card holds — and that stack has
+never been assembled (item 23). A block size chosen now would be a guess with a number attached.
+
+**Design-independent, therefore required now:** the state layout (exists), the **session aggregate**
+(43 layer states + position + non-token inputs — the legacy graph has only a bare
+`std::vector<V4LayerStateSnapshot>`; the rewrite needs its own, with the fields a session actually is),
+**restore** (exists), a **residency seam** whose first implementation is VRAM-only, and **R4**.
 
 ---
 
@@ -1356,9 +1405,13 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > 14–18 own the rest). And **the eviction policy's quality** — the registry's LRU is exercised, but
 > whether it chooses *well* is item 22's and the routing-placement study's question.
 
-22. **Prefix cache manager.** Block table, cache key (tokens **+ non-token graph inputs**), matching, eviction; state pieces placed across tiers. Gate: **restore is byte-exact** with respect to never having evicted, and a candidate boundary outside the local window is detected rather than served stale (Part I §6.3 R3–R4).
-    **Status (2026-09-16): the restore half (R3) is certified; the matcher half (R4) is not started.**
-    This item previously carried *"This item now also gates item 19's throughput half"*, on the grounds
+22. **Session state and the reuse manager.** This was framed as *"Prefix cache manager. Block table, cache key, matching, eviction"* — the **enterprise** mechanism (vLLM's paged blocks, sglang's radix tree). It is **re-scoped** along the line §6.5 draws, because matching is not what the near-term goal needs:
+    * **22a — session swap.** A session aggregate, identity, `restore_state`, **R4**, and a residency seam whose first implementation is VRAM-only. This is what makes *"old context does not pass prefill again"* true for a multi-turn conversation, and it needs **no cache key, no block table and no matching** — the state that is wanted is known by identity, because it is the same conversation continuing.
+    * **22b — the manager proper.** Block table, cache key (tokens **+ non-token inputs**), matching, eviction, and the cold-tier session store with its GiB cap (§6.3 R5). **Blocked on item 23**, not merely unstarted: its parameters (state bytes per `N` tokens, what varies per turn, sessions-per-card) are measurements of an assembled graph, and no such graph has run.
+
+    Gate for **22a**: restore is byte-exact with respect to never having evicted (**R3 — certified**), and a candidate boundary outside the local window is detected rather than served stale (**R4 — not started**).
+    **Status (2026-09-17): R3 certified; R4 not started; 22b not designed, deliberately.**
+    This item also previously carried *"This item now also gates item 19's throughput half"*, on the grounds
     that the compressor's partial ring capped the chunk at 8. **That is no longer part of this item:**
     the cap was measured to be false and removed (see item 19(a)). The layout contract below is still
     required *for prefix reuse*, which is what it was written for — but it is **not** a prerequisite

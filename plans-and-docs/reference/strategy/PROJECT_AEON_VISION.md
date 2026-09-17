@@ -153,7 +153,7 @@ To ensure day-one utility and prevent ecosystem isolation:
 
 2. **Phase 2: Advanced Memory Hierarchy & Prefill Pipeline**
    - Integrate double-buffered layer prefetching to optimize Time-To-First-Token (TTFT).
-   - Implement hierarchical prefix caching (RadixTree) to accelerate iterative agentic interactions.
+   - Implement hierarchical prefix caching (RadixTree) to accelerate iterative agentic interactions. **Clarification (2026-09-17):** "RadixTree" names sglang's **enterprise** mechanism — a shared KV pool for many users on datacenter hardware — and this bullet should not be read as "build a radix tree". What a consumer single-node engine needs first is **session swap**: one resident session, its state persisted on the NVMe cold tier and swapped back when the user changes session, which needs no cache key and no matching. Prefix *matching* is deferred until there is an assembled graph and a measured workload; its consumer case (a sub-agent forked from a parent's context) is real but later. See plan §6.5.
    - Deploy bandwidth-adaptive host CPU compute routing ($q^*$) for cache-miss load balancing.
 
 3. **Phase 3: Multi-Hardware Elastic Scaling**
