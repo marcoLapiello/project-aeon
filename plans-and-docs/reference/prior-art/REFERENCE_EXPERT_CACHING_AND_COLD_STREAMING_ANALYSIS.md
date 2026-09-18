@@ -352,7 +352,7 @@ FreeToken's hybrid path is the clearest operational example: GPU cache hits and 
 
 ### 8. More capacity is not automatically more throughput
 
-Colibri's measurements show that after cold misses decrease, RAM/VRAM residency, NUMA placement, upload pressure, and compute bandwidth can dominate. Aeon's M17 result similarly showed that the current LRU already captures available short-term token locality. Increasing capacity without changing the request schedule will not remove just-in-time wait time.
+Colibri's measurements show that after cold misses decrease, RAM/VRAM residency, NUMA placement, upload pressure, and compute bandwidth can dominate. Aeon's routing-locality measurement (M17, deleted 2026-09-18 with the other pre-rewrite model-path entries) similarly showed that the current LRU already captures available short-term token locality. Increasing capacity without changing the request schedule will not remove just-in-time wait time.
 
 ## Recommended Aeon Follow-Up Measurements
 

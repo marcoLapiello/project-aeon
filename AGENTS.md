@@ -31,8 +31,9 @@ streaming, artifact-format and kernel layers are kept; the graph that composes t
   graph's build phases (P1–P7) and the acceptance criterion. It consumes the specification and
   re-derives nothing.
 - [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md) — authoritative silicon
-  measurements. **Read its banner before comparing any `E2E` entry** — pre-rewrite model-path
-  measurements are marked invalid, and they describe a *different computation*, not a slower one.
+  measurements. **Read its banner**: the pre-rewrite model-path entries were **deleted 2026-09-18**
+  (they measured a *different computation*, not a slower one), so §4 holds only component, storage
+  and machine measurements, and §5 holds everything measured on the rebuilt graph.
 
 Execution records (active, completed, superseded) are indexed in the status document. Do not use an
 old checklist or review as current implementation evidence.
@@ -156,9 +157,9 @@ scheduling it.
 - **Superseded —** [Model Correctness Execution Plan](plans-and-docs/execution/superseded/MODEL_CORRECTNESS_EXECUTION_PLAN.md):
   the staged in-place repair, replaced by the plan. Retained for chronology; do not execute.
 - **Completed and still valid —** Phase 0–2 foundations; modular runtime ownership; artifact and
-  backend contracts; native text front end; the Stage-1 expert-kernel path
-  ([report](plans-and-docs/analysis/historical/EXPERT_KERNELS_REVIEW_stage-1_IMPLEMENTATION_REPORT.md));
-  warm-tier repair and supply telemetry ([closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md)).
+  backend contracts; native text front end; the Stage-1 expert-kernel path (swizzled layout plus
+  fused W1/W3 and W2 kernels, now the default routed-expert path); warm-tier repair and supply
+  telemetry ([closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md)).
 - **Paused —** Phase 2 continuation (cold-tier, storage layout, placement, latency hiding), pending
   the graph rewrite and the host-pressure tradeoff.
 
@@ -172,8 +173,9 @@ Pointers only; each is specified in the plan's "Open unknowns" table or the ledg
 - **Kept infrastructure —** cold-tier characterization, physical `.aeon` placement, host-memory
   pressure, the model-backed `>= 6.0 GB/s` target, kernel occupancy tuning, the routing placement
   study, the explicit backend factory, and Phase 3 multi-GPU.
-- **Before comparing any number —** read the ledger banner: pre-rewrite model-path measurements
-  describe a *different computation*, not merely a slower one.
+- **Before comparing any number —** read the ledger banner: the pre-rewrite model-path entries were
+  deleted because they measured a *different computation*, not merely a slower one. §4 keeps only
+  what the graph change cannot move; §5 is the post-rewrite record.
 
 ---
 

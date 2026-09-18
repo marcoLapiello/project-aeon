@@ -1,6 +1,6 @@
 # Project Aeon: Technical Blockers, Failure Modes & Engineering Mitigations
 
-*Status: risk analysis. The failure modes and mitigations remain useful design input, but some recommendations are hypotheses or have since been tested. Treat [PHASE_2_EXECUTION_PLAN.md](../../execution/active/PHASE_2_EXECUTION_PLAN.md) and [EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md](../../analysis/current/EXPERT_PERFORMANCE_REVIEW_CONCLUSIONS.md) as the current execution references.*
+*Status: risk analysis. The failure modes and mitigations remain useful design input, but some recommendations are hypotheses or have since been tested. Treat [PHASE_2_EXECUTION_PLAN.md](../../execution/active/PHASE_2_EXECUTION_PLAN.md) as the current execution reference.*
 
 ## Executive Summary
 This document provides a critical engineering analysis of the potential blockers, structural traps, and failure modes that could jeopardize Project Aeon. Many offloading and streaming experiments (such as Colibri) achieve theoretical feasibility on paper but degrade to single-digit or sub-token-per-second throughput (1–2 tok/s) in real-world workloads.

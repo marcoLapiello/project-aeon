@@ -92,7 +92,7 @@ reference code; every remaining unknown names the gate that settles it.
 
 | Document | Purpose |
 | :--- | :--- |
-| [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Authoritative silicon record. **Read its banner before comparing any `E2E` entry** — pre-rewrite model-path measurements are marked invalid. |
+| [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Authoritative silicon record. **Read its banner**: the pre-rewrite model-path entries were **deleted 2026-09-18**, so only component, storage and machine measurements survive in §4 and everything on the rebuilt graph is in §5. |
 | [CODEBASE_MAP.md](CODEBASE_MAP.md) | Source-tree map. Its "current engine path" section describes the pre-rewrite runtime and is being superseded as the rewrite lands. |
 
 ### Historical and reference (rationale only — not checklists)
