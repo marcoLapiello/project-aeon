@@ -171,7 +171,7 @@ that owns the claim, in the inference pipeline plan.
 | Model-level tensors | `V4ModelResources` (`host_embed_table`, `d_hc_head_fn/base/scale`, `d_lm_head`, `d_final_norm`, 4 RoPE caches) | `core/v4_model_resources.hpp:17-30` | exists |
 | RoPE tables | `kernel::RopeTable` (two instances: plain + YaRN-on-compressed) | `kernels/v4_rope.hpp:41` | exists |
 | Scratch | `PipelineScratchBuffers` (residual, HC, MLA, compressor, indexer, MoE, **head** incl. `d_logits`, argmax) | `core/v4_pipeline_scratch.hpp:23` | exists, **not gated** |
-| Batched scratch | `PipelineBatchScratchBuffers` | `core/v4_pipeline_scratch.hpp:334` | exists |
+| Batched scratch | ~~`PipelineBatchScratchBuffers`~~ | `core/v4_pipeline_scratch.hpp:334` | **deleted 2026-09-18** — pipeline-only dead code; the chunk path has its own `V4LayerBodyBatchScratch` |
 | Streams | 4: `compute`, `sdma`, `sdma_cold`, `demotion` | `core/v4_device_streams.hpp` (the type; created by `V4ModelHost`) | exists, owned by the host; the executor borrows it, so its capacity fallback drains exactly the set that carries expert traffic |
 | Expert payload I/O | `aeon::io::DirectIOReader` (io_uring, `O_DIRECT`, 4 MiB chunks) | `infrastructure/io/direct_io_reader.hpp` | exists |
 | VRAM expert pool | `UnifiedVRAMExpertPool` (`get_w1/w2/w3_packed`, `get_*_scale`, `get_slot_base`, `upload_from_host_expert`, `download_to_host_expert`) | `backend/swizzled_w4a16/core/vram_expert_pool.hpp` | exists |
@@ -291,11 +291,19 @@ a lease grants no ordering whatsoever — see plan **trap 41**.
 
 ## 5. The engine assembly — the component that does not exist
 
-Everything in §3 is a *part*. What is missing is the thing that **owns** the parts and runs them in
-order. Today the only assembly in the tree is `V4Pipeline::initialize` (`core/v4_pipeline.hpp:259`)
-plus `V4Pipeline::step` (`:460`), and it is **behind `AEON_ENABLE_LEGACY_V4_GRAPH` (default OFF)**
-— so the single end-to-end text-in/text-out CLI, `tools/aeon_chat.cpp`, is a legacy target
-(`cmake/AeonLegacyGraph.cmake`). The rewrite has no driver.
+> **Historical (written before P1). Superseded by P1–P4 and by the 2026-09-18 cleanup.** The
+> assembly now exists: `core/v4_model_host.hpp` (steps 1–15 of §5.1) plus `core/v4_graph.hpp`,
+> `core/v4_sampler.hpp` and `core/v4_engine.hpp`; `tools/aeon_chat.cpp` is in the default build.
+> The pre-rewrite graph **was deleted on 2026-09-18** — `core/v4_pipeline.hpp`,
+> `AEON_ENABLE_LEGACY_V4_GRAPH` and `cmake/AeonLegacyGraph.cmake` no longer exist. What follows
+> is retained as the record of how the assembly was specified and lifted.
+
+Everything in §3 is a *part*. What was missing is the thing that **owns** the parts and runs them in
+order. At the time of writing the only assembly in the tree was `V4Pipeline::initialize`
+(`core/v4_pipeline.hpp:259`) plus `V4Pipeline::step` (`:460`), and it was **behind
+`AEON_ENABLE_LEGACY_V4_GRAPH` (default OFF)** — so the single end-to-end text-in/text-out CLI,
+`tools/aeon_chat.cpp`, was a legacy target (`cmake/AeonLegacyGraph.cmake`). The rewrite had no
+driver. (Rebuilt by P1–P4; the legacy path is gone.)
 
 ### 5.1 The exact assembly recipe, already proven
 
@@ -339,8 +347,9 @@ Step 13 is the only part with real mass, and the tiering gate already drives its
   (`V4Layer`, `V4ModelResources`, `V4ModelSpec`, `V4ModelContract`, `MemoryBudgetEngine`,
   `PipelineScratchBuffers`, `V4ExpertSupplyCoordinator`, `V4LayerBody*`) are **already un-gated**
   and are reused as they stand. Nothing is duplicated.
-* `core/v4_pipeline.hpp` is **not** modified. It is scheduled for deletion with the legacy graph
-  and touching it would create a second copy of the assembly to keep in sync.
+* `core/v4_pipeline.hpp` was **left untouched** during the rewrite and has since been **deleted
+  (2026-09-18)** with the rest of the legacy graph; touching it would have created a second copy of
+  the assembly to keep in sync.
 * `tools/aeon_chat.cpp` is moved out of `cmake/AeonLegacyGraph.cmake` and re-bound to the new
   engine, so text-in/text-out stops being a legacy target (§3.1 gap G6).
 
@@ -679,6 +688,66 @@ end, and the logits **bit-identical** to a run with all experts resident. This i
 lists as item 21's `Stage D.2` remainder — streaming while the graph runs.
 **Unblocks:** the engine purpose. Before this, the graph is correct but is not the engine.
 
+#### P5/P6 — mechanism, strategy, and why P5 still goes first
+
+**2026-09-18. Recorded before P5's gate is trusted, because the question "should P6 precede P5?"
+has an obvious-sounding answer that is wrong in its conclusion only after the layering is written
+down.**
+
+The premise is correct and is a fact about the model, not a preference: **prefill and decode want
+different expert-transfer strategies.** The chunk path in the tree is already evidence of it —
+`run_layer_body_chunk` (`core/v4_layer_body_batch.hpp:570-592`) loops `run_layer_body_attention_tail`
+per row, so a chunk **batches attention and leaves the MoE serialized per token**. Prefill is
+expert-bound (`6 × 14,155,776 B × 43 = 3.65 GB` per token; P6's reconnaissance), so that serialization
+amortizes ~5% of the work. The strategy must change at P6.
+
+The premise is right; the conclusion does not follow, because the differing strategy sits **above**
+the layer P5 certifies, and the two must not be collapsed into the one word "tiering":
+
+| | Phase-independent — **P5** | Phase-dependent — **P6** |
+| :--- | :--- | :--- |
+| What it is | the **mechanism**: Hot←Warm←Cold promotion, `O_DIRECT` cold reads, LRU demotion, staging recycling, the read/supply overlap | the **strategy**: how many tokens one request set carries, when leases are scoped and released, how slots are sized |
+| Where it lives | `TieredExpertSupply`, `ExpertRegistry`, `PrefetchStagingArena`, `V4ExpertSupplyCoordinator` — none of which knows how many tokens are in flight | the executor's members: `state_`/`current_layer_` hold **one** dispatch (`ids.size() == 6`), `leases_` spans a whole token, `ensure_pool_headroom()` is thresholded on one layer's worth, `TOTAL_STAGING_SLOTS = 2 × 6` |
+| P6's effect | none — the tiers are the same | the dispatch shape becomes a set of `6C` requests |
+
+**So P6 is not a second delivery path and does not unexercise P5's mechanism.** It is an
+optimization of *dispatch granularity* over the same proven mechanism. Three reasons keep P5 first:
+
+1. **The chunk path already runs through P5's mechanism — correctly, just slowly.** Each row hits
+the same seam; the tiering is exercised, merely not under miss pressure. P6 changes the *shape* of
+a request, not the *place* a request is answered.
+2. **Attribution.** This document's own rule: P1 before P2 because a head defect produces
+plausibly-scaled logits; P4 before P5 because tiering bugs and numerical bugs have identical
+symptoms. Building a new batched interface on a streaming path whose safety under misses is
+undemonstrated is two unknowns at once, and the failure signature is the lease hazard this document
+already names — **a plausible number, produced from wrong weights, with nothing recording that it
+became wrong**.
+3. **Cost.** P5 adds no code; P6 adds an interface. Certifying the simpler request shape first is the
+more attributable experiment, and it is the one that can be run today.
+
+**The real defect is P5's gate scope, and this is the part to fix rather than the order.** P5 risks
+certifying *decode's* strategy as *the* strategy. Its gate must therefore split its claims:
+
+| P5 asserts | Status after P6 |
+| :--- | :--- |
+| the logits are bit-identical to an all-resident run; `invariants_hold()`; cold reads counted; staging slots returned; `forced_drains()` recorded | **phase-neutral invariants** — P6 must preserve every one |
+| leases released at the **token** boundary | **decode-specific** — becomes per-chunk (or per-token-within-chunk); P6 re-derives |
+| `TOTAL_STAGING_SLOTS = 12` returned | the *invariant* survives; the **number** is derived from `C` at P6 |
+| the "distinct requests" reuse metric (P2's `767 of 1032`) | **decode-specific** — within-chunk dedup changes what the number *means* |
+| one `state_` / `current_layer_` | **decode-specific** — becomes a set of `6C` requests |
+
+The lower four are **decode-specific and named so**: P6 re-derives them rather than "regressing" a
+property that was never meant to be phase-general.
+
+**One action before P5's gate is trusted, and one rule that belongs in §8.** The action: write down
+the phase-parameterized dispatch shape — how `on_routing_ready` / `accumulate_routed` take a *set*
+of tokens rather than one, how leases are scoped, how staging is sized from `C` — **before** P5
+certifies the mechanism *through* it, so there is no throwaway strategy to unwind at P6. The rule is
+the dedup/bit-identity constraint below, which is a correctness constraint and not bookkeeping: the
+fixed-order reduce sums the six contributions in **slot order**, fp32 addition is not associative,
+and so a within-chunk dedup that permutes which slot a token's k-th expert occupies breaks the
+bit-identity P5 asserts. It must be found before P6's design is fixed, not after.
+
 ### P6 — chunked prefill through the host
 **Build:** `V4Graph::forward_chunk` over `run_layer_body_chunk`; the batched embedding (G6).
 **Gate:** the item-19 equality gate re-run through the new host (`chunk ≡ serial`, exact), then —
@@ -787,7 +856,9 @@ logits and therefore fluent-looking garbage — the failure mode that is hardest
 the fact. P2 before P3 because sampling cannot be validated on logits that are themselves
 unvalidated. P4 before P5 because tiering bugs and numerical bugs produce identical symptoms, which
 is the plan's own warning — do not stand up the streaming system before the numerics are correct.
-P5 before P6 because prefill multiplies expert traffic, not attention traffic.
+P5 before P6 because prefill multiplies expert traffic, not attention traffic — and because P6
+changes the *strategy* while P5 certifies the *mechanism* underneath it; see §P5/P6 above for why
+that layering, and not merely the traffic argument, is what fixes the order.
 
 ---
 
@@ -800,7 +871,9 @@ that bind *composition* specifically:
 | :--- | :--- | :--- |
 | One body, not two | Part III | a decode loop and a prefill loop that drift; the chunk path must call the same two halves |
 | One accumulation | `aeon_moe_fused_w2_contrib` + `v4_moe_accumulate_fixed_order` | selecting the atomic or fp16 path anywhere, because a byte-exact restore cannot rest on an undefined order (trap 38) |
+| Accumulation order is slot order | §P5/P6 (dedup) | a within-chunk expert dedup that permutes which slot a token's k-th expert occupies: the fixed-order reduce sums in slot order, fp32 is not associative, and P5's bit-identity claim would silently break |
 | A lease grants no ordering | trap 41 | releasing leases before the token boundary without an event protocol |
+| Tiering is mechanism, not strategy | §P5/P6 | holding one request shape as *the* shape: the seam is per-token today and prefill needs a set of `6C` — the phase-parameterized dispatch shape is written before P5's gate, so no strategy is thrown away at P6 |
 | Never clamp a position | trap 40 | replacing `record_position`'s refusal with a modulo or a `min` |
 | Compare against an independent oracle | Part V, rule 6 | certifying a step against our own kernel |
 | A gate that prints PASS is not evidence | Part V, mutation rule | shipping P1–P4 gates that no wrong variant has been shown to fail |

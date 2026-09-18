@@ -73,8 +73,10 @@ Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
 | Tier 4 — items 21–23: streaming/tiering, prefix cache, generating loop | item 21 done; item 22's restore half (R3) done; **23 closed** — executor seam, head end (P1), 43-layer driver (P2), sampler (P3) and text binding (P4) all built | plan §Tier 4 / [Graph Composition Plan](plans-and-docs/analysis/current/graph_composition_plan.md) |
 
 `core/v4_layer_body.hpp` is the single layer body; decode, chunked prefill and every Tier-2/3 gate
-call it. It is deliberately **not** wired into `core/v4_pipeline.hpp`, which is the pre-rewrite graph
-and stays behind `AEON_ENABLE_LEGACY_V4_GRAPH`. Default `ctest`: **45 tests** (legacy: 47, which adds exactly the two gated real-weight parity tests).
+call it. The pre-rewrite graph (`core/v4_pipeline.hpp`) and its gate were **deleted on 2026-09-18**,
+together with the two gated real-weight parity anchors, the two tools that drove it, the superseded
+`dsv4_chat_formatter`, and the orphaned `v4_attention_oracle` — roughly 5,600 lines, all of it
+unreachable from the default build (verified by a trial deletion + build). Default `ctest`: **44 tests**.
 
 **Next: P5 — tiering on the live path.** **P0–P4 are green and the graph speaks**: `V4ModelHost`builds the whole assembly (`core/v4_model_host.hpp` — loader → config → spec → contract → budget →
 resources → scratch → streams → 43 layers → Hot/Warm expert pools → registry → staging → tiered
@@ -190,6 +192,9 @@ Pointers only; each is specified in the plan's "Open unknowns" table or the ledg
 4. **Maintenance of AGENTS.md**: Update the "Progress Tracking & State of Execution" section whenever milestones or micro-steps transition between Past, Present, and Future but keep in mind that this is an entry-point not a detailed record - more details are documented in the related plans and documents.
 5. **The specification is authoritative**: For DeepSeek-V4 graph semantics, [Inference Pipeline Plan](plans-and-docs/analysis/current/inference_pipeline_plan.md) governs. Do not implement a graph op from memory, from this file, or from an unsourced reference. If the plan lacks a citation for something being implemented, add the citation or tag it `[?]` first.
 6. **Anti-circularity**: a test must not compare a kernel against an oracle derived from that kernel's own helper — that proves self-consistency, not correctness. New graph tests compare against an independently written reference.
-7. **The legacy graph is gated**: `AEON_ENABLE_LEGACY_V4_GRAPH` (default `OFF`) controls the pre-rewrite graph, its tests, and its tools. Leave it off. Enable it only to re-derive a specific value from the old path, and never treat a green legacy run as coverage.
+7. **No second graph**: the pre-rewrite graph is gone (`AEON_ENABLE_LEGACY_V4_GRAPH` and
+`core/v4_pipeline.hpp` were deleted 2026-09-18; recover them from git history or `main` if a
+specific old value must be re-derived). There is exactly one graph, and a re-introduced legacy
+path is a defect, not a convenience.
 8. **Empirical Milestone Logging**: For every significant milestone or architectural transition, log the exact test conditions, throughput (tok/s), latencies (TTFT, decode step ms), and cache metrics in [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md). Do not log noise for small code edits; log meaningful, comparable system-level milestones to provide clear before-and-after tracking on the path to production.
 9. **Modular, Scalable and Maintainable**: avoid growing monolithic files with mixed concerns, extract those concerns in separate smaller and focused modules, reuse and improve existing modules, avoid duplications and redundancies.
