@@ -2,27 +2,15 @@
 
 **Audited: 2026-09-18, on branch `rewrite/graph-v2`.**
 
-This file is the navigation point for project state. It is deliberately short:
-detailed numbers belong in [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md), design
-rationale in the reference documents, and step-by-step implementation in the plan
-linked below. [AGENTS.md](../../AGENTS.md) carries the engineering rules.
+This file is the navigation point for project state. It is deliberately short: detailed numbers belong in [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md), design rationale in the reference documents, and step-by-step implementation in the plan linked below. [AGENTS.md](../../AGENTS.md) carries the engineering rules.
 
 ---
 
 ## 1. Where the project is
 
-Project Aeon is **rewriting its DeepSeek-V4 inference graph**. The storage, streaming, artifact-format
-and kernel layers are kept; the graph that composes them is rebuilt from a verified specification —
-[DSV4 Inference Pipeline Plan](../execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md), the authority
-for graph semantics, whose every `[V]` claim cites readable reference code and whose every remaining
-unknown names the gate that settles it.
+Project Aeon is **rewriting its DeepSeek-V4 inference graph**. The storage, streaming, artifact-format and kernel layers are kept; the graph that composes them is rebuilt from a verified specification — [DSV4 Inference Pipeline Plan](../execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md), the authority for graph semantics, whose every `[V]` claim cites readable reference code and whose every remaining unknown names the gate that settles it.
 
-**Why.** An audit of the runtime against the selected checkpoint found structural errors in the graph
-— not tuning gaps: a missing Hyper-Connections comb scale, a missing compressor APE term, and HCA
-layers running indexer selection they do not have. The tests of the time did not catch them because
-several compared a kernel against an oracle derived from the same helper (the anti-circularity rule).
-Measurements taken against that graph describe a different computation and are invalid; the ledger
-records the deletion.
+**Why.** An audit of the runtime against the selected checkpoint found structural errors in the graph — not tuning gaps: a missing Hyper-Connections comb scale, a missing compressor APE term, and HCA layers running indexer selection they do not have. The tests of the time did not catch them because several compared a kernel against an oracle derived from the same helper (the anti-circularity rule). Measurements taken against that graph describe a different computation and are invalid; the ledger records the deletion.
 
 ### Current execution state
 
@@ -48,8 +36,7 @@ The graph is **built and speaks**. Each row points at the document that owns the
 | Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
 | Default `ctest` | 44 tests |
 
-Gate results, tolerances, mutation tallies and their findings belong to the plan and the ledger. This
-table is a pointer, not a record.
+Gate results, tolerances, mutation tallies and their findings belong to the plan and the ledger. This table is a pointer, not a record.
 
 ---
 
@@ -94,64 +81,37 @@ table is a pointer, not a record.
 
 ### Historical and reference (rationale only — not checklists)
 
-`analysis/historical/` holds completed reviews, design analyses, and the
-pre-rewrite planning documents (`AEON_V4_REVIEW_AND_FIX_*`, the supply-chain and
-backend analyses, the vLLM reference map, and the llama.cpp prefill analysis).
-`reference/strategy/` and `reference/prior-art/` hold vision, risk, and external
-research. None of these are current implementation evidence.
+`analysis/historical/` holds completed reviews, design analyses, and the pre-rewrite planning documents (`AEON_V4_REVIEW_AND_FIX_*`, the supply-chain and backend analyses, the vLLM reference map, and the llama.cpp prefill analysis). `reference/strategy/` and `reference/prior-art/` hold vision, risk, and external research. None of these are current implementation evidence.
 
 ---
 
 ## 3. Open gates
 
-Pointers only. Each gate is specified, with its procedure and its result, in the document that owns
-it.
+Pointers only. Each gate is specified, with its procedure and its result, in the document that owns it.
 
-**Graph correctness is closed.** Tiers 0–4 and the composition plan's P0–P4 are done, and the
-acceptance criterion is met (one command, conversation in, text out, on the artifact's real weights
-through Hot/Warm/Cold).
+**Graph correctness is closed.** Tiers 0–4 and the composition plan's P0–P4 are done, and the acceptance criterion is met (one command, conversation in, text out, on the artifact's real weights through Hot/Warm/Cold).
 
 **Open work** — both extracted from the composition plan on 2026-09-18:
 
-- [Expert Streaming and Chunked Prefill](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md):
-  tiering under miss pressure on the live path, then chunked prefill with a chunk-wide expert
-  dispatch. Carries item 21's concurrency remainder and item 19's throughput half.
-- [Session State and Swap](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md): the session
-  aggregate, registry, residency seam, cold-tier store and R4. Session swap precedes the prefix
-  **matcher**, which is deliberately deferred along with MTP and multi-GPU.
+- [Expert Streaming and Chunked Prefill](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md): tiering under miss pressure on the live path, then chunked prefill with a chunk-wide expert dispatch. Carries item 21's concurrency remainder and item 19's throughput half.
+- [Session State and Swap](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md): the session aggregate, registry, residency seam, cold-tier store and R4. Session swap precedes the prefix **matcher**, which is deliberately deferred along with MTP and multi-GPU.
 
 **Measurement gates, settled empirically rather than by reading:**
 
 1. **KV fp8/E4M3 vs bf16 storage delta** — open.
 2. **MoE routed-expert accumulation order** — partially settled.
 3. ~~Indexer Hadamard rotation~~ — **settled: do not apply it** (plan Gate 11).
-4. ~~Local-window prefix-reuse boundary~~ — **settled at item 20**: the compressed store never evicts
-   inside the declared context, so only the local ring is window-bounded and must be **replayed**, not
-   restored.
+4. ~~Local-window prefix-reuse boundary~~ — **settled at item 20**: the compressed store never evicts inside the declared context, so only the local ring is window-bounded and must be **replayed**, not restored.
 
-**Kept infrastructure** — cold-tier characterization, physical `.aeon` placement, host-memory
-pressure, the model-backed `>= 6.0 GB/s` target, kernel occupancy tuning, the routing placement study,
-the explicit backend factory, and Phase 3 multi-GPU.
+**Kept infrastructure** — cold-tier characterization, physical `.aeon` placement, host-memory pressure, the model-backed `>= 6.0 GB/s` target, kernel occupancy tuning, the routing placement study, the explicit backend factory, and Phase 3 multi-GPU.
 
-**Host-memory pressure** is an active investigation: a `45 GiB` Warm tier does not finish
-`initialize()` on the `62.62 GiB` host, and releasing the dense mapping's page cache (`13.68 GiB`,
-verified) did not fix it. The refuted hypotheses, the one kept change and the measurement that would
-split the problem are in
-[HOST_MEMORY_PRESSURE_INVESTIGATION.md](../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md).
+**Host-memory pressure** is an active investigation: a `45 GiB` Warm tier does not finish `initialize()` on the `62.62 GiB` host, and releasing the dense mapping's page cache (`13.68 GiB`, verified) did not fix it. The refuted hypotheses, the one kept change and the measurement that would split the problem are in [HOST_MEMORY_PRESSURE_INVESTIGATION.md](../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md).
 
 ---
 
 ## 4. Conventions
 
-- **Update this file and `AGENTS.md` §3 whenever a milestone transitions.** They
-  are the two documents a new session should read first.
-- **Mark superseded documents explicitly** rather than deleting them; move them to
-  `execution/superseded/` or `analysis/historical/`.
-- **Do not add a fourth place to record state.** Measurements go in the ledger,
-  the implementation sequence in the plan, navigation here.
-- **Target availability.** The rewrite deleted several pre-rewrite test targets
-  (`bench_full_model`, `test_hot_warm_cold_pipeline`, the `test_v4_stage*` /
-  `attention*` / `layer_state*` families, `test_aeon_moe_fused_w13`,
-  `bench_aeon_moe_fused_w13`). Older plans and ledger evidence lines still name
-  them, which is correct for historical records but **not** for instructions.
-  [CODEBASE_MAP.md](CODEBASE_MAP.md) is authoritative for what actually builds.
+- **Update this file and `AGENTS.md` §3 whenever a milestone transitions.** They are the two documents a new session should read first.
+- **Mark superseded documents explicitly** rather than deleting them; move them to `execution/superseded/` or `analysis/historical/`.
+- **Do not add a fourth place to record state.** Measurements go in the ledger, the implementation sequence in the plan, navigation here.
+- **Target availability.** The rewrite deleted several pre-rewrite test targets (`bench_full_model`, `test_hot_warm_cold_pipeline`, the `test_v4_stage*` / `attention*` / `layer_state*` families, `test_aeon_moe_fused_w13`, `bench_aeon_moe_fused_w13`). Older plans and ledger evidence lines still name them, which is correct for historical records but **not** for instructions. [CODEBASE_MAP.md](CODEBASE_MAP.md) is authoritative for what actually builds.
