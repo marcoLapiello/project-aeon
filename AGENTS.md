@@ -54,104 +54,43 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 ---
 
 ## 3. Progress Tracking & State of Execution
-*Status: 2026-09-17, branch `rewrite/graph-v2`.*
+*Status: 2026-09-18, branch `rewrite/graph-v2`.*
 
-**This section is an index, not a record.** One row per milestone, pointing at the document that owns
-the detail: the [DSV4 Inference Pipeline Plan](plans-and-docs/execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md) (per-item gate results, traps 1–44, mutation
-tables, open unknowns), the [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) (plan inventory and document
-boundaries), and the [Performance Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md) (silicon measurements and its validity banner).
-**Do not restate a finding, gate result, tolerance, trap, or measurement here — link to it.** When a
-milestone transitions, change its row.
+**This is an index, not a record.** One row per milestone, pointing at the document that owns the
+detail: the [DSV4 Inference Pipeline Plan](plans-and-docs/execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md)
+(per-item gate results, traps 1–44, mutation tables), the
+[DSV4 Graph Composition Plan](plans-and-docs/execution/completed/DSV4_GRAPH_COMPOSITION_PLAN.md)
+(the build phases P0–P4 and the acceptance criterion), the
+[Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) (milestone table, open gates,
+document map) and the [Performance Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md) (silicon
+measurements). **Do not restate a finding, gate result, tolerance, trap or measurement here — link
+to it.**
 
-### The graph rewrite (active)
-Executing Part V of the plan. Tiers 0–3 are complete; Tier 4 is under way.
+### The graph rewrite (complete)
+Part V of the plan is executed end to end, and so is the composition plan's P0–P4.
 
 | Stage | State | Detail |
 | :--- | :--- | :--- |
 | Tier 0 — specification research (phases 0.1–0.2f) | done | plan §Tier 0 |
-| Step 0 — prompt encoding | done | plan §Step 0 |
+| Step 0 — prompt encoding; Step 3 — `hc_head` | verified | plan §Step 0, §Step 3 |
 | Tier 1 — oracle harness + all 11 primitives | done, mutation-tested | plan §Tier 1 |
-| Tier 2 — items 16–18: layer body, all three attention classes, serial loop | **closed** | plan §Tier 2 |
-| Tier 3 — items 19–20: chunked prefill, long-context lifecycle | done *(item 19's throughput half blocked)* | plan §Tier 3 |
-| Tier 4 — items 21–23: streaming/tiering, prefix cache, generating loop | item 21 done; item 22's restore half (R3) done; **23 closed** — executor seam, head end (P1), 43-layer driver (P2), sampler (P3) and text binding (P4) all built | plan §Tier 4 / [DSV4 Graph Composition Plan](plans-and-docs/execution/completed/DSV4_GRAPH_COMPOSITION_PLAN.md) |
+| Tier 2 — layer body, all three attention classes, serial loop | closed | plan §Tier 2 |
+| Tier 3 — chunked prefill, long-context lifecycle | done | plan §Tier 3 |
+| Tier 4 — item 21: streaming and tiering | certified | plan §Tier 4 |
+| Tier 4 — item 22: state restore (R3) | certified | plan §Tier 4 |
+| Tier 4 — item 23: the generating loop | closed by P0–P4 | [composition plan](plans-and-docs/execution/completed/DSV4_GRAPH_COMPOSITION_PLAN.md) §7 |
+| P0–P4 — executor seam, head end, 43-layer driver, sampler, text binding | built; acceptance criterion met | composition plan §7 |
 
 `core/v4_layer_body.hpp` is the single layer body; decode, chunked prefill and every Tier-2/3 gate
-call it. The pre-rewrite graph (`core/v4_pipeline.hpp`) and its gate were **deleted on 2026-09-18**,
-together with the two gated real-weight parity anchors, the two tools that drove it, the superseded
-`dsv4_chat_formatter`, and the orphaned `v4_attention_oracle` — roughly 5,600 lines, all of it
-unreachable from the default build (verified by a trial deletion + build). Default `ctest`: **44 tests**.
+call it. `aeon_chat`, now in the **default** build, takes a conversation and returns text on the
+artifact's real weights through Hot/Warm/Cold — the acceptance criterion. The pre-rewrite graph
+(`core/v4_pipeline.hpp`) and its gate were **deleted on 2026-09-18** (~5,600 lines, verified
+unreachable by a trial deletion + build). Default `ctest`: **44 tests**.
 
-**Next: tiering under miss pressure, then chunked prefill — see the
+**Next: tiering under miss pressure, then chunked prefill.** Both are owned by the
 [Expert Streaming and Chunked Prefill Analysis](plans-and-docs/analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md),
-which was cut out of the composition plan on 2026-09-18 and owns both. Session state and swap is the
-other extraction, in
-[Session State and Swap Analysis](plans-and-docs/analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md).** **P0–P4 are green and the graph speaks**: `V4ModelHost`builds the whole assembly (`core/v4_model_host.hpp` — loader → config → spec → contract → budget →
-resources → scratch → streams → 43 layers → Hot/Warm expert pools → registry → staging → tiered
-supply → production `V4TieredExpertExecutor`), `V4Graph` runs `embed_token` → 43 ×
-`run_layer_body_decoding` → `hc_head` → final norm → LM head (**34 checks, 0 failures, 5/5 mutations**,
-`forward_token` reproducing the gate's own per-layer loop at **0 differing of 517 120** fp16 logits),
-`core/v4_sampler.hpp` turns those logits into a token behind a **logit-processor seam** (**57 checks,
-6/6 mutations, plus one named equivalent**), and `core/v4_engine.hpp` binds the tokenizer, the prompt
-encoder and the generation loop to them (**28 checks, 7/7 mutations**) — so `aeon_chat`, now in the
-**default** build, takes a conversation and returns text:
-
-```
-What is the capital of France?  ->  The capital of France is **Paris**.
-```
-
-EOS-reached, 43 layers, on the artifact's real weights through Hot/Warm/Cold — the plan's acceptance
-criterion, and the same sentence the pre-rewrite graph produced.
-
-**A resource-accounting correction landed with P4 (ledger M28).** The budget reserved
-`dense_file_size()` — the whole container — while the graph uploads only what the contract
-enumerates, so **1.957 GiB** was reserved for VRAM never touched (`embed.weight`, read from the host
-mmap, and the unused `mtp.*` draft head). Reserving it cost 148 Hot expert slots. The budget now
-derives dense bytes from `V4ModelContract::uploaded_dense_bytes`, plans against `min(free, total)`
-rather than nominal VRAM, and caps host RAM at `total − 10 GiB` rather than 70% of total. Measured:
-**21.99 → 23.76 GiB** held (`rocm-smi --showpids`), **675 → 809** Hot slots. Note
-`rocm-smi --showmeminfo` numbers devices differently from `--showpids`; use the latter for a
-per-process figure.
-
-**The prefill reconnaissance was recorded before that work starts**, because it found that the
-composition plan's own framing of it was too small. The rewrite has **no prefill path** (the prompt
-goes through the same one-token-at-a-time call as decode), the host allocates **neither** batch
-scratch type, and the expert seam is **strictly per token** — so a chunk batches attention and leaves
-the MoE serialized, which is ~95% of prefill's cost (3.65 GB of expert weights streamed per token).
-What must be built is an interface change, not just a driver. The detailed list, the measured
-numbers, and the two budget literals still to be derived are in the
-[Expert Streaming and Chunked Prefill Analysis](plans-and-docs/analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md).
-
-**Tiering under pressure adds not a component but *pressure*:** run with `hot_vram_slots` small
-enough that every layer misses and with a warm tier that is not preloaded, and re-derive the item-21
-properties **through the graph** — cold reads counted, staging slots returned, `forced_drains()`
-recorded, `invariants_hold()` at the end, and the logits bit-identical to a run with all experts
-resident. That is item 21's remainder, and it is named so the engine purpose is not mistaken for
-done. Both work items, their order, and each gate are in that plan.
-
-**Two traps found in the last two phases, both about the *instrument* rather than the arithmetic.**
-**Trap 44 (P3):** the gate had to assert that the seam runs *before* the truncations, and the first
-check written for it — "a promoted token survives `top_k = 1`" — passes on **both** orderings, so it
-was a passing check that discriminated nothing; it was replaced by what the processor **sees**. The
-general form: **for an ordering claim, assert an observable of the moved step, not a downstream
-consequence both orderings produce.** The sweep is what found it, which is why the sweep runs before
-the gate is trusted. **At P4 the same shape appeared one level up:** the "the history is in the
-context" claim was first made on the *drawn token*, and at `T=1` both contexts drew the same one —
-the honest instrument is the **logits** (129 251 of 129 280 differ), because a peaked distribution can
-draw the same token from two different distributions.
-
-**A cost trap found at P2, worth knowing before touching a model-level gate.** The new gate takes
-~3 minutes, and essentially all of it is the *reference*, not the device: the same 172 layer-steps
-cost the device 1.6 s. The fp64 reference materialises each real expert's three matrices as `double`
-— 600 MB per expert — so it is memory-bound, and the per-element swizzle address arithmetic that
-looks expensive is not (hoisting it bought `1.4x`). The reuse measurement is in the gate: 767 of
-1032 requests were distinct `(layer, expert)` pairs, so caching decoded experts cannot pay either.
-The same shape as trap 42: **attribute an instrument's cost by measurement, not by inspection.**
-The three graph gates now have three distinct cost shapes, which is the useful part: P2 is **180 s of
-fp64 reference**, P3 is **8 s of pure transform** (no model in the loop at all), and P4 is **~110 s of
-device** — a text-in/text-out run has to run the model, and the model costs what it costs.
-
-**Two items are explicit non-goals for the near term** and are named so they are not mistaken for
-gaps: the prefix **matcher** (22b) and **R4**. Session swap needs neither.
+cut out of the composition plan on 2026-09-18. Session state and swap is the other extraction, in the
+[Session State and Swap Analysis](plans-and-docs/analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md).
 
 ### Other states
 - **Superseded —** [Model Correctness Execution Plan](plans-and-docs/execution/superseded/MODEL_CORRECTNESS_EXECUTION_PLAN.md):
@@ -161,21 +100,11 @@ gaps: the prefix **matcher** (22b) and **R4**. Session swap needs neither.
   fused W1/W3 and W2 kernels, now the default routed-expert path); warm-tier repair and supply
   telemetry ([closure report](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md)).
 - **Paused —** Phase 2 continuation (cold-tier, storage layout, placement, latency hiding), pending
-  the graph rewrite and the host-pressure tradeoff.
+  the host-pressure tradeoff.
 
 ### Open gates
-Pointers only; each is specified in the plan's "Open unknowns" table or the ledger.
-- **Graph correctness —** Tier 4 item 23's remaining half: the sampler (P3) and the text binding (P4).
-  The 43-layer driver (P2) is closed. (See *Next* above.)
-- **Measurement gates —** KV fp8/E4M3 vs bf16 storage; MoE routed-expert accumulation order
-  (partially settled); local-window prefix-reuse boundary (half settled by item 20). The indexer
-  Hadamard is **settled — do not apply it** (plan Gate 11).
-- **Kept infrastructure —** cold-tier characterization, physical `.aeon` placement, host-memory
-  pressure, the model-backed `>= 6.0 GB/s` target, kernel occupancy tuning, the routing placement
-  study, the explicit backend factory, and Phase 3 multi-GPU.
-- **Before comparing any number —** read the ledger banner: the pre-rewrite model-path entries were
-  deleted because they measured a *different computation*, not merely a slower one. §4 keeps only
-  what the graph change cannot move; §5 is the post-rewrite record.
+See [Documentation Status §3](plans-and-docs/status/DOCUMENTATION_STATUS.md) for the single list. The
+named non-goals for the near term are the prefix **matcher** and **R4**; session swap needs neither.
 
 ---
 
@@ -191,7 +120,7 @@ Pointers only; each is specified in the plan's "Open unknowns" table or the ledg
 1. **Incremental Micro-Steps**: Advance through small, verifiable steps. Never implement broad abstractions before underlying hardware primitives are verified on silicon.
 2. **Hardware-Grounded Verification**: Test and benchmark on physical hardware (`gfx1100`) at every step.
 3. **Commit Messages**: Follow standard conventional commits format (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `perf:`).
-4. **Maintenance of AGENTS.md**: Update the "Progress Tracking & State of Execution" section whenever milestones or micro-steps transition between Past, Present, and Future but keep in mind that this is an entry-point not a detailed record - more details are documented in the related plans and documents.
+4. **Maintenance of AGENTS.md**: Update the "Progress Tracking & State of Execution" section whenever milestones or micro-steps transition between Past, Present, and Future. This is an entry point, not a detailed record: state a milestone as one row and point at the document that owns its detail. When a milestone advances, **change its row — do not append a narrative**. Detail added here is duplication that will drift.
 5. **The specification is authoritative**: For DeepSeek-V4 graph semantics, [DSV4 Inference Pipeline Plan](plans-and-docs/execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md) governs. Do not implement a graph op from memory, from this file, or from an unsourced reference. If the plan lacks a citation for something being implemented, add the citation or tag it `[?]` first.
 6. **Anti-circularity**: a test must not compare a kernel against an oracle derived from that kernel's own helper — that proves self-consistency, not correctness. New graph tests compare against an independently written reference.
 7. **No second graph**: the pre-rewrite graph is gone (`AEON_ENABLE_LEGACY_V4_GRAPH` and
