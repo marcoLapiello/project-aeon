@@ -25,32 +25,15 @@ __global__ void v4_pipeline_swiglu_clamp_kernel(
     }
 }
 
-__global__ void v4_pipeline_swiglu_clamp_batched_kernel(
-    const half* __restrict__ gate,
-    const half* __restrict__ up,
-    half* __restrict__ out,
-    int total_elements,
-    float limit
-) {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < total_elements) {
-        float gate_value = __half2float(gate[index]);
-        float up_value = __half2float(up[index]);
-        gate_value = fminf(gate_value, limit);
-        up_value = fminf(fmaxf(up_value, -limit), limit);
-        out[index] = __float2half(
-            (gate_value / (1.0f + expf(-gate_value))) * up_value);
-    }
-}
-
 // Accumulate weighted expert output into token hidden state.
 //
 // **SUPERSEDED — do not select this in any new path.** Its accumulator is stored in
 // fp16 and re-rounded on every one of the six steps, which violates plan §2.10.3
 // ("accumulate in fp32"); measured against the fixed-order pair below it is 3.4x
-// less accurate on the model's own routing-weight shape. It is retained only
-// because the pre-rewrite graph behind `AEON_ENABLE_LEGACY_V4_GRAPH` still calls
-// it. The replacement is `aeon_moe_fused_w2_contrib_kernel` +
+// less accurate on the model's own routing-weight shape. It is retained **only as a
+// gate control**: the deterministic fixtures use it to check that a run
+// reproducing the fp16 order still matches, so its reader is `tests/support/`.
+// The replacement is `aeon_moe_fused_w2_contrib_kernel` +
 // `v4_moe_accumulate_fixed_order_kernel`, which is fp32 *and* has a fixed order.
 __global__ void v4_pipeline_accumulate_expert_kernel(
     half* __restrict__ accum_out,
@@ -78,9 +61,8 @@ __global__ void v4_pipeline_accumulate_expert_kernel(
 // path did:
 //
 //   * plan §2.10.3 requires **fp32 accumulation**. The fp16 read-modify-write
-//     above (`v4_pipeline_accumulate_expert_kernel`, still used by the pre-rewrite
-//     graph) violates that: it stores its accumulator in fp16 and re-rounds on
-//     each of the six steps.
+//     above (`v4_pipeline_accumulate_expert_kernel`) violates that: it stores its
+//     accumulator in fp16 and re-rounds on each of the six steps.
 //   * trap 38 requires a **fixed order**. `atomicAdd` cannot provide one, because
 //     the order in which the six expert blocks reach a given element is the
 //     scheduler's.

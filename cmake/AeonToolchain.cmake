@@ -2,7 +2,7 @@
 #
 # Included from the top-level CMakeLists.txt after AeonOptions.cmake. This module
 # owns everything that applies to every target; per-target definitions live in
-# AeonInfrastructure.cmake and AeonLegacyGraph.cmake.
+# AeonInfrastructure.cmake.
 
 # --- C++20 -------------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)

@@ -32,10 +32,9 @@
 //
 // Neither of the two older paths had both required properties: the `atomicAdd`
 // path has an undefined reduction order (trap 38), and the fp16 read-modify-write
-// path (still used by the pre-rewrite graph behind `AEON_ENABLE_LEGACY_V4_GRAPH`)
-// re-rounds six times, which plan §2.10.3 forbids. Since a decode step that is not
-// bit-reproducible cannot support a byte-exact restore (item 22/R3), the fixed-order
-// pair is the only admissible choice here — it is not a preference.
+// path re-rounds six times, which plan §2.10.3 forbids. Since a decode step that
+// is not bit-reproducible cannot support a byte-exact restore (item 22/R3), the
+// fixed-order pair is the only admissible choice here — it is not a preference.
 //
 // -----------------------------------------------------------------------------
 // The lease policy, and the hazard it exists to close

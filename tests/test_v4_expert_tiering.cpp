@@ -279,9 +279,9 @@ struct TieringGate {
         supply.reap_registry_transfers();
     }
 
-    // The pipeline's own teardown order (v4_pipeline.hpp:1053-1060): leases are
-    // released, transfers reaped, and only then are the consumed staging slots
-    // returned to the arena.
+    // The teardown order the removed pipeline established: leases are released,
+    // transfers reaped, and only then are the consumed staging slots returned to
+    // the arena.
     void finish_round(const std::vector<uint32_t>& staging_taken) {
         for (uint32_t gid : leased) registry.release_lease(gid);
         leased.clear();

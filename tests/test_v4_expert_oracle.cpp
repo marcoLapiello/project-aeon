@@ -19,9 +19,10 @@
 // Section D matters because sections A-C build their payloads with an encoder
 // written from the same format description as the decoder. That pair is
 // self-consistent by construction; only real artifact bytes prove the description
-// matches what the converter actually wrote. (The legacy `test_v4_real_expert_parity`
-// does that check too, against `v4_int4_reference.hpp`; it is gated off by default
-// and does not test the clamp rule at all, so this gate does not rely on it.)
+// matches what the converter actually wrote. (The pre-rewrite
+// `test_v4_real_expert_parity` did a similar check against `v4_int4_reference.hpp`;
+// it and that reference were deleted on 2026-09-18, and it did not test the clamp
+// rule at all, so this gate never relied on it.)
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"

@@ -188,13 +188,11 @@ __global__ void v4_half_to_float_n_kernel(
 // GPU argmax over the [129280] FP16 logit head (Expert Review Step 5).
 // Phase 1 and Phase 2 are separate launches because HIP has no implicit
 // grid-wide barrier between blocks in one ordinary kernel launch.
-constexpr int V4_ARGMAX_BLOCKS = 505;
-
 __global__ void __launch_bounds__(256) v4_argmax_fp16_partial_kernel(
     const __half* __restrict__ logits,
     int n,
-    float* __restrict__ partial_vals,   // [V4_ARGMAX_BLOCKS]
-    int32_t* __restrict__ partial_idx   // [V4_ARGMAX_BLOCKS]
+    float* __restrict__ partial_vals,   // [argmax_blocks]
+    int32_t* __restrict__ partial_idx   // [argmax_blocks]
 ) {
     __shared__ float s_val[256];
     __shared__ int   s_idx[256];

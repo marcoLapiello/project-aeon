@@ -30,8 +30,8 @@
 //
 // The expert half is a **lift**, not a second design: `V4Pipeline::initialize`
 // performs the same sequence (composition plan §6.1, G1). The difference is that
-// the pre-rewrite version builds and runs its own graph inline, while this hands
-// the same objects to whichever graph the caller drives.
+// the historical version built and ran its own graph inline, while this hands the
+// same objects to whichever graph the caller drives.
 //
 // The **streaming system enters the graph only here**. `V4Graph` never learns
 // which tier answered a request: it calls the `V4RoutedExpertExecutor` the body
@@ -41,13 +41,8 @@
 // What is *not* re-implemented here. Every object below already exists and is
 // used as it stands: `AeonModelLoader`, `DeepSeekV4Config`, `V4ModelSpec`,
 // `V4ModelContract`, `MemoryBudgetEngine`, `V4ModelResources`, `V4Layer`,
-// `PipelineScratchBuffers`, `V4DeviceStreams`, `V4LayerBodyTables`. The pre-rewrite
-// `V4Pipeline::initialize` performs the same sequence, and this is that sequence
-// lifted into the rewrite rather than a second design of it — with one difference
-// that matters: the pre-rewrite version builds and runs the old graph inline,
-// while this exposes the same objects to be driven by whichever graph the caller
-// has. That is what makes it shareable with `AEON_ENABLE_LEGACY_V4_GRAPH` instead
-// of a fork of it.
+// `PipelineScratchBuffers`, `V4DeviceStreams`, `V4LayerBodyTables`. This is that
+// assembly lifted into the rewrite rather than a second design of it.
 //
 // Verification note (plan Part V, second rule). A host is not an op, so there is
 // no arithmetic oracle for it. Its gate is that the assembly's own invariants

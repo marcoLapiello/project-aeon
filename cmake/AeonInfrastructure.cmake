@@ -56,21 +56,12 @@ if(AEON_BUILD_TESTS)
             tests/test_dsv4_tokenizer.cpp
             src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp)
 
-    # Native DSV4 chat/thinking prompt formatting (CPU-side).
-    aeon_add_test(test_dsv4_chat_formatter
-        SOURCES
-            tests/test_dsv4_chat_formatter.cpp
-            src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
-            src/architecture/deepseek_v4/text/dsv4_chat_formatter.cpp
-            src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp)
-
     # Step 0 oracle: render the artifact's golden vectors and compare byte-for-byte
     # against the checkpoint's own encoder output (checkpoint plan Stage B).
     aeon_add_test(test_dsv4_prompt_encoding_oracle
         SOURCES
             tests/test_dsv4_prompt_encoding_oracle.cpp
             src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
-            src/architecture/deepseek_v4/text/dsv4_chat_formatter.cpp
             src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp)
 
     # EOS-aware token generation loop and stop reasons (CPU-side).
@@ -429,11 +420,17 @@ if(AEON_BUILD_TESTS)
         TIMEOUT 1800)
 endif()
 
+# --- Artifact inspection -----------------------------------------------------
+# Standalone artifact inspector: dumps the model contract and dense tensor
+# inventory (Stage 0 evidence). It uses only kept components (`V4ModelContract`,
+# `AeonModelLoader`), so it was promoted out of the legacy gate rather than
+# deleted with it.
+aeon_add_executable(aeon_model_contract SOURCES tools/aeon_model_contract.cpp)
+
 # --- The text-in/text-out CLI -------------------------------------------------
-# `aeon_chat` was a **legacy** target (cmake/AeonLegacyGraph.cmake) until P4. The
-# acceptance criterion is one command, and a command that exists only behind
-# `AEON_ENABLE_LEGACY_V4_GRAPH` cannot meet it. It is re-bound to `V4Engine` and
-# built by default, so the default build contains a way to run the model.
+# The acceptance criterion is one command, and `aeon_chat` is it. It is bound to
+# `V4Engine` (the rewritten graph) and built by default, so the default build
+# always contains a way to run the model.
 #
 # It links the text sources because the engine drives them: the tokenizer, the
 # canonical prompt encoder (Step 0's port, not the superseded chat formatter) and

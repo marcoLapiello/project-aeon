@@ -2,8 +2,8 @@
 // aeon_chat — text in, text out, driven by the rewritten graph.
 //
 // This was a **legacy** target until P4: it drove `V4Pipeline`, the pre-rewrite
-// graph that lives behind `AEON_ENABLE_LEGACY_V4_GRAPH`. The composition plan
-// lists re-binding it as agreement **G5** and part of phase **P4**, and the reason
+// graph (since deleted). The composition plan lists re-binding it as agreement
+// **G5** and part of phase **P4**, and the reason
 // is the acceptance criterion — "one command takes a conversation and returns
 // text" — which cannot be met by a binary that is not in the default build.
 //

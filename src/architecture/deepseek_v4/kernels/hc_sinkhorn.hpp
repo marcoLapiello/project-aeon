@@ -220,68 +220,6 @@ __global__ void __launch_bounds__(256) hc_project_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256) hc_project_batched_kernel(
-    const float* __restrict__ residual_in,
-    const float* __restrict__ fn,
-    float* __restrict__ mixes,
-    int hidden_size,
-    int hc_mult,
-    float rms_eps
-) {
-    const int mix_idx = blockIdx.x;
-    const int token_idx = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int wid = tid >> 5;
-    const int hc_hidden_size = hc_mult * hidden_size;
-    const float* residual_row = residual_in + static_cast<size_t>(token_idx) * hc_hidden_size;
-    const float* fn_row = fn + static_cast<size_t>(mix_idx) * hc_hidden_size;
-
-    __shared__ float s_warp_sqr[8];
-    __shared__ float s_warp_dot[8];
-
-    const float4* residual4 = reinterpret_cast<const float4*>(residual_row);
-    const float4* fn4 = reinterpret_cast<const float4*>(fn_row);
-    const int num_f4 = hc_hidden_size / 4;
-    float local_sqr = 0.0f;
-    float local_dot = 0.0f;
-    for (int index = tid; index < num_f4; index += 256) {
-        const float4 residual_value = residual4[index];
-        const float4 fn_value = fn4[index];
-        local_sqr += residual_value.x * residual_value.x +
-                     residual_value.y * residual_value.y +
-                     residual_value.z * residual_value.z +
-                     residual_value.w * residual_value.w;
-        local_dot += residual_value.x * fn_value.x +
-                     residual_value.y * fn_value.y +
-                     residual_value.z * fn_value.z +
-                     residual_value.w * fn_value.w;
-    }
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_sqr += __shfl_xor(local_sqr, offset, 32);
-        local_dot += __shfl_xor(local_dot, offset, 32);
-    }
-    if (lane == 0) {
-        s_warp_sqr[wid] = local_sqr;
-        s_warp_dot[wid] = local_dot;
-    }
-    __syncthreads();
-
-    if (wid == 0) {
-        float block_sqr = lane < 8 ? s_warp_sqr[lane] : 0.0f;
-        float block_dot = lane < 8 ? s_warp_dot[lane] : 0.0f;
-        for (int offset = 4; offset > 0; offset /= 2) {
-            block_sqr += __shfl_xor(block_sqr, offset, 32);
-            block_dot += __shfl_xor(block_dot, offset, 32);
-        }
-        if (lane == 0) {
-            const float rms = rsqrtf(block_sqr / static_cast<float>(hc_hidden_size) + rms_eps);
-            mixes[static_cast<size_t>(token_idx) * (hc_mult * (2 + hc_mult)) + mix_idx] =
-                block_dot * rms;
-        }
-    }
-}
-
 // Vectorized Pre-Combine Kernel:
 // Pre-combines 4 residual streams into layer_input [4096] half elements using float4 and half2 vectorization.
 // Each thread processes 4 output elements (1 float4 load per stream, producing 2 half2 elements).
@@ -329,48 +267,6 @@ __global__ void __launch_bounds__(256) hc_pre_combine_kernel(
     half2* out_ptr = reinterpret_cast<half2*>(layer_input + idx);
     out_ptr[0] = h01;
     out_ptr[1] = h23;
-}
-
-__global__ void __launch_bounds__(256) hc_pre_combine_batched_kernel(
-    const float* __restrict__ residual_in,
-    const float* __restrict__ pre_mix,
-    __half* __restrict__ layer_input,
-    int hidden_size,
-    int hc_mult
-) {
-    const int token_idx = blockIdx.y;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int idx = tid * 4;
-    const bool valid = idx < hidden_size;
-
-    __shared__ float s_pre[4];
-    if (threadIdx.x < 4) {
-        s_pre[threadIdx.x] = pre_mix[static_cast<size_t>(token_idx) * hc_mult + threadIdx.x];
-    }
-    __syncthreads();
-    if (!valid) return;
-
-    const size_t residual_offset = static_cast<size_t>(token_idx) * hc_mult * hidden_size;
-    const float* r0 = residual_in + residual_offset;
-    const float* r1 = r0 + hidden_size;
-    const float* r2 = r1 + hidden_size;
-    const float* r3 = r2 + hidden_size;
-    const float4 v0 = reinterpret_cast<const float4*>(r0)[tid];
-    const float4 v1 = reinterpret_cast<const float4*>(r1)[tid];
-    const float4 v2 = reinterpret_cast<const float4*>(r2)[tid];
-    const float4 v3 = reinterpret_cast<const float4*>(r3)[tid];
-    const float p0 = s_pre[0];
-    const float p1 = s_pre[1];
-    const float p2 = s_pre[2];
-    const float p3 = s_pre[3];
-    const float out0 = p0 * v0.x + p1 * v1.x + p2 * v2.x + p3 * v3.x;
-    const float out1 = p0 * v0.y + p1 * v1.y + p2 * v2.y + p3 * v3.y;
-    const float out2 = p0 * v0.z + p1 * v1.z + p2 * v2.z + p3 * v3.z;
-    const float out3 = p0 * v0.w + p1 * v1.w + p2 * v2.w + p3 * v3.w;
-    half2* output = reinterpret_cast<half2*>(
-        layer_input + static_cast<size_t>(token_idx) * hidden_size + idx);
-    output[0] = __floats2half2_rn(out0, out1);
-    output[1] = __floats2half2_rn(out2, out3);
 }
 
 // GPU Wave32 Kernel for HC Sinkhorn and Pre/Post Mix calculation
