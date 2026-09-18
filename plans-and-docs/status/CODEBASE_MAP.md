@@ -55,9 +55,8 @@ which loads the model architecture configuration, evaluates the runtime memory
 policy, and opens the dedicated `O_DIRECT` descriptor. The cold request path uses
 `DirectIOReader` and the staging arena before upload on `sdma_cold_stream`; mapped
 access remains available inside the loader for native `.aeon` ownership and
-validation. The bounded Hot/Warm/Cold path is implemented, while physical layout,
-cold-cache measurement, and latency-hiding acceptance remain open in
-[PHASE_2_EXECUTION_PLAN.md](../execution/active/PHASE_2_EXECUTION_PLAN.md).
+validation. The bounded Hot/Warm/Cold path is implemented. See
+[PHASE_2_EXECUTION_PLAN.md](../execution/completed/PHASE_2_EXECUTION_PLAN.md) for the storage and kernel work.
 
 ## Active validation (default `ctest` — 44 tests)
 

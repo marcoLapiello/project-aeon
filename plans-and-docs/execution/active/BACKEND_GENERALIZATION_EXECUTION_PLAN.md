@@ -1,8 +1,10 @@
 # Backend Generalization Execution Plan
 
-**Date:** 2026-09-12
+**Date:** 2026-09-12 (state re-checked 2026-09-18)
 **Status:** Open; manifest, backend selection, dense binding, and source boundaries implemented
 **Scope:** Generalize storage, artifact selection, and runtime ownership boundaries while preserving the current DeepSeek-V4 swizzled backend.
+
+Runtime note: the graph that consumes these contracts is now `V4ModelHost` (assembly), `V4Graph` (forward), `V4Sampler` (logit processing) and `V4Engine` (text binding). The generalized components below are unchanged by that rewrite.
 
 ## Decision
 
@@ -24,7 +26,7 @@ The first implementation slice is complete:
   `DirectIOReader` consume runtime payload and alignment metadata.
 - `UnifiedVRAMExpertPool` retains only the current swizzled W1/W2/W3 views and
   rejects those views for another format kind.
-- The current `V4Pipeline` rejects a non-swizzled artifact before dense device
+- The model host rejects a non-swizzled artifact before dense device
   weights are allocated.
 
 The manifest contract sub-step is also complete:
@@ -69,7 +71,7 @@ The source tree now makes the ownership boundaries visible:
 
 ### V4 architecture
 
-`V4Pipeline`, `V4Layer`, attention, routing, HC, KV state, tokenizer, and
+`V4Graph`, `V4Layer`, attention, routing, HC, KV state, tokenizer, and
 generation remain DeepSeek-V4-specific. Their fixed kernel geometry is an
 architecture contract, not a quantization-format contract.
 
@@ -106,7 +108,7 @@ The current backend remains validated by:
   swizzled-view guarding, and end-to-end dynamic pipeline execution;
 - `test_expert_registry_warm_state`: Warm ownership and staging transitions;
 - `test_model_direct_io`: model-backed 4 KiB sector and direct-read validation;
-- `test_hot_warm_cold_pipeline`: full-model silicon Hot/Warm/Cold pipeline smoke;
+- `tests/test_v4_expert_tiering`: Cold/Hot/Warm delivery against the mmapped container;
 - `ctest --test-dir build -R 'test_aeon_(loader|swizzled_loader)'`.
 
 No performance result is attributed to this refactor. The existing v2 model

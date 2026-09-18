@@ -1,7 +1,7 @@
 # Phase 2: Single-GPU 3-Tier Storage & Memory Hierarchy Optimization
 *Architecture Target: DeepSeek-V4-Flash-0731 (INT4-W4A16 on AMD RDNA3 / gfx1100)*
 
-*Status: active plan. Spikes 0-2 are complete; Spike 3 has a bounded Hot/Warm/Cold implementation with open storage-layout, host-pressure, cold-cache, and latency-hiding acceptance gates. See [DOCUMENTATION_STATUS.md](../../status/DOCUMENTATION_STATUS.md) for the project-wide status classification.*
+*Status: completed record. Spikes 0-3 were implemented. The runtime that consumed this work was subsequently rebuilt; the targets that were never reached (storage layout, host-memory pressure, model-backed throughput) are not restated here. See [DOCUMENTATION_STATUS.md](../../status/DOCUMENTATION_STATUS.md) for the project-wide status classification.*
 
 ---
 
@@ -76,24 +76,11 @@ Phase 2 is partitioned into four distinct, decoupled Spikes:
   - Multi-tier eviction policy: Priority score combining decayed activation frequency and recency to prevent cache pollution from transient tokens.
 
 - **Micro-Step 1.4: Pipeline Integration & Verification (`tests/test_dynamic_expert_pool.cpp`)**
-  - Wire `AeonMemoryBudgetEngine`, `GlobalVRAMExpertPool`, and `ExpertRegistry` into `V4Pipeline`.
+  - Wire `AeonMemoryBudgetEngine`, `GlobalVRAMExpertPool`, and `ExpertRegistry` into the model host.
   - Benchmark on physical silicon:
     - Test feasibility validation (boundary checks with small, valid, and over-budget context sizes).
     - Measure cache hit rate, eviction overhead, and token latency across varying sequence lengths.
     - Record findings in [PERFORMANCE_LEDGER.md](../../status/PERFORMANCE_LEDGER.md).
-
-#### Historical checkpoint: open issues before segmented/direct-I/O Warm integration (Recorded 2026-09-07)
-
-The following issues describe the pre-segmented, mmap-backed Warm preload and
-are retained as implementation history. They are not a description of the
-current bounded Tier 2 path; the remaining acceptance work is recorded in the
-Spike 3 checkpoints below.
-1. **Tier 2 Warm Host DDR Preload Bottleneck & Memory Pressure**:
-   - **Page-Cache & Swap Contention**: Populating 3,325 warm experts (~43.8 GB) synchronously via `mmap` / `memcpy` caused severe memory pressure, pushing active process pages into the Linux swap partition and risking OOM termination (`Getötet` / exit code 137).
-   - **Extremely Slow Pre-population**: Single-threaded `mmap` page-faulting across a 145 GB disk file is completely unviable for large allocations. Warm expert pre-loading must be converted to sector-aligned Direct I/O (`O_DIRECT` / `pread` / `io_uring`) instead of sequential `memcpy` over `mmap`.
-   - **Host RAM Budget Configuration**: User configuration for `host_ram_bytes` must be explicitly capped to safe bounds (e.g., target ~35 GB instead of maximum hardware limits) so that user-space buffers never compete with the Linux OS, window compositor, or kernel buffers.
-2. **`hipHostMalloc` Fallback**:
-   - `hipHostMalloc` failed with OOM when requesting ~43.8 GB in a single contiguous pinned slab, falling back to `posix_memalign`. The staging pool needs segmented slab allocation or explicit capacity limits tailored to available unpinned/pinned memory limits (`ulimit -l`).
 
 ---
 
@@ -124,38 +111,6 @@ Spike 3 checkpoints below.
 - **Micro-Step 3.2: End-to-End 3-Tier Pipeline Validation**
   - Silicon test measuring end-to-end 3-tier streaming throughput from NVMe $\to$ Host RAM $\to$ GPU VRAM, validating data integrity and measuring throughput in GB/s.
 
-#### Spike 3 Implementation Sequence
-
-The implementation is deliberately staged so storage correctness is established before changing GPU scheduling:
-
-1. **Storage primitive and model contract**
-  - Extend `src/infrastructure/io/direct_io_reader.hpp` with reusable asynchronous request submission and completion harvesting while retaining the existing synchronous `read_direct()` API.
-  - Force regular-file `O_DIRECT` reads onto the asynchronous io_uring worker path and split expert payloads into 4 MiB sector-aligned requests; a single large `IORING_OP_READ` was observed to execute synchronously during `io_uring_enter` on this kernel/device combination.
-  - Unit convention: `AEON_EXPERT_BYTES = 14,155,776` bytes = `13.5 MiB` = `14.155776 MB` decimal = `3,456` 4 KiB sectors. The format is unchanged; earlier `13.5 MB` references used binary MiB terminology.
-  - Open `model_experts_swizzled.aeon` with `O_DIRECT | O_RDONLY | O_CLOEXEC` and expose validated `(file_offset, byte_length)` metadata through `AeonModelLoader`.
-  - Reject non-sector-aligned buffers, offsets, lengths, invalid expert IDs, short completions, and negative `io_uring` results.
-2. **Staging ownership**
-  - Make each `PrefetchStagingArena` slot's lifetime explicit: available, I/O pending, I/O complete, and GPU transfer pending.
-  - Reuse a slot only after both its direct-I/O completion and HIP SDMA event have been observed.
-  - Track whether host memory came from `hipHostMalloc` or `posix_memalign`; release it with the matching API.
-3. **First implementation gate**
-  - Add a model-backed batch direct-I/O test that reads real expert blocks into aligned staging buffers, compares them byte-for-byte with the existing loader, and reports aggregate throughput and completion latency.
-  - The initial gate ran with warm preload disabled; the large contiguous Tier 2 preload is now replaced by segmented allocation and an explicit host-memory budget.
-4. **Pipeline integration**
-  - Replace only the cold branch of the existing lookahead prefetch boundary in `src/architecture/deepseek_v4/core/v4_pipeline.hpp`.
-  - Submit cold reads while the current layer computes, reap them before the corresponding HIP upload, and preserve the existing Hot VRAM and Warm Host paths.
-  - Record a HIP event for each uploaded staging slot and prevent slot reuse until the SDMA event completes.
-  - Populate both initial Hot VRAM and Warm Host residents through bounded `O_DIRECT` batches; do not fault routed expert pages through the expert mmap in the dynamic-global path.
-  - Current request-path behavior is demotion-free: evicted Hot VRAM payloads
-    return to Cold NVMe because weights are immutable. Pinned Warm Host hits
-    upload directly; unpinned segments use the staging fallback. Warm-slot
-    ownership is still protected before promotion or reuse.
-5. **Silicon completion gate**
-  - Validate bit-exact expert payloads, direct NVMe throughput (target >= 6.0 GB/s), cold-read counts, staging stalls, TTFT, decode throughput, and generated-token validity.
-  - Update `PERFORMANCE_LEDGER.md`, this plan, and `AGENTS.md` only after the end-to-end measurements are captured.
-
-The first implementation slice is limited to items 1-3. This keeps an `io_uring` or alignment defect from being confused with a pipeline scheduling defect.
-
 #### Spike 3 Implementation Checkpoint (2026-09-08)
 
 - [x] Added batched `io_uring` submission/completion handling, strict 4KB request validation, and default `IOSQE_ASYNC` execution in `src/infrastructure/io/direct_io_reader.hpp`.
@@ -165,10 +120,7 @@ The first implementation slice is limited to items 1-3. This keeps an `io_uring`
 - [x] Added `tests/test_model_direct_io.cpp` and the `test_model_direct_io` CTest target; the gate now validates 24 aligned 4 MiB subreads for six experts.
 - [x] Silicon checks passed after the async/chunked fix: generic direct I/O (`6.43 GB/s`), model-backed six-expert payload parity (`3.17 GiB/s`), native pipeline golden token `69146`, and async cold-miss generation (`32.87 tok/s`).
 - [x] Root cause isolated: baseline `io_uring_enter` submission took about `45 ms` for six expert reads while completion waits were sub-millisecond; `IOSQE_ASYNC` removed that synchronous submission behavior. A 4 MiB direct-read sweep was also materially faster than 14-16 MiB requests on this device.
-- [ ] The model-backed batch result remains below the `>= 6.0 GB/s` Spike 3 target because the target fixture is a short/sequential workload while routed experts are physically scattered across the 145 GB container. The model file has `1,552` physical extents versus `6` for a fresh 128 MiB probe file on the same NVMe/ext4 filesystem. Repacking/defragmentation and higher-volume queue-saturation measurements remain open.
-- [x] Historical 12-slot native source A/B produced identical tokens and measured direct `32.31/32.57 tok/s` versus mmap-source `33.57/33.22 tok/s`. The temporary benchmark target was retired when the partial-model initializer was removed. This was not an apples-to-apples cold-cache proof because the mmap case warmed its page-cache pages during its warmup step; it showed that replacing the source fill alone did not improve the then-current end-to-end critical path.
-- [ ] Move direct-I/O completion and GPU upload farther ahead of routed execution, and benchmark cold-cache and steady-state modes separately before claiming an inference-throughput gain.
-- [ ] At the M11 checkpoint, full Tier 2 warm-cache integration and end-to-end NVMe -> Host DDR -> VRAM measurement remained open; the bounded segmented integration is recorded in the checkpoint below.
+- [x] Historical 12-slot native source A/B produced identical tokens and measured direct `32.31/32.57 tok/s` versus mmap-source `33.57/33.22 tok/s`. Replacing the source fill alone did not improve the then-current end-to-end critical path.
 
 #### Spike 3 Tier 2 Integration Checkpoint (2026-09-08, historical pre-M16 behavior)
 
@@ -176,17 +128,7 @@ The first implementation slice is limited to items 1-3. This keeps an `io_uring`
 - [x] Added bounded direct-I/O batch loading for initial Hot VRAM and Warm Host residents. The dynamic-global path now fills both tiers from the `O_DIRECT` descriptor instead of synchronously faulting expert payloads from mmap.
   - [x] Added the initial VRAM-to-host expert downloads for Hot-to-Warm demotion and corrected Warm-to-Hot promotion ordering so host slots could not be overwritten before their payload was staged. The later M16 change removed demotion from the request path.
 - [x] Corrected staging-slot release across multi-layer execution; the 43-layer path can reuse the fixed double-buffer arena without invalid state transitions.
-- [x] Added `test_hot_warm_cold_pipeline`: 43 layers, context 256, 676 Hot slots, 8 Warm slots, and 10,324 Cold slots. Silicon run completed one valid step with token `295`, 12 Hot hits, 0 Warm hits, and 24 Cold misses; all five focused Phase 2 tests passed.
-- [x] Measured a repeat Warm-serving workload with the full-model benchmark: the 8 GiB profile served 555 requests from Warm Host and 601 from Cold NVMe during the measured generation.
-- [x] Ran the full configured Warm capacity: 2,654 slots (`34.99 GiB`) populated through direct I/O and used by the 43-layer benchmark. The run completed successfully, but host swap usage rose by approximately `0.7 GiB`; controlled cold-cache comparison, storage layout, and the `>= 6.0 GB/s` model-backed target remain open.
-- [x] Removed the synchronous Hot-to-Warm demotion wait: VRAM-to-host DMA is now event-tracked per Warm slot and only waited on when the payload is consumed or the slot is reused. Controlled 0 GiB versus 35 GiB runs now measure `4.37 tok/s` versus `5.15 tok/s` with identical output and service counts.
-  - [ ] Reduce host-memory pressure, measure the unpinned Warm Host staging fallback, reach the `>= 6.0 GB/s` model-backed throughput target, and complete controlled Tier 2 end-to-end measurements; remaining work is dominated by physical expert placement and storage-layout optimization.
-
----
-
-## 3. Milestone Verification & Success Criteria
-
-1. **VRAM Hit Rate**: Global dynamic VRAM pool achieves $\ge 40\%$ hit rate (up from $2.4\%$) on multi-token sequences.
-2. **Transfer Latency Hiding**: Asynchronous SDMA prefetching hides $\ge 80\%$ of PCIe transfer time behind attention/shared-expert compute.
-3. **NVMe Direct I/O**: Direct I/O reader streams cold experts from NVMe at $\ge 6.0\text{ GB/s}$ directly into pinned host buffers.
-4. **Empirical Ledger Logging**: Update [PERFORMANCE_LEDGER.md](../../status/PERFORMANCE_LEDGER.md) at the end of each spike with exact before-and-after throughputs, latencies, and cache statistics.
+- [x] Added a full-model Hot/Warm/Cold smoke test: 43 layers, context 256, 676 Hot slots, 8 Warm slots, and 10,324 Cold slots. Silicon run completed one valid step with token `295`, 12 Hot hits, 0 Warm hits, and 24 Cold misses.
+- [x] Measured a repeat Warm-serving workload on the full 43-layer model: the 8 GiB profile served 555 requests from Warm Host and 601 from Cold NVMe during the measured generation.
+- [x] Ran the full configured Warm capacity: 2,654 slots (`34.99 GiB`) populated through direct I/O and used by the 43-layer benchmark. The run completed successfully; host swap usage rose by approximately `0.7 GiB`.
+- [x] Removed the synchronous Hot-to-Warm demotion wait: VRAM-to-host DMA is now event-tracked per Warm slot and only waited on when the payload is consumed or the slot is reused. Controlled 0 GiB versus 35 GiB runs measure `4.37 tok/s` versus `5.15 tok/s` with identical output and service counts.

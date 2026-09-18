@@ -9,7 +9,7 @@ This document consolidates the model-architecture information identified for the
 > **Authority note (2026-09-15).** This is an **orientation overview** of the model
 > family. For the selected checkpoint's authoritative op semantics — each claim
 > tagged and cited against readable reference code — use
-> [inference_pipeline_plan.md](inference_pipeline_plan.md). Where the two differ,
+> [DSV4_INFERENCE_PIPELINE_PLAN.md](../../execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md). Where the two differ,
 > the plan governs.
 
 ## 1. Model overview

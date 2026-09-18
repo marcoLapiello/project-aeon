@@ -169,4 +169,4 @@ sampled correctly.
   `read_experts_direct_blocking`, `preload_hot_experts`
 - `src/infrastructure/core/host_expert_pool.hpp` — the pinned Warm allocation
 - `src/architecture/deepseek_v4/core/v4_model_contract.hpp` — `uploaded_dense_bytes`
-- [PERFORMANCE_LEDGER](../status/PERFORMANCE_LEDGER.md) **M28**
+- [PERFORMANCE_LEDGER](../../status/PERFORMANCE_LEDGER.md) **M28**

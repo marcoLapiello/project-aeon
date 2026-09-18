@@ -1,4 +1,4 @@
-# Inference Pipeline Plan
+# DSV4 Inference Pipeline Plan
 ## DeepSeek-V4-Flash-0731 — Full Text-In / Text-Out Procedure
 
 **Target hardware:** AMD Radeon RX 7900 XTX (RDNA 3, gfx1100)
@@ -1594,7 +1594,7 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > engine assembly. Each is its own step with its own gate, per the earning order.
 >
 > **P1 of the composition plan is done (2026-09-17) — the head end runs.** The
-> [graph composition plan](graph_composition_plan.md) took over the sequencing here, because what
+> [DSV4 graph composition plan](DSV4_GRAPH_COMPOSITION_PLAN.md) took over the sequencing here, because what
 > remained was composition rather than graph research, and its P1 built the two things this
 > block listed as missing at the *head*: the engine assembly's first nine steps
 > (`core/v4_model_host.hpp` — loader → config → spec → contract → budget → resources → scratch →
@@ -1642,7 +1642,7 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > (P3/P4/P5). What remains of item 23 is therefore the sampler and the text binding.
 >
 > **P3 of the composition plan is done (2026-09-17) — the graph decides a token.** The
-> [graph composition plan](graph_composition_plan.md) built the sampler as its own component rather
+> [DSV4 graph composition plan](DSV4_GRAPH_COMPOSITION_PLAN.md) built the sampler as its own component rather
 > than as a tail of the graph, because sampling is not a model operation: `core/v4_graph.hpp` ends at
 > logits and never learns how a token was chosen. `core/v4_sampler.hpp` is `V4Sampler` (the seam, the
 > configuration, the generator, and the device workspace for the certified argmax pair) over a set of
@@ -1707,9 +1707,12 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > sentence the pre-rewrite graph produced** (§1.1 of the composition plan), now produced by the
 > rebuilt graph. **Item 23's three seams are therefore closed**: the routed-expert executor, the
 > 43-layer driver, and the text binding. What remains of Part V is not item 23 but Tier 4's remaining
-> items — 21's `Stage D.2` concurrency (P5), 22b and R4 (P7) — and the throughput work, which the plan
-> keeps a separate gate. `2.7 tok/s` is not a throughput claim: it is an unbatched single-token decode
-> with the warm tier unallocated, and the ledger owns that number's proper measurement.
+> items — 21's concurrency remainder and 22b/R4, now owned by the
+> [Expert Streaming and Chunked Prefill Analysis](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md)
+> and the [Session State and Swap Analysis](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md)
+> respectively — and the throughput work, which the plan keeps a separate gate. `2.7 tok/s` is not a
+> throughput claim: it is an unbatched single-token decode with the warm tier unallocated, and the
+> ledger owns that number's proper measurement.
 
 **Do not build the streaming system before the numerics are correct.** Streaming bugs and numerical bugs produce identical symptoms, and debugging both at once is intractable.
 

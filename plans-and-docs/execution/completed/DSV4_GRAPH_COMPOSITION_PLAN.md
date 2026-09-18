@@ -1,4 +1,4 @@
-# Graph Composition Plan — one ordered path from text to text
+# DSV4 Graph Composition Plan — one ordered path from text to text
 
 **Status:** 2026-09-17, branch `rewrite/graph-v2`.
 **Subject:** the **composition** of DeepSeek-V4-Flash-0731 into one ordered graph — text in,
@@ -10,7 +10,7 @@ established it says so and points at the gate.
 
 > Evidence convention: paths are `src/`-relative and line numbers are from the working tree at the
 > revision above. Where a claim is about behaviour rather than a symbol, the source line is cited.
-> Where a step is *certified*, the pointer is to the [inference pipeline plan](inference_pipeline_plan.md),
+> Where a step is *certified*, the pointer is to the [DSV4 inference pipeline plan](DSV4_INFERENCE_PIPELINE_PLAN.md),
 > which owns the gate result. Nothing here is derived from memory.
 
 ---
@@ -46,7 +46,7 @@ following holds — measured, not asserted:
 
 The **shell** has already produced coherent text once — through the *pre-rewrite* graph:
 `What is the capital of France?` → `The capital of France is **Paris**.`, EOS-reached, 43 layers, on
-silicon `[V execution/active/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md §1.1]`. That run is **not
+silicon `[V execution/completed/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md §1.1]`. That run is **not
 evidence about this graph** (the ledger marks pre-rewrite model-path measurements invalid, and the
 legacy parity tests are gated off), but it settles three things this plan depends on:
 
@@ -57,8 +57,9 @@ legacy parity tests are gated off), but it settles three things this plan depend
 * the risk in this plan is therefore not "can it speak", it is "does the rebuilt graph compute what
   the gates say it computes, and does it still speak when it does".
 
-The legacy `V4Pipeline::step` also shows the serial prefill shape P4 needs (`prefill()` loops
-`step()` with `RoutingPhase::Prefill`) — order B invariant 4: serial before batched. P6 batches it.
+The legacy `V4Pipeline::step` also showed the serial prefill shape P4 needs (`prefill()` loops
+`step()` with `RoutingPhase::Prefill`) — order B invariant 4: serial before batched. Batching it is
+not this plan's (§7, "Beyond P4").
 
 ---
 
@@ -351,7 +352,7 @@ Step 13 is the only part with real mass, and the tiering gate already drives its
   (2026-09-18)** with the rest of the legacy graph; touching it would have created a second copy of
   the assembly to keep in sync.
 * `tools/aeon_chat.cpp` is moved out of `cmake/AeonLegacyGraph.cmake` and re-bound to the new
-  engine, so text-in/text-out stops being a legacy target (§3.1 gap G6).
+  engine, so text-in/text-out stops being a legacy target (gap G5).
 
 | New module | Owns | Depends on |
 | :--- | :--- | :--- |
@@ -411,55 +412,50 @@ or before P4 is a prerequisite of the first coherent run:**
 | **P2 — done** | the rest of G1 and G2, and G9 | the pools/supply/executor, the 43-layer loop, and `reference::model_body`; 34 checks, 5/5 mutations |
 | **P3 — done** | G3 | the sampler and the logit-processor seam, `core/v4_sampler.hpp`; 57 checks, 6/6 mutations |
 | **P4 — done** | G5 | the text binding (`core/v4_engine.hpp`) and `aeon_chat` off the legacy graph; 28 checks, 7/7 mutations |
-| P5 — diagnostics under tiering | G4, G14 | observer and telemetry wiring; aids, not prerequisites |
-| P6 — chunked prefill | G6, G7, G8 | batched embedding, on-device top-k, the chunk driver |
-| P7 — session state | G10, G11, G12, G13 | the session aggregate, registry, cold store, and R4 |
+
+The remaining gaps were extracted on 2026-09-18: the tiering and prefill work (the observer, the
+telemetry wiring, the batched embedding, the on-device indexer top-k, the chunk driver) into
+[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md),
+and the session state work into
+[SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md).
+Neither is listed here.
 
 | # | Missing | Why it is required | Where it goes | Certified by |
 | :-- | :--- | :--- | :--- | :--- |
 | **G1** | **The engine assembly / `V4ModelHost`.** Steps 1–15 of §5.1, including the Hot/Warm preload. | Nothing constructs the graph. This is the single largest genuine absence. **Done (P1 + P2)** — steps 1–9 in P1, 10–15 (pools, registry, staging, supply, executor, preload) in P2. | `core/v4_model_host.hpp` | assert the assembly's own invariants: contract passes, `registry.invariants_hold()`, `hot_vram_slots` residents, warm slots as budgeted, and one cold miss decrements `cold_nvme_slots` |
 | **G2** | **The 43-layer driver + head composition (`V4Graph`).** | `run_layer_body_decoding` is per *layer*; nothing calls it 43 times, and nothing calls `hc_head` → norm → LM head. **Done (P1 + P2)** — the head stage in P1, the 43-call loop in P2 (`run_layer` / `forward_token`). | `core/v4_graph.hpp` | **P2 gate** vs `reference` `model_body` (see G9) |
 | **G3** | **The sampler with a logit-processor seam.** `temperature`, `top_k`, `top_p`, RNG, and a hook that may mask/bias the fp32 logits *before* sampling. | Plan Step 5 + §6.4: structured output and tool-call JSON are logit masks, so the seam is **non-deferrable**; only argmax exists today. **Done (P3)** — `core/v4_sampler.hpp`, `V4Sampler` + the pure `sampler_ops`, with `V4SplitMix64`. | `core/v4_sampler.hpp` | **P3 gate**: seeded replay + mask + `T→0` + the untruncated default, and the **ordering** of the seam asserted by what the processor sees |
-| **G4** | **A real `V4LayerBodyObserver` for the new graph.** | The body takes an observer; the only production one lived inside `V4Pipeline`. The null one runs but leaves no diagnostic path. | `core/v4_graph.hpp` (observer adapter) | none needed; must not perturb the hot path (assert identical output traced vs null) |
 | **G5** | **The end-to-end binding + a non-legacy CLI.** `generate_token_ids` bound to `V4Graph`, and `aeon_chat` re-targeted off the legacy graph. | Criterion 1 is *one command, conversation in, text out*. Today that command only exists behind the legacy flag. **Done (P4)** — `core/v4_engine.hpp`, and `aeon_chat` moved into the default build. | `core/v4_engine.hpp`, `tools/aeon_chat.cpp`, `cmake/AeonInfrastructure.cmake` | **P4 gate**: the acceptance run, plus the binding identity, the stop conditions and the history-matters check |
-| **G6** | **Batched token embedding (gather + broadcast).** | Decode uses 4 small H2D copies of the row. A prefill chunk needs a gather over the chunk's ids on the device. | `core/v4_graph.hpp` prep | item-19-style `chunk ≡ serial` on the embedding stage |
-| **G7** | **On-device indexer top-k.** `select_indexer_topk` does one D2H + sync and one H2D + sync per CSA token. | Part III forbids per-token host sync in a prefill. Changes no value, so no equivalence gate can see it. Target is **zero syncs**. | `kernels/v4_attention.hpp` | a sync counter in the body (countable now, needs no baseline) |
-| **G8** | **The chunked-prefill driver over the new host.** `run_layer_body_chunk` is certified; nothing calls it. | Prefill is mandatory for daily use (Part III). | `core/v4_graph.hpp` (`forward_chunk`) | the item-19 equality gate re-run through the new host |
 | **G9** | **`model_body` — the model-level fp64 oracle.** embed → 43 × `layer_body` → `hc_head_reduce` → `rmsnorm` → LM head. | The plan's binding rule 6: a graph test must compare against an independently written reference. `layer_body` exists; the composition does not. **Done (P2)**, with `model_embed` and `model_head`. | `reference/dsv4_oracle.hpp` | it *is* the instrument for G2/G5; pinned by closed-form self-checks |
-| **G10** | **Session aggregate + identity.** `current_seq_len` + 43 × `V4LayerStateSnapshot` + the **non-token inputs** (thinking mode, reasoning effort, active tool set, response format). | Item 22a. `restore_state` is certified (R3) but no type carries a whole session, and the non-token inputs exist only as encoder parameters. | `core/v4_session.hpp` | R3 at session granularity: snapshot → reset → restore → continue, bit-identical |
-| **G11** | **Session registry + residency seam (VRAM-only first).** | §6.5 R5: a resident session's state stays in VRAM; an inactive session's may leave. Needs a consumer, which is now the engine. | `core/v4_session.hpp` | two sessions alternating: each continues bit-identically and only one is resident |
-| **G12** | **Cold-tier session store with a GiB cap.** | §6.3 R5: an inactive session's home is NVMe (sector-aligned, so it reuses the `O_DIRECT` path), never warm RAM, which the experts already over-subscribe. | `infrastructure/io/` | round-trip byte-exactness on the `O_DIRECT` path |
-| **G13** | **R4 — declining a reuse boundary older than the local window.** | The local ring is not reconstructible; a matched prefix shorter than the entry must replay the last `C` tokens rather than serve a stale ring. Needed only once matching exists (22b). | `core/v4_session.hpp` | a boundary outside the window is **refused**, not served |
-| **G14** | **Expert-timing / telemetry / routing-counter wiring into the new host.** | Diagnostics only; the substrate exists and is unused by the rewrite. | `core/v4_model_host.hpp` | none required |
 
 Two items are **explicitly not gaps**, and are listed here so they are not mistaken for them:
 *the routed-expert executor* (built and gated — item 23's first seam, `core/v4_expert_executor.hpp`)
 and *the layer body* (Tier 2/3, certified on real weights).
 
-### 6.1 How many of the 14 are actually new work — seven are lifts
+### 6.1 How many of the gaps are actually new work — five were lifts
 
-The count "14 gaps" reads as "14 subsystems". It is not, and the difference matters enough to write
-down, because it is the difference between a lost project and an unfinished one. **Seven of the
-fourteen gaps are code that already exists and runs in the pre-rewrite graph** and has to be lifted
-into the rewrite, not invented:
+The original count "14 gaps" read as "14 subsystems". It was not, and the difference mattered
+enough to write down, because it is the difference between a lost project and an unfinished one.
+**Seven of those fourteen were code that already exists and runs in the pre-rewrite graph** and had
+to be lifted into the rewrite, not invented. Two of them — the observer and the telemetry wiring —
+later moved out with the rest of the tiering scope, leaving five here:
 
 | Gap | Status | Evidence it is a lift, not new work |
 | :--- | :--- | :--- |
 | G1 | **lift** | `V4Pipeline::initialize` (`core/v4_pipeline.hpp:259`) does steps 1–15 today, including the Hot and Warm preload |
 | G2 | **lift + compose** | the 43-call loop and the head stage both exist in `V4Pipeline::step` (`:460`, head at `:1257-1292`); what changes is that the loop must call the **new** body |
-| G4 | **lift** | `V4Pipeline::begin_attention_trace` / `queue_trace_copy` (`:2121`, `:2114`) implement the observer the body now declares |
 | G5 | **rebind** | `tools/aeon_chat.cpp` was complete and works — against `V4Pipeline::generate_until_stop`. Only its engine pointer changed — **done in P4**, and it now points at `V4Engine` |
-| G10 | **lift** | `V4PipelineStateSnapshot` (`:59`) is already `current_seq_len` + a vector of layer snapshots |
-| G14 | **lift** | `enable_expert_timing` / `collect_expert_timing` (`:150`, `:2239`) and the supply telemetry wiring all exist |
 | G3 | **half-lift** | the GPU argmax pair exists (`kernels/v4_attention.hpp:193,236`); temperature / top-k / top-p and the seam were new — **done in P3** |
 
-**Genuinely new work: G6 (batched embedding — small), G7 (on-device indexer top-k — kernel work),
-G8 (the chunk driver over the certified chunk body), G9 (the model-level oracle), G11–G13 (session
-registry, cold store, R4).** That is a bounded, named list, and none of it is a research question.
+**Genuinely new work in this document: G9 (the model-level oracle)** — and it is the P2 gate's own
+instrument. The session-aggregate lift (G10) and the new session work (registry, cold store, R4) went
+with [SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md);
+the prefill work items went with
+[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md).
+None of it is a research question.
 
-Of the seven lifts, **G1, G2, G3, G5, G9 are now spent** (P1–P4). What remains is the diagnostics
-lifts (G4, G14, both P5) and the new work above — so the *new* work is now the larger half, which is
-the honest reading of where the rewrite stands rather than a flattering one.
+Of the four lifts listed, **G1, G2, G3 and G5 are spent** (P1–P4), and G9 was built by P2. Every gap
+this document opened is closed.
 
 ### 6.2 Why the gaps were invisible until now — a blind spot in the process, not bad luck
 
@@ -557,7 +553,8 @@ could be amortised — it cannot (see the trap below).
 `sliding_window = 128` tokens, which at 43 layers is tens of thousands of expert fetches — the
 real-scale state gate and the serial-decode gate own the ring), HCA compression (its first entry is at
 position 127; CSA *is* exercised — it commits at position 3), and the sampler, the text binding, the
-observer and tiering under pressure (P3/P4/P5).
+observer and tiering under pressure (P3/P4; the observer and the tiering gate were extracted — see
+§7, "Beyond P4").
 
 **One finding, and it is a cost trap rather than a correctness one.** The gate's first run took 5
 minutes, all of it the *reference*, not the device: the device pass costs 1.6 s for the same 172
@@ -670,210 +667,44 @@ the rest in the seven further generations plus the 24-token acceptance run at 2.
 it is irreducible without changing what is being measured — a text-in/text-out run has to run the
 model, and the model costs what it costs. The honest note is that 2.7 tok/s at 43 layers is a
 *correctness* number from a single-token decode path with no batching and no warm tier; throughput is
-P6's and the ledger's, explicitly not this gate's.
+the extracted plan's and the ledger's, explicitly not this gate's.
 
-**Not covered, named so it is not mistaken for coverage:** throughput (P6), tiering under pressure
-(P5), prefix reuse and session swap (P7 — every turn here re-prefills from position 0), and any claim
+**Not covered, named so it is not mistaken for coverage:** throughput and tiering under pressure
+(both extracted — see §7, "Beyond P4"), prefix reuse and session swap (extracted the same way, and
+the engine here re-prefills from position 0 on every turn), and any claim
 about *quality* beyond the one prompt printed above. Multi-turn coherence is measured as "the history
 changes the distribution", which is the strongest machine-checkable form; whether the prose is good is
 not a gate.
 
-### P5 — tiering on the live path
-**Build:** nothing new — the host already routes through the supply. What is added is the
-*measurement* and the *pressure*: run with `hot_vram_slots` small enough that every layer misses,
-and with a warm tier that is not preloaded.
-**Gate:** the item-21 properties re-derived **through the graph** rather than one round at a time:
-cold reads counted, staging slots returned, `forced_drains()` recorded, `invariants_hold()` at the
-end, and the logits **bit-identical** to a run with all experts resident. This is the gate the plan
-lists as item 21's `Stage D.2` remainder — streaming while the graph runs.
-**Unblocks:** the engine purpose. Before this, the graph is correct but is not the engine.
+### Beyond P4 — not this plan
 
-#### P5/P6 — mechanism, strategy, and why P5 still goes first
-
-**2026-09-18. Recorded before P5's gate is trusted, because the question "should P6 precede P5?"
-has an obvious-sounding answer that is wrong in its conclusion only after the layering is written
-down.**
-
-The premise is correct and is a fact about the model, not a preference: **prefill and decode want
-different expert-transfer strategies.** The chunk path in the tree is already evidence of it —
-`run_layer_body_chunk` (`core/v4_layer_body_batch.hpp:570-592`) loops `run_layer_body_attention_tail`
-per row, so a chunk **batches attention and leaves the MoE serialized per token**. Prefill is
-expert-bound (`6 × 14,155,776 B × 43 = 3.65 GB` per token; P6's reconnaissance), so that serialization
-amortizes ~5% of the work. The strategy must change at P6.
-
-The premise is right; the conclusion does not follow, because the differing strategy sits **above**
-the layer P5 certifies, and the two must not be collapsed into the one word "tiering":
-
-| | Phase-independent — **P5** | Phase-dependent — **P6** |
-| :--- | :--- | :--- |
-| What it is | the **mechanism**: Hot←Warm←Cold promotion, `O_DIRECT` cold reads, LRU demotion, staging recycling, the read/supply overlap | the **strategy**: how many tokens one request set carries, when leases are scoped and released, how slots are sized |
-| Where it lives | `TieredExpertSupply`, `ExpertRegistry`, `PrefetchStagingArena`, `V4ExpertSupplyCoordinator` — none of which knows how many tokens are in flight | the executor's members: `state_`/`current_layer_` hold **one** dispatch (`ids.size() == 6`), `leases_` spans a whole token, `ensure_pool_headroom()` is thresholded on one layer's worth, `TOTAL_STAGING_SLOTS = 2 × 6` |
-| P6's effect | none — the tiers are the same | the dispatch shape becomes a set of `6C` requests |
-
-**So P6 is not a second delivery path and does not unexercise P5's mechanism.** It is an
-optimization of *dispatch granularity* over the same proven mechanism. Three reasons keep P5 first:
-
-1. **The chunk path already runs through P5's mechanism — correctly, just slowly.** Each row hits
-the same seam; the tiering is exercised, merely not under miss pressure. P6 changes the *shape* of
-a request, not the *place* a request is answered.
-2. **Attribution.** This document's own rule: P1 before P2 because a head defect produces
-plausibly-scaled logits; P4 before P5 because tiering bugs and numerical bugs have identical
-symptoms. Building a new batched interface on a streaming path whose safety under misses is
-undemonstrated is two unknowns at once, and the failure signature is the lease hazard this document
-already names — **a plausible number, produced from wrong weights, with nothing recording that it
-became wrong**.
-3. **Cost.** P5 adds no code; P6 adds an interface. Certifying the simpler request shape first is the
-more attributable experiment, and it is the one that can be run today.
-
-**The real defect is P5's gate scope, and this is the part to fix rather than the order.** P5 risks
-certifying *decode's* strategy as *the* strategy. Its gate must therefore split its claims:
-
-| P5 asserts | Status after P6 |
-| :--- | :--- |
-| the logits are bit-identical to an all-resident run; `invariants_hold()`; cold reads counted; staging slots returned; `forced_drains()` recorded | **phase-neutral invariants** — P6 must preserve every one |
-| leases released at the **token** boundary | **decode-specific** — becomes per-chunk (or per-token-within-chunk); P6 re-derives |
-| `TOTAL_STAGING_SLOTS = 12` returned | the *invariant* survives; the **number** is derived from `C` at P6 |
-| the "distinct requests" reuse metric (P2's `767 of 1032`) | **decode-specific** — within-chunk dedup changes what the number *means* |
-| one `state_` / `current_layer_` | **decode-specific** — becomes a set of `6C` requests |
-
-The lower four are **decode-specific and named so**: P6 re-derives them rather than "regressing" a
-property that was never meant to be phase-general.
-
-**One action before P5's gate is trusted, and one rule that belongs in §8.** The action: write down
-the phase-parameterized dispatch shape — how `on_routing_ready` / `accumulate_routed` take a *set*
-of tokens rather than one, how leases are scoped, how staging is sized from `C` — **before** P5
-certifies the mechanism *through* it, so there is no throwaway strategy to unwind at P6. The rule is
-the dedup/bit-identity constraint below, which is a correctness constraint and not bookkeeping: the
-fixed-order reduce sums the six contributions in **slot order**, fp32 addition is not associative,
-and so a within-chunk dedup that permutes which slot a token's k-th expert occupies breaks the
-bit-identity P5 asserts. It must be found before P6's design is fixed, not after.
-
-### P6 — chunked prefill through the host
-**Build:** `V4Graph::forward_chunk` over `run_layer_body_chunk`; the batched embedding (G6).
-**Gate:** the item-19 equality gate re-run through the new host (`chunk ≡ serial`, exact), then —
-separately — throughput, whose blocker was measured false and whose real work is batched
-projections (`G7` and the projection batching are its own phase).
-
-#### P6 reconnaissance — 2026-09-17, measured before the phase starts
-
-Recorded here, not implemented, so P6 begins from measurements rather than from an inherited
-constant. Everything below was read or computed from the tree at `6b999bd` + the uncommitted budget
-audit; nothing here changes behaviour.
-
-**The rewrite has no prefill path.** `V4Engine::chat` renders the prompt and drives
-`text::generate_token_ids`, whose step is `V4Graph::forward_token` — **one token, one position, one
-call**. Prompt tokens go through the identical path as generated tokens. The measured TTFT of
-`4,487 ms` for an 11-token prompt is `~410 ms × 11`, i.e. serial, and it is not a bug: G8 is listed
-as unbuilt and this is the phase that builds it.
-
-**Two batch scratch types exist, and the host allocates neither.**
-
-| Type | Cap | Allocated by | Used by |
-| :--- | ---: | :--- | :--- |
-| `PipelineBatchScratchBuffers` (`v4_pipeline_scratch.hpp:334`) | 16 | `V4Pipeline` (legacy) | the pre-rewrite graph only |
-| `V4LayerBodyBatchScratch` (`v4_layer_body_batch.hpp:99`) | 16 | **nobody** | the item-19 gate only |
-
-So `M = 16` inside `PipelineScratchBuffers` is a decode-path allocation sized for a batch path the
-rewrite does not have yet. The consequence is that the budget's single scratch line is wrong in both
-directions:
-
-| | Bytes | MiB |
-| :--- | ---: | ---: |
-| `PIPELINE_SCRATCH_BYTES` (reserved) | 104,857,600 | 100.00 |
-| real decode scratch (`PipelineScratchBuffers`) | 4,903,616 | 4.68 |
-| **real batch scratch (16 tokens)** | **11,630,400** | **11.09** |
-
-The reservation over-counts decode by ~95 MiB **and does not cover the prefill scratch at all**.
-Two of the batch scratch's eleven MiB are `ffn_norm_act_` and `moe_accum_`, each carrying an extra
-`kMPad = 16` multiplier **on top of** `rows = 16` — 2 MiB apiece. P6 must therefore reserve
-**two derived lines** (decode + batch), not one literal. See the open item below.
-
-**The staging arena is decode-shaped.** `TOTAL_STAGING_SLOTS = NUM_BUFFERS (2) ×
-EXPERTS_PER_HORIZON (6) = 12` — *double-buffer one token's top-6*. A 16-token chunk routes to up to
-`16 × 6 = 96` expert requests per layer, which is 8 waves against 12 slots.
-
-**But the arena is not what breaks it, and this is the finding that matters.** The expert seam is
-strictly **per token**: `V4RoutedExpertExecutor::accumulate_routed(layer_id, position, expert_input,
-expert_weights, moe_accum)` takes *one* token's FFN-norm row and *one* token's six weights, and
-`run_layer_body_chunk` loops `for row … run_layer_body_attention_tail(...)`. The executor therefore
-sees **six experts at a time**, and `6 ≤ 12`, so the tiering stays correct. What follows is the
-opposite of a correctness bug and worse than one: **the chunk batches attention and leaves the MoE
-serialized per token.**
-
-That matters because prefill is expert-bound, not attention-bound:
-
-- `6 experts × 14,155,776 B × 43 layers = 3.65 GB` of weights streamed **per token**;
-- at the measured `~6.3 GB/s` `O_DIRECT` (`PERFORMANCE_LEDGER` M1) that is `≈ 0.58 s/token`;
-- the attention half of a token is tens of milliseconds.
-
-So chunked prefill wired the way the seam exists today would amortize roughly **5%** of the work.
-The honest statement is that P6 is **not** "call `run_layer_body_chunk`".
-
-**What P6 must build, then** — each item is a decision, not a mechanical step:
-
-1. **The chunk driver** (G8) plus allocating `V4LayerBodyBatchScratch`: the 11.09 MiB that is
-   currently unaccounted for in the budget.
-2. **A chunk-wide expert dispatch.** The seam needs a batch form (`on_routing_ready` /
-   `accumulate_routed` over `C` tokens) so a chunk's `6C` requests are **issued as a set** rather
-   than one token at a time. This is an interface change to the thing the plan calls "the image of
-   one token", and it is the item that actually unlocks prefill throughput.
-3. **Sizing the staging arena from the chunk size**, which is a real tradeoff rather than a bigger
-   constant: `2 × 6 × C = 192` slots at `C = 16` is **2.72 GB of pinned host RAM**. Slots recycle
-   once the payload is resident in VRAM, so 192 is an upper bound rather than a requirement — but
-   the current design binds one slot per request **for the request's whole lifetime**, so the
-   reservation would approach it. The number must be derived from chunk size and the latency/
-   bandwidth product, never hardcoded (see the open item below).
-4. **Deduplicating experts within a chunk.** 16 tokens draw ~96 requests from 256 experts, so
-   collisions are likely and every hit saves a full 14 MB fetch. This also changes what "distinct
-   requests" means for item 21's reuse measurement (P2 measured **767 of 1032** for *decode*).
-5. **A deliberate chunk size.** `kMaxTokens = 16` is currently inherited from the workspace, and it
-   bounds both the batch scratch and the staging demand. A 1000-token prompt is then 63 chunks with
-   no cross-chunk expert reuse and no prefix cache (P7). Raising it is a memory decision (the
-   in-code note says so) and it should be made openly rather than inherited.
-
-**Open item added by this reconnaissance — the budget's scratch and staging lines are literals.**
-Two constants in `memory_budget.hpp` are not measurements:
-
-- `PIPELINE_SCRATCH_BYTES = 100 MiB`, a fixed literal. It should be derived from
-  `PipelineScratchBuffers` (decode) **plus** a batch term for the configured chunk size, so the
-  reservation cannot drift from the allocations and so prefill is not silently un-budgeted.
-- the staging line writes `12` as a literal instead of `PrefetchStagingArena::TOTAL_STAGING_SLOTS`.
-  If `NUM_BUFFERS` ever changed, the budget and the arena's real allocation would disagree with no
-  error. It must use the arena's own constant, and after P6, the chunk-derived value.
-
-Both are folded into item 1's work rather than fixed now, because the correct form of the batch term
-depends on the chunk size this phase chooses. (The rest of the budget audit landed on 2026-09-17 —
-uploaded-dense accounting, usable-VRAM planning, and the host cap — and is recorded in
-[PERFORMANCE_LEDGER](../status/PERFORMANCE_LEDGER.md) **M28**, which also carries the
-before/after VRAM measurement: **`21.99 GiB → 23.76 GiB`** of the card, `675 → 809` Hot slots.)
-
-### P7 — session swap
-**Build:** G10–G12. G13 only when matching exists.
-**Gate:** R3 at session granularity, then two sessions alternating residency.
+The remaining work was **extracted on 2026-09-18**: tiering under miss pressure, chunked prefill and
+the diagnostics wiring they need — with the two rules those work items bind — into
+[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md);
+and the session state work (aggregate, registry, residency, cold store, R4) into
+[SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md).
+Those documents own it; nothing about it is decided or restated here.
 
 **Ordering rationale, stated once.** P1 before P2 because a head defect produces plausibly-scaled
 logits and therefore fluent-looking garbage — the failure mode that is hardest to attribute after
 the fact. P2 before P3 because sampling cannot be validated on logits that are themselves
-unvalidated. P4 before P5 because tiering bugs and numerical bugs produce identical symptoms, which
-is the plan's own warning — do not stand up the streaming system before the numerics are correct.
-P5 before P6 because prefill multiplies expert traffic, not attention traffic — and because P6
-changes the *strategy* while P5 certifies the *mechanism* underneath it; see §P5/P6 above for why
-that layering, and not merely the traffic argument, is what fixes the order.
+unvalidated. P4 before tiering under pressure because tiering bugs and numerical bugs produce
+identical symptoms, which is the plan's own warning — do not stand up the streaming system before
+the numerics are correct. The ordering *within* the extracted work is argued in those documents, not
+here.
 
 ---
 
 ## 8. What the composition must respect
 
-Not restated here — the [inference pipeline plan](inference_pipeline_plan.md) owns them. The ones
+Not restated here — the [DSV4 inference pipeline plan](DSV4_INFERENCE_PIPELINE_PLAN.md) owns them. The ones
 that bind *composition* specifically:
 
 | Rule | Where it comes from | What it forbids here |
 | :--- | :--- | :--- |
 | One body, not two | Part III | a decode loop and a prefill loop that drift; the chunk path must call the same two halves |
 | One accumulation | `aeon_moe_fused_w2_contrib` + `v4_moe_accumulate_fixed_order` | selecting the atomic or fp16 path anywhere, because a byte-exact restore cannot rest on an undefined order (trap 38) |
-| Accumulation order is slot order | §P5/P6 (dedup) | a within-chunk expert dedup that permutes which slot a token's k-th expert occupies: the fixed-order reduce sums in slot order, fp32 is not associative, and P5's bit-identity claim would silently break |
 | A lease grants no ordering | trap 41 | releasing leases before the token boundary without an event protocol |
-| Tiering is mechanism, not strategy | §P5/P6 | holding one request shape as *the* shape: the seam is per-token today and prefill needs a set of `6C` — the phase-parameterized dispatch shape is written before P5's gate, so no strategy is thrown away at P6 |
 | Never clamp a position | trap 40 | replacing `record_position`'s refusal with a modulo or a `min` |
 | Compare against an independent oracle | Part V, rule 6 | certifying a step against our own kernel |
 | A gate that prints PASS is not evidence | Part V, mutation rule | shipping P1–P4 gates that no wrong variant has been shown to fail |
@@ -900,15 +731,15 @@ unbatched single-token decode with the warm tier unallocated.
 | :--- | :--- | :--- |
 | MTP / DSpark draft head (`num_nextn_predict_layers=1`) | speculative decoding, not the base forward pass | the base decoder is green |
 | Multi-GPU pipeline parallelism | out of scope for this revision | Phase 3 |
-| The prefix **matcher** (block table, cache key, radix search, eviction) | its parameters are measurements of an assembled graph; session swap needs no key | P7 is green and a fork workload exists |
+| The prefix **matcher** (block table, cache key, radix search, eviction) | its parameters are measurements of an assembled graph; session swap needs no key | session swap is green and a fork workload exists (see [SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md)) |
 | Tool use beyond the prompt encoding it already has | schema formatting, parser, turn orchestration are frontend work | the logit-processor seam (P3) plus a tool workload |
 | The fp8/E4M3 KV store vs bf16 | a storage decision whose delta must be measured, not assumed | the KV-precision gates (plan Gates 9/10) |
-| Expert-placement policy (routing-aware hotlists) | a scheduling optimization, not a correctness requirement | P5 is green |
-| Throughput targets | speed and correctness are two different gates | P6 |
+| Expert-placement policy (routing-aware hotlists) | a scheduling optimization, not a correctness requirement | the tiering gate is green (see [EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md)) |
+| Throughput targets | speed and correctness are two different gates | the chunked-prefill work (same document) |
 
-**Known remainders carried in, not re-decided here:** item 19's throughput half (batched
-projections — the alleged chunk cap was measured false), the indexer top-k host round-trip (G7,
-countable today, target zero), streaming under concurrency (P5), and the KV-precision gates.
+**Known remainders carried in, not re-decided here:** the KV-precision gates (the inference plan's
+Gates 9/10). The prefill-throughput remainders — item 19's batched projections, the indexer top-k
+host round-trip, streaming under concurrency — went with the extracted plan.
 
 ---
 
@@ -934,7 +765,9 @@ produced by the rebuilt graph.
 
 Every gate was mutation-tested before it was trusted, and two of them found the *gate* defective
 rather than the code: P2's first logits instrument assumed a scale it should not have (trap 42), and
-P3's first ordering assertion passed on both the correct and the wrong ordering (trap 44). Six of the
-fourteen gaps were lifts of code that already runs in the pre-rewrite graph (§6.1) and five of those
-are now spent, so what remains — chunked prefill, tiering under pressure, session swap — is named,
-bounded, and none of it is a research question.
+P3's first ordering assertion passed on both the correct and the wrong ordering (trap 44). Of the
+fourteen gaps, seven were lifts of code that already ran in the pre-rewrite graph (§6.1) and all
+seven are spent, so **every gap this plan opened is closed**. The work that remained when it closed —
+tiering under pressure and chunked prefill, then session state — was extracted on 2026-09-18 into
+[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md)
+and [SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md).

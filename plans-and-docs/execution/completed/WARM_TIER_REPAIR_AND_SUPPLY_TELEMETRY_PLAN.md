@@ -3,13 +3,13 @@
 **Date:** 2026-09-11
 **Status:** Complete; Stage 4 silicon gate, Stage 5 closure evidence, and second-pass structural corrections recorded
 **Priority:** P0 foundational runtime infrastructure
-**Parent track:** Phase 2 is paused while this plan is executed
+**Parent track:** Phase 2 (completed record)
 **Scope:** Persistent Hot/Warm residency, asynchronous refill, transfer ownership, and supply-chain telemetry
 **Closure report:** [WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md](WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md)
 
 ## 1. Decision Record
 
-The broad Phase 2 optimization sequence is paused. The next implementation is this focused plan. The existing [Phase 2 execution plan](PHASE_2_EXECUTION_PLAN.md) remains the historical record of the completed storage and kernel work and is not being rewritten as part of this step.
+At the time of this plan, the broad Phase 2 optimization sequence was paused for this focused work. [PHASE_2_EXECUTION_PLAN.md](PHASE_2_EXECUTION_PLAN.md) is the historical record of the storage and kernel work.
 
 The following decisions are accepted for implementation:
 

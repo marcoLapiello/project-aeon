@@ -2,7 +2,7 @@
 
 > ## ⛔ SUPERSEDED — do not execute
 >
-> **Superseded 2026-09-15 by [inference_pipeline_plan.md](../../analysis/current/inference_pipeline_plan.md).**
+> **Superseded 2026-09-15 by [DSV4_INFERENCE_PIPELINE_PLAN.md](../completed/DSV4_INFERENCE_PIPELINE_PLAN.md).**
 >
 > Stages 0-6 were executed against the runtime and produced useful *evidence*
 > (contract parsing, INT4 parity, CPU oracles, class-aware device state, serial

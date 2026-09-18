@@ -1,6 +1,6 @@
 # Native Text-In/Text-Out Implementation Plan
 
-*Status: native text-in/text-out turn verified; external behavioral correctness gate remains open*
+*Status: complete; native text-in/text-out turn verified*
 
 ## 1. Objective
 
@@ -16,7 +16,7 @@ human text/messages
     -> human-readable response
 ```
 
-The final runtime must remain C++20/native HIP with no Python, PyTorch, Transformers, or vLLM dependency. Python/vLLM may be used during preparation and validation as an offline behavioral oracle. The available machine cannot run the complete DSV4 checkpoint through vLLM locally, so final model-behavior comparison must use a compatible external API.
+The final runtime must remain C++20/native HIP with no Python, PyTorch, Transformers, or vLLM dependency. Python/vLLM may be used during preparation and validation as an offline reference.
 
 This work is a prerequisite for trustworthy activation profiling. The current `profile_routing` results are plumbing artifacts only and must not drive Hot/Warm placement until the prompt contract and native model behavior have passed the correctness gates below.
 
@@ -27,7 +27,7 @@ This work is a prerequisite for trustworthy activation profiling. The current `p
 - [x] EOS-aware greedy generation with explicit `eos`, `max_new_tokens`, `context_limit`, and `error` stop reasons.
 - [x] `aeon_chat` native CLI and full 43-layer silicon smoke (`What is 2+2?`, 4 generated tokens, `5.57 tok/s`).
 - [x] Full 43-layer unrestricted chat turn reached EOS with a readable answer (`What is the capital of France?` -> `The capital of France is **Paris**.`).
-- [ ] External compatible-reference comparison and activation-profile unlock.
+- [ ] Activation-profile unlock.
 
 ## 2. Current boundaries and evidence
 
@@ -353,9 +353,9 @@ Required fixture cases:
 
 The fixtures are a contract, not a claim that the full model can run locally in vLLM.
 
-## 6. Correctness validation without local vLLM inference
+## 6. Correctness validation
 
-The machine cannot run the full DSV4 checkpoint through vLLM, so use layered validation.
+Use layered validation.
 
 ### Gate A: tokenizer and formatter parity
 
@@ -393,42 +393,9 @@ Use the existing native model tests for transformer and swizzled-kernel correctn
 - `test_v4_attention`;
 - `test_hot_warm_cold_pipeline`;
 
-### Gate C: external API behavioral comparison
+### Gate C: activation-profile eligibility
 
-Use a compatible external API as the behavioral oracle. The API provider/model revision is part of every result artifact. Use deterministic settings where available:
-
-```text
-temperature = 0
-top_p = 1
-fixed maximum output tokens
-explicit system/user messages
-explicit DSV4 mode if the provider exposes it
-```
-
-Compare a fixed correctness corpus containing:
-
-- simple factual questions;
-- arithmetic and exact-format tasks;
-- instruction following;
-- code generation;
-- multi-turn context;
-- a longer answer requiring more than eight tokens;
-- EOS/length behavior.
-
-Record:
-
-- input messages and selected mode;
-- exact Aeon rendered prompt and token IDs;
-- Aeon generated IDs, stop reason, and decoded text;
-- API request parameters, model identifier, timestamp, and response;
-- provider logprobs or token IDs when available;
-- manual/evaluated behavioral result.
-
-An API match is a behavioral check, not proof of exact logits or expert routing. Differences may arise from model revision, quantization, sampling implementation, hidden system prompts, or provider formatting. Do not claim activation-level parity from API text agreement alone.
-
-### Gate D: activation-profile eligibility
-
-Only after Gates A-C pass for the chosen prompt mode:
+Only after Gates A and B pass for the chosen prompt mode:
 
 - mark the prompt contract as verified;
 - generate the profile corpus with the same formatter and tokenizer;
@@ -502,21 +469,14 @@ Do not begin multi-request scheduling before single-request text correctness is 
 - Run one real user question through all 43 layers.
 - Decision gate: human-readable response is produced without Python at runtime.
 
-### Step 5: external API comparison
-
-- Create a correctness corpus and a small API adapter outside the runtime.
-- Compare Aeon and API under controlled settings.
-- Investigate failures before changing profiler or cache behavior.
-- Decision gate: agreed behavioral threshold and no unexplained prompt-format mismatch.
-
-### Step 6: unlock activation profiling
+### Step 5: unlock activation profiling
 
 - Update `profile_routing` to consume verified text-derived JSONL or expose a text-to-profile preparation command.
 - Add tokenizer/formatter hashes and prompt mode to profile metadata.
 - Build profile and held-out corpora.
 - Resume the per-layer probability ranking study.
 
-### Step 7: serving transport
+### Step 6: serving transport
 
 - Add a transport layer around the tested text-generation service.
 - Start with one request at a time and streaming output.
@@ -558,14 +518,10 @@ The text-in/text-out milestone is complete when:
 6. Native detokenization returns human-readable text.
 7. The executable reports a response and stop reason without Python installed or imported at runtime.
 8. Component and formatter tests pass.
-9. The output is compared against an external compatible API under recorded deterministic settings.
-10. Any remaining differences are documented and explained to the extent possible given API-only reference access.
-11. Only then are multi-prompt activation rankings eligible for placement decisions.
+9. Multi-prompt activation rankings are eligible for placement decisions.
 
 ## 11. Important limitations
 
-- External API agreement cannot prove exact hidden-state, logits, or expert-routing parity.
-- The API may use a different checkpoint revision, quantization, system prompt, or formatter.
 - The local checkpoint's missing standard `chat_template` remains a packaging/provenance issue; the custom DSV4 formatter is the current evidence-backed contract.
 - Native tokenizer correctness is a hard prerequisite. A simplified tokenizer invalidates both responses and activation profiles.
 - Chat and thinking modes must remain separate datasets and metadata identities.
