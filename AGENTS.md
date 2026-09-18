@@ -27,7 +27,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 
 ## 3. Progress Tracking & State of Execution
 
-*Status: 2026-09-18, branch `rewrite/graph-v2`.*
+*Status: 2026-09-18.*
 
 ### Past
 
