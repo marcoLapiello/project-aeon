@@ -1,6 +1,8 @@
 # Expert Streaming and Chunked Prefill Plan
 
-*Status: active. Extracted 2026-09-18 from the graph composition plan, whose build phases it continues.*
+*Status: active analysis. Extracted 2026-09-18 from the graph composition plan, whose build phases it continues.*
+
+> **Superseded as the working document (2026-09-19).** The actionable plan is [EXPERT_STREAMING_EXECUTION_PLAN.md](../../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md). That document owns the steps, the gates and the corrections: several claims here are revised there — the "all-resident" bit-identity claim (not realizable), "W1 adds no code" (false, but small), and the candidate-staging strategy (weak in both phases, where the layer sweep is strong in prefill). Read this document for the reasoning; read that one for what to do.
 
 **Subject:** the routed-expert path of the live graph — its transfer strategy, and the prefill path
 that the graph does not yet have. Two work items:
