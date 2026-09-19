@@ -188,6 +188,8 @@ Two thirds of every eviction is discarded. A/B **2 vs 6** (the exact decode-matc
 
 **Attention does not bound the chunk.** Measured from the kernel constants: `DSV4_MAX_ATTENTION_KEYS = 128 + 512 = 640`. 23 of 43 layers are hard-capped; only the HCA class grows, and at `context / 128`. Attention work per chunk is therefore **linear in `C`**, and ≈1000× smaller than the expert transfer. **The real ceiling is the batch scratch and the staging budget.**
 
+**Iteration order is a separate decision, and it is open.** Chunk-major re-fetches every ring once per chunk; layer-major (§6.2) fetches each once. §6.3 prices it and §6.5 gives the fallback rule. This step should not fix the order until that is settled.
+
 **Gate.** The item-19 equality gate re-run through the new host at the chosen chunk size (`chunk ≡ serial`, exact), then — separately — throughput.
 
 **Files.** `core/v4_graph.hpp`, `core/v4_layer_body_batch.hpp`, `core/v4_expert_executor.hpp`, `core/v4_expert_supply.hpp`, `core/memory_budget.hpp`.
@@ -239,36 +241,105 @@ Corrections to the analysis document and the historical supply-chain analysis. T
 
 ## 6. OPEN — the supply chain during prefill
 
-**This section is deliberately unresolved.** It records the approaches and the one measurement that would decide between them. It is not a checklist.
+**This section is deliberately unresolved.** It records the problem, the candidate approaches, and the measurements that would decide between them. It is not a checklist.
 
 ### 6.1 The question
 
 Prefill and decode alternate on every turn. A large prefill touches all 11,008 experts, so it rearranges both pools completely, and decode never gets a long enough run to establish the "natural selection" the Warm tier exists to capture. **The mechanism is sound and the workload never lets it operate.**
 
-### 6.2 The approaches
+### 6.2 The re-read — an iteration-order artifact
+
+The driver loops layers, and a chunk's tokens are processed inside each layer. Call this **chunk-major**. For a prompt longer than one chunk, every ring is therefore re-entered once per chunk, and its experts are re-fetched every time.
+
+| Prompt 1000 tokens, chunk 256 | Ring entries | Expert bytes |
+| :--- | ---: | ---: |
+| **Chunk-major** (today's structure) | 4 passes × 43 rings = 172 | **592 GB** |
+| **Layer-major** | 43 (once each) | **148 GB** |
+
+A ring is 255 experts ≈ 3.44 GB. The **444 GB difference is ~70 s at 6.33 GB/s**, and it exists purely because we return to ring 0 after 43 rings have evicted it.
+
+**Layer-major** swaps the loops: for each layer, process every chunk before moving on. Chunk `c` at layer `L` needs layer `L`'s KV for positions before `start(c)`, which chunks `0..c-1` wrote on this same pass — legal, and position order stays monotonic. **The same fetch count as a full-length chunk, without the full-length chunk's scratch.**
+
+Ragged tails need no special case: the chunk is a batch size inside a layer, not a partition of the prompt. The last iteration simply has fewer rows.
+
+### 6.3 Layer-major: what it costs, and where it stops
+
+Layer-major keeps the **residual stream for every token** alive across all 43 layers, instead of only the chunk in flight. The residual is **fp32 and 4 streams wide**: `4 × 4096 × 4 B = 64 KB` per token.
+
+| Prompt tokens | Residual | In Hot-slot equivalents |
+| ---: | ---: | ---: |
+| 340 | 22 MB | < 1 slot |
+| 4096 | 268 MB | 19 slots |
+| 32768 | **2.0 GiB** | **152 slots** |
+
+Slot-equivalents are `residual ÷ 14,155,776`. Against a 779-slot Hot pool, spending a quarter of it (~195 slots) buys layer-major up to **~42,000 tokens**. Beyond that the residual starts dismantling the expert pool, and chunk-major is the fallback.
+
+**Two buffers, or one.** The existing body pings-pongs `res_in → res_out`, which for a persistent residual means `2N` (4.0 GiB at 32768, 304 slots). Writing back **in place** would halve it to `N` — and in-place is safe by reasoning, because the residual has **no cross-token dependence**: each token's residual update reads only its own row. That is a property to verify, not assume, and it needs the body to accept a write-back target.
+
+### 6.4 The scratch and the residual are different things
+
+They must not be conflated — their lifetimes differ by three orders of magnitude:
+
+| | Scratch (`V4LayerBodyBatchScratch`) | Residual carry |
+| :--- | :--- | :--- |
+| Holds | per-op temporaries for the rows in flight | the tensor being transformed |
+| Lifetime | one op, one layer | the whole prefill |
+| Sized from | the row count (chunk size) | the prompt token count |
+
+So the residual is **not** scratch, and cannot be: scratch is recycled per layer, and the residual must survive all 43.
+
+**The scratch already sizes itself from a row count** (`allocate(count)` derives `rows`), so dynamic sizing exists. What is missing is the *accounting*: the host allocates neither batch scratch type today, and `PIPELINE_SCRATCH_BYTES` is a 100 MiB literal that neither covers the batch scratch nor tracks the chunk size. That is Step 7's derived-lines work, and it is independent of layer-major — layer-major only changes the *carry*, not the workspace.
+
+### 6.5 The fallback is pre-flight, not on-the-fly
+
+The decision needs no runtime detection, and that is better than detecting on the fly — a mid-prefill failure has no clean recovery. At prefill entry the engine already knows all three inputs: the token count `N`, the residual requirement `N × 64 KB`, and the budget. The choice is one computed branch:
+
+```text
+residual_bytes = N × 64 KB  (in place)  or  2N × 64 KB  (ping-pong)
+layer-major  if residual_bytes ≤ affordable headroom
+chunk-major  otherwise
+```
+
+The guard must be **exact**, because the two failure directions are both bad: too aggressive and the allocation fails after work has begun; too conservative and every long prompt silently pays the re-read.
+
+### 6.6 Prefix reuse is a dependency, and the two are complementary
+
+**Today, `N` is the entire conversation, not the new turn.** `V4Engine::chat` renders the full message list, calls `reset_generation_state()`, and re-prefills from token 0 — every turn. So a fifth-turn conversation pays a full-context prefill for the fifth time.
+
+That is not a performance nicety on this engine, it is a product requirement: with a disk-bound supply, re-prefilling 32k tokens per turn is minutes of TTFT. [Session State and Swap](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) is the work item, and multi-turn agentic use at large context is the target that makes it mandatory rather than optional.
+
+The two are **complementary**: layer-major's cost scales with the *unreused* portion of the prompt, and prefix reuse is exactly what shrinks that portion. With reuse in place, `N` is the new turn's delta — small — and layer-major becomes viable almost unconditionally. Without it, layer-major is limited to the ~42k-token ceiling of §6.3.
+
+### 6.7 The Warm admission approaches
+
+These govern **what Warm holds**, a separate axis from §6.2's **iteration order**.
 
 | Approach | Mechanism | Status |
 | :--- | :--- | :--- |
 | **A. Sweep releases, bypasses Warm** | the sweep never promotes from or writes to Warm, so Warm survives prefill intact | needs a measurement: bypassing costs NVMe reads the Warm tier could have served |
 | **B. Sweep consumes Warm** | the sweep promotes Warm-resident experts like any other request | faster prefill (host RAM ≈25 GB/s vs NVMe ≈6.3 GB/s); drains Warm |
 | **C. Admit by decode priority** | as slots free, refill Warm with the experts decode is most likely to route to, rather than round-robin | needs the routing profile; the profile is a separate open study |
-| **D. Tail refill** | during the last chunk, stop sweeping and refill Warm | **cannot restore Warm** — ≈3000 slots is 40 GB ≈ 6.4 s of NVMe, far longer than the tail. Only a fraction of what frees up is recoverable. |
+| **D. Cold → Warm fill** | read early into Warm, use much later | **not a transfer saving** — Cold → Warm → Hot moves the same bytes as Cold → Hot. It buys only *persistence*. Buildable; the condition is §6.3's — it matters only when the Hot pool cannot hold a ring. |
+| **E. Tail refill** | during the last chunk, stop sweeping and refill Warm | **cannot restore Warm** — ≈3000 slots is 40 GB ≈ 6.4 s of NVMe, far longer than the tail. Only a fraction of what frees up is recoverable. |
 
 **A and B are the real trade, and it is roughly balanced:** preserving ~3022 warm slots might save prefill ~18 s; a warm decode start saves ~275 ms per token until Warm is re-established. Which wins is a measurement.
 
 **C is the interesting one**, and it is the surviving half of the historical document's rolling idea — with prediction applied to *what to admit to Warm*, not to *what to prefetch*, because only the former has time to act.
 
-### 6.3 The measurement that decides it
+### 6.8 The measurement that decides it
 
 **Does decode routing concentrate?** If the same experts recur across tokens, every approach above has something to preserve, and C is worth building. If routing is flat across 11,008 experts, none of them helps, Warm cannot be made useful by any admission policy, and decode's speed comes from coverage alone.
 
+One known headwind: **layers 0–2 use a hash router keyed on token id**, not a learned one, so their routing is flat and non-repeating by construction. Those three layers can never benefit from Warm.
+
 The instrument exists but is unpopulated: `ExpertCatalogEntry::moving_frequency` and `activation_count` are recorded and unused, and `RoutingCounter` collects per-layer phase-specific selection counts but is not wired into the rewrite. The open [Routing Profile and Placement Study](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) is where this is answered.
 
-### 6.4 What must not be assumed
+### 6.9 What must not be assumed
 
 - That Warm helps decode. M28's evidence is **negative and unexplained** — a 40 GiB Warm tier moved decode less than the run-to-run spread. Step 5 tests one explanation.
 - That a bigger Warm pool helps. Coverage is bounded by physics (a 62.62 GiB host), and the tier is pinned and therefore unevictable.
 - That candidate staging helps anywhere. §2 argues it does not.
+- That layer-major is free. §6.3 gives its cost and its ceiling; neither has been measured.
 
 ---
 
@@ -288,7 +359,10 @@ The instrument exists but is unpopulated: `ExpertCatalogEntry::moving_frequency`
 
 | Deferred | Revisits when |
 | :--- | :--- |
-| Expert-placement policy (routing-aware hotlists) | Steps 3–5 are green **and** §6.3 is answered |
-| Warm admission by decode priority (approach C) | §6.3 shows routing concentrates |
+| **Prefill iteration order (layer-major vs chunk-major)** | §6.3's cost and ceiling are measured against a real prompt, and the in-place residual write-back is verified |
+| **Cold → Warm fill path** (§6.7 D) | the Hot pool cannot hold a ring — i.e. contexts beyond §6.3's ceiling |
+| Expert-placement policy (routing-aware hotlists) | Steps 3–5 are green **and** §6.8 is answered |
+| Warm admission by decode priority (approach C) | §6.8 shows routing concentrates |
 | Chunk size as a tuned constant | the Step 7 sweep is complete |
+| Prefix reuse (session state and swap) | **not deferrable** — a product requirement, and the input that makes §6.3 viable at full context |
 | Prefix matcher, MTP, multi-GPU | unchanged from the composition plan |
