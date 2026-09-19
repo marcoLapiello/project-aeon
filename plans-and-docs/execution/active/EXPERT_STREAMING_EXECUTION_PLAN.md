@@ -64,6 +64,8 @@ This is the plan's central structural decision: **prefill and decode get differe
 
 **Why decode keeps demotion and prefill does not.** The Warm tier is meant to accumulate the experts that get reused. Demotion is what feeds it. In prefill the sweep visits each layer once and never returns, so a demoted expert is dead weight; in decode the same experts recur across tokens, so demotion pays. Measured break-even: a demotion costs ≈0.54 ms and saves ≈2.13 ms of NVMe — it pays whenever more than ~25% of demoted experts are reused before Warm evicts them. (The staging→VRAM copy that ends a fetch is common to both paths, so it cancels out of the comparison.) **That reuse rate is unmeasured, and Step 5 measures it.**
 
+The sizes above, and the dense-versus-streamed split they rest on, are derived and checked in [Appendix A](#appendix-a--model-composition-verified). Two facts from it bear on this section: the routed experts are **92%** of the model, and the dense backbone is **257 MiB per layer** in all 43 layers — including layers 0 and 1, which are dense in the same sense as every other layer and differ only in their attention class.
+
 ---
 
 ## 4. The steps
@@ -236,6 +238,8 @@ Corrections to the analysis document and the historical supply-chain analysis. T
 | Demotion queue = 2 | Not a small tightness: ~2/3 of all evictions are dropped, every token. |
 | `moving_frequency` | Recorded on every activation, **never read**. Victim selection is plain LRU. |
 | No Hot slot reclaimable | Not "the pool is full of needed experts". It is the **lease count**: up to 258 slots are leased per token (43 × 6), so a pool below ~264 can have every slot un-evictable. |
+| Layer 42 is a Sliding layer | False. It is **CSA** (ratio 4). The class counts are **2 Sliding / 21 CSA / 20 HCA**, not 3/20/20 — the alternating pattern runs to layer 42 inclusive. The implementation and its tests were always right (they read `compress_ratios`); only `deepseek_v4_flash_architecture.md` was wrong, and it is corrected. |
+| The dense backbone is the first two layers | False — see [Appendix A](#appendix-a--model-composition-verified). Every one of the 43 layers has a full dense set; only the 256 routed experts per layer stream. |
 
 ---
 
@@ -366,3 +370,68 @@ The instrument exists but is unpopulated: `ExpertCatalogEntry::moving_frequency`
 | Chunk size as a tuned constant | the Step 7 sweep is complete |
 | Prefix reuse (session state and swap) | **not deferrable** — a product requirement, and the input that makes §6.3 viable at full context |
 | Prefix matcher, MTP, multi-GPU | unchanged from the composition plan |
+
+---
+
+## Appendix A — Model composition (verified)
+
+The premise the supply-chain discussion rests on: **what is resident and what streams.** Every figure below is computed from `V4ModelContract::uploaded_dense_bytes` and the checkpoint's own `config.json`; the total reproduces the recorded `13,643,885,660 B` exactly.
+
+| | Bytes | Size | Lifetime |
+| :--- | ---: | ---: | :--- |
+| **Dense backbone** (uploaded) | 13,643,885,660 | **12.71 GiB** | VRAM, permanent |
+| `embed.weight` | 1,059,061,760 | 0.99 GiB | **host RAM**, read per token |
+| **Routed experts** (11,008) | 155,826,782,208 | **145.12 GiB** | streamed from NVMe |
+
+The routed experts are **92% of the model**. The dense backbone is 8.7%.
+
+### Model-level tensors (outside the layer stack)
+
+| Tensor | Dtype / shape | Size |
+| :--- | :--- | ---: |
+| `head.weight` (LM head) | F16 [129280, 4096] | 1010.0 MiB |
+| `hc_head_fn` | F32 [4, 16384] | 0.25 MiB |
+| `hc_head_base`, `hc_head_scale` | F32 | 20 B |
+| `norm.weight` (final RMSNorm) | F16 [4096] | 8 KiB |
+| **subtotal** | | **1,010.25 MiB** |
+
+### Per layer — identical in all 43 layers
+
+| Group | Tensors | Size |
+| :--- | :--- | ---: |
+| **Attention** | `wq_a` `q_norm` `wq_b` `wkv` `kv_norm` `attn_sink` `wo_a` `wo_b` | 204.0 MiB |
+| **Shared expert** | `w1` `w2` `w3` — the always-firing FFN | 48.0 MiB |
+| **Hyper-connections + norms** | `hc_attn_*`, `hc_ffn_*`, `attn_norm`, `ffn_norm` | 3.0 MiB |
+| **Router** | `ffn.gate.weight` [256, 4096] | 2.0 MiB |
+| **per-layer total** | | **257.0 MiB** |
+
+### Per-layer additions, by class
+
+| Class | Layers | Extra tensors | Size each |
+| :--- | ---: | :--- | ---: |
+| **CSA** (ratio 4) | 21 | compressor ×4 + indexer ×6 | 36.52 MiB |
+| **HCA** (ratio 128) | 20 | compressor ×4 | 8.25 MiB |
+| **Sliding** (ratio 0) | 2 | none | 0 |
+| **Hash router** | 3 (layers 0–2) | `ffn.gate.tid2eid` I64 [129280, 6] | 5.92 MiB |
+
+### The layer schedule
+
+`compress_ratios` has **46** entries; the first 43 describe layers, the last 3 are auxiliary zeros.
+
+| Layers | Class | Count |
+| :--- | :--- | ---: |
+| 0, 1 | Sliding | 2 |
+| 2, 4, 6, … **42** | **CSA** | **21** |
+| 3, 5, … 41 | HCA | 20 |
+
+The alternating pattern ends on **CSA at layer 42**, not on a sliding layer. `V4ModelSpec::validate_config` enforces `layer % 2 == 0 ? 4 : 128` for `layer >= 2`.
+
+### The hash router
+
+Layers 0–2 select experts from `ffn.gate.tid2eid`, a `[129280, 6]` table **indexed by token id** — `out_indices[k] = table[token_id][k]`. There is no top-k selection; `ffn.gate.weight` still runs, but only to compute the *weights* of the already-chosen six.
+
+Consequences for the supply: the choice is **independent of context and position**, so the same token always draws the same six experts at that layer, and different tokens draw unrelated ones. That defeats cross-turn reuse for those three layers by construction. (`deepseek_v4_flash_architecture.md` describes these as the only layers without `ffn.gate.bias`, which only layers 3–42 carry.)
+
+### `embed.weight` and `head.weight` are not duplicates
+
+They are distinct `[129280, 4096]` F16 matrices — `tie_word_embeddings` is `false`, and `test_v4_graph_head.cpp` asserts they differ **from the bytes**. `embed.weight` is held host-side deliberately (it is read one row per token, and placing it on the device would cost ~74 Hot slots); the rest of the dense container's page cache is released after upload by `release_dense_pages_except("embed.weight")`.

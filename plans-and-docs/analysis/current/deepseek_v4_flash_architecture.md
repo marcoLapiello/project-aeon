@@ -43,26 +43,25 @@ The model combines four major architectural ideas:
 
 ## 2. Decoder-layer schedule
 
-The public `compress_ratios` schedule is:
+The `compress_ratios` array in the selected checkpoint's `config.json` holds **46** entries: the 43 base-decoder entries, followed by 3 auxiliary entries that must be `0`.
 
 ```text
-[0, 0,
- 4, 128, 4, 128, 4, 128, 4, 128,
- 4, 128, 4, 128, 4, 128, 4, 128,
- 4, 128, 4, 128, 4, 128, 4, 128,
- 4, 128, 4, 128, 4, 128, 4, 128,
- 4, 128, 4, 128, 4, 128,
- 0]
+index  0- 9: [0, 0, 4, 128, 4, 128, 4, 128, 4, 128]
+index 10-19: [4, 128, 4, 128, 4, 128, 4, 128, 4, 128]
+index 20-29: [4, 128, 4, 128, 4, 128, 4, 128, 4, 128]
+index 30-39: [4, 128, 4, 128, 4, 128, 4, 128, 4, 128]
+index 40-45: [4, 128, 4, 0, 0, 0]
 ```
 
-Interpreted by layer index:
+Interpreted by layer index (base decoder only — entries 43–45 are auxiliary and describe no layer):
 
 | Layer indices | Count | Layer type | Compression ratio |
 |---|---:|---|---:|
 | 0–1 | 2 | Sliding-window attention | Not applicable |
-| 2, 4, ..., 40 | 20 | Compressed Sparse Attention | 4 |
+| 2, 4, ..., **42** | **21** | Compressed Sparse Attention | 4 |
 | 3, 5, ..., 41 | 20 | Heavily Compressed Attention | 128 |
-| 42 | 1 | Sliding-window attention | Not applicable |
+
+The alternating CSA/HCA pattern runs from layer 2 to layer 42 inclusive and therefore ends on **CSA**, not on a sliding layer. The class counts are **2 Sliding / 21 CSA / 20 HCA**, and `V4ModelSpec::validate_config` enforces them (`layer % 2 == 0 ? 4 : 128` for `layer >= 2`); `test_v4_model_contract.cpp` asserts `compress_ratios[42] == 4` and `layers[42].attention_kind == CSA` directly. Attention-layer state is therefore not homogeneous across all 43 decoder blocks.
 
 The alternating CSA/HCA pattern is part of the model architecture. Attention-layer state is therefore not homogeneous across all 43 decoder blocks.
 
