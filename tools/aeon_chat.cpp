@@ -66,6 +66,7 @@ struct Options {
     std::string run_id{"unnamed"};
     uint32_t max_hot_slots{0};
     std::string dump_logits_path;
+    uint64_t demotion_queue{0};
 };
 
 void print_usage(const char* executable) {
@@ -89,6 +90,7 @@ void print_usage(const char* executable) {
         << "  --run-id <id>            Run identifier stamped on telemetry rows (default: unnamed)\n"
         << "  --max-hot-slots <n>      Cap the Hot VRAM expert pool at <n> slots (0 = derived)\n"
         << "  --dump-logits <path>     Append each position's raw fp16 logits to <path>\n"
+        << "  --demotion-queue <n>     Demotion-queue capacity (0 = derived from warm refill)\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill\n"
         << "  --deterministic-experts  Accepted and inert; the rewrite always uses the fixed-order\n"
@@ -182,6 +184,9 @@ Options parse_options(int argc, char** argv) {
                 require_value(argc, argv, index, "--max-hot-slots"), "--max-hot-slots"));
         } else if (argument == "--dump-logits") {
             options.dump_logits_path = require_value(argc, argv, index, "--dump-logits");
+        } else if (argument == "--demotion-queue") {
+            options.demotion_queue = parse_unsigned(
+                require_value(argc, argv, index, "--demotion-queue"), "--demotion-queue");
         } else if (argument == "--no-warm-preload") {
             options.preload_warm_host = false;
         } else if (argument == "--no-warm-refill") {
@@ -260,6 +265,7 @@ int main(int argc, char** argv) {
         engine_options.runtime.run_id = options.run_id;
         engine_options.runtime.max_hot_vram_slots = options.max_hot_slots;
         engine_options.dump_logits_path = options.dump_logits_path;
+        engine_options.runtime.demotion_queue_capacity = options.demotion_queue;
 
         aeon::core::V4Engine engine;
         engine.initialize(engine_options);
@@ -327,6 +333,7 @@ int main(int argc, char** argv) {
                       << " outstanding_leases=" << leases
                       << " forced_drains=" << engine.host().forced_drains()
                       << " staging_in_use=" << engine.host().staging_in_use_slots()
+                      << " demotion_queue=" << engine.host().demotion_queue_capacity()
                       << "\n";
         }
 

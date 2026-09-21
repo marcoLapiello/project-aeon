@@ -93,6 +93,13 @@ struct AeonRuntimeConfig {
     // size never reaches on this GPU (779 slots against an ≈264-slot arm point).
     uint32_t max_hot_vram_slots{0};
 
+    // Demotion-queue capacity override. Zero (the default) derives it from
+    // `enable_warm_refill` — the default capacity when refill is on, 0 when off.
+    // A positive value sets it directly, which is how the Step 5 A/B varies the
+    // number of evictions allowed in flight before the rest are dropped with
+    // `queue_pressure`.
+    uint64_t demotion_queue_capacity{0};
+
     // Hardware target device index
     int device_id{0};
 

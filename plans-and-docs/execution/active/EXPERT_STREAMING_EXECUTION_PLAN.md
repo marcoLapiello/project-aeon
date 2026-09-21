@@ -196,6 +196,12 @@ Two thirds of every eviction is discarded. A/B **2 vs 6** (the exact decode-matc
 
 **Files.** `infrastructure/core/tiered_expert_supply.hpp`, `core/memory_budget.hpp` (config), scripts.
 
+**Status: done** (`2026-09-21`). Added `AeonRuntimeConfig::demotion_queue_capacity` (0 = derived from `enable_warm_refill`, so `--no-warm-refill` still disables demotion) and `--demotion-queue <n>`; the applied value is reported on the `[Invariants]` line. `scripts/expert_demotion_queue_ab.sh` runs capacity 2 vs 6 at `--warm-gib 40`. Recorded in the ledger as **M33**; all four assertions pass.
+
+The ladder (decode, 23 tokens): **`logical_bytes_from_warm` `17.65 → 25.54 GB`**, **NVMe `19.75 → 11.86 GB` (−40%)**, **drops `979 → 0`**, logits byte-identical. The cost is real and the plan's estimate was low: decode D2H rises `23.54 → 37.36 GB` (`+59%`). At the measured stream rates (NVMe `6.33 GB/s`, D2H ≈`25 GB/s`) that is `−1.25 s` of NVMe against `+0.55 s` of D2H — a net ≈`0.7 s` over 23 tokens, ≈`30 ms/token`, roughly `10%` of the measured decode step. The implied demotion reuse is ≈`57%`, well above the plan's `~25%` break-even.
+
+**Two corrections to record.** (1) The plan said "12 only helps prefill"; at capacity `6` the drops are **0 in both phases** (`queue_depth_max = 6`, i.e. the queue never overflowed), so `12` would add nothing for this workload — the interesting question becomes the *depth* at which it stops being enough, not the phase. (2) The plan's "≈1.2 → 3.5 GB per token" D2H estimate is off by roughly an order of magnitude against this measurement (`1.02 → 1.62 GB/token` decode).
+
 ---
 
 ### Step 6 — Chunked prefill through the host
@@ -265,7 +271,9 @@ Corrections to the analysis document and the historical supply-chain analysis. T
 | Expert sweep | **Strong in prefill.** Needs no prediction — the set is known. |
 | Prefill and Warm | The sweep **consumes** Warm when it promotes a Warm-resident expert. Open — see §6. |
 | `enable_warm_refill` | The name lies. It sets the demotion queue to 2 instead of 0. **Nothing proactively demotes a Hot expert.** |
-| Demotion queue = 2 | Not a small tightness: ~2/3 of all evictions are dropped, every token. |
+| Demotion queue = 2 | Not a small tightness: ~2/3 of all evictions are dropped, every token. **M33:** at capacity `6` the drops are `0` in both phases; decode NVMe falls `40%` for a D2H cost that nets ≈`30 ms/token` saved. |
+| "12 only helps prefill" | False as stated. Capacity `6` already reached `queue_depth_max = 6` with **0** drops in **both** phases, so `12` adds nothing for this workload; the question is the depth at which the queue overtops, not the phase. |
+| Demotion D2H "≈1.2 → 3.5 GB per token" | Measured decode D2H is `1.02 GB/token` (q2) → `1.62 GB/token` (q6) — about an order of magnitude below the estimate. |
 | `moving_frequency` | Recorded on every activation, **never read**. Victim selection is plain LRU. |
 | No Hot slot reclaimable | Not "the pool is full of needed experts". It is the **lease count**: up to 258 slots are leased per token (43 × 6), so a pool below ~264 can have every slot un-evictable. |
 | Layer 42 is a Sliding layer | False. It is **CSA** (ratio 4). The class counts are **2 Sliding / 21 CSA / 20 HCA**, not 3/20/20 — the alternating pattern runs to layer 42 inclusive. The implementation and its tests were always right (they read `compress_ratios`); only `deepseek_v4_flash_architecture.md` was wrong, and it is corrected. |

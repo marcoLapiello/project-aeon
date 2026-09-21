@@ -63,6 +63,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `budget-cap` | Hot VRAM expert-pool cap feasibility and behavior | M30 |
 | `tier-invariance` | Two runs, different tiers, byte-identical logits | M31 |
 | `starved-pool` | Hot-pool cap forcing the emergency drain; logits still exact | M32 |
+| `demotion-ab` | Demotion-queue capacity 2 vs 6; drops, Warm, NVMe, D2H | M33 |
 
 ## 4. Milestone cards
 
@@ -181,3 +182,27 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Warm-enabled starved run (mid-eviction hazard probe)**: `--max-hot-slots 12 --warm-gib 40`, first the `8`-token prompt then a `96`-token generation. Both exit `0` — the `"request-path CPU synchronization is forbidden"` throw was **not reached**. The 96-token run: `forced_drains=2478`, `staging_in_use=0`, `invariants_hold=true`, all demotion drops `queue_pressure`. Starved+Warm decode NVMe `16.52 GB` versus starved Warm-off `25.57 GB` (`-35%`). Logits identical to *all three* other configurations (uncapped Warm-off, uncapped Warm-on, starved Warm-off) — **four configurations, one logits file**.
 - **Conclusion / next gate**: Step 4 gate met — the emergency valve, eviction under lease pressure, and the async-demotion path all executed (`378` drains) with no number changed and no leak; the cost of starvation is `2.4×` decode NVMe traffic, which is the sweep's target. The mid-eviction hazard is a **narrow race** (≈2% of a layer) that this exposure did not reach, not a structural impossibility.
 - **Evidence**: `scripts/expert_starved_pool.sh`, `/tmp/aeon-starved-pool.9uqTbu/{ref,starved}.log`, `/tmp/aeon-starved-warm/{starved-warm,long}.{log,telemetry.jsonl}`
+
+### M33: Demotion-queue A/B — capacity 6 removes every drop and cuts decode NVMe 40%
+- **Run**: `2026-09-21`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers
+- **Class / comparison key**: `Analysis / demotion-ab`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: essay prompt, context `32768`, `--greedy`, `24` generated tokens, `n=1`, `--warm-gib 40`; arm q2 (`--demotion-queue 2`, the default) vs arm q6 (`--demotion-queue 6`)
+- **Metrics** (whole run, then decode phase):
+
+  | Field | q2 | q6 | Δ |
+  | :--- | ---: | ---: | ---: |
+  | `logical_bytes_from_warm` (all) | `32.74 GB` | `43.05 GB` | `+31%` |
+  | `bytes_from_nvme` (all) | `48.60 GB` | `38.29 GB` | `−21%` |
+  | `demotion_drops` (all) | `2312` | **`0`** | `−100%` |
+  | decode Warm | `17.65 GB` | `25.54 GB` | `+45%` |
+  | decode NVMe | `19.75 GB` | `11.86 GB` | **`−40%`** |
+  | decode drops | `979` | `0` | `−100%` |
+  | decode D2H | `23.54 GB` | `37.36 GB` | `+59%` |
+  | `demotion_queue_depth_max` | `2` | `6` | — |
+
+  Cost/benefit at measured stream rates (NVMe `6.33 GB/s`, D2H ≈`25 GB/s`): decode NVMe `−1.25 s` versus D2H `+0.55 s` ⇒ net ≈`0.7 s` over `23` tokens ≈`30 ms/token`, ≈`10%` of the measured decode step. Implied demotion reuse ≈`57%` (above the `~25%` break-even).
+- **Correctness / service**: logits **byte-identical** across arms (`cmp`); both arms exit `0`
+- **Conclusion / next gate**: Step 5 gate met — the larger queue converts every dropped demotion into Warm service, cutting decode NVMe `40%` for a D2H cost that is cheaper at the measured stream rates, so it pays. Capacity `6` sufficed for **both** phases here (`queue_depth_max = 6`), which corrects the plan's "12 only helps prefill" note
+- **Evidence**: `scripts/expert_demotion_queue_ab.sh`, `/tmp/aeon-demotion-ab.MAvbnY/{q2,q6}.{log,telemetry.jsonl,logits.bin}`

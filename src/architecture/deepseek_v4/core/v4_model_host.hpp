@@ -203,10 +203,11 @@ public:
         if (verbose_) {
             std::printf(
                 "[Host] %d layers (%u Sliding, %u CSA, %u HCA), context %u tokens, "
-                "%u hot + %u warm expert slots%s\n",
+                "%u hot + %u warm expert slots, demotion queue %llu%s\n",
                 num_layers, count_kind(V4AttentionKind::Sliding),
                 count_kind(V4AttentionKind::CSA), count_kind(V4AttentionKind::HCA),
                 context_capacity_, budget_.hot_vram_slots, budget_.warm_host_slots,
+                static_cast<unsigned long long>(demotion_queue_capacity_),
                 executor_ ? "" : " (expert tier not built: no Hot VRAM slot)");
         }
     }
@@ -315,6 +316,11 @@ public:
     uint32_t staging_in_use_slots() const noexcept {
         return staging_ ? staging_->in_use_slots() : 0;
     }
+
+    // The demotion-queue capacity the supply was configured with, after the derived
+    // default and the `demotion_queue_capacity` override are resolved. Reported so a
+    // gate can name which arm of the Step 5 A/B it ran.
+    uint64_t demotion_queue_capacity() const noexcept { return demotion_queue_capacity_; }
 
     // Diagnostics, for an assembly gate: the registry's residency claims and the
     // pool it made them against. Not used by the graph.
@@ -431,8 +437,11 @@ private:
             &next_io_id_,
             streams_.compute, streams_.sdma, streams_.sdma_cold, streams_.demotion,
             format.payload_bytes,
-            runtime_cfg.enable_warm_refill
-                ? V4ExpertSupplyCoordinator::DEFAULT_DEMOTION_QUEUE_CAPACITY : 0);
+            runtime_cfg.demotion_queue_capacity > 0
+                ? runtime_cfg.demotion_queue_capacity
+                : (runtime_cfg.enable_warm_refill
+                    ? V4ExpertSupplyCoordinator::DEFAULT_DEMOTION_QUEUE_CAPACITY : 0));
+        demotion_queue_capacity_ = supply_.demotion_queue_capacity();
 
         // 14 — the routed-expert scratch and the production executor. The executor
         // borrows the four streams the host owns, so its capacity fallback drains
@@ -588,6 +597,7 @@ private:
     MemoryBudgetReport budget_;
     uint32_t context_capacity_{0};
     size_t last_released_dense_bytes_{0};
+    uint64_t demotion_queue_capacity_{0};
 
     V4DeviceStreams streams_;
     V4ModelResources resources_;
