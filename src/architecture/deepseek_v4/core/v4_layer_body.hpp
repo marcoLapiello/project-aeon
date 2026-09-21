@@ -124,6 +124,22 @@ public:
         (void)weights;
     }
 
+    // A **layer-wide** dispatch: the `6C` requests of a chunk issued as one set
+    // (Step 6 D1). The default is the per-token sequence, so an executor with
+    // nothing to batch — a gate's synthetic one, for instance — needs no override,
+    // and `C = 1` reproduces `on_routing_ready` exactly. A real supply overrides it
+    // to deduplicate the layer's union and submit the transfers together, which is
+    // the whole point: one set of reads instead of `C` serialized ones.
+    virtual void on_routing_ready_batch(uint32_t layer_id,
+                                        uint32_t first_position,
+                                        const std::vector<std::vector<int32_t>>& ids,
+                                        const std::vector<std::vector<float>>& weights) {
+        for (size_t index = 0; index < ids.size(); ++index) {
+            on_routing_ready(layer_id, first_position + static_cast<uint32_t>(index),
+                             ids[index], weights[index]);
+        }
+    }
+
     // Accumulate `Σ_k w_k · W2_k · clamped_swiglu(W1_k·x, W3_k·x)` into
     // `moe_accum`, which already holds the shared expert's output.
     //
@@ -778,14 +794,21 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
 // Splitting here is what lets a chunk write every key before any query runs. For
 // a single token the split is invisible: `run_layer_body_decoding` below calls
 // both halves back to back with nothing in between.
-inline V4LayerBodyOutput run_layer_body_attention_tail(
+// Phase 2a — attention through the FFN RMSNorm. Everything a token's selection
+// does **not** depend on, and everything the router **does** depend on.
+//
+// The tail is split into phases here — not duplicated — so that a chunk can run
+// each phase over every one of its tokens before the next begins. That order is
+// what makes a chunk-wide expert dispatch possible: the router (#2b) of every
+// token must have run before the layer's union can be issued as one set, and the
+// MoE (#2c) of none of them may have run before it.
+inline void run_layer_body_attention_and_norm(
     V4Layer& layer,
     V4LayerBodyRow& scratch,
     const V4LayerBodyTables& tables,
     uint32_t token_id,
     uint32_t pos,
     hipStream_t stream,
-    V4RoutedExpertExecutor& experts,
     V4LayerBodyObserver& observer,
     V4LayerBodyPre pre) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
@@ -799,7 +822,6 @@ inline V4LayerBodyOutput run_layer_body_attention_tail(
     constexpr int O_LORA = kernel::DSV4_O_LORA_RANK;
     constexpr int O_GROUPS = kernel::DSV4_O_GROUPS;
     constexpr int TOT_LORA = kernel::DSV4_TOTAL_O_LORA_DIM;
-    constexpr int INTER_DIM = 2048;
 
     V4AttentionTraceRecord* attention_trace = pre.trace;
     const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
@@ -946,6 +968,23 @@ inline V4LayerBodyOutput run_layer_body_attention_tail(
                                  scratch.d_ffn_norm_act, H * sizeof(half),
                                  hipMemcpyDeviceToDevice, stream));
     }
+}
+
+// Phase 2b — the router (step H). Writes the per-token top-k ids and weights and
+// returns them, because a chunk-wide dispatch needs every token's selection on the
+// host before it can issue the layer's union as one set.
+inline V4LayerBodyOutput run_layer_body_router(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    uint32_t token_id,
+    uint32_t pos,
+    hipStream_t stream,
+    V4LayerBodyObserver& observer,
+    V4LayerBodyPre pre) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int M_PAD = 16;
+    V4AttentionTraceRecord* attention_trace = pre.trace;
+    (void)M_PAD;
 
     // -----------------------------------------------------------------
     // H. MoE router (2.9)
@@ -992,12 +1031,28 @@ inline V4LayerBodyOutput run_layer_body_attention_tail(
         attention_trace->routed_expert_weights.assign(
             output.topk_weights.begin(), output.topk_weights.end());
     }
+    return output;
+}
 
-    // The ids are known: the supply system now does its bookkeeping and then
-    // dispatches. The ordering is deliberate — all of it happens before the
-    // shared-expert pass so the device stays busy while the CPU submits I/O.
-    experts.on_routing_ready(static_cast<uint32_t>(layer.layer_id), pos,
-                             output.topk_indices, output.topk_weights);
+// Phase 2c — the shared expert, the routed accumulate, and the HC FFN post.
+//
+// The dispatch (`on_routing_ready`) is deliberately **not** here: a chunk issues
+// the layer's union once for all of its tokens, between 2b and 2c, so the caller
+// owns that call. Decode issues it per token, exactly where it always did.
+inline void run_layer_body_moe_and_post(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    uint32_t pos,
+    hipStream_t stream,
+    V4RoutedExpertExecutor& experts,
+    V4LayerBodyObserver& observer,
+    V4LayerBodyPre pre) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int HC = 4;
+    constexpr int HC_DIM = HC * H;
+    constexpr int INTER_DIM = 2048;
+    constexpr int M_PAD = 16;
+    V4AttentionTraceRecord* attention_trace = pre.trace;
 
     // -----------------------------------------------------------------
     // 2.10.4 — shared expert (always fires), accumulating into the cleared buffer
@@ -1065,7 +1120,30 @@ inline V4LayerBodyOutput run_layer_body_attention_tail(
                              HC_DIM * sizeof(half), hipMemcpyDeviceToDevice, stream));
     kernel::v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
         scratch.d_res_in_half, scratch.d_res_in, HC_DIM);
+}
 
+// The three phases back to back: the whole attention tail for **one token**, in
+// the order decode has always run it. A chunk drives the phases itself — every
+// token's 2a, then every token's 2b, then one dispatch, then every token's 2c —
+// and that ordering is the only difference between a chunk and a sequence of
+// decode steps.
+inline V4LayerBodyOutput run_layer_body_attention_tail(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    const V4LayerBodyTables& tables,
+    uint32_t token_id,
+    uint32_t pos,
+    hipStream_t stream,
+    V4RoutedExpertExecutor& experts,
+    V4LayerBodyObserver& observer,
+    V4LayerBodyPre pre) {
+    run_layer_body_attention_and_norm(layer, scratch, tables, token_id, pos, stream,
+                                      observer, pre);
+    const V4LayerBodyOutput output =
+        run_layer_body_router(layer, scratch, token_id, pos, stream, observer, pre);
+    experts.on_routing_ready(static_cast<uint32_t>(layer.layer_id), pos,
+                             output.topk_indices, output.topk_weights);
+    run_layer_body_moe_and_post(layer, scratch, pos, stream, experts, observer, pre);
     return output;
 }
 
