@@ -586,6 +586,17 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // Phase 2a — attention through the FFN RMSNorm, for every token. Each token
     // composes its own row-set, because the row-set is a property of the query's
     // position.
+    // Phase 2.
+    //
+    // Note: the three sub-phases below (attention for all, router for all, one
+    // layer-wide dispatch, MoE for all) are the shape Step 6 item 4 needs, but
+    // they are only valid **together with** a chunk-wide expert dispatch. With the
+    // per-token dispatch they separate `on_routing_ready` from
+    // `on_routed_consumed`, and the staging arena — whose slots are addressed by
+    // layer parity, six per layer — then hands the same six slots to every token at
+    // the layer at once. So the per-token tail is kept until the layer-wide
+    // dispatch lands.
+    std::vector<V4LayerBodyOutput> outputs(count);
     for (uint32_t row = 0; row < count; ++row) {
         const uint32_t query_position = start_position + row;
         V4LayerBodyRow view = workspace.row(row);
@@ -593,32 +604,9 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
             layer, workspace, start_position, row, query_position, stream));
         view.d_composed_keys = workspace.composed_keys();
         view.d_composed_positions = workspace.composed_positions();
-        run_layer_body_attention_and_norm(layer, view, tables, token_ids[row],
-                                          query_position, stream, observer, pre[row]);
-    }
-
-    // Phase 2b — the router, for every token. All `C` selections are known when
-    // this ends, which is what makes the single dispatch below possible.
-    std::vector<V4LayerBodyOutput> outputs(count);
-    std::vector<std::vector<int32_t>> batch_ids(count);
-    std::vector<std::vector<float>> batch_weights(count);
-    for (uint32_t row = 0; row < count; ++row) {
-        outputs[row] = run_layer_body_router(layer, workspace.row(row), token_ids[row],
-                                             start_position + row, stream, observer,
-                                             pre[row]);
-        batch_ids[row] = outputs[row].topk_indices;
-        batch_weights[row] = outputs[row].topk_weights;
-    }
-
-    // Phase 2b' — the layer-wide dispatch. One set of `6C` requests, deduplicated
-    // to the layer's union, submitted together.
-    experts.on_routing_ready_batch(static_cast<uint32_t>(layer.layer_id), start_position,
-                                   batch_ids, batch_weights);
-
-    // Phase 2c — shared expert, routed accumulate, HC FFN post, per token.
-    for (uint32_t row = 0; row < count; ++row) {
-        run_layer_body_moe_and_post(layer, workspace.row(row), start_position + row,
-                                    stream, experts, observer, pre[row]);
+        outputs[row] = run_layer_body_attention_tail(
+            layer, view, tables, token_ids[row], query_position, stream,
+            experts, observer, pre[row]);
     }
 
     // Commit. Only now may the ring move: every query that could have needed a
