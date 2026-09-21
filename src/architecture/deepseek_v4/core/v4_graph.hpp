@@ -46,6 +46,7 @@
 // consumer, which is why `logits()` is fp16 and says so.
 // -----------------------------------------------------------------------------
 
+#include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
 #include "architecture/deepseek_v4/core/v4_model_host.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "architecture/deepseek_v4/kernels/v4_gemv.hpp"
@@ -56,10 +57,13 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace aeon::core {
 
@@ -217,6 +221,111 @@ public:
         return logits;
     }
 
+    // --- Step 6 — the layer-major prefill window -----------------------------
+
+    // Gathers `count` token rows into the carry, broadcast across the `hc_mult`
+    // streams and widened to fp32 in one pass.
+    //
+    // `embed.weight` is host-resident (Appendix A: read one row per token, and on
+    // the device it would cost ~74 Hot slots), so the rows are gathered on the
+    // host into one contiguous broadcast and uploaded with a **single** copy —
+    // the plan's "a gather over the chunk's ids, not 4 H2D copies per row". The
+    // broadcast is Step 1's shape unchanged: every stream carries the same halves.
+    void embed_window(const uint32_t* token_ids, uint32_t count, hipStream_t stream) {
+        const uint32_t hidden = static_cast<uint32_t>(host_.config().hidden_size);
+        const uint32_t hc_mult = static_cast<uint32_t>(host_.config().hc_mult);
+        const uint32_t hc_dim = hc_mult * hidden;
+        const uint32_t vocab = static_cast<uint32_t>(host_.config().vocab_size);
+
+        embed_staging_.resize(static_cast<size_t>(count) * hc_dim);
+        for (uint32_t row = 0; row < count; ++row) {
+            // Refused rather than clamped (trap 40): an out-of-range id indexes past
+            // the table, and a finite number from the wrong row is unattributable.
+            const uint32_t token_id = token_ids[row];
+            if (token_id >= vocab) {
+                throw std::out_of_range(
+                    "V4Graph::embed_window: token id " + std::to_string(token_id) +
+                    " is outside the vocabulary of " + std::to_string(vocab));
+            }
+            const half* source = host_.resources().host_embed_table +
+                                 static_cast<size_t>(token_id) * hidden;
+            half* destination = embed_staging_.data() + static_cast<size_t>(row) * hc_dim;
+            for (uint32_t stream_index = 0; stream_index < hc_mult; ++stream_index) {
+                std::memcpy(destination + static_cast<size_t>(stream_index) * hidden, source,
+                            static_cast<size_t>(hidden) * sizeof(half));
+            }
+        }
+
+        CHECK_HIP(hipMemcpyAsync(host_.prefill_carry_half(), embed_staging_.data(),
+                                 static_cast<size_t>(count) * hc_dim * sizeof(half),
+                                 hipMemcpyHostToDevice, stream));
+
+        const int total = static_cast<int>(count * hc_dim);
+        constexpr int kThreads = 256;
+        kernel::v4_half_to_float_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            host_.prefill_carry_half(), host_.prefill_carry(), total);
+    }
+
+    // Layer-major prefill over a **window** of `count` tokens (Step 6 D-a).
+    //
+    // The nested order is window -> layer -> chunk: for each layer, every chunk of
+    // the window runs before the next layer is entered, so a layer's routed-expert
+    // set is fetched once per window instead of once per chunk. The residual cannot
+    // live in the per-layer chunk workspace — that is recycled as layers advance
+    // (§6.4) — so it is carried in the host-owned buffer sized `count x hc_dim`.
+    //
+    // `chunk` is the body chunk `C`: the rows in flight per body invocation, which
+    // bounds the batch scratch and is at most `V4LayerBodyBatchScratch::kMaxTokens`.
+    // `count` is the window `W`. Neither is derived — `C` and `W` are the two knobs
+    // of Step 6 §6b — and `chunk == count` is the degenerate schedule with one body
+    // invocation per layer.
+    const half* forward_window(const uint32_t* token_ids, uint32_t start_position,
+                               uint32_t count, uint32_t chunk, hipStream_t stream) {
+        if (count == 0) {
+            throw std::invalid_argument("V4Graph::forward_window: an empty window");
+        }
+        if (chunk == 0 || chunk > V4LayerBodyBatchScratch::kMaxTokens) {
+            throw std::invalid_argument(
+                "V4Graph::forward_window: the chunk must be in [1, " +
+                std::to_string(V4LayerBodyBatchScratch::kMaxTokens) + "]");
+        }
+        const uint32_t hc_dim = static_cast<uint32_t>(host_.config().hc_mult) *
+                                static_cast<uint32_t>(host_.config().hidden_size);
+
+        host_.ensure_prefill_carry(count);
+        embed_window(token_ids, count, stream);
+
+        const uint32_t layers = host_.num_layers();
+        const V4LayerBodyTables tables = host_.tables();
+        const uint32_t workspace_tokens = std::min(chunk, count);
+
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            host_.ensure_batch_scratch(layer, workspace_tokens);
+            V4LayerBodyBatchScratch& workspace = host_.batch_scratch();
+
+            for (uint32_t offset = 0; offset < count; offset += chunk) {
+                const uint32_t span = std::min(chunk, count - offset);
+                copy_carry_to_workspace(workspace, offset, span, hc_dim, stream);
+                (void)run_layer_body_chunk(
+                    host_.layer(layer), workspace, tables, token_ids + offset,
+                    start_position + offset, span, stream, host_.executor(), observer_);
+                copy_workspace_to_carry(workspace, offset, span, hc_dim, stream);
+            }
+
+            // The **layer boundary** (Step 0 D3), which the state forces rather than
+            // a policy choosing it: anything wider would lease the whole model. A
+            // lease grants no ordering, so handing it back needs a compute-stream
+            // boundary here; this drain is the per-layer cost D3 says to measure.
+            CHECK_HIP(hipStreamSynchronize(stream));
+            host_.release_expert_leases();
+        }
+
+        // The head reads the last position's residual, which is where the serial
+        // path leaves it too (`scratch().d_res_in`).
+        copy_carry_row_to_scratch(count - 1, hc_dim, stream);
+        return head_stage(stream);
+    }
+
     // --- read access, for the gate and for whatever runs above -----------------
 
     const float* residual() const noexcept { return host_.scratch().d_res_in; }
@@ -229,6 +338,52 @@ public:
 
 private:
     V4ModelHost& host_;
+
+    // Host staging for the batched embedding gather. One contiguous broadcast of
+    // the window's rows, uploaded once; a member so the allocation is reused rather
+    // than made per call.
+    std::vector<half> embed_staging_;
+
+    // The carry <-> workspace copies. Both directions move one token's `hc_dim`
+    // residual, both halves, device to device.
+    void copy_carry_to_workspace(V4LayerBodyBatchScratch& workspace, uint32_t offset,
+                                 uint32_t span, uint32_t hc_dim, hipStream_t stream) {
+        for (uint32_t row = 0; row < span; ++row) {
+            const V4LayerBodyRow view = workspace.row(row);
+            const size_t source = static_cast<size_t>(offset + row) * hc_dim;
+            CHECK_HIP(hipMemcpyAsync(view.d_res_in_half, host_.prefill_carry_half() + source,
+                                     static_cast<size_t>(hc_dim) * sizeof(half),
+                                     hipMemcpyDeviceToDevice, stream));
+            CHECK_HIP(hipMemcpyAsync(view.d_res_in, host_.prefill_carry() + source,
+                                     static_cast<size_t>(hc_dim) * sizeof(float),
+                                     hipMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    void copy_workspace_to_carry(V4LayerBodyBatchScratch& workspace, uint32_t offset,
+                                 uint32_t span, uint32_t hc_dim, hipStream_t stream) {
+        for (uint32_t row = 0; row < span; ++row) {
+            const V4LayerBodyRow view = workspace.row(row);
+            const size_t destination = static_cast<size_t>(offset + row) * hc_dim;
+            CHECK_HIP(hipMemcpyAsync(host_.prefill_carry_half() + destination, view.d_res_in_half,
+                                     static_cast<size_t>(hc_dim) * sizeof(half),
+                                     hipMemcpyDeviceToDevice, stream));
+            CHECK_HIP(hipMemcpyAsync(host_.prefill_carry() + destination, view.d_res_in,
+                                     static_cast<size_t>(hc_dim) * sizeof(float),
+                                     hipMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    void copy_carry_row_to_scratch(uint32_t row, uint32_t hc_dim, hipStream_t stream) {
+        auto& scratch = host_.scratch();
+        const size_t source = static_cast<size_t>(row) * hc_dim;
+        CHECK_HIP(hipMemcpyAsync(scratch.d_res_in, host_.prefill_carry() + source,
+                                 static_cast<size_t>(hc_dim) * sizeof(float),
+                                 hipMemcpyDeviceToDevice, stream));
+        CHECK_HIP(hipMemcpyAsync(scratch.d_res_in_half, host_.prefill_carry_half() + source,
+                                 static_cast<size_t>(hc_dim) * sizeof(half),
+                                 hipMemcpyDeviceToDevice, stream));
+    }
 
     // The body requires an observer; a real one that traces a forward pass is P5's
     // (composition plan G4). The null observer copies nothing, so the hot path is

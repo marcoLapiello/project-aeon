@@ -59,6 +59,7 @@
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_layer.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
+#include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_model_resources.hpp"
 #include "architecture/deepseek_v4/core/v4_model_spec.hpp"
@@ -240,6 +241,10 @@ public:
         layers_.clear();
         resources_.free();
         scratch_.free();
+        batch_scratch_.free();
+        if (d_prefill_carry_half_) { (void)hipFree(d_prefill_carry_half_); d_prefill_carry_half_ = nullptr; }
+        if (d_prefill_carry_) { (void)hipFree(d_prefill_carry_); d_prefill_carry_ = nullptr; }
+        prefill_carry_tokens_ = 0;
         streams_.destroy();
         loader_.close_all();
         layer_specs_.clear();
@@ -262,6 +267,53 @@ public:
 
     PipelineScratchBuffers& scratch() noexcept { return scratch_; }
     const PipelineScratchBuffers& scratch() const noexcept { return scratch_; }
+
+    // --- the layer-major prefill working set (Step 6) ------------------------
+    //
+    // Two buffers, and the distinction between them is the whole reason they are
+    // separate (§6.4): the **chunk workspace** holds per-op temporaries for the
+    // rows in flight and is recycled as layers advance, while the **carry** holds
+    // the residual being transformed and must survive all 43 layers of a pass.
+
+    // The per-layer chunk workspace. `V4LayerBodyBatchScratch` sizes itself from a
+    // layer's own capacities (the indexer's candidate scores and top-k), so it is
+    // re-allocated whenever the layer changes. Reusing the allocation across the
+    // chunks of one layer is the point: a layer-major pass enters each layer once.
+    void ensure_batch_scratch(uint32_t layer_id, uint32_t count) {
+        if (batch_scratch_count_ == count && batch_scratch_layer_ == layer_id) return;
+        batch_scratch_.allocate(layer(layer_id), count);
+        batch_scratch_layer_ = layer_id;
+        batch_scratch_count_ = count;
+    }
+
+    V4LayerBodyBatchScratch& batch_scratch() noexcept { return batch_scratch_; }
+    const V4LayerBodyBatchScratch& batch_scratch() const noexcept { return batch_scratch_; }
+
+    // The residual carry: one window's worth of per-token residual, both fp16 and
+    // fp32, held in VRAM for the whole layer-major pass. Grows only, so a window
+    // of a given size is allocated once and reused by every later pass that fits.
+    void ensure_prefill_carry(uint32_t tokens) {
+        if (tokens == 0) {
+            throw std::invalid_argument("V4ModelHost: a prefill carry cannot be zero tokens");
+        }
+        if (tokens <= prefill_carry_tokens_) return;
+
+        if (d_prefill_carry_half_) { (void)hipFree(d_prefill_carry_half_); d_prefill_carry_half_ = nullptr; }
+        if (d_prefill_carry_) { (void)hipFree(d_prefill_carry_); d_prefill_carry_ = nullptr; }
+        prefill_carry_tokens_ = 0;
+
+        const uint32_t hc_dim = static_cast<uint32_t>(config_.hc_mult) *
+                                static_cast<uint32_t>(config_.hidden_size);
+        CHECK_HIP(hipMalloc(&d_prefill_carry_half_,
+                            static_cast<size_t>(tokens) * hc_dim * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_prefill_carry_,
+                            static_cast<size_t>(tokens) * hc_dim * sizeof(float)));
+        prefill_carry_tokens_ = tokens;
+    }
+
+    half* prefill_carry_half() noexcept { return d_prefill_carry_half_; }
+    float* prefill_carry() noexcept { return d_prefill_carry_; }
+    uint32_t prefill_carry_tokens() const noexcept { return prefill_carry_tokens_; }
 
     const V4DeviceStreams& streams() const noexcept { return streams_; }
 
@@ -638,6 +690,15 @@ private:
     V4ModelResources resources_;
     PipelineScratchBuffers scratch_;
     std::vector<V4Layer> layers_;
+
+    // The layer-major prefill working set (Step 6). The workspace is re-allocated
+    // when the layer changes; the carry grows and is kept.
+    V4LayerBodyBatchScratch batch_scratch_;
+    uint32_t batch_scratch_layer_{UINT32_MAX};
+    uint32_t batch_scratch_count_{0};
+    half* d_prefill_carry_half_{nullptr};
+    float* d_prefill_carry_{nullptr};
+    uint32_t prefill_carry_tokens_{0};
 
     UnifiedVRAMExpertPool vram_pool_;
     HostExpertPool host_pool_;

@@ -82,9 +82,9 @@ Every constant that *is* the `C = 1` case, and its general form:
 
 ## 4. Out of scope
 
-The note makes the shapes parameterizable; it does **not** choose among strategies:
+The note makes the shapes parameterizable; it does **not** choose among strategies. As of `2026-09-21` two of those are no longer open here — they were decided in Step 6, and are recorded for reference only:
 
-- **Prefill iteration order** (chunk-major vs layer-major, §6.2) — open.
-- **Warm admission** (approaches A–E, §6.7) — open.
+- **Prefill iteration order** (chunk-major vs layer-major) — **decided: layer-major within a window** (Step 6 D-a). This note's `C` is the body chunk; the layer-major span `W` is a separate knob (Step 6 §6b).
+- **Warm admission** (approaches A–E) — **decided: A, Warm frozen** (Step 6 D-b).
 - **The numeric `depth`** — Step 7's sweep.
 - **Prefix reuse** (§6.6) — a product dependency, not this note's.

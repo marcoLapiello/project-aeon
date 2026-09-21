@@ -206,45 +206,84 @@ The ladder (decode, 23 tokens): **`logical_bytes_from_warm` `17.65 → 25.54 GB`
 
 ---
 
-### Step 6 — Chunked prefill through the host
+### Step 6 — Layer-major prefill through the host
 
-**Requirement.** Build the prefill path:
+**Status: decided (2026-09-21); core built (2026-09-21).** The strategy questions this step previously held open — iteration order, Warm policy, residency — are settled by the decisions below. The **window driver is built and outcome 1 is met** (ledger M37): a layer-major pass is byte-identical to serial. §6 keeps the discussion that led here; it is no longer the specification for this step.
 
-1. **`V4Graph::forward_chunk`** over `run_layer_body_chunk`, plus the batched token embedding (a gather over the chunk's ids on the device, not 4 H2D copies per row).
-2. **Allocate `V4LayerBodyBatchScratch`** (≈11 MiB at `C = 16`) — the host allocates neither batch scratch type today.
-3. **A chunk-wide expert dispatch**: `on_routing_ready` / `accumulate_routed` over `C` tokens, so a chunk's `6C` requests are issued **as a set**.
-4. **Deduplicate within the chunk** — collapse `6C` requests to the layer's distinct expert set.
-5. **Size the staging arena from transfer-concurrency depth**, never from `C` and never hardcoded: `banks × depth` (`banks = 2`), with the layer's **deduplicated** distinct set as the ceiling and disk-saturation depth as the target. See the [Step 0 note](../analysis/current/EXPERT_DISPATCH_SHAPE_NOTE.md) and §7.
+#### 6a. The decisions (not to be re-litigated)
 
-**Why a large chunk is the lever.** A layer's expert set is fetched once and used by every token in the chunk. For a 1000-token prompt:
+| # | Decision | Why | Arbiter |
+| :--- | :--- | :--- | :--- |
+| **D-a** | **Iteration order — layer-major within a bounded window.** For each window of `W` tokens, visit layers 0…42, processing the window's tokens in body chunks of `C ≤ W`. Chunk-major is the degenerate `W = C`. | Fetches each layer's expert set **once per window**, not once per chunk. | `colibri/c/deepseek_v4.c` (segment loop) |
+| **D-b** | **Warm is frozen during prefill (policy A).** No promotion, no demotion; a swept expert's eviction is a **release** (no copy). | Promotion is a **move**: the Warm slot is returned to the free list on completion, so reading Warm during the sweep **destroys** the decode set. Release leaks nothing. | `expert_registry.hpp` completion path; §2 |
+| **D-c** | **The registry seam is kept.** The sweep goes through the same `on_routing_ready` / `accumulate_routed` path, batched, with leases released at the **layer boundary** (D3). | Preserves the certified invariants and the dedup-slot-order rule (§7) rather than bypassing them with a second path. | [Step 0 note](../analysis/current/EXPERT_DISPATCH_SHAPE_NOTE.md) D1–D3 |
+| **D-d** | **The sweep reuses the Hot pool.** No dedicated prefill bank. | VRAM is binding — dense `12.71 GiB` + KV on a `24 GiB` card. Colibri affords a separate `2.2 GB` transient bank only because its dense set is `6.3 GB`. | [Appendix A](#appendix-a--model-composition-verified) |
 
-| Chunk | Passes | Total expert bytes | At 6.33 GB/s |
-| ---: | ---: | ---: | ---: |
-| 16 (today's `kMaxTokens`) | 63 | 3.1 TB | 485 s |
-| 256 | 4 | 621 GB | 98 s |
-| 1024 | 1 | **156 GB** | **25 s** |
+> **Naming.** This window is not any of the three existing "segments": not `HostExpertPool::SEGMENT_SLOTS` (host storage), not the attention compressor's two-segment overlap, not a pinned host segment. It is the **layer-major span**. Colibri calls the same quantity a *prefill segment* (`V4_PREFILL_SEGMENT`); "window" is used here only to avoid the collision.
 
-**156 GB is the floor** — the entire model read once. Chunk 1024 reaches it for this prompt.
+#### 6b. The three knobs, and why they are separate
 
-**Attention does not bound the chunk.** Measured from the kernel constants: `DSV4_MAX_ATTENTION_KEYS = 128 + 512 = 640`. 23 of 43 layers are hard-capped; only the HCA class grows, and at `context / 128`. Attention work per chunk is therefore **linear in `C`**, and ≈1000× smaller than the expert transfer. **The real ceiling is the batch scratch and the staging budget.**
+| Knob | Bounds | Effect of raising it |
+| :--- | :--- | :--- |
+| **`C`** — body chunk | the batch scratch (`V4LayerBodyBatchScratch`, MiB) | fewer GEMM launches; ~flat in throughput |
+| **`W`** — layer-major window | the residual carry (`W × 64 KB`) | fewer sweeps; fewer expert bytes |
+| **`N`** — prompt length | — | more sweeps unless `W` grows with it |
 
-**Iteration order is a separate decision, and it is open.** Chunk-major re-fetches every ring once per chunk; layer-major (§6.2) fetches each once. §6.3 prices it and §6.5 gives the fallback rule. This step should not fix the order until that is settled.
+The residual is **bounded by the window, not the prompt**, so no VRAM is reserved for a hypothetical carry and there is no pre-flight cliff (superseding §6.5's binary guard):
 
-**Gate.** The item-19 equality gate re-run through the new host at the chosen chunk size (`chunk ≡ serial`, exact), then — separately — throughput.
+$$\text{expert bytes} \approx \left\lceil \frac{N}{W} \right\rceil \times 156\,\text{GB} \quad (W \gtrsim 256 = \text{one ring}), \qquad \text{residual} = \min(N, W) \times 64\,\text{KB}$$
 
-**Files.** `core/v4_graph.hpp`, `core/v4_layer_body_batch.hpp`, `core/v4_expert_executor.hpp`, `core/v4_expert_supply.hpp`, `core/memory_budget.hpp`.
+A prompt longer than one window is simply `⌈N/W⌉` windows, each re-sweeping. Costs in the table below use the **single-drive** rate (6.33 GB/s); colibri's own figures are on a 2× NVMe mirror and must not be imported directly.
+
+| Configuration (prompt 1000 tokens) | Sweeps | Expert bytes | Time | Residual |
+| :--- | ---: | ---: | ---: | ---: |
+| chunk-major, `C = 16` (today) | 63 | 3.1 TB | 485 s | 1 MB |
+| chunk-major, `C = 256` | 4 | 621 GB | 98 s | 16 MB |
+| **layer-major, `W ≥ 1024`** | **1** | **156 GB** | **25 s** | **64 MB** |
+
+**156 GB is the floor** — the whole model read once. `W ≥ N` reaches it. The residual column is the *in-place* carry; until D-e below is verified it is ping-pong, i.e. doubled.
+
+#### 6c. Requirement (the build)
+
+1. **`V4Graph::forward_chunk`** over `run_layer_body_chunk`, plus a batched token embedding (a device-side gather of the chunk's ids, not per-row H2D copies). **[built — `forward_window` + `embed_window`]**
+2. **Host allocates `V4LayerBodyBatchScratch`**, sized from `C` — the host allocates neither batch scratch type today. **[built — `ensure_batch_scratch`]**
+3. **Windowed layer-major driver:** for each window, for each layer, for each body chunk within the window. **[built — `V4Graph::forward_window` + a host-owned residual carry]**
+4. **Chunk-wide expert dispatch:** `on_routing_ready` / `accumulate_routed` over `C` tokens so the `6C` requests are issued **as a set** (D1); dedup to the layer's distinct set (D2) without permuting slot-sum order; leases released at the **layer boundary** (D3). **[layer-boundary release built; the `6C` set and dedup are the remaining work — the window currently drives the existing per-token dispatch]**
+5. **Warm-frozen policy (D-b):** a prefill-phase switch that disables promotion **and** demotion; eviction is release. Verified by outcome 3. **[pending]**
+6. **Double-buffered sweep:** prefetch layer `L+1`'s set into the spare ring while `L` computes, so the transfer drains before `L+1` needs it. This is what reaches the transfer floor; without it the sweep serializes. The target layer is always `L+1` — never speculative, since layer-major knows it. Arbiter: `colibri/c/deepseek_v4_bank_pair.h`. **[pending]**
+7. **D-e — verify the in-place residual.** §6.3 asserts each token's residual update reads only its own row, so a write-back target is safe (`W` rather than `2W`). **Verified.** The body chains `d_res_in_half = d_res_out_half` per row and reads only that row's own residual; M37 asserts the carry round-trips the window byte-exactly, so the carry is `min(N,W) × 64 KB`, not double.
+
+**Attention does not bound the window.** From the kernel constants, `DSV4_MAX_ATTENTION_KEYS = 640`: 23 of 43 layers are hard-capped and only HCA grows, at `context / 128`. Attention is **linear in `W`** and ≈1000× smaller than the sweep. The window's real ceiling is the residual (VRAM) and the batch scratch.
+
+#### 6d. Gate (outcomes)
+
+| # | Outcome | Instrument |
+| :--- | :--- | :--- |
+| **1** | **Equality** — item 19 re-run through the new host: `chunk ≡ serial`, exact (greedy token ids identical **and** logits byte-identical). **Met (`2026-09-21`, M37):** the window's final logits differ in `0` of `258560` bytes and the residual in `0` of `65536`, at body chunks `16` and `5`; `8` checks, `0` failures. | `test_v4_prefill_window` |
+| **2** | **Tier-invariance preserved** — the M31 comparison still holds on prefill (Hot+Cold vs Hot+Warm → identical logits), proving Warm-frozen changed no number. | `scripts/expert_tier_invariance.sh` |
+| **3** | **Warm preserved (the decisive check of D-b)** — Warm's resident set is unchanged across a prefill; the first decode tokens serve from Warm at the pre-prefill rate, with `logical_bytes_from_warm > 0`. | `--supply-telemetry` |
+| **4** | **No leak** — `invariants_hold()`, `outstanding_leases() == 0`, `staging_in_use == 0` at end; prefill `demotion_attempts == 0`, `forced_drains == 0`. | `[Invariants]` line |
+| **5** | **Throughput** — prefill tok/s against the measured baseline, and bytes/token against §6b's prediction. | ledger |
+
+> **A harness rule this step established.** A gate that reads device buffers must **synchronize the stream first**. The forward paths enqueue on the non-default, non-blocking compute stream, and a plain `hipMemcpy` does not order against it, so a read can return the previous run's buffer. M37's first version did this and reported a fabricated `76%` divergence that cost an investigation and pointed at the wrong component. The body's own `hipStreamSynchronize` sits *before* its final stages, so it does not cover them.
+
+**Files.** `core/v4_graph.hpp`, `core/v4_layer_body_batch.hpp`, `core/v4_expert_executor.hpp`, `core/v4_expert_supply.hpp`, `core/memory_budget.hpp`, `tools/aeon_chat.cpp`.
+
+**Arbiters.** `aeon-references/colibri/c/deepseek_v4.c` (window/chunk loop), `c/deepseek_v4_bank_pair.h` (double-buffered sweep). Both are DSV4-only paths. Colibri's `~0.35 s/layer` is a **2× NVMe** figure — on one drive it is `~0.7 s/layer` (`≈30 s` per full sweep), which is the rate every time above uses.
 
 ---
 
-### Step 7 — Chunk size: sweep, then expose
+### Step 7 — Window and chunk: sweep, then expose
 
-**Requirement.** No chunk-size target is set in advance. `kMaxTokens = 16` is currently inherited and bounds both the batch scratch and the staging demand. Sweep the size and measure; **expose the winner as a user setting**, so the engine is configurable for other hardware rather than tuned for this GPU.
+**Requirement.** Neither knob carries a target in advance: `C` (body chunk, bounds the scratch) and `W` (layer-major window, bounds the residual) — Step 6 §6b. `kMaxTokens = 16` is inherited and fixes both today. Sweep them and measure, then **expose both as user settings** so the engine is configurable for other hardware rather than tuned for this GPU.
 
-**Consequence for the budget.** `PIPELINE_SCRATCH_BYTES = 100 MiB` is a literal that is wrong in both directions today: it over-counts decode scratch (4.68 MiB) by ~95 MiB **and does not cover the batch scratch at all**. Replace it with **two derived lines** — decode plus a batch term computed from the configured chunk size — and make the staging line use the arena's own constant.
+**Expected shape, to confirm or refute.** The window is the lever and the chunk is nearly flat: on colibri, `V4_PREFILL_CHUNK` 128 vs 64 differed by ~3% end to end, while the window count dominated. Aeon's silicon decides.
 
-**Gate.** The sweep's throughput curve, recorded in the ledger; the budget lines track the configured chunk size with no literal.
+**Consequence for the budget.** `PIPELINE_SCRATCH_BYTES = 100 MiB` is a literal that is wrong in both directions today: it over-counts decode scratch (4.68 MiB) by ~95 MiB **and does not cover the batch scratch at all**. Replace it with **three derived lines** — decode, a batch term from the configured `C`, and a residual-carry term from the configured `W` — and make the staging line use the arena's own constant.
 
-**Files.** `core/memory_budget.hpp` (derived lines), `tools/aeon_chat.cpp` (the setting).
+**Gate.** The sweep's throughput vs `W` and vs `C`, recorded in the ledger; the budget lines track the configured `W` and `C` with no literal.
+
+**Files.** `core/memory_budget.hpp` (derived lines), `tools/aeon_chat.cpp` (the settings).
 
 ---
 
@@ -284,9 +323,22 @@ Corrections to the analysis document and the historical supply-chain analysis. T
 
 ---
 
-## 6. OPEN — the supply chain during prefill
+## 6. The supply chain during prefill — the record
 
-**This section is deliberately unresolved.** It records the problem, the candidate approaches, and the measurements that would decide between them. It is not a checklist.
+**The strategy is decided in [Step 6](#step-6--layer-major-prefill-through-the-host) (D-a–D-d, 2026-09-21).** This section is retained as the evidence that led there, not as the specification. Subsection status:
+
+| § | Subject | Status |
+| :--- | :--- | :--- |
+| 6.1 | the question | answered — the split is by phase (§3) |
+| 6.2 | the re-read / iteration order | **decided** — layer-major within a window (D-a) |
+| 6.3 | the residual cost | current, generalized — the carry is bounded by `W`, not `N` (Step 6 §6b) |
+| 6.4 | scratch vs residual | current |
+| 6.5 | the fallback guard | **superseded** — a bounded window has no cliff (Step 6 §6b) |
+| 6.6 | prefix reuse | open, **not deferrable** |
+| 6.7 | Warm admission | **decided A** (D-b); B rejected, C–E future |
+| 6.8 | does routing concentrate | open — Phase 2 of the routing study |
+| 6.9 | what must not be assumed | standing |
+| 6.10 | the throughput theses | open — still the leading explanation |
 
 ### 6.1 The question
 
@@ -317,7 +369,7 @@ Layer-major keeps the **residual stream for every token** alive across all 43 la
 | 4096 | 268 MB | 19 slots |
 | 32768 | **2.0 GiB** | **152 slots** |
 
-Slot-equivalents are `residual ÷ 14,155,776`. Against a 779-slot Hot pool, spending a quarter of it (~195 slots) buys layer-major up to **~42,000 tokens**. Beyond that the residual starts dismantling the expert pool, and chunk-major is the fallback.
+Slot-equivalents are `residual ÷ 14,155,776`. Against a 779-slot Hot pool, spending a quarter of it (~195 slots) buys a single layer-major pass up to **~42,000 tokens**. **Generalized (Step 6 §6b):** the span is a chosen window `W`, not the prompt — the carry is capped at `W × 64 KB`, and a prompt longer than one window pays `⌈N/W⌉` windows rather than falling back to chunk-major.
 
 **Two buffers, or one.** The existing body pings-pongs `res_in → res_out`, which for a persistent residual means `2N` (4.0 GiB at 32768, 304 slots). Writing back **in place** would halve it to `N` — and in-place is safe by reasoning, because the residual has **no cross-token dependence**: each token's residual update reads only its own row. That is a property to verify, not assume, and it needs the body to accept a write-back target.
 
@@ -337,15 +389,9 @@ So the residual is **not** scratch, and cannot be: scratch is recycled per layer
 
 ### 6.5 The fallback is pre-flight, not on-the-fly
 
-The decision needs no runtime detection, and that is better than detecting on the fly — a mid-prefill failure has no clean recovery. At prefill entry the engine already knows all three inputs: the token count `N`, the residual requirement `N × 64 KB`, and the budget. The choice is one computed branch:
+**Superseded by Step 6 §6b (2026-09-21).** This subsection assumed layer-major over the *whole* prompt, which forced an exact binary guard between layer-major and chunk-major at prefill entry. Bounding the layer-major span to a **window** `W` removes the cliff: the residual is a function of `W`, which is *chosen*, not of `N`, which is *given*, so no allocation can fail after work has begun. The open decision is therefore the window size (Step 7's sweep), not a guard.
 
-```text
-residual_bytes = N × 64 KB  (in place)  or  2N × 64 KB  (ping-pong)
-layer-major  if residual_bytes ≤ affordable headroom
-chunk-major  otherwise
-```
-
-The guard must be **exact**, because the two failure directions are both bad: too aggressive and the allocation fails after work has begun; too conservative and every long prompt silently pays the re-read.
+*Retained from the original:* the choice still belongs at prefill entry — a mid-prefill failure has no clean recovery — and in-place versus ping-pong still halves or doubles the carry (now `W × 64 KB` vs `2W × 64 KB`).
 
 ### 6.6 Prefix reuse is a dependency, and the two are complementary
 
@@ -361,13 +407,13 @@ These govern **what Warm holds**, a separate axis from §6.2's **iteration order
 
 | Approach | Mechanism | Status |
 | :--- | :--- | :--- |
-| **A. Sweep releases, bypasses Warm** | the sweep never promotes from or writes to Warm, so Warm survives prefill intact | needs a measurement: bypassing costs NVMe reads the Warm tier could have served |
-| **B. Sweep consumes Warm** | the sweep promotes Warm-resident experts like any other request | faster prefill (host RAM ≈25 GB/s vs NVMe ≈6.3 GB/s); drains Warm |
+| **A. Sweep releases, bypasses Warm** | the sweep never promotes from or writes to Warm, so Warm survives prefill intact | **Decided (Step 6 D-b).** Bypassing forfeits no NVMe read Warm could have served: promotion is a *move*, so reading Warm during the sweep would destroy the decode set. Freezing Warm is the only policy that preserves it. |
+| **B. Sweep consumes Warm** | the sweep promotes Warm-resident experts like any other request | **Rejected.** Faster prefill (host RAM ≈25 GB/s vs NVMe ≈6.3 GB/s), but it does not merely *drain* Warm as a cost of speed — it *deletes* the entries decode depends on. One ~18 s prefill saving does not repay `~275 ms × generated tokens` of lost decode warmth. |
 | **C. Admit by decode priority** | as slots free, refill Warm with the experts decode is most likely to route to, rather than round-robin | needs the routing profile; the profile is a separate open study |
 | **D. Cold → Warm fill** | read early into Warm, use much later | **not a transfer saving** — Cold → Warm → Hot moves the same bytes as Cold → Hot. It buys only *persistence*. Buildable; the condition is §6.3's — it matters only when the Hot pool cannot hold a ring. |
 | **E. Tail refill** | during the last chunk, stop sweeping and refill Warm | **cannot restore Warm** — ≈3000 slots is 40 GB ≈ 6.4 s of NVMe, far longer than the tail. Only a fraction of what frees up is recoverable. |
 
-**A and B are the real trade, and it is roughly balanced:** preserving ~3022 warm slots might save prefill ~18 s; a warm decode start saves ~275 ms per token until Warm is re-established. Which wins is a measurement.
+**A and B were the real trade, and it was roughly balanced** — preserving ~3022 warm slots might save prefill ~18 s, while a warm decode start saves ~275 ms per token until Warm is re-established. **Resolved for A** (Step 6 D-b): the asymmetry is that B's cost is charged *per decode token* while its saving is charged *once per prefill*.
 
 **C is the interesting one**, and it is the surviving half of the historical document's rolling idea — with prediction applied to *what to admit to Warm*, not to *what to prefetch*, because only the former has time to act.
 
@@ -433,11 +479,11 @@ So the two statements are both true and must be stated together: **the recency p
 
 | Deferred | Revisits when |
 | :--- | :--- |
-| **Prefill iteration order (layer-major vs chunk-major)** | §6.3's cost and ceiling are measured against a real prompt, and the in-place residual write-back is verified |
+| **Layer-major window `W` and body chunk `C`** | the Step 7 sweep completes (the order itself is decided: Step 6 D-a) |
+| **In-place residual write-back** (§6.3, Step 6 D-e) | Step 6 verifies no cross-token dependence; until then the carry is ping-pong (`2W × 64 KB`) |
 | **Cold → Warm fill path** (§6.7 D) | the Hot pool cannot hold a ring — i.e. contexts beyond §6.3's ceiling |
 | Expert-placement policy (routing-aware hotlists) | Steps 3–5 are green **and** §6.8 is answered |
 | Warm admission by decode priority (approach C) | §6.8 shows routing concentrates |
-| Chunk size as a tuned constant | the Step 7 sweep is complete |
 | Prefix reuse (session state and swap) | **not deferrable** — a product requirement, and the input that makes §6.3 viable at full context |
 | Prefix matcher, MTP, multi-GPU | unchanged from the composition plan |
 

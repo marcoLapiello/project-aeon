@@ -199,6 +199,17 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_layer_body_chunk_oracle.cpp TIMEOUT 600)
 endif()
 
+# --- Step 6: the layer-major prefill window -----------------------------------
+# The plan's Step 6 D-a decides prefill is layer-major within a bounded window.
+# This gate certifies the equality half of that decision: a layer-major pass over
+# N tokens through the real host (43 layers, the real expert supply) is
+# byte-identical to the certified serial path, and the body chunk size is not
+# observable. Speed is a separate outcome and is not asserted here.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_prefill_window
+        SOURCES tests/test_v4_prefill_window.cpp TIMEOUT 1800)
+endif()
+
 # --- Tier-3 sequence: the long-context lifecycle ------------------------------
 # Item 20. Every earlier layer-body gate shrinks the local window (to 6, 10, 4)
 # and the index top-k so a wrap fits in a short run, and each names the shrinkage

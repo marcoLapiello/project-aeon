@@ -67,6 +67,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `staging-depth` | Staging arena contention; depth lever viability | M34 |
 | `routing-reuse` | Decode reuse-distance (ideal-LRU) vs measured Hot hit rate | M35 |
 | `routing-opt` | Belady-OPT vs ideal-LRU: policy headroom | M36 |
+| `prefill-window` | Layer-major window vs serial `forward_token`, byte-exact | M37 |
 
 ## 4. Milestone cards
 
@@ -244,3 +245,15 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: `test_routing_reuse` now also covers OPT — hand-computed `6/14` vs LRU `0/14` on an LRU-pessimal cycling trace, plus the structural `OPT ≥ ideal-LRU` invariant. (A sentinel bug — final occurrences keyed as `-1`, which sorts as *soonest* — was caught by this test and fixed.)
 - **Conclusion / next gate**: **Recency is at its ceiling, but a non-recency policy is not.** OPT beats ideal-LRU by `+16.9` points at the Hot capacity (and `+28.5` at `258`). This is an **oracle upper bound**, so it is the maximum a policy can win at `779`, not the expected win. It validates thesis 2's *direction* while refuting its *mechanism*: the lever is a better policy (frequency/placement), and how much is capturable needs the Phase 2 static ranking
 - **Evidence**: `--profile-routing` (`opt_hit` column), `tests/test_routing_reuse.cpp`, `/tmp/aeon-opt.log`
+
+### M37: Layer-major prefill window — `window ≡ serial`, bit-exact
+- **Run**: `2026-09-21`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers; `test_v4_prefill_window`
+- **Class / comparison key**: `Analysis / prefill-window`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: a `16`-token window at context `256`, through the real host (43 layers, the real expert supply); the layer-major path `V4Graph::forward_window(ids, 0, 16, C)` at body chunk `C = 16` (one invocation per layer) and `C = 5` (several), against the serial reference `forward_token` once per token in position order
+- **Metrics**: final logits `0` of `258560` bytes differing; final residual `0` of `65536` bytes differing; the two chunk schedules byte-identical to each other; `8` checks, `0` failures. Leases `0` outstanding, staging `0` slots in use at the end
+- **Correctness / service**: greedy logits and residual are bit-identical to the certified serial path; the chunk size is not observable in the result
+- **Conclusion / next gate**: **Step 6 outcome 1 met.** The iteration order is an ordering: layer-major within a bounded window changes no number, so the strategy decided in Step 6 D-a is certified at the equality half before any speed is claimed. Throughput (outcome 5) is the separate gate
+- 🔶 **Correction — the "divergence" this gate first reported was a harness artifact.** An earlier version read device buffers with `hipMemcpy` immediately after a forward pass and reported ~`76%` of the logits differing. The forward paths enqueue on the **compute stream**, which is non-default and non-blocking, and a plain `hipMemcpy` does not order against it — so the read returned the *previous* run's buffer. The body's own `hipStreamSynchronize` sits *before* its final stages (the topk readback) and therefore does not cover them. Synchronizing the device before each read makes all `8` checks pass, with the chunk body **unmodified**: the two speculative fixes made while chasing the artifact (a `(layer % 2) × 6` → free-list staging redesign, and a safe-release `hipEventSynchronize`) were reverted, because the original staging path was never the cause. **A gate that compares device buffers must synchronize the stream first**; this is load-bearing, and the failure mode is a fabricated divergence that points at the wrong component
+- **Evidence**: `tests/test_v4_prefill_window.cpp`, `src/architecture/deepseek_v4/core/v4_graph.hpp` (`forward_window`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (batch scratch + residual carry)
