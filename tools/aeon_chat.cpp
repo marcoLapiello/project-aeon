@@ -232,6 +232,58 @@ void print_ids(const char* label, const std::vector<uint32_t>& ids) {
     std::cout << "]\n";
 }
 
+// The [Invariants] line is unconditional, not gated behind `--diagnostic`: the
+// gate scripts grep it, and a run that leaked a lease or broke a registry
+// invariant is not a valid measurement. Its format is therefore stable.
+void print_invariants(const aeon::core::V4Engine& engine) {
+    std::cout << "[Invariants] registry.invariants_hold="
+              << (engine.host().registry().invariants_hold() ? "true" : "false")
+              << " outstanding_leases=" << engine.host().outstanding_expert_leases()
+              << " forced_drains=" << engine.host().forced_drains()
+              << " staging_in_use=" << engine.host().staging_in_use_slots()
+              << " demotion_queue=" << engine.host().demotion_queue_capacity()
+              << "\n";
+}
+
+// Per-layer outcome distribution: the fraction of layer dispatches answered
+// entirely from Hot, from Hot+Warm with no Cold, and with at least one Cold. A
+// layer waits on its slowest of six fetches, so this distribution — not the cold
+// request rate — is what a flat throughput under a shrinking miss rate reflects.
+void print_layer_outcomes(const aeon::core::V4Engine& engine) {
+    for (const bool prefill : {false, true}) {
+        const uint64_t total = engine.host().layer_dispatches(prefill);
+        if (total == 0) continue;
+        const auto pct = [total](uint64_t part) {
+            return 100.0 * static_cast<double>(part) / static_cast<double>(total);
+        };
+        std::cout << "[Layer outcomes] phase=" << (prefill ? "prefill" : "decode")
+                  << " dispatches=" << total
+                  << std::fixed << std::setprecision(1)
+                  << " all_hot=" << pct(engine.host().layer_outcome_count(prefill, 0)) << "%"
+                  << " warm_no_cold=" << pct(engine.host().layer_outcome_count(prefill, 1)) << "%"
+                  << " has_cold=" << pct(engine.host().layer_outcome_count(prefill, 2)) << "%\n";
+    }
+}
+
+// Decode routing reuse-distance curve (routing study Phase 1): the ideal-LRU hit
+// rate at each capacity next to the measured Hot hit rate and the Belady-OPT
+// bound. A gap between measured and ideal-LRU means the recency policy is leaving
+// locality uncaptured; the ideal-LRU-to-OPT gap is the headroom only a non-recency
+// policy could reach.
+void print_routing_reuse(const aeon::core::V4Engine& engine) {
+    if (!engine.host().routing_reuse_enabled()) return;
+    const auto curve = engine.host().routing_reuse_curve();
+    std::cout << "[Routing reuse] decode requests=" << curve.observed
+              << " compulsory=" << curve.compulsory
+              << " measured_hot_hit=" << std::fixed << std::setprecision(1)
+              << curve.measured_hit_rate * 100.0 << "%\n";
+    for (size_t i = 0; i < curve.capacities.size(); ++i) {
+        std::cout << "    capacity=" << curve.capacities[i]
+                  << " ideal_lru_hit=" << curve.ideal_lru_hit_rate[i] * 100.0 << "%"
+                  << " opt_hit=" << curve.opt_hit_rate[i] * 100.0 << "%\n";
+    }
+}
+
 std::vector<aeon::text::Dsv4PromptMessage> build_messages(const Options& options) {
     std::vector<aeon::text::Dsv4PromptMessage> messages;
     if (!options.system_prompt.empty()) {
@@ -326,63 +378,11 @@ int main(int argc, char** argv) {
         const std::string visible =
             aeon::core::V4Engine::strip_thinking(reply.text, engine.tokenizer());
 
-        // Decode routing reuse-distance curve (Phase 1 of the routing study): the
-        // ideal-LRU hit rate at each capacity next to the measured Hot hit rate. A
-        // wide gap means the recency policy leaves locality uncaptured; parity means
-        // only a different strategy could help.
-        if (engine.host().routing_reuse_enabled()) {
-            const auto curve = engine.host().routing_reuse_curve();
-            std::cout << "[Routing reuse] decode requests=" << curve.observed
-                      << " compulsory=" << curve.compulsory
-                      << " measured_hot_hit=" << std::fixed << std::setprecision(1)
-                      << curve.measured_hit_rate * 100.0 << "%\n";
-            for (size_t i = 0; i < curve.capacities.size(); ++i) {
-                std::cout << "    capacity=" << curve.capacities[i]
-                          << " ideal_lru_hit=" << curve.ideal_lru_hit_rate[i] * 100.0 << "%"
-                          << " opt_hit=" << curve.opt_hit_rate[i] * 100.0 << "%\n";
-            }
-        }
-
-        // The tier-invariance gate reads these two lines: a run that leaked a lease
-        // or broke a registry invariant is not a valid half of the comparison, so it
-        // is reported unconditionally rather than only under `--diagnostic`. The
-        // format is stable because a shell script greps it.
-        {
-            const bool invariants = engine.host().registry().invariants_hold();
-            const size_t leases = engine.host().outstanding_expert_leases();
-            std::cout << "[Invariants] registry.invariants_hold="
-                      << (invariants ? "true" : "false")
-                      << " outstanding_leases=" << leases
-                      << " forced_drains=" << engine.host().forced_drains()
-                      << " staging_in_use=" << engine.host().staging_in_use_slots()
-                      << " demotion_queue=" << engine.host().demotion_queue_capacity()
-                      << "\n";
-        }
-
-        // Per-layer outcome distribution: the fraction of layer dispatches answered
-        // entirely from Hot, from Hot+Warm with no Cold, and with >=1 Cold. A layer
-        // waits on its slowest of six fetches, so this distribution — not the cold
-        // request rate — is what a flat throughput under a shrinking miss rate
-        // reflects. Decode is the phase that matters; prefill is printed alongside.
-        for (const bool prefill : {false, true}) {
-            const uint64_t total = engine.host().layer_dispatches(prefill);
-            if (total == 0) continue;
-            const uint64_t all_hot = engine.host().layer_outcome_count(prefill, 0);
-            const uint64_t warm_only = engine.host().layer_outcome_count(prefill, 1);
-            const uint64_t has_cold = engine.host().layer_outcome_count(prefill, 2);
-            const auto pct = [total](uint64_t part) {
-                return total == 0 ? 0.0 : 100.0 * static_cast<double>(part) /
-                                               static_cast<double>(total);
-            };
-            std::cout << "[Layer outcomes] phase=" << (prefill ? "prefill" : "decode")
-                      << " dispatches=" << total
-                      << std::fixed << std::setprecision(1)
-                      << " all_hot=" << pct(all_hot) << "%"
-                      << " warm_no_cold=" << pct(warm_only) << "%"
-                      << " has_cold=" << pct(has_cold) << "%\n";
-        }
+        print_invariants(engine);
 
         if (options.diagnostic) {
+            print_routing_reuse(engine);
+            print_layer_outcomes(engine);
             std::cout << "Rendered prompt: "
                       << engine.encoder().encode(messages, prompt_options) << "\n";
             print_ids("Prompt IDs:", engine.encoder().encode_tokens(messages, prompt_options));

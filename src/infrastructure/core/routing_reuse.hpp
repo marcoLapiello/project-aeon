@@ -73,7 +73,6 @@ public:
         // Exact distance histogram; distances above `total_experts_` collapse into
         // one overflow bucket (they are misses at every capacity we report anyway).
         distance_hist_.assign(static_cast<size_t>(total_experts_) + 1, 0);
-        overflow_ = 0;
         // 1-based Fenwick over request positions; index 0 is unused. Start at a
         // capacity that covers a short run and grow (by rebuild) when exceeded.
         fenwick_capacity_ = std::max<size_t>(total_experts_, 1024);
@@ -89,13 +88,8 @@ public:
     }
 
     bool enabled() const noexcept { return enabled_; }
-    void set_enabled(bool value) noexcept { enabled_ = value; }
 
     uint64_t observed() const noexcept { return observed_; }
-
-    // Raw distance histogram for tests and diagnostics: `histogram[d]` counts
-    // learned-layer requests whose stack distance was exactly `d`.
-    const std::vector<uint64_t>& histogram() const noexcept { return distance_hist_; }
 
     // Feed one layer's requests, in slot order. `layer_id` selects whether the
     // outcome is aggregated; the clock always advances so the cache model stays
@@ -216,14 +210,13 @@ private:
         return static_cast<double>(hits) / static_cast<double>(observed_);
     }
 
+    // A learned-layer expert can recur only after at most `total_experts_ - 1`
+    // distinct selections, and the histogram is `total_experts_ + 1` wide, so the
+    // index is always in range; the clamp is a guard, not a live branch.
     void record_distance(int64_t distance) {
-        if (distance < 0) distance = 0;
-        const size_t index = static_cast<size_t>(distance);
-        if (index < distance_hist_.size()) {
-            ++distance_hist_[index];
-        } else {
-            ++overflow_;
-        }
+        const size_t index = static_cast<size_t>(distance < 0 ? 0 : distance);
+        const size_t clamped = std::min(index, distance_hist_.size() - 1);
+        ++distance_hist_[clamped];
     }
 
     // Fenwick tree over request positions, marking where each expert was last
@@ -274,7 +267,6 @@ private:
     uint64_t observed_{0};
     uint64_t measured_hot_{0};
     uint64_t compulsory_{0};
-    uint64_t overflow_{0};
     std::vector<uint64_t> distance_hist_{};
     std::vector<uint32_t> stream_ids_{};
     std::vector<uint8_t> stream_counted_{};

@@ -1,6 +1,6 @@
 # Routing Profile and Frequency-Informed Placement Study
 
-*Status: study defined; the aggregation library exists and the driver draft needs adjustment to the rebuilt runtime before use.*
+*Status: **Phase 1 complete** (reuse-distance + Belady-OPT, see [Expert Streaming Execution Plan §6.10](./../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) and ledger M35/M36). **Phase 2 scoped below.** The aggregation library exists and the driver draft needs adjustment to the rebuilt runtime before use.*
 
 ## 1. Purpose
 
@@ -184,3 +184,24 @@ This phase is complete when:
 9. The profile results are sufficient to choose the next step: frequency-informed placement, a different locality study, or abandoning static frequency placement.
 
 Placement changes, speculative prefetch, entropy analysis, and other secondary metrics are explicitly outside this first implementation phase.
+
+## 10. Phase 2 — is the headroom real, and is it capturable?
+
+*Added 2026-09-21, after Phase 1. Phase 1 answered the recency question and left exactly this one open.*
+
+**What Phase 1 established.** Ideal-LRU equals the measured Hot hit rate (`60.5%` vs `60.6%` at `779` slots), so the current recency policy is at its ceiling — **LRU is not thrashing**. But Belady-OPT (an oracle that sees the future) reaches `77.4%` at the same capacity, so a **non-recency policy has up to `+16.9` points of headroom**. That is an *upper bound*: it says the prize exists, not that a real policy captures it.
+
+**What Phase 2 must decide.** Whether a **practical, online** frequency-aware policy captures a useful fraction of that gap on *unseen* workloads. Two gates, in order:
+
+| Gate | Question | Instrument | Decision if it fails |
+| :--- | :--- | :--- | :--- |
+| **P2-a: skew** | Within each layer, does a small top-k of experts carry most of that layer's selections? | `RoutingCounter` per-layer counts; coverage at top-4/8/16/32 (already computed by `RoutingProfile`) | If routing is flat per layer, no frequency policy helps — abandon frequency placement, keep coverage/capacity as the only lever |
+| **P2-b: generalization** | Does a ranking built on corpus A predict corpus B? | profile set vs held-out set; rank correlation + held-out coverage | If it does not generalize, a *pre-ranked static* placement is dead. Only an **online adaptive** policy (no pre-ranked list) remains, which is a larger build |
+
+P2-a is cheap (the existing counters plus a small driver). P2-b is the gate that decides *which* design is even buildable, so it is not optional.
+
+**The design intent this study is meant to inform — dynamic, not pinned.** The target is **not** a static placement that pins a fixed top-k per layer forever. That would be wrong twice: the popular experts differ by workload, and a pin has no adaptation. The target is a **dynamic eviction policy**: experts keep flowing between Hot, Warm and Cold; only the rule that chooses the victim changes — from *least recently used* to *least frequently used*. And not raw frequency: **frequency with decay**, so an expert that was hot early does not clog the pool forever. The registry already records exactly this signal — `ExpertCatalogEntry::moving_frequency` is an EMA (`f ← 0.9·f + 0.1` on each activation), currently recorded and never read (plan §5). A Phase-3 policy would read it.
+
+**Also worth measuring here (secondary, cheap).** Per-layer coverage gives the aggregate view; a direct measure of the **temporal** structure — reuse-distance and OPT curves computed *per layer* rather than globally — would say which layers are cacheable at all. It is the same instrument as Phase 1, applied per layer.
+
+**Out of scope for Phase 2.** Changing the default placement policy, speculative prefetch, entropy/transition analysis, and any router-logit collection. Phase 2 produces **data**, and its output is a decision about whether a Phase-3 policy is worth building.
