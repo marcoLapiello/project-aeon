@@ -56,6 +56,8 @@ Releasing at the layer boundary restores the no-reader-in-flight precondition, w
 - **Target:** the concurrency depth that saturates `io_uring` (tens of slots); found by the Step 7 sweep.
 - Staging holds transfers **in transit**; a completed expert frees its slot as it lands in VRAM.
 
+**Measured, `2026-09-21` (ledger M34): there is no depth to sweep today.** In the single-dispatch path the arena is not a free-list pool — `staging_offset = (layer % 2) * 6` addresses two *fixed* banks by layer parity, so nothing ever waits for a slot. The per-transfer metric named `staging_reuse_wait_ns` is idle time since the slot last freed (mean `26–29 ms` ≈ one layer period), so slots sit idle rather than starve. `depth` only becomes a real parameter once **more than one layer's dispatch overlaps** — which is exactly what Steps 6–7 introduce, and the reason this sizing question is deferred to them rather than resolved now.
+
 ### D5 — Two independent budgets
 
 The **expert sweep's residency** (one layer's ~255 experts in **VRAM**) and the **staging arena** (**pinned host**) are separate. Never summed. Conflating them produced D4's 40 GiB error.

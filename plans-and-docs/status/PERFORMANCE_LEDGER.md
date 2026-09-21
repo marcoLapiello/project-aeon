@@ -64,6 +64,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `tier-invariance` | Two runs, different tiers, byte-identical logits | M31 |
 | `starved-pool` | Hot-pool cap forcing the emergency drain; logits still exact | M32 |
 | `demotion-ab` | Demotion-queue capacity 2 vs 6; drops, Warm, NVMe, D2H | M33 |
+| `staging-depth` | Staging arena contention; depth lever viability | M34 |
 
 ## 4. Milestone cards
 
@@ -208,3 +209,14 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: logits **byte-identical** across arms (`cmp`); both arms exit `0`
 - **Conclusion / next gate**: Step 5 gate met — the larger queue converts every dropped demotion into Warm service (`drops 979 → 0`; Warm hits `+45%`), cutting decode NVMe `40%`. **Throughput effect not established** (`n=1`, predicted ≈`5%` ≈ noise); the queue is a resource/cleanliness win. Capacity `6` sufficed for **both** phases (`queue_depth_max = 6`), so `12` adds nothing here. **The per-layer outcome distribution measured on a `512`-token run (queue `6`): decode `all_hot 8.4%`, `warm_no_cold 46.3%`, `has_cold 45.3%` (`21973` dispatches `= 511 × 43`)** — nearly half of decode layers touch Cold and only `8.4%` are all-Hot, confirming the max-of-six explanation for the flat throughput (§6.10 thesis 1)
 - **Evidence**: `scripts/expert_demotion_queue_ab.sh`, `/tmp/aeon-demotion-ab.MAvbnY/{q2,q6}.{log,telemetry.jsonl,logits.bin}`, `/tmp/aeon-q6-essay.log`, `/tmp/aeon-layers.log`
+
+### M34: Staging depth — not a bottleneck in the single-token path
+- **Run**: `2026-09-21`; branch `main`; analysis of the M33 A/B telemetry (no new silicon run)
+- **Class / comparison key**: `Analysis / staging-depth`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: the M33 `q2`/`q6` 24-token runs at context `32768`, `--warm-gib 40`; decode phase
+- **Metrics**: staging-using decode transfers ≈`2642`; `staging_reuse_wait_ns` sum `69.37 s` (q2) / `75.66 s` (q6) ⇒ mean slot idle **`26.3 / 28.6 ms`**. Slot addressing is fixed: `staging_offset = (layer % 2) * 6` (`v4_expert_supply.hpp`), two banks by layer parity, no free-list
+- **Correctness / service**: no run has ever thrown a staging state-transition error; `staging_in_use == 0` at every measured end (M32)
+- **Conclusion / next gate**: **Premise refuted.** Staging is not contended — its slots idle ≈ one layer period and never block; `staging_reuse_wait_ns` is a misnamed *idle* counter, not a wait. Raising `TOTAL_STAGING_SLOTS` cannot help the single-dispatch path. Depth becomes a lever only when dispatches overlap (chunked prefill/prefetch-ahead), i.e. Step 6, where Step 0 D4's `banks × depth` sizing applies
+- **Evidence**: `/tmp/aeon-demotion-ab.MAvbnY/{q2,q6}.telemetry.jsonl`, `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` (`staging_offset`), `src/infrastructure/core/prefetch_staging.hpp` (`take_reuse_delay_ns`)
