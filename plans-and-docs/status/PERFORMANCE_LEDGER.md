@@ -62,6 +62,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `supply-telemetry` | Per-phase, per-tier supply request/byte counters | M29 |
 | `budget-cap` | Hot VRAM expert-pool cap feasibility and behavior | M30 |
 | `tier-invariance` | Two runs, different tiers, byte-identical logits | M31 |
+| `starved-pool` | Hot-pool cap forcing the emergency drain; logits still exact | M32 |
 
 ## 4. Milestone cards
 
@@ -168,3 +169,14 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: `registry.invariants_hold()` true in both; `outstanding_leases == 0` in both; output `The capital of France is **Paris**.` in both
 - **Conclusion / next gate**: Step 3 gate met — the tier that answered did not change a single byte of the logits, so the supply is numerically invisible; the identical request counts confirm the comparison is of *answering tier*, not *workload*
 - **Evidence**: `scripts/expert_tier_invariance.sh`, `/tmp/aeon-tier-invariance.dh1W11/{A,B}.{logits.bin,telemetry.jsonl}`
+
+### M32: Starved-pool gate — the emergency drain runs and stays exact
+- **Run**: `2026-09-21`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers
+- **Class / comparison key**: `Analysis / starved-pool`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: acceptance prompt `What is the capital of France?`, context `32768`, `--greedy`, `8` generated tokens, `n=1`; reference `--warm-gib 0` (derived `779` slots), starved `--warm-gib 0 --max-hot-slots 12`; both `--dump-logits`
+- **Metrics**: reference `forced_drains=0`; starved `forced_drains=378`, `staging_in_use=0` in both. Starved prefill `2838` Cold requests / `40.17 GB` NVMe; decode `1806` / `25.57 GB` NVMe — versus the uncapped Run A's `10.76 GB` decode, i.e. `2.4×` the NVMe traffic
+- **Correctness / service**: logits **byte-identical** to the uncapped reference (`cmp`); `registry.invariants_hold()` true; `outstanding_leases == 0`; staging arena fully drained
+- **Conclusion / next gate**: Step 4 gate met — the emergency valve, eviction under lease pressure, and the async-demotion path all executed (`378` drains) with no number changed and no leak; the cost of starvation is `2.4×` decode NVMe traffic, which is the sweep's target
+- **Evidence**: `scripts/expert_starved_pool.sh`, `/tmp/aeon-starved-pool.9uqTbu/{ref,starved}.log`

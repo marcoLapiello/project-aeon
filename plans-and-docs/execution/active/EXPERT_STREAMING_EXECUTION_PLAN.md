@@ -162,11 +162,15 @@ Same context means **the same Hot pool**, so the only thing that differs is *whi
 
 **Gap to close (annotated 2026-09-21).** `forced_drains()` is an executor accessor with **no telemetry field and no CLI path**, so this assertion has no way to read the value from a run today. Step 4 must add either a `forced_drains` field to `SupplyTelemetry`/`phase_summary` or a test-level accessor on `V4ModelHost`, before the gate can be evaluated. Also note the cap floor: at `max_hot_vram_slots = 12` the pool holds exactly two layers' worth and the drain path is reachable (M30), but the earlier plan text said "two layers' worth" while the derived arm point is ~264 slots — the cap is the only way to reach the regime.
 
+**Gap closed** (`2026-09-21`, Step 4 implementation). `V4ModelHost::forced_drains()` and `V4ModelHost::staging_in_use_slots()` were added, and the unconditional `[Invariants]` line now reports `forced_drains` and `staging_in_use` alongside the registry and lease figures — a test-level accessor path, which is the option that did not enlarge `SupplyTelemetry`.
+
 **Why this is the step that matters.** It is the only configuration that exercises the emergency valve, the eviction-under-lease-pressure path, and a newly identified hazard:
 
 > A demotion is asynchronous. If a later layer's router asks for an expert that is **mid-eviction**, the registry cannot serve it. If the D2H has completed it is re-fetched from Warm; if it is **still in flight the request path throws** (`"request-path CPU synchronization is forbidden"`). This is a latent failure mode with no measurement behind it. Step 1's telemetry, and this gate, are what quantify it.
 
-**Files.** new script; no source change beyond Step 2.
+**Files.** new script (`scripts/expert_starved_pool.sh`); host accessors `forced_drains()` / `staging_in_use_slots()` plus the extended `[Invariants]` line.
+
+**Status: done** (`2026-09-21`). `scripts/expert_starved_pool.sh` runs the uncapped reference and the `--max-hot-slots 12` starved run, asserting `forced_drains > 0`, `staging_in_use == 0`, byte-identical logits, `invariants_hold()`, and zero leases. Recorded in the ledger as **M32**. All pass: the uncapped run reports `forced_drains=0`, the capped run `forced_drains=378`, `staging_in_use=0`, and the logits are **byte-identical** — so the emergency valve, eviction under lease pressure, and the async-demotion path all ran, and none changed a number. Cost: starved decode reads `2.4×` the NVMe bytes.
 
 ---
 

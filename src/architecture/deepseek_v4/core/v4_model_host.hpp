@@ -302,6 +302,20 @@ public:
         return executor_ ? executor_->outstanding_leases() : 0;
     }
 
+    // Times the emergency drain in `ensure_pool_headroom` fired. Zero whenever the
+    // pool can hold a token's `6 x 43` leases, which is the intended steady state;
+    // a non-zero value is how a gate says it ran the starved regime (Step 4).
+    uint64_t forced_drains() const noexcept {
+        return executor_ ? executor_->forced_drains() : 0;
+    }
+
+    // Staging slots not AVAILABLE. A gate asserts this returns to 0 at the end of a
+    // run — the arena must not leak. Reads the concrete executor's arena, so it is
+    // safe only after `initialize_experts`; returns 0 when the arena does not exist.
+    uint32_t staging_in_use_slots() const noexcept {
+        return staging_ ? staging_->in_use_slots() : 0;
+    }
+
     // Diagnostics, for an assembly gate: the registry's residency claims and the
     // pool it made them against. Not used by the graph.
     const ExpertRegistry& registry() const noexcept { return registry_; }

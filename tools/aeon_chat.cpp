@@ -324,7 +324,10 @@ int main(int argc, char** argv) {
             const size_t leases = engine.host().outstanding_expert_leases();
             std::cout << "[Invariants] registry.invariants_hold="
                       << (invariants ? "true" : "false")
-                      << " outstanding_leases=" << leases << "\n";
+                      << " outstanding_leases=" << leases
+                      << " forced_drains=" << engine.host().forced_drains()
+                      << " staging_in_use=" << engine.host().staging_in_use_slots()
+                      << "\n";
         }
 
         if (options.diagnostic) {

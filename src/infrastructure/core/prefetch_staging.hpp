@@ -141,6 +141,19 @@ public:
         return slot_states[slot_idx];
     }
 
+    // Slots not currently AVAILABLE — i.e. a transfer is in flight through them.
+    // A gate asserts this returns to 0: every slot must be handed back when its
+    // transfer completes, or a long run leaks the arena and the next fetch stalls.
+    uint32_t in_use_slots() const {
+        uint32_t in_use = 0;
+        for (uint32_t i = 0; i < TOTAL_STAGING_SLOTS; ++i) {
+            if (slot_states[i] != SlotState::AVAILABLE) {
+                ++in_use;
+            }
+        }
+        return in_use;
+    }
+
     void begin_io(uint32_t slot_idx) {
         transition(slot_idx, SlotState::AVAILABLE, SlotState::IO_PENDING);
     }
