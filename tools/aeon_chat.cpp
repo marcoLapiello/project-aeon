@@ -65,6 +65,7 @@ struct Options {
     std::string supply_telemetry_path;
     std::string run_id{"unnamed"};
     uint32_t max_hot_slots{0};
+    std::string dump_logits_path;
 };
 
 void print_usage(const char* executable) {
@@ -87,6 +88,7 @@ void print_usage(const char* executable) {
         << "  --supply-telemetry <p>   Write supply telemetry JSONL to path <p> (default: off)\n"
         << "  --run-id <id>            Run identifier stamped on telemetry rows (default: unnamed)\n"
         << "  --max-hot-slots <n>      Cap the Hot VRAM expert pool at <n> slots (0 = derived)\n"
+        << "  --dump-logits <path>     Append each position's raw fp16 logits to <path>\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill\n"
         << "  --deterministic-experts  Accepted and inert; the rewrite always uses the fixed-order\n"
@@ -178,6 +180,8 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--max-hot-slots") {
             options.max_hot_slots = static_cast<uint32_t>(parse_unsigned(
                 require_value(argc, argv, index, "--max-hot-slots"), "--max-hot-slots"));
+        } else if (argument == "--dump-logits") {
+            options.dump_logits_path = require_value(argc, argv, index, "--dump-logits");
         } else if (argument == "--no-warm-preload") {
             options.preload_warm_host = false;
         } else if (argument == "--no-warm-refill") {
@@ -255,6 +259,7 @@ int main(int argc, char** argv) {
         engine_options.runtime.supply_telemetry_path = options.supply_telemetry_path;
         engine_options.runtime.run_id = options.run_id;
         engine_options.runtime.max_hot_vram_slots = options.max_hot_slots;
+        engine_options.dump_logits_path = options.dump_logits_path;
 
         aeon::core::V4Engine engine;
         engine.initialize(engine_options);
@@ -309,6 +314,18 @@ int main(int argc, char** argv) {
 
         const std::string visible =
             aeon::core::V4Engine::strip_thinking(reply.text, engine.tokenizer());
+
+        // The tier-invariance gate reads these two lines: a run that leaked a lease
+        // or broke a registry invariant is not a valid half of the comparison, so it
+        // is reported unconditionally rather than only under `--diagnostic`. The
+        // format is stable because a shell script greps it.
+        {
+            const bool invariants = engine.host().registry().invariants_hold();
+            const size_t leases = engine.host().outstanding_expert_leases();
+            std::cout << "[Invariants] registry.invariants_hold="
+                      << (invariants ? "true" : "false")
+                      << " outstanding_leases=" << leases << "\n";
+        }
 
         if (options.diagnostic) {
             std::cout << "Rendered prompt: "

@@ -295,6 +295,13 @@ public:
         if (executor_) executor_->release_leases();
     }
 
+    // Leases still held by the tiered executor. A gate asserts this is 0 at the
+    // end of a run: every lease must be handed back by the token boundary, or a
+    // slot stays frozen and the next dispatch's victim selection starves.
+    size_t outstanding_expert_leases() const noexcept {
+        return executor_ ? executor_->outstanding_leases() : 0;
+    }
+
     // Diagnostics, for an assembly gate: the registry's residency claims and the
     // pool it made them against. Not used by the graph.
     const ExpertRegistry& registry() const noexcept { return registry_; }

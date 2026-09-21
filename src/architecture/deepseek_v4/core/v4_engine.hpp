@@ -63,6 +63,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -167,6 +168,14 @@ struct V4EngineOptions {
     // per engine so turn 2 does not depend on what turn 1 happened to draw.
     uint64_t seed{0};
 
+    // When non-empty, every position's raw fp16 logits are appended to this file,
+    // in order, as `[vocab_size]` little-endian halves with no header. It exists so
+    // a tier-invariance gate can compare two runs byte-for-byte (`cmp`): the claim
+    // is that *which tier answered did not change the number*, and a byte compare
+    // is the only assertion that states it without a tolerance. It perturbs nothing
+    // when empty.
+    std::string dump_logits_path;
+
     bool verbose{false};
 };
 
@@ -202,6 +211,15 @@ public:
         host_.initialize(options_.model_dir, options_.runtime, options_.verbose);
         graph_ = std::make_unique<V4Graph>(host_);
 
+        if (!options_.dump_logits_path.empty()) {
+            logits_dump_.open(options_.dump_logits_path,
+                              std::ios::out | std::ios::binary | std::ios::trunc);
+            if (!logits_dump_) {
+                throw std::runtime_error(
+                    "V4Engine: failed to open logits dump: " + options_.dump_logits_path);
+            }
+        }
+
         tokenizer_.load(options_.tokenizer_path);
         encoder_ = std::make_unique<text::Dsv4PromptEncoder>(tokenizer_);
 
@@ -228,6 +246,7 @@ public:
     }
 
     void free() noexcept {
+        if (logits_dump_.is_open()) logits_dump_.close();
         sampler_.reset();
         encoder_.reset();
         graph_.reset();
@@ -255,6 +274,19 @@ public:
     // statement is that `chat` is exactly this composition.
     uint32_t advance(uint32_t token_id, uint32_t position) {
         const half* logits = graph_->forward_token(token_id, position, host_.streams().compute);
+        if (logits_dump_.is_open()) {
+            const uint32_t vocab = static_cast<uint32_t>(host_.config().vocab_size);
+            logits_host_.resize(vocab);
+            // The compute stream just wrote the logits, so the copy is ordered after
+            // them on that stream; the synchronize is the readback boundary the
+            // sampler relies on anyway, so the dump adds no ordering of its own.
+            (void)hipMemcpyAsync(logits_host_.data(), logits,
+                                 static_cast<size_t>(vocab) * sizeof(half),
+                                 hipMemcpyDeviceToHost, host_.streams().compute);
+            (void)hipStreamSynchronize(host_.streams().compute);
+            logits_dump_.write(reinterpret_cast<const char*>(logits_host_.data()),
+                               static_cast<std::streamsize>(vocab) * sizeof(half));
+        }
         return sampler_->select(logits, host_.streams().compute);
     }
 
@@ -406,6 +438,8 @@ private:
     // tokenizer for the same reason.
     V4ModelHost host_{};
     std::unique_ptr<V4Graph> graph_{};
+    std::ofstream logits_dump_{};
+    std::vector<half> logits_host_{};
     text::Dsv4Tokenizer tokenizer_{};
     std::unique_ptr<text::Dsv4PromptEncoder> encoder_{};
     std::unique_ptr<V4Sampler> sampler_{};

@@ -61,6 +61,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `e2e-43L-text` | Text in/text out at 43 layers; single-token decode, no batching | M28 |
 | `supply-telemetry` | Per-phase, per-tier supply request/byte counters | M29 |
 | `budget-cap` | Hot VRAM expert-pool cap feasibility and behavior | M30 |
+| `tier-invariance` | Two runs, different tiers, byte-identical logits | M31 |
 
 ## 4. Milestone cards
 
@@ -156,3 +157,14 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: one token completes at the cap; `is_feasible` true; output intact
 - **Conclusion / next gate**: Step 2 gate met — the cap is honored, feasibility holds, and the graph runs starved; the derived pool on this GPU never reaches this regime, so this knob is what makes Step 4's drain gate testable
 - **Evidence**: `tools/aeon_chat.cpp` `--max-hot-slots`, `tests/test_dynamic_expert_pool.cpp` (Test 2b), `/tmp/aeon-telemetry/run-c-cap12.jsonl`
+
+### M31: Tier-invariance gate — the answering tier does not change the number
+- **Run**: `2026-09-21`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers
+- **Class / comparison key**: `Analysis / tier-invariance`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: acceptance prompt `What is the capital of France?`, context `32768`, `--greedy`, `8` generated tokens, `n=1`; run A `--warm-gib 0` (Hot+Cold), run B `--warm-gib 40` (Hot+Warm); both `--dump-logits` and `--supply-telemetry`
+- **Metrics**: logits dumps **byte-identical** (`cmp`, `4,654,080 B` each); generated token ids identical; total request counts identical across runs — prefill `1521` (`A`: `1521` Cold; `B`: `1029` Cold + `492` Warm), decode `760` (`A`: `760` Cold; `B`: `437` Cold + `323` Warm). `logical_bytes_from_warm`: A `0`, B `11.54 GB`. Demotion drops in B: decode `156/437` (`36%`)
+- **Correctness / service**: `registry.invariants_hold()` true in both; `outstanding_leases == 0` in both; output `The capital of France is **Paris**.` in both
+- **Conclusion / next gate**: Step 3 gate met — the tier that answered did not change a single byte of the logits, so the supply is numerically invisible; the identical request counts confirm the comparison is of *answering tier*, not *workload*
+- **Evidence**: `scripts/expert_tier_invariance.sh`, `/tmp/aeon-tier-invariance.dh1W11/{A,B}.{logits.bin,telemetry.jsonl}`

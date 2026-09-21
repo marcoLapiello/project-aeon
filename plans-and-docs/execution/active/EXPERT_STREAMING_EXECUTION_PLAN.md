@@ -150,6 +150,8 @@ Same context means **the same Hot pool**, so the only thing that differs is *whi
 
 **Files.** new script; `tools/aeon_chat.cpp` (dump flag).
 
+**Status: done** (`2026-09-21`). `--dump-logits <path>` writes each position's raw fp16 logits; `scripts/expert_tier_invariance.sh` runs A (Warm `0`) and B (Warm `40`) at context `32768`, both greedy, and asserts (i)–(v). All pass; recorded in the ledger as **M31**. The strongest single result: the logits files are **byte-identical** (`cmp`, 4,654,080 B each), and the **total request counts are identical** across runs — prefill `1521` = `1029` Cold + `492` Warm in B, decode `760` = `437` + `323` — so the only thing that changed is *which tier answered*, not *what was asked*.
+
 ---
 
 ### Step 4 — The starved-pool gate
@@ -158,7 +160,9 @@ Same context means **the same Hot pool**, so the only thing that differs is *whi
 
 **Assert:** `forced_drains() > 0`; the staging arena returns to zero in-use slots; the logits still match Run A; `invariants_hold()` passes.
 
-**Why this is the step that matters.** This is item 21's remainder — streaming while the graph runs. It is the only configuration that exercises the emergency valve, the eviction-under-lease-pressure path, and a newly identified hazard:
+**Gap to close (annotated 2026-09-21).** `forced_drains()` is an executor accessor with **no telemetry field and no CLI path**, so this assertion has no way to read the value from a run today. Step 4 must add either a `forced_drains` field to `SupplyTelemetry`/`phase_summary` or a test-level accessor on `V4ModelHost`, before the gate can be evaluated. Also note the cap floor: at `max_hot_vram_slots = 12` the pool holds exactly two layers' worth and the drain path is reachable (M30), but the earlier plan text said "two layers' worth" while the derived arm point is ~264 slots — the cap is the only way to reach the regime.
+
+**Why this is the step that matters.** It is the only configuration that exercises the emergency valve, the eviction-under-lease-pressure path, and a newly identified hazard:
 
 > A demotion is asynchronous. If a later layer's router asks for an expert that is **mid-eviction**, the registry cannot serve it. If the D2H has completed it is re-fetched from Warm; if it is **still in flight the request path throws** (`"request-path CPU synchronization is forbidden"`). This is a latent failure mode with no measurement behind it. Step 1's telemetry, and this gate, are what quantify it.
 
