@@ -60,6 +60,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `kernel-stage1` | Isolated synthetic swizzled/fused expert kernels | M23-M24 |
 | `e2e-43L-text` | Text in/text out at 43 layers; single-token decode, no batching | M28 |
 | `supply-telemetry` | Per-phase, per-tier supply request/byte counters | M29 |
+| `budget-cap` | Hot VRAM expert-pool cap feasibility and behavior | M30 |
 
 ## 4. Milestone cards
 
@@ -144,3 +145,14 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: identical output in both runs (`The capital of France is **Paris**.`); `Hot` occupancy steady `809/809`; Warmup phase empty as expected (preloads bypass the supply)
 - **Conclusion / next gate**: Step 1 gate met — `phase_summary` rows carry `request_count > 0` and the tier bytes move with the tier configuration; `logical_bytes_from_warm` is `0` in A and `> 0` in B
 - **Evidence**: `tools/aeon_chat.cpp` `--supply-telemetry`, `/tmp/aeon-telemetry/run-{a-warm0,b-warm40}.jsonl` (Step 1 of [Expert Streaming Execution Plan](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md))
+
+### M30: Hot-slot pressure knob — the starved pool is reachable
+- **Run**: `2026-09-21`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers
+- **Class / comparison key**: `Analysis / budget-cap`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: acceptance prompt `What is the capital of France?`, context `256`, `--greedy`, `n=1`; `--max-hot-slots 12` vs the derived `809`; `--supply-telemetry` JSONL
+- **Metrics**: at `--max-hot-slots 12` the report shows `Tier 1: Hot VRAM : 12 slots (0.16 GB)` and `[Hot cap] requested 12 slots, applied 12 slots`; `Feasibility Status: [FEASIBLE / APPROVED]`. Prefill telemetry: `2838` cold requests / `40.17 GB` NVMe for an `11`-token prompt ≈ `3.65 GB/token`, versus `1.79 GB/token` at the derived `809` slots. Unit test: cap `12 → 12`, cap `3 → 6` (floored), cap above derived `→ 817` (unchanged).
+- **Correctness / service**: one token completes at the cap; `is_feasible` true; output intact
+- **Conclusion / next gate**: Step 2 gate met — the cap is honored, feasibility holds, and the graph runs starved; the derived pool on this GPU never reaches this regime, so this knob is what makes Step 4's drain gate testable
+- **Evidence**: `tools/aeon_chat.cpp` `--max-hot-slots`, `tests/test_dynamic_expert_pool.cpp` (Test 2b), `/tmp/aeon-telemetry/run-c-cap12.jsonl`

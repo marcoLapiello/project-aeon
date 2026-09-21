@@ -64,6 +64,7 @@ struct Options {
     uint64_t seed{0};
     std::string supply_telemetry_path;
     std::string run_id{"unnamed"};
+    uint32_t max_hot_slots{0};
 };
 
 void print_usage(const char* executable) {
@@ -85,6 +86,7 @@ void print_usage(const char* executable) {
         << "  --warm-gib <n>           Warm host allocation in GiB (default: 0)\n"
         << "  --supply-telemetry <p>   Write supply telemetry JSONL to path <p> (default: off)\n"
         << "  --run-id <id>            Run identifier stamped on telemetry rows (default: unnamed)\n"
+        << "  --max-hot-slots <n>      Cap the Hot VRAM expert pool at <n> slots (0 = derived)\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill\n"
         << "  --deterministic-experts  Accepted and inert; the rewrite always uses the fixed-order\n"
@@ -173,6 +175,9 @@ Options parse_options(int argc, char** argv) {
                 require_value(argc, argv, index, "--supply-telemetry");
         } else if (argument == "--run-id") {
             options.run_id = require_value(argc, argv, index, "--run-id");
+        } else if (argument == "--max-hot-slots") {
+            options.max_hot_slots = static_cast<uint32_t>(parse_unsigned(
+                require_value(argc, argv, index, "--max-hot-slots"), "--max-hot-slots"));
         } else if (argument == "--no-warm-preload") {
             options.preload_warm_host = false;
         } else if (argument == "--no-warm-refill") {
@@ -249,6 +254,7 @@ int main(int argc, char** argv) {
         engine_options.runtime.enable_warm_refill = options.enable_warm_refill;
         engine_options.runtime.supply_telemetry_path = options.supply_telemetry_path;
         engine_options.runtime.run_id = options.run_id;
+        engine_options.runtime.max_hot_vram_slots = options.max_hot_slots;
 
         aeon::core::V4Engine engine;
         engine.initialize(engine_options);
@@ -260,6 +266,14 @@ int main(int argc, char** argv) {
         // is printed verbatim rather than summarised.
         if (options.verbose) {
             std::cout << engine.host().budget().to_string();
+            // A cap is worth reporting explicitly, because the requested value and
+            // the applied one differ whenever the cap is below 6 (floored) or above
+            // the derived size (no effect) — the gate reads the applied figure.
+            if (options.max_hot_slots > 0) {
+                std::cout << "[Hot cap] requested " << options.max_hot_slots
+                          << " slots, applied " << engine.host().budget().hot_vram_slots
+                          << " slots\n";
+            }
         }
 
         aeon::text::Dsv4PromptOptions prompt_options;

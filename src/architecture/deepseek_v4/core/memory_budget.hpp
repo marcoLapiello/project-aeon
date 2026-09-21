@@ -85,6 +85,14 @@ struct AeonRuntimeConfig {
     std::string supply_telemetry_path;
     std::string run_id{"unnamed"};
 
+    // Diagnostic pressure knob. Zero (the default) leaves the Hot pool at the
+    // derived size. A non-zero value caps it at `min(derived, value)`, floored at
+    // 6 (one layer's routed experts) so the graph stays runnable. It exists so a
+    // gate can force the starved-pool path — the emergency drain in
+    // `ensure_pool_headroom` and eviction-under-lease-pressure — which the derived
+    // size never reaches on this GPU (779 slots against an ≈264-slot arm point).
+    uint32_t max_hot_vram_slots{0};
+
     // Hardware target device index
     int device_id{0};
 
@@ -371,6 +379,15 @@ public:
         report.vram_available_for_experts = remaining_for_experts;
         report.hot_vram_slots = static_cast<uint32_t>(
             remaining_for_experts / expert_format.payload_bytes);
+
+        // Diagnostic cap (see `AeonRuntimeConfig::max_hot_vram_slots`). The cap is
+        // itself floored at one layer's routed experts, because a smaller pool
+        // cannot hold a single dispatch's working set and the executor would refuse
+        // — a knob that makes the graph unrunnable is not a useful pressure knob.
+        if (runtime_cfg.max_hot_vram_slots > 0) {
+            const uint32_t cap = std::max<uint32_t>(runtime_cfg.max_hot_vram_slots, 6);
+            report.hot_vram_slots = std::min(report.hot_vram_slots, cap);
+        }
         report.hot_vram_bytes = static_cast<size_t>(report.hot_vram_slots) *
                                 expert_format.payload_bytes;
 

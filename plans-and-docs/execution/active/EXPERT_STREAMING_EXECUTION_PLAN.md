@@ -121,9 +121,11 @@ Each step states its **requirement**, its **gate**, and its **files**. A step is
 
 **Why it is needed.** `hot_vram_slots` is derived, never user-set. At context 32768 it is 779, and the emergency valve (`ensure_pool_headroom`) only arms below ~264 slots — so **the drain path is never exercised on the live graph**, and neither is eviction-under-lease-pressure. Step 4's gate asks for exactly that. Without this knob, half the mechanism is uncertified.
 
-**Gate.** `--verbose` reports the capped count, `is_feasible` stays true, and one token completes at a cap of 12.
+**Gate.** `--verbose` reports the capped count, `is_feasible` stays true, and one token completes at a cap of 12. `--max-hot-slots <n>` is the flag.
 
 **Files.** `core/memory_budget.hpp`, `tools/aeon_chat.cpp`.
+
+**Status: done** (`2026-09-21`). `--max-hot-slots <n>` caps the derived pool at `min(derived, n)`, floored at 6; the floored/bounded behavior is pinned in `tests/test_dynamic_expert_pool.cpp` (cap 12 → 12, cap 3 → 6, cap-above-derived → unchanged). Gate recorded in the ledger as **M30**: at `--max-hot-slots 12` the report reads `12 slots`, `is_feasible` holds, and a token completes — and an 11-token prompt reads `40.17 GB` from NVMe against `1.79 GB/token` uncapped, which is the starved regime Step 4's drain gate needs.
 
 ---
 

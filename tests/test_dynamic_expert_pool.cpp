@@ -63,6 +63,44 @@ int main() {
               << " Hot VRAM expert slots and " << valid_report.warm_host_slots << " Warm Host slots.\n";
 
     // -------------------------------------------------------------------------
+    // Test 2b: Diagnostic Hot-slot cap (`max_hot_vram_slots`)
+    // -------------------------------------------------------------------------
+    // The knob shortens the Hot pool so a gate can force the starved path. Three
+    // properties, none of which the derived path exercises:
+    //   * a cap below the derived size reduces the pool to exactly the cap;
+    //   * a cap below one layer's routed experts is floored at 6, never applied
+    //     literally (a pool that cannot hold a dispatch is not a pressure knob);
+    //   * a cap above the derived size has no effect.
+    std::cout << "\n[Test 2b] Testing the diagnostic Hot-slot cap..." << std::endl;
+    {
+        aeon::core::AeonRuntimeConfig capped_cfg;
+        capped_cfg.context_size = 4096;
+        capped_cfg.warm_host_bytes = 0;
+
+        capped_cfg.max_hot_vram_slots = 12;
+        auto capped = aeon::core::MemoryBudgetEngine::evaluate(
+            capped_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
+        assert(capped.is_feasible);
+        assert(capped.hot_vram_slots == 12);
+        assert(capped.hot_vram_slots < valid_report.hot_vram_slots);
+
+        capped_cfg.max_hot_vram_slots = 3;  // below one layer's experts -> floored to 6
+        auto floored = aeon::core::MemoryBudgetEngine::evaluate(
+            capped_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
+        assert(floored.is_feasible);
+        assert(floored.hot_vram_slots == 6);
+
+        capped_cfg.max_hot_vram_slots = valid_report.hot_vram_slots + 1000;  // above derived -> no effect
+        auto uncapped = aeon::core::MemoryBudgetEngine::evaluate(
+            capped_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
+        assert(uncapped.is_feasible);
+        assert(uncapped.hot_vram_slots == valid_report.hot_vram_slots);
+
+        std::cout << "  > [PASSED] cap 12 -> 12 slots; cap 3 -> floored to 6; cap above derived -> "
+                  << uncapped.hot_vram_slots << " (unchanged).\n";
+    }
+
+    // -------------------------------------------------------------------------
     // Test 3: Host-Side Expert Registry Initialization & Tier Tracking
     // -------------------------------------------------------------------------
     std::cout << "\n[Test 3] Testing ExpertRegistry initialization & published ownership maps..." << std::endl;
