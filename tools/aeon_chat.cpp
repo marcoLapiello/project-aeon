@@ -20,11 +20,12 @@
 //     accumulation"); the pre-rewrite graph had a selectable atomic path and that
 //     is what the flag used to choose. It therefore changes nothing here, and a
 //     green run cannot be produced by turning it on.
-//   * the supply-telemetry flags (`--supply-telemetry`, `--run-id`) are **gone**,
-//     not forgotten: wiring the telemetry sink into the new host is G14, which the
-//     composition plan schedules for P5 as diagnostics rather than prerequisites.
-//     Accepting the flags and writing nothing would be worse than not accepting
-//     them.
+//
+// The supply-telemetry flags (`--supply-telemetry`, `--run-id`) are **restored**
+// here: the sink is wired into the host (`V4ModelHost::initialize` opens it,
+// `free` flushes it) and the engine labels each dispatch's phase. Only
+// supply-mediated traffic is captured — the Hot and Warm startup preloads read
+// directly, so the Warmup phase is empty by construction.
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/core/memory_budget.hpp"
@@ -61,6 +62,8 @@ struct Options {
     float temperature{1.0f};
     float top_p{1.0f};
     uint64_t seed{0};
+    std::string supply_telemetry_path;
+    std::string run_id{"unnamed"};
 };
 
 void print_usage(const char* executable) {
@@ -80,6 +83,8 @@ void print_usage(const char* executable) {
         << "  --top-p <value>          Nucleus threshold in (0, 1] (default: the artifact's own)\n"
         << "  --seed <n>               Sampling seed (default: 0)\n"
         << "  --warm-gib <n>           Warm host allocation in GiB (default: 0)\n"
+        << "  --supply-telemetry <p>   Write supply telemetry JSONL to path <p> (default: off)\n"
+        << "  --run-id <id>            Run identifier stamped on telemetry rows (default: unnamed)\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill\n"
         << "  --deterministic-experts  Accepted and inert; the rewrite always uses the fixed-order\n"
@@ -163,6 +168,11 @@ Options parse_options(int argc, char** argv) {
             options.top_p = parse_float(require_value(argc, argv, index, "--top-p"), "--top-p");
         } else if (argument == "--seed") {
             options.seed = parse_unsigned(require_value(argc, argv, index, "--seed"), "--seed");
+        } else if (argument == "--supply-telemetry") {
+            options.supply_telemetry_path =
+                require_value(argc, argv, index, "--supply-telemetry");
+        } else if (argument == "--run-id") {
+            options.run_id = require_value(argc, argv, index, "--run-id");
         } else if (argument == "--no-warm-preload") {
             options.preload_warm_host = false;
         } else if (argument == "--no-warm-refill") {
@@ -237,6 +247,8 @@ int main(int argc, char** argv) {
             options.warm_gib * 1024ULL * 1024ULL * 1024ULL;
         engine_options.runtime.preload_warm_host = options.preload_warm_host;
         engine_options.runtime.enable_warm_refill = options.enable_warm_refill;
+        engine_options.runtime.supply_telemetry_path = options.supply_telemetry_path;
+        engine_options.runtime.run_id = options.run_id;
 
         aeon::core::V4Engine engine;
         engine.initialize(engine_options);

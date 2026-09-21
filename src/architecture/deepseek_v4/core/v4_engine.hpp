@@ -316,7 +316,15 @@ public:
         const auto started = Clock::now();
 
         const auto step = [&](uint32_t token_id, uint32_t position, bool prefill) -> uint32_t {
+            // The phase is set before the forward pass, because the expert dispatch
+            // happens inside it and `TieredExpertSupply` records against whichever
+            // phase is current at that moment. Opening the sink already made this a
+            // no-op when telemetry is off.
+            host_.set_supply_phase(prefill);
             const uint32_t next = advance(token_id, position);
+            if (!prefill) {
+                host_.record_supply_decode_token();
+            }
             // TTFT is the moment the *last* prompt token's forward has produced a
             // token — not the moment the loop was entered, and not the first
             // prompt token's. The decode clock starts there for the same reason:

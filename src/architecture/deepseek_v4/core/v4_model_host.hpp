@@ -184,6 +184,20 @@ public:
             }
         }
 
+        // The telemetry sink is opened before the supply is built, so a request
+        // recorded during initialization cannot be dropped. (`enable_jsonl` opens
+        // in truncate mode and clears the summaries, so "open early" means "start
+        // from a clean slate and capture everything after it" rather than "start
+        // clean and hope nothing has happened yet".)
+        if (!runtime_cfg.supply_telemetry_path.empty()) {
+            telemetry_.enable_jsonl(runtime_cfg.supply_telemetry_path, runtime_cfg.run_id);
+            if (verbose_) {
+                std::printf("[Host] Supply telemetry -> %s (run_id=%s)\n",
+                            runtime_cfg.supply_telemetry_path.c_str(),
+                            runtime_cfg.run_id.c_str());
+            }
+        }
+
         initialize_experts(runtime_cfg);
 
         if (verbose_) {
@@ -198,6 +212,11 @@ public:
     }
 
     void free() noexcept {
+        // Flush the telemetry sink first, while the pools it observes still exist,
+        // so the final summary captures the peak occupancy of the run being torn
+        // down rather than a post-free zero.
+        telemetry_.disable();
+
         // Teardown is the construction order reversed, and the two references that
         // matter are dropped first: the executor borrows the supply, the pool, the
         // staging arena and the registry, and the supply borrows the reader and the
@@ -281,6 +300,19 @@ public:
     const ExpertRegistry& registry() const noexcept { return registry_; }
     UnifiedVRAMExpertPool& vram_pool() noexcept { return vram_pool_; }
     const SupplyTelemetry& telemetry() const noexcept { return telemetry_; }
+
+    // Tell the telemetry which phase the next dispatch belongs to. The caller is
+    // the generation loop, which already knows whether the token it is about to
+    // advance is a prompt token (prefill) or a generated one (decode); this only
+    // forwards that fact, it does not derive it. A no-op when the sink is off.
+    void set_supply_phase(bool prefill) {
+        telemetry_.set_phase(prefill ? RoutingPhase::Prefill : RoutingPhase::Decode);
+    }
+
+    // One generated token's worth of decode accounting. A no-op when the sink is off.
+    void record_supply_decode_token() {
+        telemetry_.record_decode_token();
+    }
 
     // Dense-container page-cache residency dropped after the uploads, in bytes (0
     // when the runtime was configured not to release). Reported rather than

@@ -44,7 +44,7 @@ Oldest to newest. Each new milestone fuses the two older rows into one, so the t
 
 | Work in progress | State | Detail |
 | :--- | :--- | :--- |
-| Expert streaming and chunked prefill | next | [EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](plans-and-docs/analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md) |
+| Expert streaming and chunked prefill | in progress | [EXPERT_STREAMING_EXECUTION_PLAN.md](plans-and-docs/execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) (Steps 0–1 done; Step 2 next) |
 | Session state and swap | open | [SESSION_STATE_AND_SWAP_ANALYSIS.md](plans-and-docs/analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) |
 | Host-memory pressure | open investigation | [HOST_MEMORY_PRESSURE_INVESTIGATION.md](plans-and-docs/analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) |
 | Routing profile and placement study | open | [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) |
@@ -84,3 +84,4 @@ Directions we have explicitly defined as future — researched or discussed, not
 5. **Anti-circularity**: A test must not compare a kernel against an oracle derived from that kernel's own helper — that proves self-consistency, not correctness. New graph tests compare against an independently written reference.
 6. **Empirical Milestone Logging**: For every significant milestone or architectural transition, log the exact test results in the [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md). Do not log noise for small code edits; log meaningful, comparable system-level milestones to provide clear before-and-after tracking on the path to production.
 7. **Modular, Scalable and Maintainable**: Avoid growing monolithic files with mixed concerns. Extract them into separate, focused modules; reuse and improve existing ones; avoid duplication and redundancy.
+8. **Modular, Scalable and Maintainable**

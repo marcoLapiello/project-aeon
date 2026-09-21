@@ -74,6 +74,17 @@ struct AeonRuntimeConfig {
     // The production default retains the fused atomic accumulation path.
     bool deterministic_expert_accumulation{false};
 
+    // Supply telemetry sink. Empty path disables recording entirely (the default);
+    // a non-empty path opens a JSONL stream that `TieredExpertSupply` writes its
+    // request, timing, occupancy, and demotion records into. `run_id` is stamped on
+    // every row so several runs can share or be told apart in one directory.
+    //
+    // Only supply-mediated traffic is captured: the Hot and Warm startup preloads
+    // read through `read_experts_direct_blocking`, not through the supply, so the
+    // Warmup phase stays empty by construction.
+    std::string supply_telemetry_path;
+    std::string run_id{"unnamed"};
+
     // Hardware target device index
     int device_id{0};
 

@@ -111,6 +111,8 @@ Each step states its **requirement**, its **gate**, and its **files**. A step is
 
 **Files.** `core/memory_budget.hpp`, `core/v4_model_host.hpp`, `core/v4_engine.hpp`, `tools/aeon_chat.cpp`.
 
+**Status: done** (`2026-09-21`). Sink wired (`AeonRuntimeConfig::supply_telemetry_path` / `run_id`; `V4ModelHost::initialize` opens it before `initialize_experts`, `free()` flushes it; `V4Engine` labels each dispatch's phase and counts decode tokens; `--supply-telemetry` / `--run-id` restored). Gate recorded in the ledger as **M29**: two runs of the M28 prompt (`--warm-gib 0` vs `40`) produce `phase_summary` rows with `request_count > 0`, and the tier bytes move — Warm serves `42%` of decode requests, cutting NVMe bytes `10.57 → 6.14 GB`, with `logical_bytes_from_warm` `0 → 4.43 GB`.
+
 ---
 
 ### Step 2 — The pressure knob

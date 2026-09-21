@@ -59,6 +59,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `primitive-fixture` | Same named component test and shape only | M1-M2 |
 | `kernel-stage1` | Isolated synthetic swizzled/fused expert kernels | M23-M24 |
 | `e2e-43L-text` | Text in/text out at 43 layers; single-token decode, no batching | M28 |
+| `supply-telemetry` | Per-phase, per-tier supply request/byte counters | M29 |
 
 ## 4. Milestone cards
 
@@ -123,3 +124,23 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: output `The capital of France is **Paris**.`, stop `eos`, `9` tokens; per-tier counts `--` (supply not instrumented on this path)
 - **Conclusion**: decode `≈3 tok/s` in all configurations; Hot/Cold-only vs Hot/Warm/Cold moves it less than the run-to-run spread. Prefill not amortized. Warm bound by physical RAM (`≈40 GiB`), not the `52.62 GB` budget cap.
 - **Evidence**: `tools/aeon_chat.cpp`, `rocm-smi --showpids`
+
+### M29: Supply telemetry live — tier configuration moves the measured bytes
+- **Run**: `2026-09-21`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers
+- **Class / comparison key**: `Analysis / supply-telemetry`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: acceptance prompt `What is the capital of France?`, context `256`, `--greedy`, `8` generated tokens, `n=1`; run A `--warm-gib 0`, run B `--warm-gib 40`; `--supply-telemetry` JSONL
+- **Metrics**: per `phase_summary` row (`request_count`, bytes):
+
+  | Run | Phase / tier | req | bytes |
+  | :--- | :--- | ---: | ---: |
+  | A Warm `0` | prefill cold | `1516` | `21.46 GB` NVMe |
+  | A Warm `0` | decode cold | `747` | `10.57 GB` NVMe (`1.51 GB/tok`) |
+  | B Warm `40` | decode cold | `434` | `6.14 GB` NVMe |
+  | B Warm `40` | decode **warm** | `313` | `4.43 GB` host (`logical_bytes_from_warm`) |
+
+  Run A decode is Cold-only; run B serves `42%` of decode requests from Warm and cuts NVMe bytes `42%` (`10.57 → 6.14 GB`). Demotion, run B decode: `747` attempts, `254` dropped (`34%`).
+- **Correctness / service**: identical output in both runs (`The capital of France is **Paris**.`); `Hot` occupancy steady `809/809`; Warmup phase empty as expected (preloads bypass the supply)
+- **Conclusion / next gate**: Step 1 gate met — `phase_summary` rows carry `request_count > 0` and the tier bytes move with the tier configuration; `logical_bytes_from_warm` is `0` in A and `> 0` in B
+- **Evidence**: `tools/aeon_chat.cpp` `--supply-telemetry`, `/tmp/aeon-telemetry/run-{a-warm0,b-warm40}.jsonl` (Step 1 of [Expert Streaming Execution Plan](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md))
