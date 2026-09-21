@@ -39,6 +39,8 @@ These four words are used precisely. Two of them were confused in earlier drafts
 
 **Transient staging is not Warm.** A cold payload passes through a pinned host buffer on its way to VRAM, but nothing *owns* it there and the buffer is recycled immediately. This distinction is load-bearing: it is why a cold fetch costs two copies rather than one, and why a cold expert must never be routed through the Warm tier merely because host memory is physically involved.
 
+**Staging is a corridor, and every tier that needs a pinned landing zone walks through it.** It is not cold's passage alone: a Cold read always lands there (the `O_DIRECT` buffer must be pinned), an **unpinned** Warm segment uses it as a bounce buffer, and a demotion may borrow a slot for its D2H. A **pinned** Warm expert is the only traffic that skips it — its Promotion is a single H2D. Pinning is a property of the `HostExpertPool`'s **segment**, fixed at allocation: a segment whose `hipHostMalloc` *and* `hipHostRegister` both failed is unpinned for the process lifetime, and experts demoted into it never become pinned later (`pinned_slot_count()` / `unpinned_slot_count()` measure the split). An unpinned Warm hit still beats Cold — it pays a DDR memcpy (≈1.1 ms) and no disk read — but it loses Warm's advantage, not its advantage over Cold.
+
 **Cold → Warm does not exist.** Warm is filled by exactly two paths: the startup preload, and demotion. Nothing ever promotes a Cold expert into Warm, so a Warm hit always means the expert was resident there before the run reached it.
 
 And two strategies, which are **not** the same thing:
@@ -74,9 +76,21 @@ Each step states its **requirement**, its **gate**, and its **files**. A step is
 
 ### Step 0 — The dispatch-shape note (no code)
 
-**Requirement.** Write down how the expert seam becomes *batched*: how `on_routing_ready` / `accumulate_routed` take a **set** of tokens rather than one, how leases are scoped, and how the staging arena is sized from the chunk size `C`. One page, in the analysis document's own folder.
+**Requirement.** Write down how the expert seam becomes *batched*: how `on_routing_ready` / `accumulate_routed` take a **set** of tokens rather than one, how leases are scoped, and how the staging arena is sized. One page, in the analysis document's own folder.
 
 **Why.** `TOTAL_STAGING_SLOTS = 2 × 6 = 12`, one dispatch in flight, and per-token leases are decode-shaped facts today. Writing the batched shape down first means the certify-able constants are written as the `C = 1` case of a parameterized form, not as facts that must be unwound at Step 6.
+
+**The findings it must pin** (`C` = tokens per dispatch; `C = 1` reproduces today exactly). The note is [EXPERT_DISPATCH_SHAPE_NOTE.md](../analysis/current/EXPERT_DISPATCH_SHAPE_NOTE.md).
+
+| # | Finding | Question it answers |
+| :--- | :--- | :--- |
+| **D1** | **Dispatch unit** — a batch of `6C` requests submitted as a set | shape of `on_routing_ready` / `accumulate_routed`; `C = 1` = today |
+| **D2** | **Dedup before dispatch** | collapse `6C` to the layer's distinct set; must not permute slot-sum order |
+| **D3** | **Lease scope** — forced by the safety rule, not chosen: token boundary at `C = 1`, **layer boundary** at `C > 1`; chunk-wide leases are infeasible (≤11,008 = whole model) | how long a slot stays un-evictable |
+| **D4** | **Staging sizing** — `banks × depth`, **not** `2 × 6 × C` (40.5 GiB at `C = 256`); ceiling = deduplicated distinct set, target = disk-saturation depth | how many staging slots |
+| **D5** | **Two independent budgets** — sweep residency (VRAM) vs staging (pinned host), never summed | where the "40 GiB" error came from |
+| **D6** | **In-flight dispatches** — one layer's batch, tracked per dispatch | how many dispatch states exist |
+| **D7** | **Literal audit** — every `C = 1` constant and its general form | what Step 6 must parameterize |
 
 **Gate.** None. This is the one action that must precede Step 3's gate, so no throwaway strategy is certified as *the* strategy.
 
@@ -176,7 +190,7 @@ Two thirds of every eviction is discarded. A/B **2 vs 6** (the exact decode-matc
 2. **Allocate `V4LayerBodyBatchScratch`** (≈11 MiB at `C = 16`) — the host allocates neither batch scratch type today.
 3. **A chunk-wide expert dispatch**: `on_routing_ready` / `accumulate_routed` over `C` tokens, so a chunk's `6C` requests are issued **as a set**.
 4. **Deduplicate within the chunk** — collapse `6C` requests to the layer's distinct expert set.
-5. **Size the staging arena from `C`**, never hardcoded: use `PrefetchStagingArena::TOTAL_STAGING_SLOTS`, derived.
+5. **Size the staging arena from transfer-concurrency depth**, never from `C` and never hardcoded: `banks × depth` (`banks = 2`), with the layer's **deduplicated** distinct set as the ceiling and disk-saturation depth as the target. See the [Step 0 note](../analysis/current/EXPERT_DISPATCH_SHAPE_NOTE.md) and §7.
 
 **Why a large chunk is the lever.** A layer's expert set is fetched once and used by every token in the chunk. For a 1000-token prompt:
 
@@ -240,6 +254,7 @@ Corrections to the analysis document and the historical supply-chain analysis. T
 | No Hot slot reclaimable | Not "the pool is full of needed experts". It is the **lease count**: up to 258 slots are leased per token (43 × 6), so a pool below ~264 can have every slot un-evictable. |
 | Layer 42 is a Sliding layer | False. It is **CSA** (ratio 4). The class counts are **2 Sliding / 21 CSA / 20 HCA**, not 3/20/20 — the alternating pattern runs to layer 42 inclusive. The implementation and its tests were always right (they read `compress_ratios`); only `deepseek_v4_flash_architecture.md` was wrong, and it is corrected. |
 | The dense backbone is the first two layers | False — see [Appendix A](#appendix-a--model-composition-verified). Every one of the 43 layers has a full dense set; only the 256 routed experts per layer stream. |
+| "Size the staging arena from `C`" | False. Staging is a **pipeline buffer** for transfers in transit, sized from transfer-concurrency depth (`banks × depth`). The chunk's deduplicated distinct set (≤256/layer) is its **ceiling**, not its size: `2 × 6 × C` at `C = 256` is 40.5 GiB pinned, which cannot fit. Dedup is a precondition of the ceiling being finite. |
 
 ---
 
@@ -356,6 +371,7 @@ The instrument exists but is unpopulated: `ExpertCatalogEntry::moving_frequency`
 | **Never clamp a position** | Trap 40. An out-of-range position is refused, never clamped. |
 | **Anti-circularity** | A test must not compare a kernel against an oracle derived from that kernel's own helper. |
 | **Tiering is mechanism, not strategy** | Holding one request shape as *the* shape. Step 0 exists to prevent exactly this. |
+| **Staging is a pipeline buffer, not a working-set store** | Sizing it from the chunk size or the layer's expert set. It holds transfers **in transit**; the sweep's residency is a separate **VRAM** budget, never summed with it. |
 
 ---
 
