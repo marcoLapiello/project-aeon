@@ -67,6 +67,7 @@ struct Options {
     uint32_t max_hot_slots{0};
     std::string dump_logits_path;
     uint64_t demotion_queue{0};
+    bool profile_routing{false};
 };
 
 void print_usage(const char* executable) {
@@ -91,6 +92,7 @@ void print_usage(const char* executable) {
         << "  --max-hot-slots <n>      Cap the Hot VRAM expert pool at <n> slots (0 = derived)\n"
         << "  --dump-logits <path>     Append each position's raw fp16 logits to <path>\n"
         << "  --demotion-queue <n>     Demotion-queue capacity (0 = derived from warm refill)\n"
+        << "  --profile-routing        Print the decode routing reuse-distance (ideal-LRU) curve\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill\n"
         << "  --deterministic-experts  Accepted and inert; the rewrite always uses the fixed-order\n"
@@ -187,6 +189,8 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--demotion-queue") {
             options.demotion_queue = parse_unsigned(
                 require_value(argc, argv, index, "--demotion-queue"), "--demotion-queue");
+        } else if (argument == "--profile-routing") {
+            options.profile_routing = true;
         } else if (argument == "--no-warm-preload") {
             options.preload_warm_host = false;
         } else if (argument == "--no-warm-refill") {
@@ -266,6 +270,7 @@ int main(int argc, char** argv) {
         engine_options.runtime.max_hot_vram_slots = options.max_hot_slots;
         engine_options.dump_logits_path = options.dump_logits_path;
         engine_options.runtime.demotion_queue_capacity = options.demotion_queue;
+        engine_options.runtime.profile_routing_reuse = options.profile_routing;
 
         aeon::core::V4Engine engine;
         engine.initialize(engine_options);
@@ -320,6 +325,22 @@ int main(int argc, char** argv) {
 
         const std::string visible =
             aeon::core::V4Engine::strip_thinking(reply.text, engine.tokenizer());
+
+        // Decode routing reuse-distance curve (Phase 1 of the routing study): the
+        // ideal-LRU hit rate at each capacity next to the measured Hot hit rate. A
+        // wide gap means the recency policy leaves locality uncaptured; parity means
+        // only a different strategy could help.
+        if (engine.host().routing_reuse_enabled()) {
+            const auto curve = engine.host().routing_reuse_curve();
+            std::cout << "[Routing reuse] decode requests=" << curve.observed
+                      << " compulsory=" << curve.compulsory
+                      << " measured_hot_hit=" << std::fixed << std::setprecision(1)
+                      << curve.measured_hit_rate * 100.0 << "%\n";
+            for (size_t i = 0; i < curve.capacities.size(); ++i) {
+                std::cout << "    capacity=" << curve.capacities[i]
+                          << " ideal_lru_hit=" << curve.ideal_lru_hit_rate[i] * 100.0 << "%\n";
+            }
+        }
 
         // The tier-invariance gate reads these two lines: a run that leaked a lease
         // or broke a registry invariant is not a valid half of the comparison, so it

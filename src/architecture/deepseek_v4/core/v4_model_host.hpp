@@ -352,6 +352,16 @@ public:
         return executor_ ? executor_->layer_dispatches(prefill) : 0;
     }
 
+    // Routing reuse-distance profiling (Phase 1 of the routing study). Enabled at
+    // construction from `AeonRuntimeConfig::profile_routing_reuse`; off otherwise.
+    bool routing_reuse_enabled() const noexcept {
+        return executor_ && executor_->reuse_profiling_enabled();
+    }
+
+    RoutingReuseProfiler::Curve routing_reuse_curve() const {
+        return executor_ ? executor_->reuse_curve() : RoutingReuseProfiler::Curve{};
+    }
+
     // One generated token's worth of decode accounting. A no-op when the sink is off.
     void record_supply_decode_token() {
         telemetry_.record_decode_token();
@@ -466,6 +476,9 @@ private:
         executor_ = std::make_unique<V4TieredExpertExecutor>(
             supply_, vram_pool_, *staging_, registry_, expert_scratch_, streams_,
             config_.swiglu_limit);
+        if (runtime_cfg.profile_routing_reuse) {
+            executor_->enable_reuse_profiling();
+        }
     }
 
     size_t direct_requests_per_expert(const ExpertFormatDescriptor& format) const noexcept {

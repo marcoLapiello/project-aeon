@@ -65,6 +65,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `starved-pool` | Hot-pool cap forcing the emergency drain; logits still exact | M32 |
 | `demotion-ab` | Demotion-queue capacity 2 vs 6; drops, Warm, NVMe, D2H | M33 |
 | `staging-depth` | Staging arena contention; depth lever viability | M34 |
+| `routing-reuse` | Decode reuse-distance (ideal-LRU) vs measured Hot hit rate | M35 |
 
 ## 4. Milestone cards
 
@@ -220,3 +221,14 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: no run has ever thrown a staging state-transition error; `staging_in_use == 0` at every measured end (M32)
 - **Conclusion / next gate**: **Premise refuted.** Staging is not contended — its slots idle ≈ one layer period and never block; `staging_reuse_wait_ns` is a misnamed *idle* counter, not a wait. Raising `TOTAL_STAGING_SLOTS` cannot help the single-dispatch path. Depth becomes a lever only when dispatches overlap (chunked prefill/prefetch-ahead), i.e. Step 6, where Step 0 D4's `banks × depth` sizing applies
 - **Evidence**: `/tmp/aeon-demotion-ab.MAvbnY/{q2,q6}.telemetry.jsonl`, `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` (`staging_offset`), `src/infrastructure/core/prefetch_staging.hpp` (`take_reuse_delay_ns`)
+
+### M35: Routing reuse distance — the recency policy is already at its ceiling
+- **Run**: `2026-09-21`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers; `aeon_chat --profile-routing`
+- **Class / comparison key**: `Analysis / routing-reuse`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: essay prompt, context `32768`, non-greedy, `512` generated tokens, `--warm-gib 40`, queue `6`; layers 0–2 excluded (hash router)
+- **Metrics**: `122640` learned-layer decode requests, `6531` compulsory (`5.3%`). Ideal-LRU hit rate by capacity: `6 → 0.0%`, `64 → 0.0%`, `128 → 0.0%`, `258 → 31.3%`, `779 → 60.5%`, `1558 → 74.0%`, `3022 → 85.7%`, `11008 → 94.7%` (ceiling `= 1 − compulsory`). **Measured Hot hit rate `60.6%` vs ideal-LRU at capacity `779` `60.5%`**
+- **Correctness / service**: unit test `test_routing_reuse` (4 hand-computed stack distances, incl. the `miss@6 / hit@64` boundary, hash-layer exclusion, measured-hit tracking) passes; run exits `0`
+- **Conclusion / next gate**: The current global-LRU policy already achieves the ideal-LRU hit rate at its capacity — **no implementation headroom, so LRU is not thrashing** (thesis 2's mechanism refuted for same-capacity recency). Consequent lever is **capacity/coverage** (curve is steep `258→3022`). To decide whether a *different policy* (frequency/OPT) beats ideal-LRU, compute the **Belady-OPT curve** next
+- **Evidence**: `--profile-routing`, `tests/test_routing_reuse.cpp`, `/tmp/aeon-reuse.log`

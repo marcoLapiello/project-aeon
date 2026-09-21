@@ -87,6 +87,7 @@
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
+#include "infrastructure/core/routing_reuse.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -219,6 +220,7 @@ public:
         current_layer_ = layer_id;
         state_ = supply_.dispatch_layer_prefetch(layer_id, position, ids, leases_);
         classify_layer_outcome();
+        observe_reuse(layer_id);
     }
 
     // `moe_accum` already holds the shared expert's output; it is the accumulator's
@@ -349,6 +351,18 @@ public:
         return layer_dispatches_[prefill ? 0 : 1];
     }
 
+    // Decode routing reuse-distance profiling (Phase 1 of the routing study).
+    // Off by default; enabling it resets the profiler to the registry's expert
+    // space. It observes the decode stream only — prefill is the sweep's concern
+    // and has a different reuse structure, so mixing the two would answer neither.
+    void enable_reuse_profiling() {
+        reuse_profiler_.reset(registry_.total_experts);
+    }
+
+    bool reuse_profiling_enabled() const noexcept { return reuse_profiler_.enabled(); }
+
+    RoutingReuseProfiler::Curve reuse_curve() const { return reuse_profiler_.curve(); }
+
 private:
     // Keeps the leases this token is holding from starving the next dispatch.
     //
@@ -400,6 +414,7 @@ private:
     bool counting_prefill_{false};
     std::array<std::array<uint64_t, 3>, 2> layer_outcomes_{};
     std::array<uint64_t, 2> layer_dispatches_{};
+    RoutingReuseProfiler reuse_profiler_{};
 
     // Classifies the layer just dispatched from the answering tier of each of its
     // six transfers. Runs after `dispatch_layer_prefetch`, so `state_.supply_batch`
@@ -419,6 +434,22 @@ private:
         const LayerOutcome outcome = any_cold ? LayerOutcome::HasCold
             : (any_warm ? LayerOutcome::WarmNoCold : LayerOutcome::AllHot);
         ++layer_outcomes_[phase][static_cast<size_t>(outcome)];
+    }
+
+    // Feeds one decode layer's requests (global id + whether Hot answered) to the
+    // reuse profiler, in slot order. All six share the same layer, so slot order is
+    // a stable tie-break within a layer and does not affect the distance measure.
+    void observe_reuse(uint32_t layer_id) {
+        if (!reuse_profiler_.enabled() || counting_prefill_) return;
+        const auto& transfers = state_.supply_batch.transfers;
+        const size_t count = std::min<size_t>(transfers.size(), 6);
+        std::array<RoutingReuseProfiler::Observation, 6> observations{};
+        for (size_t i = 0; i < count; ++i) {
+            observations[i].global_expert_id = transfers[i].global_expert_id;
+            observations[i].answered_from_hot =
+                transfers[i].source_tier == ExpertTier::HOT_VRAM;
+        }
+        reuse_profiler_.observe_layer(layer_id, observations.data(), count);
     }
 };
 

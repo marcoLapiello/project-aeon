@@ -84,6 +84,9 @@ if(AEON_BUILD_TESTS)
 
     # Routing profile parser and checkpoint validation.
     aeon_add_test(test_routing_profile SOURCES tests/test_routing_profile.cpp)
+
+    # Routing reuse-distance profiler (Phase 1 of the routing study).
+    aeon_add_test(test_routing_reuse SOURCES tests/test_routing_reuse.cpp)
 endif()
 
 # --- Tier-1 primitives: independent-oracle gates -----------------------------
