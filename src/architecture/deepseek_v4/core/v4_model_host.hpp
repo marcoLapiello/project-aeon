@@ -334,6 +334,22 @@ public:
     // forwards that fact, it does not derive it. A no-op when the sink is off.
     void set_supply_phase(bool prefill) {
         telemetry_.set_phase(prefill ? RoutingPhase::Prefill : RoutingPhase::Decode);
+        // The layer-outcome classifier needs the same phase, and it lives on the
+        // executor rather than the telemetry, so it is forwarded here too.
+        if (executor_) executor_->set_counting_phase(prefill);
+    }
+
+    // Per-layer outcome counts (thesis-1 measurement): how many dispatches in the
+    // given phase were answered entirely from Hot, from Hot+Warm with no Cold, and
+    // with at least one Cold. `outcome` is 0/1/2 for AllHot/WarmNoCold/HasCold.
+    uint64_t layer_outcome_count(bool prefill, uint32_t outcome) const noexcept {
+        if (!executor_ || outcome > 2) return 0;
+        return executor_->layer_outcome_count(
+            prefill, static_cast<V4TieredExpertExecutor::LayerOutcome>(outcome));
+    }
+
+    uint64_t layer_dispatches(bool prefill) const noexcept {
+        return executor_ ? executor_->layer_dispatches(prefill) : 0;
     }
 
     // One generated token's worth of decode accounting. A no-op when the sink is off.

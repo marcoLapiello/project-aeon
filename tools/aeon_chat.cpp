@@ -337,6 +337,29 @@ int main(int argc, char** argv) {
                       << "\n";
         }
 
+        // Per-layer outcome distribution: the fraction of layer dispatches answered
+        // entirely from Hot, from Hot+Warm with no Cold, and with >=1 Cold. A layer
+        // waits on its slowest of six fetches, so this distribution — not the cold
+        // request rate — is what a flat throughput under a shrinking miss rate
+        // reflects. Decode is the phase that matters; prefill is printed alongside.
+        for (const bool prefill : {false, true}) {
+            const uint64_t total = engine.host().layer_dispatches(prefill);
+            if (total == 0) continue;
+            const uint64_t all_hot = engine.host().layer_outcome_count(prefill, 0);
+            const uint64_t warm_only = engine.host().layer_outcome_count(prefill, 1);
+            const uint64_t has_cold = engine.host().layer_outcome_count(prefill, 2);
+            const auto pct = [total](uint64_t part) {
+                return total == 0 ? 0.0 : 100.0 * static_cast<double>(part) /
+                                               static_cast<double>(total);
+            };
+            std::cout << "[Layer outcomes] phase=" << (prefill ? "prefill" : "decode")
+                      << " dispatches=" << total
+                      << std::fixed << std::setprecision(1)
+                      << " all_hot=" << pct(all_hot) << "%"
+                      << " warm_no_cold=" << pct(warm_only) << "%"
+                      << " has_cold=" << pct(has_cold) << "%\n";
+        }
+
         if (options.diagnostic) {
             std::cout << "Rendered prompt: "
                       << engine.encoder().encode(messages, prompt_options) << "\n";

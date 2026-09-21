@@ -91,6 +91,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -217,6 +218,7 @@ public:
         ensure_pool_headroom();
         current_layer_ = layer_id;
         state_ = supply_.dispatch_layer_prefetch(layer_id, position, ids, leases_);
+        classify_layer_outcome();
     }
 
     // `moe_accum` already holds the shared expert's output; it is the accumulator's
@@ -327,6 +329,26 @@ public:
         return forced_drains_;
     }
 
+    // Per-layer outcome classification (thesis-1 measurement). A layer waits on
+    // its slowest of six concurrent fetches, so what governs its latency is *which
+    // tier answered the worst one*, not how many cold reads it issued. These three
+    // counts say how often a layer is answered entirely from Hot, from Hot+Warm
+    // with no Cold, and with at least one Cold — the distribution that explains a
+    // flat throughput under a changing cold-miss rate.
+    //
+    // Indexed by phase: 0 = prefill, 1 = decode.
+    enum class LayerOutcome : uint8_t { AllHot = 0, WarmNoCold = 1, HasCold = 2 };
+
+    void set_counting_phase(bool prefill) noexcept { counting_prefill_ = prefill; }
+
+    uint64_t layer_outcome_count(bool prefill, LayerOutcome outcome) const noexcept {
+        return layer_outcomes_[prefill ? 0 : 1][static_cast<size_t>(outcome)];
+    }
+
+    uint64_t layer_dispatches(bool prefill) const noexcept {
+        return layer_dispatches_[prefill ? 0 : 1];
+    }
+
 private:
     // Keeps the leases this token is holding from starving the next dispatch.
     //
@@ -374,6 +396,30 @@ private:
     std::vector<uint32_t> leases_;
     std::vector<uint32_t> staging_in_use_;
     uint64_t forced_drains_{0};
+
+    bool counting_prefill_{false};
+    std::array<std::array<uint64_t, 3>, 2> layer_outcomes_{};
+    std::array<uint64_t, 2> layer_dispatches_{};
+
+    // Classifies the layer just dispatched from the answering tier of each of its
+    // six transfers. Runs after `dispatch_layer_prefetch`, so `state_.supply_batch`
+    // holds one transfer per routed expert with its `source_tier` resolved.
+    void classify_layer_outcome() noexcept {
+        const size_t phase = counting_prefill_ ? 0 : 1;
+        ++layer_dispatches_[phase];
+        bool any_cold = false;
+        bool any_warm = false;
+        for (const auto& transfer : state_.supply_batch.transfers) {
+            if (transfer.source_tier == ExpertTier::COLD_NVME) {
+                any_cold = true;
+            } else if (transfer.source_tier == ExpertTier::WARM_HOST) {
+                any_warm = true;
+            }
+        }
+        const LayerOutcome outcome = any_cold ? LayerOutcome::HasCold
+            : (any_warm ? LayerOutcome::WarmNoCold : LayerOutcome::AllHot);
+        ++layer_outcomes_[phase][static_cast<size_t>(outcome)];
+    }
 };
 
 } // namespace aeon::core

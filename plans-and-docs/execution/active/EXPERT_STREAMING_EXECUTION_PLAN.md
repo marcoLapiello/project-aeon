@@ -198,9 +198,11 @@ Two thirds of every eviction is discarded. A/B **2 vs 6** (the exact decode-matc
 
 **Status: done** (`2026-09-21`). Added `AeonRuntimeConfig::demotion_queue_capacity` (0 = derived from `enable_warm_refill`, so `--no-warm-refill` still disables demotion) and `--demotion-queue <n>`; the applied value is reported on the `[Invariants]` line. `scripts/expert_demotion_queue_ab.sh` runs capacity 2 vs 6 at `--warm-gib 40`. Recorded in the ledger as **M33**; all four assertions pass.
 
-The ladder (decode, 23 tokens): **`logical_bytes_from_warm` `17.65 → 25.54 GB`**, **NVMe `19.75 → 11.86 GB` (−40%)**, **drops `979 → 0`**, logits byte-identical. The cost is real and the plan's estimate was low: decode D2H rises `23.54 → 37.36 GB` (`+59%`). At the measured stream rates (NVMe `6.33 GB/s`, D2H ≈`25 GB/s`) that is `−1.25 s` of NVMe against `+0.55 s` of D2H — a net ≈`0.7 s` over 23 tokens, ≈`30 ms/token`, roughly `10%` of the measured decode step. The implied demotion reuse is ≈`57%`, well above the plan's `~25%` break-even.
+The ladder (decode, 23 tokens): **`logical_bytes_from_warm` `17.65 → 25.54 GB`**, **NVMe `19.75 → 11.86 GB` (−40%)**, **drops `979 → 0`**, logits byte-identical. Decode Warm requests rose `1247 → 1804` (`+45%`), the warm hit rate `21.0% → 30.4%`. The cost is real and the plan's estimate was low: decode D2H rises `23.54 → 37.36 GB` (`+59%`).
 
-**Two corrections to record.** (1) The plan said "12 only helps prefill"; at capacity `6` the drops are **0 in both phases** (`queue_depth_max = 6`, i.e. the queue never overflowed), so `12` would add nothing for this workload — the interesting question becomes the *depth* at which it stops being enough, not the phase. (2) The plan's "≈1.2 → 3.5 GB per token" D2H estimate is off by roughly an order of magnitude against this measurement (`1.02 → 1.62 GB/token` decode).
+🔶 **But the byte win did not become a speed win.** A realistic `1024`-token non-greedy run at the same config moved `3.40 → 3.22 tok/s` (TTFT `16.25 → 17.32 s`) — a wash inside the run-to-run spread. My initial `+30 ms/token` extrapolation assumed decode is bandwidth-bound; it is not. The cause is `P(any cold)` gating each layer (see §6.10 thesis 1). So the honest statement is: **the queue-6 default removes dropped demotions and cuts NVMe bytes (`−40%`) — a resource/cleanliness win — with no established throughput effect.**
+
+**Two corrections to record.** (1) The plan said "12 only helps prefill"; at capacity `6` the drops are **0 in both phases** (`queue_depth_max = 6`, i.e. the queue never overflowed), so `12` would add nothing for this workload — the interesting question becomes the *depth* at which it stops being enough, not the phase. (2) The plan's "≈1.2 → 3.5 GB per token" D2H estimate is off by roughly an order of magnitude against this measurement (`1.02 → 1.62 GB/token` decode). (3) The card's original "so it pays" conclusion was a bandwidth model, not a measurement; it is corrected in ledger M33 and superseded by §6.10.
 
 ---
 
@@ -383,6 +385,24 @@ The instrument exists but is unpopulated: `ExpertCatalogEntry::moving_frequency`
 - That a bigger Warm pool helps. Coverage is bounded by physics (a 62.62 GiB host), and the tier is pinned and therefore unevictable.
 - That candidate staging helps anywhere. §2 argues it does not.
 - That layer-major is free. §6.3 gives its cost and its ceiling; neither has been measured.
+
+### 6.10 Two theses on why throughput is flat (added 2026-09-21)
+
+M33 raised Warm service `45%` and cut decode NVMe `40%`, yet a realistic `1024`-token run moved `3.40 → 3.22 tok/s` — a wash. These two theses **are the leading explanation and both are testable**. They also correct an earlier guess in this plan's own analysis that decode is compute-bound: the arithmetic refutes it (≈`44 GFLOP`/token against a `~123 TFLOP/s` card is `<0.2%` of peak; 6 experts × 43 layers ≈ `8.6 GFLOP` of expert work). **Decode is supply-latency-bound.**
+
+**Thesis 1 — the max-of-six gates the layer.** A layer issues 6 concurrent fetches and waits on the *slowest*. So its latency is governed by `P(any cold)`, not the cold *count*:
+
+$$P(\text{any cold}) = 1 - (1 - p)^6$$
+
+At the M33 measured cold-request rates, `p` fell `23.5% → 14.1%`, which moves `P(any cold)` only `80% → 60%`. Feeding a latency model (`L_cold ≈ 2.13 ms`, `L_warm ≈ 0.54 ms`) gives `1.80 → 1.48 ms/layer`, i.e. ≈`5%` of a ≈`290 ms` step — **below the run-to-run spread**. It also predicts the shape M28 and M33 both show: throughput settles at a *median between warm-only and cold-only*, because the vast majority of layers still touch Cold while a minority are fully resident. **Consequence:** shrinking the cold-miss *rate* has sharply diminishing returns; only driving `P(any cold)` toward `0` (coverage) or cutting the cold *latency* itself moves throughput.
+
+**Thesis 2 — global, phase-locked LRU thrashes on a cyclic access pattern.** The pools are global with no per-layer partition, and victim selection is **plain global LRU** — `reserve_vram_destination` scans `hot_vram_lru` from `rbegin()`, and `reserve_warm_destination` does the same on `warm_host_lru`; no layer awareness anywhere (`moving_frequency` is recorded and never read, plan §5). Decode's access pattern is a cycle: `L0₆, L1₆, …, L42₆, L0₆, …`, and **LRU is pessimal for a cycle — it evicts the element next needed.** Hot holds only `779/258 ≈ 3.0` tokens' worth, so it sits *just above* the working set, the worst case for cyclic LRU; Warm (`3022/258 ≈ 11.7`) partly buffers it, which is why hits are `21–30%` rather than `0`. Worse, both pools cycle with the **same period**, so their evictions are in phase and **reinforce** the thrash rather than damping it. The remedy is a frequency-aware (LFU-like) retention that lets "natural selection" place experts by workload — which only pays if routing concentrates. **§6.8 is therefore the deciding input for thesis 2 as well.**
+
+**What to measure, in cost order.**
+
+1. **Per-layer outcome distribution** — the fraction of layer dispatches answered all-Hot / Warm-no-Cold / any-Cold. Directly confirms or kills thesis 1's shape (predicting ≈`80%`/`60%` any-Cold at `p≈23.5%`/`14.1%`). **Measured** (`2026-09-21`, `--diagnostic`, `512`-token run, queue `6`): decode `all_hot=8.4%`, `warm_no_cold=46.3%`, **`has_cold=45.3%`** (`21973` dispatches = `511 × 43`); prefill `10.2% / 28.5% / 61.3%`. **Thesis 1 confirmed in shape:** almost half of decode layers still touch Cold and only `8.4%` are answered entirely from Hot — which is exactly why a `45%` Warm-service rise moved throughput by nothing. (Note measured `has_cold` `45.3%` is *below* the `60%` predicted from the A/B's cold-request rate, and `all_hot` above it — the six selections are not independent draws, so the naive `(1−p)^6` over-predicts cold exposure.)
+2. **Routing concentration** (§6.8) — decides whether thesis 2's LFU direction has anything to preserve.
+3. **Staging depth** — `TOTAL_STAGING_SLOTS = 12` is exactly `2 layers × 6`, a thin pipeline buffer; the A/B telemetry's dominant term is `staging_reuse_wait`. Raising it (Step 0 D4: size by *concurrency depth*) is independent of both theses and cheap.
 
 ---
 
