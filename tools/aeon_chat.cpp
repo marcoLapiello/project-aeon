@@ -338,7 +338,8 @@ int main(int argc, char** argv) {
                       << curve.measured_hit_rate * 100.0 << "%\n";
             for (size_t i = 0; i < curve.capacities.size(); ++i) {
                 std::cout << "    capacity=" << curve.capacities[i]
-                          << " ideal_lru_hit=" << curve.ideal_lru_hit_rate[i] * 100.0 << "%\n";
+                          << " ideal_lru_hit=" << curve.ideal_lru_hit_rate[i] * 100.0 << "%"
+                          << " opt_hit=" << curve.opt_hit_rate[i] * 100.0 << "%\n";
             }
         }
 

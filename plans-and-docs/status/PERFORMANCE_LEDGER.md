@@ -66,6 +66,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `demotion-ab` | Demotion-queue capacity 2 vs 6; drops, Warm, NVMe, D2H | M33 |
 | `staging-depth` | Staging arena contention; depth lever viability | M34 |
 | `routing-reuse` | Decode reuse-distance (ideal-LRU) vs measured Hot hit rate | M35 |
+| `routing-opt` | Belady-OPT vs ideal-LRU: policy headroom | M36 |
 
 ## 4. Milestone cards
 
@@ -232,3 +233,14 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: unit test `test_routing_reuse` (4 hand-computed stack distances, incl. the `miss@6 / hit@64` boundary, hash-layer exclusion, measured-hit tracking) passes; run exits `0`
 - **Conclusion / next gate**: The current global-LRU policy already achieves the ideal-LRU hit rate at its capacity — **no implementation headroom, so LRU is not thrashing** (thesis 2's mechanism refuted for same-capacity recency). Consequent lever is **capacity/coverage** (curve is steep `258→3022`). To decide whether a *different policy* (frequency/OPT) beats ideal-LRU, compute the **Belady-OPT curve** next
 - **Evidence**: `--profile-routing`, `tests/test_routing_reuse.cpp`, `/tmp/aeon-reuse.log`
+
+### M36: Belady-OPT — a non-recency policy has ~17 points of headroom at the Hot capacity
+- **Run**: `2026-09-21`; branch `main`; same workload as M35 (`512` decode tokens, `122640` learned-layer requests, queue `6`, `--warm-gib 40`)
+- **Class / comparison key**: `Analysis / routing-opt`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: `aeon_chat --profile-routing`, layers 0–2 excluded; Belady-OPT simulated offline over the same stream
+- **Metrics**: hit rate by capacity (`ideal-LRU` → `OPT`): `6: 0.0 → 2.1%`, `64: 0.0 → 25.1%`, `128: 0.0 → 43.8%`, `258: 31.3 → 59.8%`, **`779: 60.5 → 77.4%`**, `1558: 74.0 → 85.9%`, `3022: 85.7 → 92.1%`, `11008: 94.7 → 94.7%`
+- **Correctness / service**: `test_routing_reuse` now also covers OPT — hand-computed `6/14` vs LRU `0/14` on an LRU-pessimal cycling trace, plus the structural `OPT ≥ ideal-LRU` invariant. (A sentinel bug — final occurrences keyed as `-1`, which sorts as *soonest* — was caught by this test and fixed.)
+- **Conclusion / next gate**: **Recency is at its ceiling, but a non-recency policy is not.** OPT beats ideal-LRU by `+16.9` points at the Hot capacity (and `+28.5` at `258`). This is an **oracle upper bound**, so it is the maximum a policy can win at `779`, not the expected win. It validates thesis 2's *direction* while refuting its *mechanism*: the lever is a better policy (frequency/placement), and how much is capturable needs the Phase 2 static ranking
+- **Evidence**: `--profile-routing` (`opt_hit` column), `tests/test_routing_reuse.cpp`, `/tmp/aeon-opt.log`

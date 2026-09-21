@@ -34,6 +34,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <set>
+#include <utility>
 #include <vector>
 
 namespace aeon::core {
@@ -59,6 +61,7 @@ public:
     struct Curve {
         std::vector<uint64_t> capacities;
         std::vector<double> ideal_lru_hit_rate;   // per capacity, 0..1
+        std::vector<double> opt_hit_rate;         // per capacity, 0..1 (Belady)
         double measured_hit_rate{0.0};            // Hot answers / observed requests
         uint64_t observed{0};                     // learned-layer requests
         uint64_t compulsory{0};                   // first-ever selections
@@ -75,6 +78,9 @@ public:
         // capacity that covers a short run and grow (by rebuild) when exceeded.
         fenwick_capacity_ = std::max<size_t>(total_experts_, 1024);
         fenwick_.assign(fenwick_capacity_ + 1, 0);
+        // The raw stream, kept so the Belady-OPT curve can be replayed offline.
+        stream_ids_.clear();
+        stream_counted_.clear();
         clock_ = 0;
         observed_ = 0;
         measured_hot_ = 0;
@@ -100,6 +106,11 @@ public:
         for (size_t i = 0; i < count; ++i) {
             const uint32_t gid = requests[i].global_expert_id;
             if (gid >= total_experts_) continue;
+
+            // Every request, learned or not, is part of the replayed stream: the
+            // OPT simulation must see the same cache occupancy LRU did.
+            stream_ids_.push_back(gid);
+            stream_counted_.push_back(learned ? 1 : 0);
 
             const int64_t last = last_pos_[gid];
             if (last < 0) {
@@ -150,11 +161,61 @@ public:
                 observed_ == 0
                     ? 0.0
                     : static_cast<double>(hits) / static_cast<double>(observed_));
+            result.opt_hit_rate.push_back(opt_hit_rate(capacity));
         }
         return result;
     }
 
 private:
+    // Belady's optimal offline policy: on a miss evict the resident whose *next*
+    // use is farthest away (or never). Its hit rate is the best any policy of that
+    // capacity can achieve, knowing the future. The gap between it and the ideal-LRU
+    // curve is the entire upside available to a non-recency policy.
+    double opt_hit_rate(uint64_t capacity) const {
+        if (observed_ == 0 || stream_ids_.empty() || capacity == 0) return 0.0;
+        const size_t count = stream_ids_.size();
+        const int64_t never = static_cast<int64_t>(count) + 1;
+
+        // next_pos[i]: the next index after i that selects the same expert, or
+        // `never`. Built by one backward pass. `last_seen` starts at `never` so a
+        // final occurrence maps to `never` (farthest), not to a small value.
+        std::vector<int64_t> next_pos(count, never);
+        std::vector<int64_t> last_seen(total_experts_, never);
+        for (int64_t i = static_cast<int64_t>(count) - 1; i >= 0; --i) {
+            const uint32_t gid = stream_ids_[static_cast<size_t>(i)];
+            next_pos[static_cast<size_t>(i)] = last_seen[gid];
+            last_seen[gid] = i;
+        }
+
+        // Resident set keyed by next-use, so the farthest-next-use eviction is the
+        // set's last element.
+        std::set<std::pair<int64_t, uint32_t>> resident;
+        std::vector<char> in_cache(total_experts_, 0);
+        std::vector<int64_t> key_of(total_experts_, 0);
+        uint64_t hits = 0;
+
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t gid = stream_ids_[i];
+            const bool counted = stream_counted_[i] != 0;
+            if (in_cache[gid]) {
+                resident.erase({key_of[gid], gid});
+                key_of[gid] = next_pos[i];
+                resident.insert({key_of[gid], gid});
+                if (counted) ++hits;
+                continue;
+            }
+            if (resident.size() >= capacity) {
+                const auto victim = std::prev(resident.end());
+                in_cache[victim->second] = 0;
+                resident.erase(victim);
+            }
+            in_cache[gid] = 1;
+            key_of[gid] = next_pos[i];
+            resident.insert({key_of[gid], gid});
+        }
+        return static_cast<double>(hits) / static_cast<double>(observed_);
+    }
+
     void record_distance(int64_t distance) {
         if (distance < 0) distance = 0;
         const size_t index = static_cast<size_t>(distance);
@@ -215,6 +276,8 @@ private:
     uint64_t compulsory_{0};
     uint64_t overflow_{0};
     std::vector<uint64_t> distance_hist_{};
+    std::vector<uint32_t> stream_ids_{};
+    std::vector<uint8_t> stream_counted_{};
 };
 
 } // namespace aeon::core

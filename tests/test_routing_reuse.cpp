@@ -31,6 +31,13 @@ static double rate_at(const RoutingReuseProfiler::Curve& c, uint64_t capacity) {
     return -1.0;
 }
 
+static double opt_at(const RoutingReuseProfiler::Curve& c, uint64_t capacity) {
+    for (size_t i = 0; i < c.capacities.size(); ++i) {
+        if (c.capacities[i] == capacity) return c.opt_hit_rate[i];
+    }
+    return -1.0;
+}
+
 int main() {
     std::cout << "=== routing reuse-distance profiler ===\n";
 
@@ -89,6 +96,28 @@ int main() {
         assert(c.observed == 3);
         assert(c.measured_hit_rate > 0.66 && c.measured_hit_rate < 0.67);
         std::cout << "  [PASSED] measured Hot hit rate = 2/3\n";
+    }
+
+    // 5. Belady-OPT vs ideal-LRU on an LRU-pessimal trace.
+    //    Trace 1,2,3,4,5,6,7,1,2,3,4,5,6,7 at capacity 6.
+    //    LRU: after the first fill it evicts exactly the item the next round needs,
+    //      so it scores 0 hits of 14.
+    //    OPT: on the id7 miss it evicts the farthest next use (id6), keeping 1..5;
+    //      hits 1..5 on the next five requests, evicts id1 for id6, then hits id7.
+    //      That is 6 hits of 14.
+    {
+        RoutingReuseProfiler p;
+        p.reset(16);
+        auto layer = obs({1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 6, 7});
+        p.observe_layer(3, layer.data(), layer.size());
+        const auto c = p.curve();
+        assert(rate_at(c, 6) == 0.0 && "LRU scores zero on the cycling trace");
+        assert(opt_at(c, 6) > 6.0 / 14.0 - 1e-9 && "OPT hits six of fourteen");
+        // OPT is optimal: it can never be worse than ideal-LRU at any capacity.
+        for (size_t i = 0; i < c.capacities.size(); ++i) {
+            assert(c.opt_hit_rate[i] + 1e-12 >= c.ideal_lru_hit_rate[i]);
+        }
+        std::cout << "  [PASSED] OPT 6/14 vs LRU 0/14 on the cycling trace; OPT >= LRU\n";
     }
 
     std::cout << "=== all routing-reuse tests passed ===\n";
