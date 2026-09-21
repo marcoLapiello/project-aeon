@@ -173,6 +173,8 @@ public:
         ExpertRegistry& registry,
         V4RoutedExpertScratch& scratch,
         const V4DeviceStreams& streams,
+        SupplyTelemetry& telemetry,
+        RoutingReuseProfiler* reuse_profiler,
         float swiglu_limit
     )
         : supply_(supply),
@@ -181,6 +183,8 @@ public:
           registry_(registry),
           scratch_(scratch),
           streams_(streams),
+          telemetry_(telemetry),
+          reuse_profiler_(reuse_profiler),
           swiglu_limit_(swiglu_limit) {
         // The fused dispatches are compiled for exactly six experts; a mismatch here
         // would be a shape error inside the kernel launch, so it is refused at
@@ -219,8 +223,7 @@ public:
         ensure_pool_headroom();
         current_layer_ = layer_id;
         state_ = supply_.dispatch_layer_prefetch(layer_id, position, ids, leases_);
-        classify_layer_outcome();
-        observe_reuse(layer_id);
+        observe_layer(layer_id);
     }
 
     // `moe_accum` already holds the shared expert's output; it is the accumulator's
@@ -327,42 +330,6 @@ public:
         return leases_.size();
     }
 
-    uint64_t forced_drains() const noexcept {
-        return forced_drains_;
-    }
-
-    // Per-layer outcome classification (thesis-1 measurement). A layer waits on
-    // its slowest of six concurrent fetches, so what governs its latency is *which
-    // tier answered the worst one*, not how many cold reads it issued. These three
-    // counts say how often a layer is answered entirely from Hot, from Hot+Warm
-    // with no Cold, and with at least one Cold — the distribution that explains a
-    // flat throughput under a changing cold-miss rate.
-    //
-    // Indexed by phase: 0 = prefill, 1 = decode.
-    enum class LayerOutcome : uint8_t { AllHot = 0, WarmNoCold = 1, HasCold = 2 };
-
-    void set_counting_phase(bool prefill) noexcept { counting_prefill_ = prefill; }
-
-    uint64_t layer_outcome_count(bool prefill, LayerOutcome outcome) const noexcept {
-        return layer_outcomes_[prefill ? 0 : 1][static_cast<size_t>(outcome)];
-    }
-
-    uint64_t layer_dispatches(bool prefill) const noexcept {
-        return layer_dispatches_[prefill ? 0 : 1];
-    }
-
-    // Decode routing reuse-distance profiling (Phase 1 of the routing study).
-    // Off by default; enabling it resets the profiler to the registry's expert
-    // space. It observes the decode stream only — prefill is the sweep's concern
-    // and has a different reuse structure, so mixing the two would answer neither.
-    void enable_reuse_profiling() {
-        reuse_profiler_.reset(registry_.total_experts);
-    }
-
-    bool reuse_profiling_enabled() const noexcept { return reuse_profiler_.enabled(); }
-
-    RoutingReuseProfiler::Curve reuse_curve() const { return reuse_profiler_.curve(); }
-
 private:
     // Keeps the leases this token is holding from starving the next dispatch.
     //
@@ -394,7 +361,7 @@ private:
         }
         supply_.reap_registry_transfers();
         release_leases();
-        ++forced_drains_;
+        telemetry_.record_forced_drain();
     }
 
     V4ExpertSupplyCoordinator& supply_;
@@ -403,53 +370,49 @@ private:
     ExpertRegistry& registry_;
     V4RoutedExpertScratch& scratch_;
     V4DeviceStreams streams_;
+    SupplyTelemetry& telemetry_;
+    // Null unless the routing study asked for reuse profiling. Kept as a pointer so
+    // its absence is the off switch: nothing is recorded when it is null.
+    RoutingReuseProfiler* reuse_profiler_{nullptr};
     float swiglu_limit_{10.0f};
 
     uint32_t current_layer_{0};
     V4ExpertSupplyCoordinator::LayerPrefetchState state_;
     std::vector<uint32_t> leases_;
     std::vector<uint32_t> staging_in_use_;
-    uint64_t forced_drains_{0};
 
-    bool counting_prefill_{false};
-    std::array<std::array<uint64_t, 3>, 2> layer_outcomes_{};
-    std::array<uint64_t, 2> layer_dispatches_{};
-    RoutingReuseProfiler reuse_profiler_{};
-
-    // Classifies the layer just dispatched from the answering tier of each of its
-    // six transfers. Runs after `dispatch_layer_prefetch`, so `state_.supply_batch`
-    // holds one transfer per routed expert with its `source_tier` resolved.
-    void classify_layer_outcome() noexcept {
-        const size_t phase = counting_prefill_ ? 0 : 1;
-        ++layer_dispatches_[phase];
+    // Reports the layer just dispatched to the two measurement consumers, each of
+    // which owns its own switch: the supply telemetry (answering-tier mix, always
+    // cheap) and the routing reuse profiler (stack distances, only when enabled).
+    // Runs after `dispatch_layer_prefetch`, so `state_.supply_batch` holds one
+    // transfer per routed expert with its `source_tier` resolved.
+    void observe_layer(uint32_t layer_id) {
+        const auto& transfers = state_.supply_batch.transfers;
         bool any_cold = false;
         bool any_warm = false;
-        for (const auto& transfer : state_.supply_batch.transfers) {
+        for (const auto& transfer : transfers) {
             if (transfer.source_tier == ExpertTier::COLD_NVME) {
                 any_cold = true;
             } else if (transfer.source_tier == ExpertTier::WARM_HOST) {
                 any_warm = true;
             }
         }
-        const LayerOutcome outcome = any_cold ? LayerOutcome::HasCold
-            : (any_warm ? LayerOutcome::WarmNoCold : LayerOutcome::AllHot);
-        ++layer_outcomes_[phase][static_cast<size_t>(outcome)];
-    }
+        const SupplyTelemetryPhase phase = telemetry_.current_phase();
+        telemetry_.record_layer_outcome(phase, any_cold, any_warm);
 
-    // Feeds one decode layer's requests (global id + whether Hot answered) to the
-    // reuse profiler, in slot order. All six share the same layer, so slot order is
-    // a stable tie-break within a layer and does not affect the distance measure.
-    void observe_reuse(uint32_t layer_id) {
-        if (!reuse_profiler_.enabled() || counting_prefill_) return;
-        const auto& transfers = state_.supply_batch.transfers;
-        const size_t count = std::min<size_t>(transfers.size(), 6);
-        std::array<RoutingReuseProfiler::Observation, 6> observations{};
-        for (size_t i = 0; i < count; ++i) {
-            observations[i].global_expert_id = transfers[i].global_expert_id;
-            observations[i].answered_from_hot =
-                transfers[i].source_tier == ExpertTier::HOT_VRAM;
+        // The reuse profiler observes the decode stream only: prefill has a
+        // different reuse structure and is the sweep's concern, so mixing the two
+        // would answer neither. A null profiler is the off switch.
+        if (reuse_profiler_ != nullptr && phase == SupplyTelemetryPhase::Decode) {
+            const size_t count = std::min<size_t>(transfers.size(), 6);
+            std::array<RoutingReuseProfiler::Observation, 6> observations{};
+            for (size_t i = 0; i < count; ++i) {
+                observations[i].global_expert_id = transfers[i].global_expert_id;
+                observations[i].answered_from_hot =
+                    transfers[i].source_tier == ExpertTier::HOT_VRAM;
+            }
+            reuse_profiler_->observe_layer(layer_id, observations.data(), count);
         }
-        reuse_profiler_.observe_layer(layer_id, observations.data(), count);
     }
 };
 

@@ -520,7 +520,8 @@ int main() {
     aeon::core::PipelineScratchBuffers production_scratch;
     production_scratch.allocate();
     V4TieredExpertExecutor production(h.supply, h.vram_pool, h.staging, h.registry,
-                                      h.expert_scratch, h.streams(), cfg.swiglu_limit);
+                                      h.expert_scratch, h.streams(), h.telemetry,
+                                      /*reuse_profiler=*/nullptr, cfg.swiglu_limit);
 
     const uint64_t cold_before = h.registry.misses_cold;
     const std::vector<Harness::Traces> production_trace = run_stack(
@@ -530,8 +531,8 @@ int main() {
              h.registry.misses_cold > cold_before,
              "cold misses +" + std::to_string(h.registry.misses_cold - cold_before));
     h.expect("B: the capacity fallback fired rather than the registry throwing",
-             production.forced_drains() > 0,
-             "drains=" + std::to_string(production.forced_drains()) + " (pool=" +
+             h.telemetry.forced_drains() > 0,
+             "drains=" + std::to_string(h.telemetry.forced_drains()) + " (pool=" +
                  std::to_string(kVramSlots) + " slots, " +
                  std::to_string(kStackDepth * kExperts) + " leases/token)");
     h.expect("B: every lease was handed back",

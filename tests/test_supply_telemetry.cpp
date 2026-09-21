@@ -60,6 +60,38 @@ int main() {
     assert(found_demotion_attempt);
     assert(found_queue_pressure_reason);
 
+    // Supply-domain measurements relocated here from the executor: the per-layer
+    // answering-tier mix and the forced-drain count. They must accumulate whether or
+    // not a JSONL sink is open, because the gates read them from a run that has no
+    // telemetry file.
+    {
+        aeon::core::SupplyTelemetry counters;
+        using Phase = aeon::core::SupplyTelemetryPhase;
+        using Outcome = aeon::core::SupplyTelemetry::LayerOutcome;
+
+        counters.record_layer_outcome(Phase::Decode, /*any_cold=*/false, /*any_warm=*/false);
+        counters.record_layer_outcome(Phase::Decode, false, true);
+        counters.record_layer_outcome(Phase::Decode, true, true);
+        counters.record_layer_outcome(Phase::Prefill, true, false);
+        counters.record_forced_drain();
+        counters.record_forced_drain();
+
+        assert(counters.layer_dispatches(Phase::Decode) == 3);
+        assert(counters.layer_dispatches(Phase::Prefill) == 1);
+        assert(counters.layer_outcome_count(Phase::Decode, Outcome::AllHot) == 1);
+        assert(counters.layer_outcome_count(Phase::Decode, Outcome::WarmNoCold) == 1);
+        assert(counters.layer_outcome_count(Phase::Decode, Outcome::HasCold) == 1);
+        assert(counters.layer_outcome_count(Phase::Prefill, Outcome::HasCold) == 1);
+        // Any cold dominates, regardless of whether warm also answered.
+        assert(counters.layer_outcome_count(Phase::Decode, Outcome::WarmNoCold) == 1);
+        assert(counters.forced_drains() == 2);
+
+        // reset() (called by enable_jsonl) clears the run-cumulative counters.
+        counters.reset();
+        assert(counters.layer_dispatches(Phase::Decode) == 0);
+        assert(counters.forced_drains() == 0);
+    }
+
     std::cout << "Supply telemetry JSONL contract passed\n";
     return 0;
 }

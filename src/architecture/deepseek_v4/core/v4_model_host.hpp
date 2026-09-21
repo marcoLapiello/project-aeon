@@ -303,11 +303,12 @@ public:
         return executor_ ? executor_->outstanding_leases() : 0;
     }
 
-    // Times the emergency drain in `ensure_pool_headroom` fired. Zero whenever the
-    // pool can hold a token's `6 x 43` leases, which is the intended steady state;
-    // a non-zero value is how a gate says it ran the starved regime (Step 4).
+    // Times the emergency drain in `ensure_pool_headroom` fired, from the supply
+    // telemetry. Zero whenever the pool can hold a token's `6 x 43` leases, which
+    // is the intended steady state; a non-zero value is how a gate says it ran the
+    // starved regime (Step 4).
     uint64_t forced_drains() const noexcept {
-        return executor_ ? executor_->forced_drains() : 0;
+        return telemetry_.forced_drains();
     }
 
     // Staging slots not AVAILABLE. A gate asserts this returns to 0 at the end of a
@@ -334,32 +335,32 @@ public:
     // forwards that fact, it does not derive it. A no-op when the sink is off.
     void set_supply_phase(bool prefill) {
         telemetry_.set_phase(prefill ? RoutingPhase::Prefill : RoutingPhase::Decode);
-        // The layer-outcome classifier needs the same phase, and it lives on the
-        // executor rather than the telemetry, so it is forwarded here too.
-        if (executor_) executor_->set_counting_phase(prefill);
     }
 
-    // Per-layer outcome counts (thesis-1 measurement): how many dispatches in the
-    // given phase were answered entirely from Hot, from Hot+Warm with no Cold, and
-    // with at least one Cold. `outcome` is 0/1/2 for AllHot/WarmNoCold/HasCold.
+    // Per-layer outcome counts (thesis-1 measurement), from the supply telemetry:
+    // how many dispatches in the given phase were answered entirely from Hot, from
+    // Hot+Warm with no Cold, and with at least one Cold. `outcome` is 0/1/2 for
+    // AllHot/WarmNoCold/HasCold.
     uint64_t layer_outcome_count(bool prefill, uint32_t outcome) const noexcept {
-        if (!executor_ || outcome > 2) return 0;
-        return executor_->layer_outcome_count(
-            prefill, static_cast<V4TieredExpertExecutor::LayerOutcome>(outcome));
+        if (outcome > 2) return 0;
+        return telemetry_.layer_outcome_count(
+            prefill ? SupplyTelemetryPhase::Prefill : SupplyTelemetryPhase::Decode,
+            static_cast<SupplyTelemetry::LayerOutcome>(outcome));
     }
 
     uint64_t layer_dispatches(bool prefill) const noexcept {
-        return executor_ ? executor_->layer_dispatches(prefill) : 0;
+        return telemetry_.layer_dispatches(
+            prefill ? SupplyTelemetryPhase::Prefill : SupplyTelemetryPhase::Decode);
     }
 
-    // Routing reuse-distance profiling (Phase 1 of the routing study). Enabled at
-    // construction from `AeonRuntimeConfig::profile_routing_reuse`; off otherwise.
+    // Routing reuse-distance profiling (Phase 1 of the routing study): a separate
+    // module with its own switch, not part of the supply telemetry.
     bool routing_reuse_enabled() const noexcept {
-        return executor_ && executor_->reuse_profiling_enabled();
+        return reuse_profiler_.enabled();
     }
 
     RoutingReuseProfiler::Curve routing_reuse_curve() const {
-        return executor_ ? executor_->reuse_curve() : RoutingReuseProfiler::Curve{};
+        return reuse_profiler_.curve();
     }
 
     // One generated token's worth of decode accounting. A no-op when the sink is off.
@@ -473,12 +474,17 @@ private:
         // borrows the four streams the host owns, so its capacity fallback drains
         // exactly the set that carries expert traffic.
         expert_scratch_.allocate();
+        // The routing reuse profiler is a separate concern from the supply
+        // telemetry and has its own switch: it is reset (which enables it) only
+        // when the routing study asks for it, and a null pointer is what the
+        // executor sees as "off".
+        if (runtime_cfg.profile_routing_reuse) {
+            reuse_profiler_.reset(registry_.total_experts);
+        }
         executor_ = std::make_unique<V4TieredExpertExecutor>(
             supply_, vram_pool_, *staging_, registry_, expert_scratch_, streams_,
+            telemetry_, runtime_cfg.profile_routing_reuse ? &reuse_profiler_ : nullptr,
             config_.swiglu_limit);
-        if (runtime_cfg.profile_routing_reuse) {
-            executor_->enable_reuse_profiling();
-        }
     }
 
     size_t direct_requests_per_expert(const ExpertFormatDescriptor& format) const noexcept {
@@ -638,6 +644,7 @@ private:
     ExpertRegistry registry_;
     std::unique_ptr<PrefetchStagingArena> staging_;
     SupplyTelemetry telemetry_;
+    RoutingReuseProfiler reuse_profiler_;
     std::unique_ptr<aeon::io::DirectIOReader> io_reader_;
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion> completions_;
     uint64_t next_io_id_{1};

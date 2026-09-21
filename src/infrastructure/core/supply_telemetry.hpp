@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -23,6 +24,12 @@ enum class SupplyTelemetryPhase : uint8_t {
 class SupplyTelemetry {
 public:
     static constexpr uint32_t schema_version = 1;
+
+    // How a layer's dispatch was answered, which governs its latency far more than
+    // its cold *count* does: a layer waits on its slowest of six concurrent
+    // fetches, so `AllHot` / `WarmNoCold` / `HasCold` is the distribution a flat
+    // throughput under a shrinking miss rate reflects.
+    enum class LayerOutcome : uint8_t { AllHot = 0, WarmNoCold = 1, HasCold = 2 };
 
     struct Summary {
         uint64_t request_count{0};
@@ -99,6 +106,9 @@ public:
                 summary = Summary{};
             }
         }
+        layer_outcomes_ = {};
+        layer_dispatches_ = {};
+        forced_drains_ = 0;
         transfer_events_.clear();
         boundary_id_++;
         baseline_vm_swap_bytes_ = read_vm_swap_bytes();
@@ -134,6 +144,36 @@ public:
             }
         }
     }
+
+    // Record one layer dispatch's answering-tier mix. These counters accumulate
+    // unconditionally, not only when a JSONL sink is open: they are a handful of
+    // increments per dispatch (~43 dispatches/token, each a six-way scan), which is
+    // negligible against a ~290 ms token, and the layer-outcome report is read by
+    // gates that run without a telemetry file.
+    void record_layer_outcome(SupplyTelemetryPhase phase,
+                              bool any_cold, bool any_warm) {
+        const uint32_t index = static_cast<uint32_t>(phase);
+        if (index >= kPhaseCount) return;
+        ++layer_dispatches_[index];
+        const LayerOutcome outcome = any_cold ? LayerOutcome::HasCold
+            : (any_warm ? LayerOutcome::WarmNoCold : LayerOutcome::AllHot);
+        ++layer_outcomes_[index][static_cast<size_t>(outcome)];
+    }
+
+    void record_forced_drain() { ++forced_drains_; }
+
+    uint64_t layer_outcome_count(SupplyTelemetryPhase phase, LayerOutcome outcome) const {
+        const uint32_t index = static_cast<uint32_t>(phase);
+        if (index >= kPhaseCount) return 0;
+        return layer_outcomes_[index][static_cast<size_t>(outcome)];
+    }
+
+    uint64_t layer_dispatches(SupplyTelemetryPhase phase) const {
+        const uint32_t index = static_cast<uint32_t>(phase);
+        return index >= kPhaseCount ? 0 : layer_dispatches_[index];
+    }
+
+    uint64_t forced_drains() const { return forced_drains_; }
 
     void record_demotion_attempt(ExpertTier source_tier) {
         if (!enabled_) return;
@@ -276,6 +316,9 @@ private:
     bool dirty_{false};
     Summary summaries_[kPhaseCount][kTierCount]{};
     std::vector<std::string> transfer_events_;
+    std::array<std::array<uint64_t, 3>, kPhaseCount> layer_outcomes_{};
+    std::array<uint64_t, kPhaseCount> layer_dispatches_{};
+    uint64_t forced_drains_{0};
 
     Summary& summary_for(SupplyTelemetryPhase phase, ExpertTier tier) {
         return summaries_[static_cast<uint32_t>(phase)][static_cast<uint32_t>(tier)];
