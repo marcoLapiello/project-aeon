@@ -175,6 +175,12 @@ int main() {
     // so the host sizes the arena for it (Step 6 D4); a smaller configuration would
     // be refused by `forward_window` rather than silently colliding two transfers.
     runtime.prefill_chunk = kWindow;
+    // This gate certifies the **driver** — that a layer-major pass equals serial and
+    // that the chunk size is not observable — not the swept residency policy. The
+    // sweep has its own gate (`test_v4_prefill_sweep`), so it is off here: with it on
+    // the window would drain Hot and stream all 43 layers, which is the subject of
+    // that other gate and would triple this one's runtime without adding a claim.
+    runtime.prefill_sweep = false;
 
     V4ModelHost host;
     host.initialize(kModelDir, runtime, /*verbose=*/true);

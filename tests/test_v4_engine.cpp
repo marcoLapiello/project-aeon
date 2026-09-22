@@ -272,6 +272,13 @@ int main() {
     V4EngineOptions engine_options;
     engine_options.model_dir = kModelDir;
     engine_options.runtime.context_size = kContext;
+    // The swept prefill streams all 43 layers per window, which is ~60 s — the
+    // subject of `test_v4_prefill_sweep` and of this gate's section H. Sections A–G
+    // are about the *binding*: that `chat` is the tokenizer, the encoder, the loop,
+    // the graph and the sampler composed correctly. They assert token identity,
+    // determinism and stop conditions, and none of those depends on the residency
+    // policy, so they run with the sweep off and stay inside a minute.
+    engine_options.runtime.prefill_sweep = false;
     engine_options.seed = 1234;
 
     V4Engine engine;
@@ -635,99 +642,6 @@ int main() {
     }
 
     // =========================================================================
-    // H. The prefill strategy follows the window (Step 6 D-a)
-    // =========================================================================
-    //
-    // The engine's prefill is the layer-major window, and the *sweep* — drain Hot,
-    // stream whole layer sets in computation order, release each layer as it
-    // retires — is engaged only when the window clears the over-fetch rule
-    // (`V4PrefillSweep::worth`): the sweep loads a whole layer, so a window whose
-    // routed draws do not reach the layer's size would fetch far more than the
-    // layer-major driver needed. Both claims are asserted, in opposite directions,
-    // because "the sweep ran" alone cannot distinguish the strategy from a code
-    // path that always sweeps or never does.
-    //
-    // What is *not* re-asserted here: byte-equality of the swept path. That is
-    // `test_v4_prefill_sweep`'s subject (ledger M40), at the graph level and
-    // without the engine, so re-running it through `chat` would buy nothing and
-    // cost a second whole-model read. What is new here is that the *engine* chooses
-    // the strategy and that the switch leaves no residue on either side of it.
-    std::printf("\n[H] The prefill strategy follows the window\n");
-    {
-        const uint64_t loads_before = engine.host().prefill_sweep().layer_loads();
-        harness.assert_that("H: no swept prefill has run yet (the short prompts)",
-                            loads_before == 0,
-                            std::to_string(loads_before) + " layer loads");
-
-        // A prompt long enough to clear `6W >= 2 x experts_per_layer` at this
-        // context's 256 experts per layer, built by repetition so the token count
-        // is measured rather than guessed.
-        std::string long_text;
-        std::vector<uint32_t> long_prompt;
-        do {
-            long_text += "The committee reviewed the proposal carefully. ";
-            long_prompt = engine.encoder().encode_tokens({user_message(long_text)},
-                                                         prompt_options);
-        } while (long_prompt.size() < 100);
-
-        harness.assert_that("H: the long prompt clears the sweep's over-fetch rule",
-                            long_prompt.size() >= 86 && long_prompt.size() < kContext,
-                            std::to_string(long_prompt.size()) + " tokens");
-
-        const auto prefill_start = Clock::now();
-        const V4Reply swept = engine.chat({user_message(long_text)}, prompt_options,
-                                          generation_options(1), sampling);
-        const double prefill_seconds = since(prefill_start);
-
-        const uint64_t loads_after = engine.host().prefill_sweep().layer_loads();
-        harness.assert_that("H: the sweep is engaged for a long window",
-                            engine.host().prefill_sweep_engaged() &&
-                                loads_after - loads_before == engine.host().num_layers(),
-                            std::to_string(loads_after - loads_before) + " layer loads, " +
-                                std::to_string(engine.host().prefill_sweep().experts_streamed()) +
-                                " experts streamed");
-        harness.assert_that("H: Hot was drained on entry — nothing crossed over",
-                            engine.host().prefill_sweep().hot_after_drain() == 0,
-                            std::to_string(engine.host().prefill_sweep().hot_after_drain()) +
-                                " Hot residents at the switch");
-        harness.assert_that("H: the switch left nothing behind",
-                            engine.host().outstanding_expert_leases() == 0 &&
-                                engine.host().staging_in_use_slots() == 0 &&
-                                engine.host().registry().invariants_hold() &&
-                                !engine.host().registry().prefill_streaming(),
-                            "leases 0, staging 0, invariants hold, not streaming");
-        harness.assert_that("H: the swept prefill produced a token", !swept.token_ids.empty(),
-                            ids_to_string(swept.token_ids));
-
-        // Step 6 outcome 5, at the engine: how many bytes a prompt of this length
-        // costs and how long it took. Printed rather than asserted — it is a
-        // measurement, and the plan's `⌈N/W⌉ x 156 GB` is the comparison it is for.
-        std::printf("  [note] swept prefill: %zu tokens in %.1f s (%.1f tok/s), %llu experts "
-                    "in %llu loads, frontier %u layers\n",
-                    long_prompt.size(), prefill_seconds,
-                    prefill_seconds > 0.0
-                        ? static_cast<double>(long_prompt.size()) / prefill_seconds : 0.0,
-                    static_cast<unsigned long long>(
-                        engine.host().prefill_sweep().experts_streamed()),
-                    static_cast<unsigned long long>(loads_after - loads_before),
-                    engine.host().prefill_sweep().frontier_depth());
-
-        // And the other direction: a short prompt keeps the layer-major window and
-        // its chunk-wide dedup but does not pre-load whole layers.
-        const V4Reply short_reply = engine.chat({user_message(kUserTurn)}, prompt_options,
-                                                generation_options(1), sampling);
-        harness.assert_that("H: a short window does not sweep",
-                            engine.host().prefill_sweep().layer_loads() == loads_after &&
-                                !engine.host().prefill_sweep_engaged(),
-                            std::to_string(engine.host().prefill_sweep().layer_loads()) +
-                                " layer loads, engaged=" +
-                                (engine.host().prefill_sweep_engaged() ? "true" : "false"));
-        harness.assert_that("H: the short prefill still produced a token",
-                            !short_reply.token_ids.empty(),
-                            ids_to_string(short_reply.token_ids));
-    }
-
-    // =========================================================================
     // G. strip_thinking — pure text, no model
     // =========================================================================
     std::printf("\n[G] strip_thinking\n");
@@ -770,6 +684,106 @@ int main() {
                     shown.token_ids.size(), aeon::text::stop_reason_name(shown.stop_reason),
                     shown.ttft_ms, shown.decode_tokens_per_second);
         std::printf("  context  : %u tokens, prompt %u\n", kContext, shown.prompt_tokens);
+    }
+
+    // =========================================================================
+    // H. The swept prefill through the engine (Step 6 items 6–7)
+    // =========================================================================
+    //
+    // The engine's prompt is one layer-major window, and the sweep is a **config**
+    // decision rather than a hidden threshold: with `prefill_sweep` on it drains Hot,
+    // streams whole layer sets in computation order, and leaves Hot empty on exit;
+    // with it off none of that happens. The assertion therefore runs in both
+    // directions.
+    //
+    // **This section is last, and why.** A swept engine is a second `V4ModelHost`, and
+    // one host's dense container is ~13 GiB of a 24 GiB card — two cannot be resident
+    // at once (measured: `VRAM capacity exceeded: Required baseline 13.28 GB, but only
+    // 0.38 GB is usable`). So the non-swept direction is asserted on the engine the
+    // rest of the gate already built, that engine is freed, and only then is the swept
+    // one constructed.
+    //
+    // What is *not* re-asserted here: byte-equality of the swept path. That is
+    // `test_v4_prefill_sweep`'s subject (ledger M40) at the graph level, and the speed
+    // of both prefill strategies is `bench_prefill_ab` (ledger M42). This section
+    // asserts only the thing the engine adds: that it *takes* the configured strategy
+    // and switches cleanly.
+    std::printf("\n[H] The swept prefill through the engine\n");
+    {
+        // Direction 1 — this gate's engine has the sweep off, so nothing was drained
+        // and no layer was pre-loaded.
+        const V4Reply plain = engine.chat({user_message(kUserTurn)}, prompt_options,
+                                          generation_options(1), sampling);
+        harness.assert_that("H: with the sweep off, no layer was pre-loaded",
+                            engine.host().prefill_sweep().layer_loads() == 0 &&
+                                !engine.host().prefill_sweep_engaged(),
+                            std::to_string(engine.host().prefill_sweep().layer_loads()) +
+                                " layer loads, engaged=" +
+                                (engine.host().prefill_sweep_engaged() ? "true" : "false"));
+        harness.assert_that("H: the non-swept prefill still produced a token",
+                            !plain.token_ids.empty(), ids_to_string(plain.token_ids));
+
+        // Release the 13 GiB before the second host is built.
+        engine.free();
+
+        // Direction 2 — the same configuration with the sweep on.
+        V4EngineOptions swept_options = engine_options;
+        swept_options.runtime.prefill_sweep = true;
+        V4Engine swept_engine;
+        swept_engine.initialize(swept_options);
+
+        // A prompt of a few hundred tokens, built by encoding rather than by guessing
+        // how many words a token is worth. The sweep's byte cost does not depend on
+        // it — that is the point of the layer-major order — but a window wider than
+        // the body chunk `C` is what distinguishes layer-major from chunk-major, so it
+        // must comfortably exceed `C` while staying inside this gate's context.
+        std::string text_h;
+        std::vector<uint32_t> got;
+        while (got.size() < 128) {
+            text_h += "The committee reviewed the proposal carefully "
+                      "and recorded its findings in the minutes. ";
+            got = swept_engine.encoder().encode_tokens({user_message(text_h)}, prompt_options);
+        }
+
+        const uint64_t loads_before = swept_engine.host().prefill_sweep().layer_loads();
+        const auto prefill_start = Clock::now();
+        const V4Reply swept = swept_engine.chat({user_message(text_h)}, prompt_options,
+                                                generation_options(1), sampling);
+        const double prefill_seconds = since(prefill_start);
+        const uint64_t loads = swept_engine.host().prefill_sweep().layer_loads() - loads_before;
+
+        harness.assert_that("H: the engine took the swept strategy",
+                            swept_engine.host().prefill_sweep_engaged() &&
+                                loads == swept_engine.host().num_layers(),
+                            std::to_string(loads) + " layer loads, " +
+                                std::to_string(swept_engine.host().prefill_sweep().experts_streamed()) +
+                                " experts streamed");
+        harness.assert_that("H: Hot was drained on entry — nothing crossed over",
+                            swept_engine.host().prefill_sweep().hot_after_drain() == 0,
+                            std::to_string(swept_engine.host().prefill_sweep().hot_after_drain()) +
+                                " Hot residents at the switch");
+        harness.assert_that("H: the switch left nothing behind",
+                            swept_engine.host().outstanding_expert_leases() == 0 &&
+                                swept_engine.host().staging_in_use_slots() == 0 &&
+                                swept_engine.host().registry().invariants_hold() &&
+                                !swept_engine.host().registry().prefill_streaming(),
+                            "leases 0, staging 0, invariants hold, not streaming");
+        harness.assert_that("H: the swept prefill produced a token", !swept.token_ids.empty(),
+                            ids_to_string(swept.token_ids));
+
+        // The measurement, printed rather than asserted: the load share is what says
+        // how much a load/compute overlap could recover (`bench_prefill_ab` is the
+        // real A/B; this is one point of it through the engine).
+        const double load_s = static_cast<double>(swept_engine.host().sweep_load_ns()) / 1e9;
+        std::printf("  [note] swept prefill: %u prompt tokens in %.1f s (%.1f tok/s), "
+                    "%llu experts in %llu loads, frontier %u layers, load %.1f s (%.0f%%)\n",
+                    swept.prompt_tokens, prefill_seconds,
+                    prefill_seconds > 0.0 ? swept.prompt_tokens / prefill_seconds : 0.0,
+                    static_cast<unsigned long long>(
+                        swept_engine.host().prefill_sweep().experts_streamed()),
+                    static_cast<unsigned long long>(loads),
+                    swept_engine.host().prefill_sweep().frontier_depth(), load_s,
+                    prefill_seconds > 0.0 ? 100.0 * load_s / prefill_seconds : 0.0);
     }
 
     stage("the whole gate", gate_start);

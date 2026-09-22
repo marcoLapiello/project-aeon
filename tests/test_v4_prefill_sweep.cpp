@@ -44,12 +44,11 @@ using aeon::core::V4ModelHost;
 
 constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
 constexpr uint32_t kContext = 256;
-// The window `W` and the body chunk `C`. `W` must clear
-// `V4PrefillSweep::worth` — the sweep fetches a whole layer, so it is engaged only
-// when the window's routed draws reach the layer's size twice over
-// (`6W >= 2 * experts_per_layer`, i.e. `W >= 86` at 256 experts) and a whole-layer
-// load is no longer an over-fetch. `C` is the body's own row cap, and the chunk is
-// a batch size *inside* a layer, not a partition of the window.
+// The window `W` and the body chunk `C`. `C` is the body's own row cap (raised to
+// `64` in Step 6 item 7; colibri's equivalent is 128) and is a batch size *inside* a
+// layer, not a partition of the window. `W` is a real layer-major window rather than
+// the chunk-major degenerate `W = C`: this gate ran at `W = 16` for a while, which is
+// exactly chunk-major and therefore certified nothing about the layer-major order.
 constexpr uint32_t kWindow = 96;
 constexpr uint32_t kChunk = 16;
 constexpr size_t kWarmBytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -159,7 +158,7 @@ int main() {
     // shadows legitimately, by design (a Warm expert in the frontier is copied, not
     // promoted).
     const uint32_t shadows_before_switch = host.registry().shadow_resident_count();
-    host.prefill_begin(kWindow);
+    host.prefill_begin();
     const bool streaming = host.registry().prefill_streaming();
     // The switch deliberately settles and reaps what the previous phase left in
     // flight, so a demotion the serial reference had already committed can land
@@ -181,10 +180,6 @@ int main() {
     std::printf("\n--- results ---\n");
 
     assert_that("B: prefill entered streaming mode", streaming, "streaming");
-    assert_that("B: the window cleared the over-fetch rule (W >= 2P/6)",
-                host.prefill_sweep_engaged(),
-                std::to_string(kWindow) + "-token window, " +
-                    std::to_string(per_layer) + " experts/layer");
     assert_that("B: Hot was drained on entry",
                 host.prefill_sweep().hot_after_drain() == 0,
                 std::to_string(host.prefill_sweep().hot_after_drain()) + " Hot residents");

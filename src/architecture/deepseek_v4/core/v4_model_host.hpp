@@ -468,6 +468,17 @@ public:
             prefill ? SupplyTelemetryPhase::Prefill : SupplyTelemetryPhase::Decode);
     }
 
+    // Lifetime supply traffic, for a benchmark. Never reset, independent of the
+    // JSONL sink, so a throughput run can state bytes read without opening one.
+    uint64_t supply_requests() const noexcept { return telemetry_.lifetime_requests(); }
+    uint64_t supply_bytes_from_nvme() const noexcept {
+        return telemetry_.lifetime_nvme_bytes();
+    }
+    uint64_t supply_bytes_from_host() const noexcept {
+        return telemetry_.lifetime_host_bytes();
+    }
+    uint64_t supply_h2d_bytes() const noexcept { return telemetry_.lifetime_h2d_bytes(); }
+
     // Routing reuse-distance profiling (Phase 1 of the routing study): a separate
     // module with its own switch, not part of the supply telemetry.
     bool routing_reuse_enabled() const noexcept {
@@ -521,19 +532,15 @@ public:
         return prefill_sweep_requested_ && prefill_sweep_.is_feasible();
     }
 
-    // The strategy the last window began with. Feasibility is necessary but not
-    // sufficient: a window too narrow for a whole-layer load to pay keeps the
-    // layer-major driver and the chunk-wide dedup, and does not sweep
-    // (`V4PrefillSweep::worth`). Recorded rather than inferred so a gate can read
-    // which of the two regimes it ran in.
+    // The strategy the last window began with. Feasibility is the only condition
+    // (`V4PrefillSweep::is_feasible`); there is no window-size rule, because a hidden
+    // eligibility test is what let the sweep be off on the production path without
+    // saying so. Recorded rather than inferred so a gate can read it.
     bool prefill_sweep_engaged() const noexcept { return sweep_active_; }
 
-    // `window_tokens` is the window `W` the driver is about to run (Step 6 sec. 6b).
-    void prefill_begin(uint32_t window_tokens) {
-        sweep_active_ = false;
-        if (!prefill_sweep_enabled()) return;
-        if (!V4PrefillSweep::worth(window_tokens, registry_.experts_per_layer)) return;
-        sweep_active_ = true;
+    void prefill_begin() {
+        sweep_active_ = prefill_sweep_enabled();
+        if (!sweep_active_) return;
         drain_expert_streams();
         supply_.reap_registry_transfers();
         executor_->release_leases();
@@ -559,6 +566,20 @@ public:
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
     // streamed, and the deepest frontier the lookahead reached.
     const V4PrefillSweep& prefill_sweep() const noexcept { return prefill_sweep_; }
+
+    // Nanoseconds the sweep spent inside its layer loads (`dispatch` + `materialize`
+    // + release), against the wall clock of the window. The split is what says
+    // whether a swept prefill is transfer-bound or compute-bound, and how much a
+    // load/compute overlap could recover.
+    uint64_t sweep_load_ns() const noexcept { return prefill_sweep_.load_ns(); }
+    // The dispatch half of the same accounting: time spent *submitting* reads, which
+    // is what the double buffer pays to keep the drive busy across the compute.
+    uint64_t sweep_io_ns() const noexcept { return prefill_sweep_.io_ns(); }
+    // Layers whose reads were in flight when a body started (1 = the double buffer
+    // is engaged; 0 = the pool is too small for two layers and loads are serial).
+    uint32_t sweep_lookahead_depth() const noexcept {
+        return prefill_sweep_.lookahead_depth();
+    }
 
     // The start of a new sequence. Every layer's ring sentinels, counters and
     // committed-entry positions go back to what a freshly allocated layer holds,

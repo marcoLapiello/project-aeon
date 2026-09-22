@@ -22,6 +22,12 @@ endif()
 if(AEON_BUILD_BENCHMARKS)
     # Request shape and queue-width investigation.
     aeon_add_benchmark(bench_model_direct_io SOURCES tests/bench_model_direct_io.cpp)
+
+    # Step 6 outcome 5: the swept prefill against its baseline. A speed claim needs
+    # its baseline in the same process, and neither arm scales the same way (the
+    # sweep's bytes are constant in the prompt, serial's grow linearly), so the bench
+    # measures both at several prompt lengths and prints tok/s and bytes for each.
+    aeon_add_benchmark(bench_prefill_ab SOURCES tests/bench_prefill_ab.cpp)
 endif()
 
 # --- Backend kernels and artifact format -------------------------------------

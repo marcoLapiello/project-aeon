@@ -312,14 +312,12 @@ public:
         const V4LayerBodyTables tables = host_.tables();
         const uint32_t workspace_tokens = std::min(chunk, count);
 
-        // Step 6 item 6: the window is the swept prefill when the sweep is enabled,
-        // feasible, **and worth it for this window** (`V4PrefillSweep::worth` — a
-        // whole-layer load for a window that would have asked for a small fraction
-        // of a layer is an over-fetch, and prefill is bound by bytes). When it is,
-        // it drains Hot on entry, keeps a sliding window of whole layer sets in
-        // layer order, and leaves Hot empty on exit — a hard switch between the two
-        // allocation strategies, not a parameter on one.
-        host_.prefill_begin(count);
+        // Step 6 item 6: the window is the swept prefill whenever the sweep is
+        // enabled and the Hot pool can hold a whole layer. It drains Hot on entry,
+        // keeps a sliding window of whole layer sets in layer order, and leaves Hot
+        // empty on exit — a hard switch between the two allocation strategies, not a
+        // parameter on one.
+        host_.prefill_begin();
 
         for (uint32_t layer = 0; layer < layers; ++layer) {
             // The layer's whole set must be resident before its body runs: the

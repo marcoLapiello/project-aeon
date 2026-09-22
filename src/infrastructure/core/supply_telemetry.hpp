@@ -124,6 +124,14 @@ public:
         uint64_t host_bytes,
         uint64_t transient_bytes
     ) {
+        // Lifetime totals are accumulated **before** the enabled check: they are a
+        // benchmark's readout, and a benchmark should not have to open a JSONL sink
+        // to learn how many bytes it moved. They are never reset (`reset()` clears
+        // the per-phase summaries only), so they span a whole run.
+        ++lifetime_requests_;
+        lifetime_nvme_bytes_ += nvme_bytes;
+        lifetime_host_bytes_ += host_bytes;
+        lifetime_h2d_bytes_ += h2d_bytes;
         if (!enabled_) return;
         auto& summary = summary_for(phase, source_tier);
         ++summary.request_count;
@@ -287,6 +295,14 @@ public:
         return total;
     }
 
+    // Lifetime supply traffic, independent of the JSONL sink and never reset. What a
+    // benchmark reads to state bytes/token: how much the run actually asked the disk
+    // and the host for.
+    uint64_t lifetime_requests() const noexcept { return lifetime_requests_; }
+    uint64_t lifetime_nvme_bytes() const noexcept { return lifetime_nvme_bytes_; }
+    uint64_t lifetime_host_bytes() const noexcept { return lifetime_host_bytes_; }
+    uint64_t lifetime_h2d_bytes() const noexcept { return lifetime_h2d_bytes_; }
+
     void flush() {
         if (!enabled_ || !output_ || !dirty_) return;
         for (uint32_t phase = 0; phase < 3; ++phase) {
@@ -325,6 +341,10 @@ private:
     uint64_t boundary_id_{0};
     uint64_t baseline_vm_swap_bytes_{0};
     bool dirty_{false};
+    uint64_t lifetime_requests_{0};
+    uint64_t lifetime_nvme_bytes_{0};
+    uint64_t lifetime_host_bytes_{0};
+    uint64_t lifetime_h2d_bytes_{0};
     Summary summaries_[kPhaseCount][kTierCount]{};
     std::vector<std::string> transfer_events_;
     std::array<std::array<uint64_t, 3>, kPhaseCount> layer_outcomes_{};

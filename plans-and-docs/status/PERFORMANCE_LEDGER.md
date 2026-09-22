@@ -72,6 +72,8 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `warm-frozen-prefill` | Warm resident set preserved across a prefill (D-b policy A) | M39 |
 | `prefill-sweep` | Layer-ordered swept prefill: drain, whole layer sets, empty on exit | M40 |
 | `engine-prefill-window` | The engine's prompt as one layer-major window; sweep eligibility; prefill tok/s | M41 |
+| `prefill-ab` | Serial vs swept prefill at two prompt lengths, tok/s and bytes | M42 |
+| `prefill-sweep-overlap` | Swept prefill with the next layer's reads dispatched before compute | M42 |
 
 ## 4. Milestone cards
 
@@ -305,3 +307,30 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: `invariants_hold()` and `outstanding_leases == 0` on every run; the swept engine prefill produces the same token as the gate's own `forward_token` replay for the short path (section A), and the swept path's byte-equality is M40's graph-level result, not re-derived here. Two corrections are recorded in the plan: the sweep is engaged **per window** above `6W ≥ 2 × experts_per_layer` (a `16`-token window over-fetches `256` for the `44` it draws — `5.8×`), and `--dump-logits` now holds one row per window plus one per decode token, because the window computes only the last position's head
 - **Conclusion / next gate**: **Step 6 item 7 built; outcome 5 measured for the first time.** The engine's prompt is one layer-major window, the swept supply is on the production path, and the long/short split is asserted in both directions. The number is the finding: the one-sweep floor of §6b is reached (`43` loads, `148 GiB`) but at **half** the single-drive rate (`3.0` vs `6.33 GB/s`), because loads are still serialized with their materialization and with compute — **load/compute overlap is the whole of outcome 5's remaining gap**, and the Step 7 sweep of `W`/`C` now has a baseline to move
 - **Evidence**: `tests/test_v4_engine.cpp` (§H), `src/architecture/deepseek_v4/core/v4_engine.hpp` (`prefill_step`/`decode_step`, `prefill_chunk_for`, `prefill_window_for`), `src/infrastructure/text/text_generation.hpp` (`PromptPrefill`), `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp` (`worth`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`prefill_begin(window)`, `prefill_sweep_engaged`), `src/architecture/deepseek_v4/core/memory_budget.hpp` (`prefill_window`), `tools/aeon_chat.cpp` (`--prefill-window`)
+
+### M42: The prefill A/B, and the double-buffered load
+- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `bench_prefill_ab` + `scripts/prefill_ab.sh`, `test_v4_prefill_sweep`, `test_v4_engine`
+- **Class / comparison key**: `Benchmark / prefill-ab`, `Benchmark / prefill-sweep-overlap`
+- **Platform**: `baseline`, Device 0 only, single NVMe (`6.33 GB/s` measured ceiling used throughout)
+- **Workload / configuration**: one arm per process (`serial` = `forward_token` per prompt token; `swept` = one `forward_window`, `prefill_sweep = true`), pristine host each, context `2048`, body chunk derived (`min(68, arena 42, pool 134) = 42`), `809` Hot slots, no Warm
+- **Metrics**: 
+
+  | N | arm | seconds | tok/s | NVMe | GiB/1k tok |
+  | ---: | :--- | ---: | ---: | ---: | ---: |
+  | 256 | serial | 103.3 | 2.48 | 394.8 GiB | 1542 |
+  | 256 | swept, before overlap | 68.1 | 3.76 | 145.1 GiB | 567 |
+  | 256 | **swept, double-buffered** | **44.8** | **5.71** | 145.1 GiB | 567 |
+  | 512 | serial | 211.2 | 2.42 | 786.5 GiB | 1536 |
+  | 512 | swept, before overlap | 97.1 | 5.27 | 145.1 GiB | 290 |
+  | 512 | **swept, double-buffered** | **73.6** | **6.96** | 145.1 GiB | 290 |
+
+  The sweep's byte count is **constant** (`145.1 GiB` = one model read) while serial's grows at `1.54 GiB/token` — the layer-major payoff, and the reason a single prompt length says nothing. Speed-up vs serial: `2.30x` at N=256, `2.88x` at N=512, rising with N.
+
+  **The overlap**: blocked-inside-`materialize` time `34.6 s -> 6.2 s` at N=512 (and `35.6 -> 6.8 s` at N=256); `io_s` (submission) `11.6 s`; `lookahead = 1`. The swept arms therefore went `+52%` (N=256) and `+32%` (N=512), and the engine's own swept prefill `52.0 s -> 41.8 s` (`+20%`).
+- **Correctness / service**: byte-exactness is unchanged and is asserted in the same run — `test_v4_prefill_sweep` `13 checks, 0 failures` with swept logits `0 differing of 258560` vs serial `forward_token`; `test_v4_engine` `38 checks, 0 failures`; `scripts/expert_tier_invariance.sh` PASS (byte-identical logits, `logical_bytes_from_warm` A `0` / B `46.6 GB`); `scripts/expert_starved_pool.sh` PASS (`forced_drains = 362`, byte-identical). Registry invariants hold and no lease leaks in any run.
+- **Conclusion / next gate**: **Step 6 outcome 5, first real accounting.** Three findings, in order of size:
+  1. **The batched prefill is faster than serial, and by more the longer the prompt** — the earlier `2.1 tok/s` report was measured at `N = 103`, below the crossover, with no baseline beside it. Corrected here.
+  2. **The overlap was worth exactly what the plan predicted it would be**, and the double buffer is one layer deep because a layer set is `~0.55 s` of drive against `~1.4 s` of compute — one in flight already keeps the drive busy.
+  3. **Compute is now the bound**: with the load hidden, `~56 s` of `73.6 s` at N=512 is the body, i.e. `144 ms/token` against colibri's `31 ms/token` (their `3324 tokens / 103.9 s`). That `4.6x` is the gap that remains, and it is not a supply problem.
+- **Two refuted arms, recorded so they are not retried.** (a) Raising `V4LayerBodyBatchScratch::kMaxTokens` `16 -> 64` (colibri's is 128) changed nothing: `5.27 -> 5.29 tok/s` at N=512. The chunk is a *launch-count* knob and launch count is not the bottleneck. (b) "The sweep is always the prefill" was made true by removing `V4PrefillSweep::worth` — a threshold that silently disabled the sweep on the production path (a `103`-token prompt swept, an `11`-token one did not) while a gate was moved down until it stopped being slow.
+- **Evidence**: `tests/bench_prefill_ab.cpp`, `scripts/prefill_ab.sh`, `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp` (`dispatch_layer` / `materialize_layer` / `dispatch_ahead`, `load_ns` / `io_ns` / `lookahead_depth`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`prefill_begin()`, `sweep_load_ns`, `sweep_io_ns`, `sweep_lookahead_depth`), `src/infrastructure/core/supply_telemetry.hpp` (`lifetime_*` counters), `cmake/AeonInfrastructure.cmake` (`bench_prefill_ab`)

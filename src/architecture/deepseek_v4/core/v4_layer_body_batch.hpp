@@ -98,7 +98,19 @@ namespace aeon::core {
 // selection would destroy an earlier token's.
 class V4LayerBodyBatchScratch {
 public:
-    static constexpr uint32_t kMaxTokens = 16;
+    // The body's row cap. It is a **memory** decision and nothing else: the
+    // composed row-set check in `compose_local_rows` is the only state bound, and it
+    // is sized from this, so raising it costs scratch and changes no contract.
+    //
+    // `16` was inherited and never justified. Colibri's equivalent bound is 128
+    // (`V4_PREFILL_CHUNK`, clamp `[1,128]`, `aeon-references/colibri/c/deepseek_v4.c`
+    // ~12073) and it is a *launch-count* knob — the sweep's byte cost does not depend
+    // on it, because the sweep loads whole layers either way. At 16 we issue 8x the
+    // body invocations colibri does for the same prompt, which is compute the sweep
+    // then pays for on top of its loads. The arena's own `6C` ceiling still bounds the
+    // chunk from below (`prefill_chunk_for`), so this is the upper limit, not the
+    // value used.
+    static constexpr uint32_t kMaxTokens = 64;
     static constexpr uint32_t kMPad = 16;
 
     ~V4LayerBodyBatchScratch() { free(); }

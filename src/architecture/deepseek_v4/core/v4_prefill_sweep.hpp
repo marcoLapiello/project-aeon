@@ -31,6 +31,29 @@
 // frontier when the next full one does not fit. When `L` retires, its slots are the
 // room the frontier advances into.
 //
+// ## The double buffer
+//
+// The slip above — "the lookahead loaded it one or more layers ago" — is the reason
+// this class exists rather than a loop in the driver, and it is worth being exact
+// about because it is where the speed is.
+//
+// A layer's reads are **issued before the previous layer's body runs**
+// (`before_layer(L)` dispatches `L + 1`, then the driver computes `L`). So while the
+// body spends ~1.4 s of compute, the drive is already reading the next layer's set;
+// `before_layer(L + 1)` then finds the transfer complete and its wait is near zero.
+// Measured before this split (ledger M42): a `512`-token swept prefill spent `34.6 s`
+// of `96.8 s` **blocked inside `materialize`**, at `4.2 GB/s` against a `6.33 GB/s`
+// drive — i.e. a third of the prefill waiting on a disk that was idle between layers.
+//
+// The buffer is one layer deep, and that is enough: a layer set is ~0.55 s of drive
+// against ~1.4 s of compute, so one layer in flight already keeps the drive busy.
+// Keeping only the dispatched state and not a queue is deliberate — the driver visits
+// layers strictly in order, so at most one layer is ever ahead.
+//
+// When the pool cannot hold two layers at once, `dispatch_ahead` is a no-op and
+// `ensure_layer` loads each layer at its own boundary: the strategy degrades to the
+// serial form rather than failing.
+//
 // ## What this is not
 //
 // The lookahead loads a layer **whole**, not a routing prediction. It can: the
@@ -51,6 +74,7 @@
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -73,37 +97,26 @@ public:
     // VRAM, since the sweep has no victim to evict and no demotion to fall back on.
     // A pool too small for one layer falls back to the per-token path rather than
     // throwing mid-prompt.
+    //
+    // There is deliberately **no** window-size condition here. An earlier revision
+    // gated the sweep on `6W >= 2 x experts_per_layer` to stop a narrow window paying
+    // a whole-layer load; the measured cost of that rule was that it silently turned
+    // the sweep off on the production path (a 103-token prompt swept, an 11-token one
+    // did not) while a gate's window was moved down until it stopped being slow. A
+    // policy that is enabled by a threshold nobody can see, on the one path the plan
+    // exists to make fast, is the wrong shape. If the narrow-window case needs a
+    // different dispatch it belongs in the measurement, not in a hidden switch.
     bool is_feasible() const noexcept {
         return supply_ != nullptr && registry_ != nullptr &&
                registry_->vram_capacity >= registry_->experts_per_layer;
     }
 
-    // Whether a window of `window_tokens` is worth the swept strategy — feasibility
-    // is necessary, not sufficient.
-    //
-    // The sweep fetches a **whole layer** before that layer runs, deliberately: the
-    // router sits inside the body, so the set is known but the selection is not.
-    // The layer-major window *without* the sweep instead fetches each layer's
-    // distinct set as its body chunks ask for it, and dedup makes that set much
-    // smaller than the layer while the window is narrow — measured at `44` distinct
-    // of `96` draws for a `16`-token window (ledger M38), i.e. `~46%` of `6W`.
-    // Loading all `256` for a window that would have asked for `44` is a `5.8x`
-    // over-fetch, paid in exactly the currency prefill is bound by. So the rule is
-    // the point where the window's routed draws reach the layer's size twice over:
-    // at `6W = 2 x experts_per_layer` the measured distinct set is already `~235` of
-    // `256` (ledger M38's `.46` distinct fraction gives a crossover near `W = 93`),
-    // and above it the whole-layer load is a small, and shrinking, over-fetch.
-    //
-    // Below the threshold the window still runs — layer-major, deduplicated, per
-    // chunk — it simply does not pre-load whole layers. The switch is therefore
-    // derived from the model (`experts_per_layer`) and the window, and carries no
-    // tuned constant.
-    static bool worth(uint32_t window_tokens, uint32_t experts_per_layer) noexcept {
-        return 2ull * experts_per_layer <= 6ull * window_tokens;
-    }
-
     // Drain Hot and establish the frontier. The caller must already have reached a
     // compute-stream boundary and reaped the registry.
+    //
+    // Layer 0's reads are **issued here, not waited for**: `before_layer(0)` — which
+    // the driver calls immediately after — materializes them. Nothing is gained in
+    // this particular gap, and it is what makes the loop below uniform.
     void begin() {
         if (active_) return;
         if (!is_feasible()) {
@@ -119,28 +132,58 @@ public:
         // the observable proof that no decode resident crossed into prefill.
         hot_after_drain_ = registry_->published_hot_slots();
         active_ = true;
-        fill_ahead(0);
+        dispatch_ahead(0);
     }
 
-    // Guarantee layer `layer`'s whole set is resident before it computes. Normally a
-    // no-op, because the lookahead reached this layer several releases ago.
+    // Guarantee layer `layer`'s whole set is resident before it computes, and leave
+    // the **next** layer's reads in flight behind it (the double buffer).
+    //
+    // The order matters and is the whole point of this class's shape. A layer's reads
+    // are issued *before* the previous layer's body runs, so the disk works through
+    // the ~1.4 s of compute the body needs instead of sitting idle until the next
+    // layer is asked for. Materializing then finds the transfer already complete and
+    // costs a wait of near zero rather than the full read.
     void before_layer(uint32_t layer) {
         if (!active_) return;
-        ensure_layer(layer);
+        if (pending_valid_) {
+            if (pending_layer_ == layer) {
+                materialize_layer();
+            } else {
+                // A *later* layer is in flight (only reachable if the driver skipped
+                // ahead). Flush it so the free-slot accounting stays simple, then load
+                // this one the synchronous way.
+                materialize_layer();
+                ensure_layer(layer);
+            }
+        } else {
+            ensure_layer(layer);
+        }
+        dispatch_ahead(layer + 1);
     }
 
-    // Retire layer `layer` and advance the frontier into the room it frees.
+    // Retire layer `layer`. The room it frees is what the layer after `layer + 1`
+    // was waiting for; if the pool was too small to hold two layers the next
+    // dispatch was skipped at `before_layer` and `ensure_layer` picks it up then.
     void after_layer(uint32_t layer) {
         if (!active_) return;
         registry_->release_layer(layer);
-        fill_ahead(layer + 1);
+        ++layers_released_;
+        update_frontier();
     }
 
     // Leave the mode. Hot must be empty, which the per-layer release guarantees.
     void end() {
         if (!active_) return;
+        // Defensive: a pending dispatch would leave a transfer in flight, and
+        // `end_prefill_stream` refuses that. The driver never leaves one (it only ever
+        // dispatches `layer + 1`, and there is no layer 43), so this is a guard rather
+        // than a path — but completing it beats throwing out of a teardown.
+        if (pending_valid_) {
+            const uint32_t layer = pending_layer_;
+            materialize_layer();
+            registry_->release_layer(layer);
+        }
         active_ = false;
-        pending_.clear();
         leases_.clear();
         registry_->end_prefill_stream();
     }
@@ -150,6 +193,18 @@ public:
     uint64_t layer_loads() const noexcept { return layer_loads_; }
     uint64_t experts_streamed() const noexcept { return experts_streamed_; }
     uint64_t layers_released() const noexcept { return layers_released_; }
+    // Nanoseconds **blocked** in a layer's loads: `materialize` (the completion waits
+    // and the H2D issuance) plus the arena release. This is the share that a
+    // load/compute overlap removes, and the number the prefill A/B reports.
+    uint64_t load_ns() const noexcept { return load_ns_; }
+    // Nanoseconds spent *submitting* a layer's reads (the io_uring queue plus the
+    // registry bookkeeping). Not blocking on the drive, but not free either — it is
+    // what the dispatcher pays to keep the disk busy.
+    uint64_t io_ns() const noexcept { return io_ns_; }
+    // Layers whose reads were in flight at the moment a body began — 1 when the
+    // double buffer is engaged, 0 when the pool is too small to hold two layers and
+    // the loads fall back to synchronous.
+    uint32_t lookahead_depth() const noexcept { return lookahead_depth_; }
     // Hot residents remaining at the instant of the drain, before the frontier
     // refilled. Must be 0: the switch carries nothing over.
     uint32_t hot_after_drain() const noexcept { return hot_after_drain_; }
@@ -158,8 +213,8 @@ public:
     uint32_t frontier_depth() const noexcept { return frontier_depth_; }
 
 private:
-    // Loads the missing experts of one layer, synchronously: the caller's next step
-    // is to compute this layer, so the bytes must be resident.
+    // Loads the missing experts of one layer and waits for them: the caller's next
+    // step is to compute this layer.
     void ensure_layer(uint32_t layer) {
         const uint32_t per_layer = registry_->experts_per_layer;
         const uint32_t missing = per_layer - registry_->layer_resident_count(layer);
@@ -171,36 +226,14 @@ private:
                 std::to_string(registry_->free_vram_slot_count()) +
                 " are free — the lookahead must not outrun the release order");
         }
-        load_layer(layer);
+        dispatch_layer(layer);
+        materialize_layer();
     }
 
-    // Fills the free slots with the next unvisited layers in layer order, topping up
-    // a partially resident frontier layer before moving on, and stopping when the
-    // next layer no longer fits. A partial last layer is deliberate: the spec fills
-    // the room it has, in computation order.
-    void fill_ahead(uint32_t from) {
-        const uint32_t per_layer = registry_->experts_per_layer;
-        const uint32_t layers = registry_->num_layers;
-        while (from < layers) {
-            const uint32_t resident = registry_->layer_resident_count(from);
-            if (resident == per_layer) {
-                ++from;
-                continue;
-            }
-            if (registry_->free_vram_slot_count() < per_layer - resident) {
-                break;
-            }
-            load_layer(from);
-            ++from;
-        }
-        uint32_t resident_layers = 0;
-        for (uint32_t layer = 0; layer < layers; ++layer) {
-            if (registry_->layer_resident_count(layer) != 0) ++resident_layers;
-        }
-        frontier_depth_ = std::max(frontier_depth_, resident_layers);
-    }
-
-    void load_layer(uint32_t layer) {
+    // Issue one layer's reads and return without waiting. The bytes are in flight
+    // when this returns; nothing is resident yet.
+    void dispatch_layer(uint32_t layer) {
+        const auto started = std::chrono::steady_clock::now();
         supply_->reap_registry_transfers();
         std::vector<uint32_t> missing;
         missing.reserve(registry_->experts_per_layer);
@@ -209,17 +242,35 @@ private:
                 missing.push_back(expert);
             }
         }
-        if (missing.empty()) return;
+        if (missing.empty()) {
+            pending_valid_ = false;
+            return;
+        }
 
-        V4ExpertSupplyCoordinator::LayerPrefetchState state =
-            supply_->dispatch_layer_stream(layer, missing, leases_);
-        supply_->materialize_layer_prefetch(state);
-        // The sweep has no `on_routed_consumed` hook, so it hands the arena's slots
-        // back itself — its loads are the only staging traffic at this point.
-        supply_->finish_streamed_batch(state);
-
+        pending_state_ = supply_->dispatch_layer_stream(layer, missing, leases_);
+        pending_layer_ = layer;
+        pending_valid_ = true;
         ++layer_loads_;
         experts_streamed_ += missing.size();
+        io_ns_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+    }
+
+    // Wait for the dispatched layer's reads and hand its staging slots back. With the
+    // double buffer engaged the wait is short by construction: the reads were issued
+    // one layer's compute ago.
+    void materialize_layer() {
+        if (!pending_valid_) return;
+        const auto started = std::chrono::steady_clock::now();
+        supply_->materialize_layer_prefetch(pending_state_);
+        // The sweep has no `on_routed_consumed` hook, so it hands the arena's slots
+        // back itself — its loads are the only staging traffic at this point.
+        supply_->finish_streamed_batch(pending_state_);
+        load_ns_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+
         // The leases the dispatch took are meaningless here: nothing evicts during a
         // swept prefill (allocation is free-list only and release is by layer), so
         // they are dropped immediately rather than carried to a boundary.
@@ -227,16 +278,50 @@ private:
             registry_->release_lease(gid);
         }
         leases_.clear();
+        pending_valid_ = false;
+        update_frontier();
+    }
+
+    // Start the next layer's reads if the pool can hold them alongside the current
+    // one. When it cannot, this is a no-op and `ensure_layer` loads that layer
+    // synchronously at its own boundary — the strategy degrades to the serial form
+    // rather than failing.
+    void dispatch_ahead(uint32_t layer) {
+        if (pending_valid_) return;
+        if (layer >= registry_->num_layers) return;
+        const uint32_t per_layer = registry_->experts_per_layer;
+        const uint32_t resident = registry_->layer_resident_count(layer);
+        if (resident == per_layer) return;
+        if (registry_->free_vram_slot_count() < per_layer - resident) return;
+        dispatch_layer(layer);
+        lookahead_depth_ = pending_valid_ ? 1u : 0u;
+    }
+
+    void update_frontier() {
+        const uint32_t layers = registry_->num_layers;
+        uint32_t resident_layers = 0;
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            if (registry_->layer_resident_count(layer) != 0) ++resident_layers;
+        }
+        if (pending_valid_) ++resident_layers;
+        frontier_depth_ = std::max(frontier_depth_, resident_layers);
     }
 
     V4ExpertSupplyCoordinator* supply_{nullptr};
     ExpertRegistry* registry_{nullptr};
     bool active_{false};
-    std::vector<V4ExpertSupplyCoordinator::LayerPrefetchState> pending_;
+    // The one layer whose reads are in flight, if any. A single slot and not a queue:
+    // the driver visits layers strictly in order, so at most one layer is ever ahead.
+    V4ExpertSupplyCoordinator::LayerPrefetchState pending_state_{};
+    uint32_t pending_layer_{0};
+    bool pending_valid_{false};
     std::vector<uint32_t> leases_;
     uint64_t layer_loads_{0};
     uint64_t experts_streamed_{0};
     uint64_t layers_released_{0};
+    uint64_t load_ns_{0};
+    uint64_t io_ns_{0};
+    uint32_t lookahead_depth_{0};
     uint32_t hot_after_drain_{0};
     uint32_t frontier_depth_{0};
 };
