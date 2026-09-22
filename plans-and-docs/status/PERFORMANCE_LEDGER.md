@@ -2,8 +2,9 @@
 
 Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 
-* **Last normalized**: 2026-09-18
-* **Scope**: latency, throughput, storage supply, cache behavior, and numerical correctness.
+* **Last normalized**: 2026-09-22.
+* **Scope**: end-to-end runs through `aeon_chat`, and — as edge cases — directly measured performance values (a benchmark, a machine reference rate) and cache/supply analyses derived from an end-to-end run.
+* **Not recorded here**: per-test correctness results and isolated synthetic-kernel microbenchmarks. Those live in the tests themselves.
 * **Status rule**: `[x] Invalidate for comparison` excludes the headline result from cross-entry comparisons.
 
 ## 1. Recording contract
@@ -22,7 +23,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 ```markdown
 ### Mxx: Short milestone name
 - **Run**: `YYYY-MM-DD`; commit or artifact; model/scope
-- **Class / comparison key**: `E2E | Kernel | I/O | Primitive | Integration | Analysis` / `key`
+- **Class / comparison key**: `E2E | Benchmark | I/O | Analysis` / `key`
 - **Platform**: `baseline` or the complete deviation from the baseline below
 - [ ] **Invalidate for comparison** | **Reason**: `--`
 - **Workload / configuration**: prompt, context, layers, cache state, `n`, statistic
@@ -37,10 +38,8 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | Class | Required fields |
 | :--- | :--- |
 | `E2E` | TTFT, decode throughput, decode step latency, service counts/hit rate, `n`/statistic, output gate |
-| `Kernel` | median or p50 latency, throughput/effective bandwidth, launch shape, max error, `n` |
-| `I/O` | throughput, request/extent conditions, payload parity, completion behavior, `n` |
-| `Primitive` | shape, latency/throughput, reference error or tolerance, pass/fail |
-| `Integration` | exercised path, pass/fail, service counts, explicitly untested path |
+| `Benchmark` | throughput, effective bandwidth, bytes moved, `n` |
+| `I/O` | throughput, request/extent conditions, completion behavior |
 | `Analysis` | sample/corpus, coverage or observed distribution, decision, limitation |
 
 ## 2. Hardware testbed
@@ -56,72 +55,32 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 
 | Comparison key | Intended use | Entries |
 | :--- | :--- | :--- |
-| `primitive-fixture` | Same named component test and shape only | M1-M2 |
-| `kernel-stage1` | Isolated synthetic swizzled/fused expert kernels | M23-M24 |
-| `e2e-43L-text` | Text in/text out at 43 layers; single-token decode, no batching | M28 |
+| `hardware-baseline` | Machine reference rates (NVMe, GEMM, PCIe/compute overlap) | M1 |
+| `e2e-43L-text` | Text in/text out at 43 layers | M28 |
 | `supply-telemetry` | Per-phase, per-tier supply request/byte counters | M29 |
 | `budget-cap` | Hot VRAM expert-pool cap feasibility and behavior | M30 |
 | `tier-invariance` | Two runs, different tiers, byte-identical logits | M31 |
 | `starved-pool` | Hot-pool cap forcing the emergency drain; logits still exact | M32 |
-| `demotion-ab` | Demotion-queue capacity 2 vs 6; drops, Warm, NVMe, D2H | M33 |
+| `demotion-ab` | Demotion-queue capacity 2 vs 6 | M33 |
 | `staging-depth` | Staging arena contention; depth lever viability | M34 |
 | `routing-reuse` | Decode reuse-distance (ideal-LRU) vs measured Hot hit rate | M35 |
 | `routing-opt` | Belady-OPT vs ideal-LRU: policy headroom | M36 |
-| `prefill-window` | Layer-major window vs serial `forward_token`, byte-exact | M37 |
-| `prefill-batch-dispatch` | Layer-wide deduplicated expert dispatch vs serial, byte-exact | M38 |
-| `warm-frozen-prefill` | Warm resident set preserved across a prefill (D-b policy A) | M39 |
-| `prefill-sweep` | Layer-ordered swept prefill: drain, whole layer sets, empty on exit | M40 |
-| `engine-prefill-window` | The engine's prompt as one layer-major window; sweep eligibility; prefill tok/s | M41 |
 | `prefill-ab` | Serial vs swept prefill at two prompt lengths, tok/s and bytes | M42 |
-| `prefill-sweep-overlap` | Swept prefill with the next layer's reads dispatched before compute | M42 |
 | `prefill-config` | Window/chunk as user settings; workspace derived and allocated at load | M43 |
 | `registry-audit-cost` | Per-request `validate_invariants()`: dispatch cost and its removal | M43 |
 
 ## 4. Milestone cards
 
-### M1: Phase 0 Foundations & Hardware Spikes
-- **Run**: `2026-09-07`; component fixtures
-- **Class / comparison key**: `Primitive / primitive-fixture`; compare each named shape only
+### M1: Hardware baseline — NVMe, GEMM, and PCIe/compute overlap
+- **Run**: `2026-09-07`; Device 0
+- **Class / comparison key**: `I/O / hardware-baseline`
 - **Platform**: `baseline`, Device 0
 - [ ] **Invalidate for comparison** | **Reason**: `--`
-- **Workload / configuration**: WMMA tile and GEMM, aligned direct I/O, and PCIe/compute overlap probes; `n=1` per fixture
-- **Metrics**: WMMA tile error `0.0`; GEMM `25.6 TFLOP/s` at `870 us` for `2048 x 2048`; NVMe `6.33 GB/s`; overlap `24.9 GB/s` with `0.0%` compute jitter
-- **Correctness / service**: FP16 tile and aligned direct-I/O payload checks passed
-- **Conclusion / next gate**: Baselines; not end-to-end inference numbers
-- **Evidence**: Phase 0 primitive probes (retired)
-
-### M2: Single-GPU Mathematical Primitives (Phase 1 Spikes 1–5)
-- **Run**: `2026-09-07`; component fixtures
-- **Class / comparison key**: `Primitive / primitive-fixture`; compare identical test shape only
-- **Platform**: `baseline`, Device 0
-- [ ] **Invalidate for comparison** | **Reason**: `--`
-- **Workload / configuration**: W4A16 projection, RMSNorm/SwiGLU, Sinkhorn, router, cached attention, and block-forward checks; `n=1` per fixture
-- **Metrics**: projection `140.34 us` (`1.91 TFLOP/s`); RMSNorm error `<8.4e-4`; Sinkhorn error `<5.96e-8`; router top-6 match `100%`; attention `41.91 us` for 16 tokens (`2.62 us/token`); block `1.80 ms/token`, error `0.0033`
-- **Correctness / service**: all named CPU-reference and assignment checks passed their recorded thresholds
-- **Conclusion / next gate**: Primitive fixtures passed; full-model parity is a separate gate
-- **Evidence**: `test_w4a16_swizzle.cpp`, `test_w4a16_swizzled_gemv.cpp`, `test_swiglu_clamp.cpp`, `test_hc_sinkhorn.cpp`, `test_moe_router.cpp`. The `test_v4_attention.cpp` and block fixtures that produced the latency figures are retired.
-
-### M23: Stage 1 Swizzled and Fused Expert Kernel Measurement
-- **Run**: `2026-09-10`; target RX 7900 XTX (`gfx1100`)
-- **Class / comparison key**: `Kernel / kernel-stage1`
-- **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
-- **Workload / configuration**: synthetic weights, version-2 swizzled layout, isolated HIP-event timing; excludes model load, NVMe, staging, routing, and cache misses; `n=101` trace iterations
-- **Metrics**: W1/W3 `12.822 -> 11.152 us` (`1.150x`, `368 -> 423 GB/s`); W2 `13.077 -> 10.926 us` (`1.197x`, `361 -> 432 GB/s`); dual W1/W3 `29.012 -> 15.816 us` (`1.834x`); fused W1/W3 `147.557 -> 39.775 us` (`3.710x`); fused W2 `107.486 -> 28.652 us` (`3.751x`)
-- **Correctness / service**: individual and dual-launch max diff `0.000`; fused W1/W3 `0.016`, fused W2 `0.002`; launch trace reduced fused paths to 101 kernels; GL2C counters unsupported, so no counter claim
-- **Conclusion / next gate**: Isolated kernels only; full-model impact not measured. The `M=16` WMMA check at `149.234 us` is not a decode comparison
-- **Evidence**: `bench_aeon_moe_fused_w13`, `test_aeon_moe_fused_w13` (retired); `test_aeon_moe_fused_w2` (built); `rocprofv2 --kernel-trace`
-
-### M24: Activation-Staging A/B Experiment
-- **Run**: `2026-09-10`; target RX 7900 XTX (`gfx1100`)
-- **Class / comparison key**: `Kernel / kernel-stage1`
-- **Platform**: `baseline`
-- [ ] **Invalidate for comparison** | **Reason**: `--`
-- **Workload / configuration**: same synthetic inputs, geometry, outputs, and FP32 accumulation as M23; direct versus `STAGE_ACTIVATION=true`; W1/W3 `n=5` alternating trials, W2 repeated
-- **Metrics**: W1/W3 direct `37.170 us` median (range `37.052-37.202`) versus staged `41.354 us` (`40.526-42.040`), ratio `0.899x`; W2 first `26.045` versus `25.937 us` (`1.004x`), repeat `25.361` versus `24.988 us` (`1.015x`)
-- **Correctness / service**: all direct/staged output max differences `0.000`; staged LDS allocation `8 KiB` for W1/W3 and `4 KiB` for W2
-- **Conclusion / next gate**: Activation staging is slower on W1/W3 and neutral on W2; do not enable
-- **Evidence**: fused kernel A/B benchmark (retired)
+- **Workload / configuration**: aligned direct-I/O read, a large WMMA GEMM, and a PCIe/compute overlap probe; `n=1` per fixture
+- **Metrics**: NVMe sequential `io_uring` `O_DIRECT` read `6.33 GB/s`; GEMM `25.6 TFLOP/s` (`2048 x 2048`, `870 us`); overlap `24.9 GB/s` with `0.0%` compute jitter
+- **Correctness / service**: aligned direct-I/O payload and FP16 tile checks passed
+- **Conclusion / next gate**: the machine's reference rates; `6.33 GB/s` is the single-drive rate used by every prefill cost model in the plan
+- **Evidence**: Phase 0 hardware probes (retired)
 
 ### M28: 43-Layer Text-In/Text-Out at `≈3 tok/s`
 - **Run**: `2026-09-17`; branch `rewrite/graph-v2`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 11,008 experts
@@ -215,10 +174,8 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
   | `demotion_queue_depth_max` | `2` | `6` | — |
 
   **Warm service (the same run, request counts):** decode Warm `1247 → 1804` requests (`+45%`), Cold `1395 → 838` (`−40%`); prefill Warm `1066 → 1237`. Warm hit rate decode `21.0% → 30.4%`. Total request counts are identical across arms (`5934`/row), so this is a like-for-like tier shift.
-
-  🔶 **Correction (2026-09-21, after a realistic run).** The cost/benefit line below is a *bandwidth* estimate and was **not confirmed in wall-clock**. A 1024-token non-greedy run (`3.40 → 3.22 tok/s`, TTFT `16.25 → 17.32 s`) is a wash within the run-to-run spread. The reason is the **max-of-six**: a layer waits on its slowest fetch, so what matters is `P(any cold) = 1 − (1 − p)⁶`, which moved only `80% → 60%` — a predicted ≈`5%` step-time gain, below noise. **Decode is supply-latency-bound, not bandwidth-bound**, so a byte reduction on the non-critical path does not show up as throughput. Treat the `−40%` NVMe as a resource win, not a latency win.
 - **Correctness / service**: logits **byte-identical** across arms (`cmp`); both arms exit `0`
-- **Conclusion / next gate**: Step 5 gate met — the larger queue converts every dropped demotion into Warm service (`drops 979 → 0`; Warm hits `+45%`), cutting decode NVMe `40%`. **Throughput effect not established** (`n=1`, predicted ≈`5%` ≈ noise); the queue is a resource/cleanliness win. Capacity `6` sufficed for **both** phases (`queue_depth_max = 6`), so `12` adds nothing here. **The per-layer outcome distribution measured on a `512`-token run (queue `6`): decode `all_hot 8.4%`, `warm_no_cold 46.3%`, `has_cold 45.3%` (`21973` dispatches `= 511 × 43`)** — nearly half of decode layers touch Cold and only `8.4%` are all-Hot, confirming the max-of-six explanation for the flat throughput (§6.10 thesis 1)
+- **Conclusion / next gate**: Step 5 gate met — the larger queue converts every dropped demotion into Warm service (`drops 979 → 0`; Warm hits `+45%`), cutting decode NVMe `40%`. **Throughput effect not established** (`n=1`, predicted ≈`5%` ≈ noise); the queue is a resource/cleanliness win, not a latency win. Capacity `6` sufficed for **both** phases (`queue_depth_max = 6`), so `12` adds nothing here. Per-layer outcome distribution on a `512`-token run (queue `6`): decode `all_hot 8.4%`, `warm_no_cold 46.3%`, `has_cold 45.3%` (`21973` dispatches `= 511 × 43`) — nearly half of decode layers touch Cold and only `8.4%` are all-Hot, which is why a byte reduction on the non-critical path does not become a speed win.
 - **Evidence**: `scripts/expert_demotion_queue_ab.sh`, `/tmp/aeon-demotion-ab.MAvbnY/{q2,q6}.{log,telemetry.jsonl,logits.bin}`, `/tmp/aeon-q6-essay.log`, `/tmp/aeon-layers.log`
 
 ### M34: Staging depth — not a bottleneck in the single-token path
@@ -229,7 +186,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Workload / configuration**: the M33 `q2`/`q6` 24-token runs at context `32768`, `--warm-gib 40`; decode phase
 - **Metrics**: staging-using decode transfers ≈`2642`; `staging_reuse_wait_ns` sum `69.37 s` (q2) / `75.66 s` (q6) ⇒ mean slot idle **`26.3 / 28.6 ms`**. Slot addressing is fixed: `staging_offset = (layer % 2) * 6` (`v4_expert_supply.hpp`), two banks by layer parity, no free-list
 - **Correctness / service**: no run has ever thrown a staging state-transition error; `staging_in_use == 0` at every measured end (M32)
-- **Conclusion / next gate**: **Premise refuted.** Staging is not contended — its slots idle ≈ one layer period and never block; `staging_reuse_wait_ns` is a misnamed *idle* counter, not a wait. Raising `TOTAL_STAGING_SLOTS` cannot help the single-dispatch path. Depth becomes a lever only when dispatches overlap (chunked prefill/prefetch-ahead), i.e. Step 6, where Step 0 D4's `banks × depth` sizing applies
+- **Conclusion / next gate**: **Premise refuted.** Staging is not contended — its slots idle ≈ one layer period and never block; `staging_reuse_wait_ns` is a misnamed *idle* counter, not a wait. Raising `TOTAL_STAGING_SLOTS` cannot help the single-dispatch path. Depth becomes a lever only when dispatches overlap (chunked prefill), where Step 0 D4's `banks × depth` sizing applies
 - **Evidence**: `/tmp/aeon-demotion-ab.MAvbnY/{q2,q6}.telemetry.jsonl`, `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` (`staging_offset`), `src/infrastructure/core/prefetch_staging.hpp` (`take_reuse_delay_ns`)
 
 ### M35: Routing reuse distance — the recency policy is already at its ceiling
@@ -238,9 +195,9 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Platform**: `baseline`, Device 0 only
 - [ ] **Invalidate for comparison** | **Reason**: `--`
 - **Workload / configuration**: essay prompt, context `32768`, non-greedy, `512` generated tokens, `--warm-gib 40`, queue `6`; layers 0–2 excluded (hash router)
-- **Metrics**: `122640` learned-layer decode requests, `6531` compulsory (`5.3%`). Ideal-LRU hit rate by capacity: `6 → 0.0%`, `64 → 0.0%`, `128 → 0.0%`, `258 → 31.3%`, `779 → 60.5%`, `1558 → 74.0%`, `3022 → 85.7%`, `11008 → 94.7%` (ceiling `= 1 − compulsory`). **Measured Hot hit rate `60.6%` vs ideal-LRU at capacity `779` `60.5%`**
-- **Correctness / service**: unit test `test_routing_reuse` (4 hand-computed stack distances, incl. the `miss@6 / hit@64` boundary, hash-layer exclusion, measured-hit tracking) passes; run exits `0`
-- **Conclusion / next gate**: The current global-LRU policy already achieves the ideal-LRU hit rate at its capacity — **no implementation headroom, so LRU is not thrashing** (thesis 2's mechanism refuted for same-capacity recency). Consequent lever is **capacity/coverage** (curve is steep `258→3022`). To decide whether a *different policy* (frequency/OPT) beats ideal-LRU, compute the **Belady-OPT curve** next
+- **Metrics**: `122640` learned-layer decode requests, `6531` compulsory (`5.3%`). Ideal-LRU hit rate by capacity: `258 → 31.3%`, `779 → 60.5%`, `1558 → 74.0%`, `3022 → 85.7%`, `11008 → 94.7%` (ceiling `= 1 − compulsory`). **Measured Hot hit rate `60.6%` vs ideal-LRU at capacity `779` `60.5%`**
+- **Correctness / service**: unit test `test_routing_reuse` (hand-computed stack distances, hash-layer exclusion, measured-hit tracking) passes; run exits `0`
+- **Conclusion / next gate**: The current global-LRU policy already achieves the ideal-LRU hit rate at its capacity — **no implementation headroom, so LRU is not thrashing**. The consequent lever is **capacity/coverage** (curve is steep `258→3022`). Whether a *different policy* (frequency/OPT) beats ideal-LRU is M36
 - **Evidence**: `--profile-routing`, `tests/test_routing_reuse.cpp`, `/tmp/aeon-reuse.log`
 
 ### M36: Belady-OPT — a non-recency policy has ~17 points of headroom at the Hot capacity
@@ -249,73 +206,17 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Platform**: `baseline`, Device 0 only
 - [ ] **Invalidate for comparison** | **Reason**: `--`
 - **Workload / configuration**: `aeon_chat --profile-routing`, layers 0–2 excluded; Belady-OPT simulated offline over the same stream
-- **Metrics**: hit rate by capacity (`ideal-LRU` → `OPT`): `6: 0.0 → 2.1%`, `64: 0.0 → 25.1%`, `128: 0.0 → 43.8%`, `258: 31.3 → 59.8%`, **`779: 60.5 → 77.4%`**, `1558: 74.0 → 85.9%`, `3022: 85.7 → 92.1%`, `11008: 94.7 → 94.7%`
-- **Correctness / service**: `test_routing_reuse` now also covers OPT — hand-computed `6/14` vs LRU `0/14` on an LRU-pessimal cycling trace, plus the structural `OPT ≥ ideal-LRU` invariant. (A sentinel bug — final occurrences keyed as `-1`, which sorts as *soonest* — was caught by this test and fixed.)
-- **Conclusion / next gate**: **Recency is at its ceiling, but a non-recency policy is not.** OPT beats ideal-LRU by `+16.9` points at the Hot capacity (and `+28.5` at `258`). This is an **oracle upper bound**, so it is the maximum a policy can win at `779`, not the expected win. It validates thesis 2's *direction* while refuting its *mechanism*: the lever is a better policy (frequency/placement), and how much is capturable needs the Phase 2 static ranking
+- **Metrics**: hit rate by capacity (`ideal-LRU` → `OPT`): `258: 31.3 → 59.8%`, **`779: 60.5 → 77.4%`**, `1558: 74.0 → 85.9%`, `3022: 85.7 → 92.1%`, `11008: 94.7 → 94.7%`
+- **Correctness / service**: `test_routing_reuse` also covers OPT — hand-computed `6/14` vs LRU `0/14` on an LRU-pessimal cycling trace, plus the structural `OPT ≥ ideal-LRU` invariant
+- **Conclusion / next gate**: **Recency is at its ceiling, but a non-recency policy is not.** OPT beats ideal-LRU by `+16.9` points at the Hot capacity (and `+28.5` at `258`). This is an **oracle upper bound**, so it is the maximum a policy can win at `779`, not the expected win. The practically capturable fraction needs the Phase 2 static ranking in the [Routing Profile and Placement Study](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)
 - **Evidence**: `--profile-routing` (`opt_hit` column), `tests/test_routing_reuse.cpp`, `/tmp/aeon-opt.log`
 
-### M37: Layer-major prefill window — `window ≡ serial`, bit-exact
-- **Run**: `2026-09-21`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers; `test_v4_prefill_window`
-- **Class / comparison key**: `Analysis / prefill-window`
-- **Platform**: `baseline`, Device 0 only
-- [ ] **Invalidate for comparison** | **Reason**: `--`
-- **Workload / configuration**: a `16`-token window at context `256`, through the real host (43 layers, the real expert supply); the layer-major path `V4Graph::forward_window(ids, 0, 16, C)` at body chunk `C = 16` (one invocation per layer) and `C = 5` (several), against the serial reference `forward_token` once per token in position order
-- **Metrics**: final logits `0` of `258560` bytes differing; final residual `0` of `65536` bytes differing; the two chunk schedules byte-identical to each other; `8` checks, `0` failures. Leases `0` outstanding, staging `0` slots in use at the end
-- **Correctness / service**: greedy logits and residual are bit-identical to the certified serial path; the chunk size is not observable in the result
-- **Conclusion / next gate**: **Step 6 outcome 1 met.** The iteration order is an ordering: layer-major within a bounded window changes no number, so the strategy decided in Step 6 D-a is certified at the equality half before any speed is claimed. Throughput (outcome 5) is the separate gate
-- 🔶 **Correction — the "divergence" this gate first reported was a harness artifact.** An earlier version read device buffers with `hipMemcpy` immediately after a forward pass and reported ~`76%` of the logits differing. The forward paths enqueue on the **compute stream**, which is non-default and non-blocking, and a plain `hipMemcpy` does not order against it — so the read returned the *previous* run's buffer. The body's own `hipStreamSynchronize` sits *before* its final stages (the topk readback) and therefore does not cover them. Synchronizing the device before each read makes all `8` checks pass, with the chunk body **unmodified**: the two speculative fixes made while chasing the artifact (a `(layer % 2) × 6` → free-list staging redesign, and a safe-release `hipEventSynchronize`) were reverted, because the original staging path was never the cause. **A gate that compares device buffers must synchronize the stream first**; this is load-bearing, and the failure mode is a fabricated divergence that points at the wrong component
-- **Evidence**: `tests/test_v4_prefill_window.cpp`, `src/architecture/deepseek_v4/core/v4_graph.hpp` (`forward_window`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (batch scratch + residual carry)
-
-### M38: Layer-wide deduplicated expert dispatch — `window ≡ serial` through the batch dispatch
-- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers; `test_v4_prefill_window`
-- **Class / comparison key**: `Integration / prefill-batch-dispatch`
-- **Platform**: `baseline`, Device 0 only
-- [ ] **Invalidate for comparison** | **Reason**: `--`
-- **Workload / configuration**: the same `16`-token window at context `256`, with `AeonRuntimeConfig::prefill_chunk = 16` (staging arena `96` slots `= 6C`, `io_uring` depth `384 = 6C × 4 chunks/expert`); body chunks `C = 16` and `C = 5`, against the serial `forward_token` reference
-- **Metrics**: final logits `0` of `258560` bytes differing; final residual `0` of `65536` bytes differing; the two chunk schedules byte-identical to each other; **dedup `1909` distinct of `4128` draws** (a `54%` collapse); last dispatch covers `16` tokens; `10` checks, `0` failures; leases `0`, staging `0` in use at the end
-- **Correctness / service**: byte-exact through the layer-wide, deduplicated dispatch — dedup changes *which copy is read*, never the slot-sum order, so the fixed-order fp32 reduce is unchanged. The mutant sweep (`scripts/mutate_expert_executor.py`) kills `5/5`, including the new `token_map`-indexed slot resolution (`EX-3`)
-- **Conclusion / next gate**: **Step 6 items 4 and D4 built.** The equality half of item 4 (the `6C` set, dedup, and the layer-wide `on_routing_ready_batch`) holds bit-exactly through the real executor; the arena is runtime-sized to the deduped ceiling `6C`, and reaching the smaller concurrency depth is Step 7. Warm-frozen (item 5) and the double-buffered sweep (item 6) remain; throughput is outcome 5
-- **Evidence**: `tests/test_v4_prefill_window.cpp`, `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` (`dispatch_layer_prefetch_batch`), `src/architecture/deepseek_v4/core/v4_expert_executor.hpp` (`on_routing_ready_batch`), `src/infrastructure/core/prefetch_staging.hpp` (runtime `slot_count`), `src/architecture/deepseek_v4/core/memory_budget.hpp` (`prefill_chunk`)
-
-### M39: Warm preserved across a prefill — the frozen-prefill policy (D-b)
-- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers; `test_v4_warm_frozen_prefill`
-- **Class / comparison key**: `Integration / warm-frozen-prefill`
-- **Platform**: `baseline`, Device 0 only
-- [ ] **Invalidate for comparison** | **Reason**: `--`
-- **Workload / configuration**: a real Warm tier of `291` slots (`warm_host_bytes` `4 GiB`, preloaded) at context `256`, `809` Hot slots; one `16`-token layer-major window (`prefill_chunk = 16`) with the phase set to prefill (frozen), then the phase set to decode, then a **control** window of the same shape with the freeze off
-- **Metrics**: Warm resident set `291 → 291` across the frozen prefill (`0` differing of `291`); `51` non-destructive copies, `721,944,576 B` served logically from Warm with `0` NVMe bytes added; leaving the phase released every shadow (`0` held) with Warm still `291`; the unfrozen control changed **`332`** experts and left Warm at `265`. `11` checks, `0` failures; leases `0`, staging `0` in use
-- **Correctness / service**: registry `invariants_hold()` throughout; the VRAM bijectivity invariant now admits exactly two owners per slot (a Hot expert, or a Warm expert's declared shadow), and the shadow LRU and per-expert shadow map are validated against the catalog. Tier-invariance holds with the freeze active: arms `--warm-gib 0` vs `--warm-gib 4` at context `2048` produce **byte-identical** logits (`3,361,280 B`), so freezing Warm changed no number. The mutant sweep (`scripts/mutate_warm_frozen.py`) kills `2/2` — the frozen request promoting normally (drains Warm), and the freeze never engaging
-- **Conclusion / next gate**: **Step 6 item 5 built, outcome 3 met.** Warm survives a prefill intact because the sweep takes a *copy* rather than a *move*; the prefill still gets Warm's bandwidth instead of paying an NVMe read to bypass it. The remaining Step 6 item is the double-buffered sweep (item 6); throughput (outcome 5) is the separate gate. The `291`-slot tier is a correctness configuration, not a throughput one
-- **Evidence**: `tests/test_v4_warm_frozen_prefill.cpp`, `src/infrastructure/core/expert_registry.hpp` (`set_warm_frozen`, shadow residency), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`set_supply_phase`), `src/architecture/deepseek_v4/core/memory_budget.hpp` (`freeze_warm_during_prefill`)
-
-### M40: The prefill sweep — drain, layer-ordered whole sets, empty on exit
-- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers; `test_v4_prefill_sweep`
-- **Class / comparison key**: `Integration / prefill-sweep`
-- **Platform**: `baseline`, Device 0 only
-- [ ] **Invalidate for comparison** | **Reason**: `--`
-- **Workload / configuration**: `809` Hot slots, `63` Warm experts (`1 GiB`), a `16`-token layer-major window at context `256`, `prefill_chunk = 16`, `prefill_sweep = true`; staging arena sized to the layer (`256` slots), `io_uring` depth `1024`
-- **Metrics**: Hot **`0`** residents at the drain instant (recorded between `begin_prefill_stream` and the first frontier fill); `11008` experts streamed in `43` loads (`43 × 256`, every layer exactly once); frontier **`2` layers deep**; Hot **`0`** residents and **`0`** shadows at the end; Warm **`0` experts differing** across the sweep; logits **`0` differing of `258560`** bytes vs the serial `forward_token` reference; `13` checks, `0` failures; leases `0`, staging `0` in use
-- **Correctness / service**: `invariants_hold()` throughout. The one new invariant is enforced, not intended: **a shadow residency is legal only while Warm is frozen** (`!warm_frozen_ ⇒ shadow_lru_.empty()`), so decode keeps single ownership. `test_v4_prefill_window` (which now drives the sweep by default) still reports `10` checks, `0` failures — the swept prefill is byte-identical to serial.
-- **Conclusion / next gate**: **Step 6 item 6 built, outcome 6 met.** Prefill is a hard switch to a layer-ordered streaming strategy: drain on entry, whole layer sets resident in computation order, bulk release per layer, empty on exit, Warm and its LRU ranking untouched. LRU is not used in prefill — nothing inside a window is reused, so the only correct release is the whole layer. Throughput (outcome 5) is the separate gate; the loads are issued and materialized in layer order, and overlapping them with compute is bounded by staging depth (§6c item 6).
-- **Evidence**: `tests/test_v4_prefill_sweep.cpp`, `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp`, `src/infrastructure/core/expert_registry.hpp` (`begin_prefill_stream`, `release_layer`, `end_prefill_stream`, the shadow invariant), `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` (`dispatch_layer_stream`, `finish_streamed_batch`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`prefill_begin`/`before_layer`/`after_layer`/`end`)
-
-### M41: The engine's prefill is the window — sweep eligibility, and outcome 5's first number
-- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers; `test_v4_engine`, `test_v4_prefill_sweep`, `test_v4_prefill_window`, `scripts/expert_tier_invariance.sh`, `scripts/expert_starved_pool.sh`
-- **Class / comparison key**: `Integration / engine-prefill-window`
-- **Platform**: `baseline`, Device 0 only
-- [ ] **Invalidate for comparison** | **Reason**: `--`
-- **Workload / configuration**: the P4 acceptance gate at context `256` (`809` Hot slots, no Warm), same prompt as before; plus a `103`-token prompt built by repetition to clear the sweep's over-fetch rule, and the `96`-token sweep gate (`prefill_chunk = 16`)
-- **Metrics**: engine gate **`40` checks, `0` failures** in `164.5 s` end to end. Section H: the `103`-token prompt swept — **`43` layer loads, `11008` experts, `148 GiB` in `49.2 s` = `2.1 tok/s` = `3.0 GB/s`**, frontier `2` layers, **`0`** Hot residents at the drain; the `11`-token prompt did **not** sweep (`0` additional layer loads). Sweep gate at a `96`-token window: `14 checks, 0 failures`, `11008` experts in `43` loads, logits `0` differing of `258560`, Warm `0` differing, `91 s`. Window gate: `10 checks, 0 failures` in `29 s` (no longer sweeping: `1909` distinct of `4128` draws). Tier-invariance **PASSED** (byte-identical logits, `logical_bytes_from_warm` A `0` / B `10.82 GB`); starved-pool **PASSED** (`forced_drains = 362`, logits byte-identical to the uncapped reference); warm-frozen `11 checks, 0 failures`
-- **Correctness / service**: `invariants_hold()` and `outstanding_leases == 0` on every run; the swept engine prefill produces the same token as the gate's own `forward_token` replay for the short path (section A), and the swept path's byte-equality is M40's graph-level result, not re-derived here. Two corrections are recorded in the plan: the sweep is engaged **per window** above `6W ≥ 2 × experts_per_layer` (a `16`-token window over-fetches `256` for the `44` it draws — `5.8×`), and `--dump-logits` now holds one row per window plus one per decode token, because the window computes only the last position's head
-- **Conclusion / next gate**: **Step 6 item 7 built; outcome 5 measured for the first time.** The engine's prompt is one layer-major window, the swept supply is on the production path, and the long/short split is asserted in both directions. The number is the finding: the one-sweep floor of §6b is reached (`43` loads, `148 GiB`) but at **half** the single-drive rate (`3.0` vs `6.33 GB/s`), because loads are still serialized with their materialization and with compute — **load/compute overlap is the whole of outcome 5's remaining gap**, and the Step 7 sweep of `W`/`C` now has a baseline to move
-- **Evidence**: `tests/test_v4_engine.cpp` (§H), `src/architecture/deepseek_v4/core/v4_engine.hpp` (`prefill_step`/`decode_step`, `prefill_chunk_for`, `prefill_window_for`), `src/infrastructure/text/text_generation.hpp` (`PromptPrefill`), `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp` (`worth`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`prefill_begin(window)`, `prefill_sweep_engaged`), `src/architecture/deepseek_v4/core/memory_budget.hpp` (`prefill_window`), `tools/aeon_chat.cpp` (`--prefill-window`)
-
 ### M42: The prefill A/B, and the double-buffered load
-- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `bench_prefill_ab` + `scripts/prefill_ab.sh`, `test_v4_prefill_sweep`, `test_v4_engine`
-- **Class / comparison key**: `Benchmark / prefill-ab`, `Benchmark / prefill-sweep-overlap`
+- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `bench_prefill_ab` + `scripts/prefill_ab.sh`
+- **Class / comparison key**: `Benchmark / prefill-ab`
 - **Platform**: `baseline`, Device 0 only, single NVMe (`6.33 GB/s` measured ceiling used throughout)
 - **Workload / configuration**: one arm per process (`serial` = `forward_token` per prompt token; `swept` = one `forward_window`, `prefill_sweep = true`), pristine host each, context `2048`, body chunk derived (`min(68, arena 42, pool 134) = 42`), `809` Hot slots, no Warm
-- **Metrics**: 
+- **Metrics**:
 
   | N | arm | seconds | tok/s | NVMe | GiB/1k tok |
   | ---: | :--- | ---: | ---: | ---: | ---: |
@@ -326,19 +227,14 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
   | 512 | swept, before overlap | 97.1 | 5.27 | 145.1 GiB | 290 |
   | 512 | **swept, double-buffered** | **73.6** | **6.96** | 145.1 GiB | 290 |
 
-  The sweep's byte count is **constant** (`145.1 GiB` = one model read) while serial's grows at `1.54 GiB/token` — the layer-major payoff, and the reason a single prompt length says nothing. Speed-up vs serial: `2.30x` at N=256, `2.88x` at N=512, rising with N.
-
-  **The overlap**: blocked-inside-`materialize` time `34.6 s -> 6.2 s` at N=512 (and `35.6 -> 6.8 s` at N=256); `io_s` (submission) `11.6 s`; `lookahead = 1`. The swept arms therefore went `+52%` (N=256) and `+32%` (N=512), and the engine's own swept prefill `52.0 s -> 41.8 s` (`+20%`).
-- **Correctness / service**: byte-exactness is unchanged and is asserted in the same run — `test_v4_prefill_sweep` `13 checks, 0 failures` with swept logits `0 differing of 258560` vs serial `forward_token`; `test_v4_engine` `38 checks, 0 failures`; `scripts/expert_tier_invariance.sh` PASS (byte-identical logits, `logical_bytes_from_warm` A `0` / B `46.6 GB`); `scripts/expert_starved_pool.sh` PASS (`forced_drains = 362`, byte-identical). Registry invariants hold and no lease leaks in any run.
-- **Conclusion / next gate**: **Step 6 outcome 5, first real accounting.** Three findings, in order of size:
-  1. **The batched prefill is faster than serial, and by more the longer the prompt** — the earlier `2.1 tok/s` report was measured at `N = 103`, below the crossover, with no baseline beside it. Corrected here.
-  2. **The overlap was worth exactly what the plan predicted it would be**, and the double buffer is one layer deep because a layer set is `~0.55 s` of drive against `~1.4 s` of compute — one in flight already keeps the drive busy.
-  3. **Compute is now the bound**: with the load hidden, `~56 s` of `73.6 s` at N=512 is the body, i.e. `144 ms/token` against colibri's `31 ms/token` (their `3324 tokens / 103.9 s`). That `4.6x` is the gap that remains, and it is not a supply problem.
-- **Two refuted arms, recorded so they are not retried.** (a) Raising `V4LayerBodyBatchScratch::kMaxTokens` `16 -> 64` (colibri's is 128) changed nothing: `5.27 -> 5.29 tok/s` at N=512. The chunk is a *launch-count* knob and launch count is not the bottleneck. (b) "The sweep is always the prefill" was made true by removing `V4PrefillSweep::worth` — a threshold that silently disabled the sweep on the production path (a `103`-token prompt swept, an `11`-token one did not) while a gate was moved down until it stopped being slow.
+  The sweep's byte count is **constant** (`145.1 GiB` = one model read) while serial's grows at `1.54 GiB/token`. Speed-up vs serial: `2.30x` at N=256, `2.88x` at N=512, rising with N. The overlap (blocked-inside-`materialize` `34.6 s → 6.2 s` at N=512; `io_s` submission `11.6 s`; `lookahead = 1`) is worth `+52%` (N=256) and `+32%` (N=512).
+- **Correctness / service**: byte-exactness asserted in the same run (swept logits `0 differing of 258560` vs serial `forward_token`); registry invariants hold and no lease leaks in any run
+- **Conclusion / next gate**: Three findings: (1) the batched prefill is faster than serial, by more the longer the prompt; (2) one layer of double-buffer is enough because a layer set is `~0.55 s` of drive against `~1.4 s` of compute; (3) with the load hidden, `~56 s` of `73.6 s` at N=512 is body compute (`144 ms/token` vs colibri's `31 ms/token`). The last figure's attribution is superseded by M43, which found a per-request registry audit inside it.
+- **Evidence**: `tests/bench_prefill_ab.cpp`, `scripts/prefill_ab.sh`, `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp` (`dispatch_ahead`, `materialize_layer`)
 
 ### M43: The prefill configuration, and the registry audit that was eating the prefill
 - **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `aeon_chat` end-to-end
-- **Class / comparison key**: `Integration / prefill-config`, `Integration / registry-audit-cost`
+- **Class / comparison key**: `E2E / prefill-config`, `E2E / registry-audit-cost`
 - **Platform**: `baseline`, Device 0 only
 - [ ] **Invalidate for comparison** | **Reason**: `--`
 - **Workload / configuration**: three end-to-end `aeon_chat` runs at context `2048`, greedy, `max-new-tokens 256`, Warm `35 GiB` unless noted. The same paragraph repeated N times as the prompt.
@@ -351,12 +247,10 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
   | 3 | 1024 | 256 | 35 GiB | 1004 | 153 | eos | `123.7 s` | `3.26 tok/s` |
 
 - **Metrics**:
-  1. **The registry audit was the prefill's hidden cost.** With the audit off, run 2's dispatch preparation fell **`io_ms` `10 162 -> 450 ms`**, TTFT **`52.4 -> 39.4 s` (`-13.0 s`, `-25%`)**, decode **`3.04 -> 3.58 tok/s` (`+18%`)**. `submit_ms` stayed at `61` and `sqes` at `67 884`, so the I/O itself was never the cost — only the bookkeeping around it. The decode gain is the same bug on the decode path (258 reservations per token).
+  1. **The registry audit was the prefill's hidden cost.** With the audit off, run 2's dispatch preparation fell **`io_ms` `10 162 -> 450 ms`**, TTFT **`52.4 -> 39.4 s` (`−25%`)**, decode **`3.04 -> 3.58 tok/s` (`+18%`)**. `submit_ms` stayed at `61` and `sqes` at `67 884`, so the I/O itself was never the cost — only the bookkeeping around it. The decode gain is the same bug on the decode path (258 reservations per token).
   2. **`C` is flat, confirmed a third time.** `C = 128 -> 256` gave no throughput (`117 -> 123 ms/prompt-token`) and cost `+87 MiB` scratch and `13` fewer Hot slots (`802 -> 789`).
   3. **The sweep's load is independent of both knobs.** `load_ms` `4 694` (W=512,C=128) vs `4 776` (W=1024,C=256); one pass, `43` layer loads, `11008` experts, `lookahead = 1` in both.
   4. **TTFT is linear in prompt tokens at `~120 ms/token`**: `117` (338 tok) vs `123` (1004 tok). Both runs are one pass, so there is no per-window overhead left to amortize.
-- **Correctness / service**: all three runs `eos`, `registry.invariants_hold=true`, `outstanding_leases=0`, `staging_in_use=0`; the replies are coherent (each run correctly detects the repeated paragraph and summarizes it). The audit itself is unchanged in coverage: it still runs **unconditionally at every boundary** (`init`, `begin_prefill_stream`, `end_prefill_stream`, `release_layer`, `set_warm_frozen`) and inside `invariants_hold()`, so every gate that asks the question still gets a full audit. `--validate-registry` restores the per-operation audit for a debugging run.
-- **Conclusion / next gate**: **Step 7's settings are exposed and the workspace is real.** `prefill_window` / `prefill_chunk` are user settings, `V4ModelHost::allocate_prefill_workspace` derives and allocates the carry and the batch scratch at load from them, and the budget's scratch line is the sum of the two derived terms. The finding that matters is the audit: **the prefill was never as compute-bound as M42's subtraction suggested** — a per-request whole-registry scan was 10.2 s of a 39 s prefill and 258 scans per decode token. M42's "`144 ms/token` is the body" is corrected accordingly; the supply and the bookkeeping are now both accounted for, and the remaining `~120 ms/prompt-token` is the next investigation.
-- **One correction to record.** M42 attributed the residual prefill time to body compute by subtracting `load_ns + io_ns` from wall clock. That subtraction was unsound — those are host-side waits on a stream that overlaps with compute — and it is now known to have included this audit. It is superseded by the direct instrumentation above.
-- **Evidence**: `src/infrastructure/core/expert_registry.hpp` (`set_validate_each_request`, `checked_validate`, the nine guarded sites), `src/architecture/deepseek_v4/core/memory_budget.hpp` (`prefill_window`, `prefill_chunk`, `prefill_carry_bytes`, `batch_scratch_allowance_bytes`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`allocate_prefill_workspace`), `src/architecture/deepseek_v4/core/v4_layer_body_batch.hpp` (`kMaxTokens = 256`, `allocate_capacity`, `bytes()`), `src/architecture/deepseek_v4/core/v4_engine.hpp` (`prefill_chunk_for`/`prefill_window_for`), `tools/aeon_chat.cpp` (`--prefill-window`, `--prefill-chunk`, `--validate-registry`, `[Prefill workspace]`, `[Prefill sweep]`)
-- **Evidence**: `tests/bench_prefill_ab.cpp`, `scripts/prefill_ab.sh`, `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp` (`dispatch_layer` / `materialize_layer` / `dispatch_ahead`, `load_ns` / `io_ns` / `lookahead_depth`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`prefill_begin()`, `sweep_load_ns`, `sweep_io_ns`, `sweep_lookahead_depth`), `src/infrastructure/core/supply_telemetry.hpp` (`lifetime_*` counters), `cmake/AeonInfrastructure.cmake` (`bench_prefill_ab`)
+- **Correctness / service**: all three runs `eos`, `registry.invariants_hold=true`, `outstanding_leases=0`, `staging_in_use=0`; the replies are coherent (each run correctly detects the repeated paragraph and summarizes it). The audit still runs **unconditionally at every boundary**; `--validate-registry` restores the per-operation audit for a debugging run.
+- **Conclusion / next gate**: **Step 7's settings are exposed and the workspace is real.** The finding that matters is the audit: **the prefill was never as compute-bound as M42's subtraction suggested** — a per-request whole-registry scan was `10.2 s` of a `39 s` prefill and `258` scans per decode token. The remaining `~120 ms/prompt-token` is linear in the prompt and is the open prefill target.
+- **Evidence**: `src/infrastructure/core/expert_registry.hpp` (`set_validate_each_request`, `checked_validate`), `core/memory_budget.hpp`, `core/v4_model_host.hpp` (`allocate_prefill_workspace`), `tools/aeon_chat.cpp` (`--prefill-window`, `--prefill-chunk`, `--validate-registry`, `[Prefill workspace]`, `[Prefill sweep]`)

@@ -1,6 +1,6 @@
 # Routing Profile and Frequency-Informed Placement Study
 
-*Status: **Phase 1 complete** (reuse-distance + Belady-OPT, see [Expert Streaming Execution Plan §6.10](./../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) and ledger M35/M36). **Phase 2 scoped below.** The aggregation library exists and the driver draft needs adjustment to the rebuilt runtime before use.*
+*Status: **Phase 1 complete** (reuse-distance + Belady-OPT, see [Performance Ledger](../../status/PERFORMANCE_LEDGER.md) M35/M36 and [Expert Streaming Execution Plan §6](EXPERT_STREAMING_EXECUTION_PLAN.md#6-open-work)). **Phase 2 scoped below.** The aggregation library exists and the driver draft needs adjustment to the rebuilt runtime before use.*
 
 ## 1. Purpose
 

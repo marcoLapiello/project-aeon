@@ -77,7 +77,7 @@ Gate results, tolerances, mutation tallies and their findings belong to the plan
 
 | Document | Purpose |
 | :--- | :--- |
-| [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Authoritative silicon record. **Read its banner**: the pre-rewrite model-path entries were **deleted 2026-09-18**, so only component, storage and machine measurements survive in §4 and everything on the rebuilt graph is in §5. |
+| [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) | Authoritative silicon record. **Read its banner**: it holds end-to-end `aeon_chat` runs plus (as edge cases) measured performance values and cache/supply analyses; per-test correctness results and isolated kernel microbenchmarks are not recorded there. |
 | [CODEBASE_MAP.md](CODEBASE_MAP.md) | Source-tree map. Its "current engine path" section describes the pre-rewrite runtime and is being superseded as the rewrite lands. |
 
 ### Historical and reference (rationale only — not checklists)
@@ -94,7 +94,7 @@ Pointers only. Each gate is specified, with its procedure and its result, in the
 
 **Open work** — both extracted from the composition plan on 2026-09-18:
 
-- [Expert Streaming and Chunked Prefill](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md): the routed-expert supply — telemetry, the tier-invariance and starved-pool gates, the demotion-queue A/B, then the layer-major prefill sweep with a chunk-wide deduplicated expert dispatch, a Warm tier frozen across the prefill, a layer-ordered draining sweep, and the engine's prompt bound to that window (**all built**). Outcome 5 is met with a measured baseline (M42: swept `5.71`/`6.96 tok/s` against serial `2.48`/`2.42` at `N = 256`/`512`, swept bytes constant at `145.1 GiB` vs serial's `1.54 GiB/token`), the next layer's reads are dispatched before the current body runs (`34.6 s → 6.2 s` exposed), and the remaining bound is the **prefill body's compute** (`≈144 ms/token` vs colibri's `≈31`) plus the Step 7 `W`/`C` sweep with the three derived budget lines. Carries item 21's concurrency remainder and item 19's throughput half. Its working document supersedes [the analysis](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md), whose §6 (the prefill supply chain) stays deliberately open.
+- [Expert Streaming and Chunked Prefill](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md): the routed-expert supply — telemetry, the tier-invariance and starved-pool gates, the demotion-queue A/B, and the layer-major prefill sweep (chunk-wide deduplicated expert dispatch, a Warm tier frozen across the prefill, a layer-ordered draining sweep, and the engine's prompt bound to that window) — **all built and gated**. Outcome 5 is met with a measured baseline (M42: swept `5.71`/`6.96 tok/s` against serial `2.48`/`2.42` at `N = 256`/`512`, swept bytes constant at `145.1 GiB` vs serial's `1.54 GiB/token`). Open work: the `W`/`C` window sweep, the prefill body's `≈120 ms/prompt-token`, the staging arena's `banks × depth` target, and prefix reuse. Its working document supersedes [the analysis](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md).
 - [Session State and Swap](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md): the session aggregate, registry, residency seam, cold-tier store and R4. Session swap precedes the prefix **matcher**, which is deliberately deferred along with MTP and multi-GPU.
 
 **Measurement gates, settled empirically rather than by reading:**
