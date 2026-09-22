@@ -50,6 +50,7 @@ Gate results, tolerances, mutation tallies and their findings belong to the plan
 | [EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md) | **Next work.** Expert transfer on the live path: tiering under miss pressure, then chunked prefill with a chunk-wide expert dispatch. |
 | [SESSION_STATE_AND_SWAP_ANALYSIS.md](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) | **Open.** Session aggregate, registry, residency seam, cold-tier store, R4. Session swap before the prefix matcher. |
 | [HOST_MEMORY_PRESSURE_INVESTIGATION.md](../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) | **Open investigation.** Why a large Warm tier never finishes loading on a `62.62 GiB` host. Records the hypotheses that were **refuted** (so they are not retried), the dense-page release that was kept, and the one measurement that would split the problem. No root cause yet. |
+| [PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md](../analysis/current/PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) | **Open.** Critical review of the Step 6 prefill sweep: the missing "batched + cached supply" arm, the small-`N` byte crossover (~94 tokens), Colibri's route-aware prefill bank versus our blind sweep, the VRAM-ownership trade, and what actually scales on multi-GPU (capacity and storage topology, not concurrency). Supplies experiments the plan should absorb; does not re-open numerics. |
 
 ### Execution records (`execution/`)
 
