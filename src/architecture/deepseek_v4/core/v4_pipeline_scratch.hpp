@@ -123,79 +123,86 @@ struct PipelineScratchBuffers {
         constexpr int HC_MULT3 = 24;
         constexpr int M = 16; // Padded row size for WMMA
 
-        CHECK_HIP(hipMalloc(&d_res_in, HC_DIM * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_res_mid, HC_DIM * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_res_out, HC_DIM * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_res_in_half, HC_DIM * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_res_mid_half, HC_DIM * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_res_out_half, HC_DIM * sizeof(half)));
+        allocate_buffer(d_res_in, HC_DIM);
+        allocate_buffer(d_res_mid, HC_DIM);
+        allocate_buffer(d_res_out, HC_DIM);
+        allocate_buffer(d_res_in_half, HC_DIM);
+        allocate_buffer(d_res_mid_half, HC_DIM);
+        allocate_buffer(d_res_out_half, HC_DIM);
 
-        CHECK_HIP(hipMalloc(&d_mixes_a, HC_MULT3 * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_pre_a, HC * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_post_a, HC * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_comb_a, HC * HC * sizeof(float)));
+        allocate_buffer(d_mixes_a, HC_MULT3);
+        allocate_buffer(d_pre_a, HC);
+        allocate_buffer(d_post_a, HC);
+        allocate_buffer(d_comb_a, HC * HC);
 
-        CHECK_HIP(hipMalloc(&d_mixes_f, HC_MULT3 * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_pre_f, HC * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_post_f, HC * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_comb_f, HC * HC * sizeof(float)));
+        allocate_buffer(d_mixes_f, HC_MULT3);
+        allocate_buffer(d_pre_f, HC);
+        allocate_buffer(d_post_f, HC);
+        allocate_buffer(d_comb_f, HC * HC);
 
-        CHECK_HIP(hipMalloc(&d_x_pre, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_x_norm, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_qa, M * 1024 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_qa_norm, M * 1024 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_q, M * 64 * 512 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_kv, M * 512 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_kv_norm_act, M * 512 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_compressor_kv, M * 1024 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_compressor_score, M * 1024 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_indexer_query, M * 8192 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_indexer_weights, M * 64 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_indexer_compressor_kv, M * 256 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_indexer_compressor_score, M * 256 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_indexer_topk_indices, M * 512 * sizeof(int32_t)));
-        CHECK_HIP(hipMalloc(&d_indexer_candidate_count, M * sizeof(int32_t)));
-        CHECK_HIP(hipMalloc(&d_attn_out, M * 64 * 512 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_z_lora, M * 8192 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_attn_proj, M * H * sizeof(half)));
+        allocate_buffer(d_x_pre, M * H);
+        allocate_buffer(d_x_norm, M * H);
+        allocate_buffer(d_qa, M * 1024);
+        allocate_buffer(d_qa_norm, M * 1024);
+        allocate_buffer(d_q, M * 64 * 512);
+        allocate_buffer(d_kv, M * 512);
+        allocate_buffer(d_kv_norm_act, M * 512);
+        allocate_buffer(d_compressor_kv, M * 1024);
+        allocate_buffer(d_compressor_score, M * 1024);
+        allocate_buffer(d_indexer_query, M * 8192);
+        allocate_buffer(d_indexer_weights, M * 64);
+        allocate_buffer(d_indexer_compressor_kv, M * 256);
+        allocate_buffer(d_indexer_compressor_score, M * 256);
+        allocate_buffer(d_indexer_topk_indices, M * 512);
+        allocate_buffer(d_indexer_candidate_count, M);
+        allocate_buffer(d_attn_out, M * 64 * 512);
+        allocate_buffer(d_z_lora, M * 8192);
+        allocate_buffer(d_attn_proj, M * H);
 
-        CHECK_HIP(hipMalloc(&d_ffn_pre, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_ffn_norm_act, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_router_logits_half, 256 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_router_logits, 256 * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_topk_weights, 6 * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_topk_indices, 6 * sizeof(int32_t)));
-        CHECK_HIP(hipMalloc(&d_token_id, 1 * sizeof(int32_t)));
+        allocate_buffer(d_ffn_pre, M * H);
+        allocate_buffer(d_ffn_norm_act, M * H);
+        allocate_buffer(d_router_logits_half, 256);
+        allocate_buffer(d_router_logits, 256);
+        allocate_buffer(d_topk_weights, 6);
+        allocate_buffer(d_topk_indices, 6);
+        allocate_buffer(d_token_id, 1);
 
-        CHECK_HIP(hipMalloc(&d_shared_gate, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_shared_up, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_shared_swiglu, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_shared_down, M * H * sizeof(half)));
+        allocate_buffer(d_shared_gate, M * 2048);
+        allocate_buffer(d_shared_up, M * 2048);
+        allocate_buffer(d_shared_swiglu, M * 2048);
+        allocate_buffer(d_shared_down, M * H);
 
-        CHECK_HIP(hipMalloc(&d_moe_accum, M * H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_expert_gate, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_expert_up, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_expert_swiglu, M * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_expert_down, M * H * sizeof(half)));
+        allocate_buffer(d_moe_accum, M * H);
+        allocate_buffer(d_expert_gate, M * 2048);
+        allocate_buffer(d_expert_up, M * 2048);
+        allocate_buffer(d_expert_swiglu, M * 2048);
+        allocate_buffer(d_expert_down, M * H);
 
-        CHECK_HIP(hipMalloc(&d_swizzled_expert_hidden, 8 * 2048 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_swizzled_moe_accum_f32, H * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_swizzled_counters, 64 * sizeof(int32_t)));
+        allocate_buffer(d_swizzled_expert_hidden, 8 * 2048);
+        allocate_buffer(d_swizzled_moe_accum_f32, H);
+        allocate_buffer(d_swizzled_counters, 64);
         CHECK_HIP(hipMemset(d_swizzled_counters, 0, 64 * sizeof(int32_t)));
 
-        CHECK_HIP(hipMalloc(&d_hc_head_out, H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_head_norm, H * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_logits, 129280 * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_argmax_partial_vals, 505 * sizeof(float)));
-        CHECK_HIP(hipMalloc(&d_argmax_partial_idx, 505 * sizeof(int32_t)));
-        CHECK_HIP(hipMalloc(&d_argmax_result, sizeof(int32_t)));
+        allocate_buffer(d_hc_head_out, H);
+        allocate_buffer(d_head_norm, H);
+        allocate_buffer(d_logits, 129280);
+        allocate_buffer(d_argmax_partial_vals, 505);
+        allocate_buffer(d_argmax_partial_idx, 505);
+        allocate_buffer(d_argmax_result, 1);
 
         // Clear initial padded memory
         CHECK_HIP(hipMemset(d_x_pre, 0, M * H * sizeof(half)));
         CHECK_HIP(hipMemset(d_x_norm, 0, M * H * sizeof(half)));
     }
 
+    // Exact VRAM these buffers hold. The budget reports this instead of a literal:
+    // the layout is a property of the model's kernel shapes rather than of a knob,
+    // but it is still a real allocation the Hot pool is sized around (the figure the
+    // old `100 MiB` constant was meant to stand for, measured).
+    size_t bytes() const noexcept { return bytes_allocated_; }
+
     void free() {
+        bytes_allocated_ = 0;
         if (d_res_in) { (void)hipFree(d_res_in); d_res_in = nullptr; }
         if (d_res_mid) { (void)hipFree(d_res_mid); d_res_mid = nullptr; }
         if (d_res_out) { (void)hipFree(d_res_out); d_res_out = nullptr; }
@@ -263,6 +270,16 @@ struct PipelineScratchBuffers {
     }
 
 private:
+    // Non-static so the allocation can be accounted; `bytes()` is what the budget
+    // report reads and what the load-time check compares against.
+    template <typename T>
+    void allocate_buffer(T*& pointer, size_t count) {
+        CHECK_HIP(hipMalloc(&pointer, count * sizeof(T)));
+        bytes_allocated_ += count * sizeof(T);
+    }
+
+    size_t bytes_allocated_{0};
+
     void move_from(PipelineScratchBuffers&& o) noexcept {
         d_res_in = o.d_res_in; o.d_res_in = nullptr;
         d_res_mid = o.d_res_mid; o.d_res_mid = nullptr;
@@ -328,6 +345,8 @@ private:
         d_argmax_partial_vals = o.d_argmax_partial_vals; o.d_argmax_partial_vals = nullptr;
         d_argmax_partial_idx = o.d_argmax_partial_idx; o.d_argmax_partial_idx = nullptr;
         d_argmax_result = o.d_argmax_result; o.d_argmax_result = nullptr;
+        bytes_allocated_ = o.bytes_allocated_;
+        o.bytes_allocated_ = 0;
     }
 };
 

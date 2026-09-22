@@ -134,6 +134,15 @@ public:
         return supply_.demotion_queue_capacity();
     }
 
+    // io_uring submission cost, split out from the rest of the dispatch path.
+    uint64_t direct_io_submit_ns() const noexcept { return supply_.direct_io_submit_ns(); }
+    uint64_t direct_io_requests_submitted() const noexcept {
+        return supply_.direct_io_requests_submitted();
+    }
+    uint64_t direct_io_submit_calls() const noexcept {
+        return supply_.direct_io_submit_calls();
+    }
+
     LayerPrefetchState dispatch_layer_prefetch(
         uint32_t target_l,
         uint32_t pos,

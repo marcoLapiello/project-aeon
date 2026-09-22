@@ -68,7 +68,9 @@ struct Options {
     std::string dump_logits_path;
     uint64_t demotion_queue{0};
     bool profile_routing{false};
-    uint32_t prefill_window{0};
+    bool validate_registry{false};
+    uint32_t prefill_window{4096};
+    uint32_t prefill_chunk{64};
 };
 
 void print_usage(const char* executable) {
@@ -94,7 +96,9 @@ void print_usage(const char* executable) {
         << "  --dump-logits <path>     Append each position's raw fp16 logits to <path>\n"
         << "  --demotion-queue <n>     Demotion-queue capacity (0 = derived from warm refill)\n"
         << "  --prefill-window <n>     Layer-major prefill window W in tokens (0 = the whole prompt)\n"
+        << "  --prefill-chunk <n>      Body chunk C in tokens, 1..64 (default: 64)\n"
         << "  --profile-routing        Print the decode routing reuse-distance (ideal-LRU) curve\n"
+        << "  --validate-registry      Audit the registry after every expert operation (slow; debug)\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill\n"
         << "  --deterministic-experts  Accepted and inert; the rewrite always uses the fixed-order\n"
@@ -194,8 +198,13 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--prefill-window") {
             options.prefill_window = static_cast<uint32_t>(parse_unsigned(
                 require_value(argc, argv, index, "--prefill-window"), "--prefill-window"));
+        } else if (argument == "--prefill-chunk") {
+            options.prefill_chunk = static_cast<uint32_t>(parse_unsigned(
+                require_value(argc, argv, index, "--prefill-chunk"), "--prefill-chunk"));
         } else if (argument == "--profile-routing") {
             options.profile_routing = true;
+        } else if (argument == "--validate-registry") {
+            options.validate_registry = true;
         } else if (argument == "--no-warm-preload") {
             options.preload_warm_host = false;
         } else if (argument == "--no-warm-refill") {
@@ -227,14 +236,6 @@ Options parse_options(int argc, char** argv) {
             (std::filesystem::path(options.model_dir) / "tokenizer.aeon").string();
     }
     return options;
-}
-
-void print_ids(const char* label, const std::vector<uint32_t>& ids) {
-    std::cout << label << " [";
-    for (size_t index = 0; index < ids.size(); ++index) {
-        std::cout << ids[index] << (index + 1 < ids.size() ? ", " : "");
-    }
-    std::cout << "]\n";
 }
 
 // The [Invariants] line is unconditional, not gated behind `--diagnostic`: the
@@ -328,7 +329,9 @@ int main(int argc, char** argv) {
         engine_options.dump_logits_path = options.dump_logits_path;
         engine_options.runtime.demotion_queue_capacity = options.demotion_queue;
         engine_options.runtime.profile_routing_reuse = options.profile_routing;
+        engine_options.runtime.validate_registry_each_request = options.validate_registry;
         engine_options.runtime.prefill_window = options.prefill_window;
+        engine_options.runtime.prefill_chunk = options.prefill_chunk;
 
         aeon::core::V4Engine engine;
         engine.initialize(engine_options);
@@ -340,6 +343,20 @@ int main(int argc, char** argv) {
         // is printed verbatim rather than summarised.
         if (options.verbose) {
             std::cout << engine.host().budget().to_string();
+            // The prefill workspace is derived from `--prefill-window` and
+            // `--prefill-chunk` and allocated at load, so its three buffers are
+            // reported together: the two VRAM ones (carry, batch scratch) and the
+            // pinned host staging arena, which are separate budgets and must never
+            // be read as one figure.
+            std::cout << "[Prefill workspace] window W=" << engine.host().prefill_window_tokens()
+                      << " chunk C=" << engine.host().prefill_chunk_tokens()
+                      << " carry=" << (engine.host().prefill_carry_bytes() / (1024 * 1024))
+                      << " MiB batch_scratch="
+                      << (engine.host().prefill_batch_scratch_bytes() / (1024 * 1024))
+                      << " MiB decode_scratch="
+                      << (engine.host().decode_scratch_bytes() / (1024 * 1024))
+                      << " MiB pinned_staging=" << (engine.host().staging_bytes() / (1024 * 1024))
+                      << " MiB\n";
             // A cap is worth reporting explicitly, because the requested value and
             // the applied one differ whenever the cap is below 6 (floored) or above
             // the derived size (no effect) — the gate reads the applied figure.
@@ -386,14 +403,38 @@ int main(int argc, char** argv) {
 
         print_invariants(engine);
 
+        // The sweep's work, **after** the run: it reads zero before one. The window is
+        // a *bound*, so `layer_loads / layers` is the number of layer-major passes the
+        // run actually took (greater than one once the prompt exceeds `W`), and
+        // `experts_streamed` against `layers x experts_per_layer` is whether each pass
+        // really loaded whole layers. Reported on the verbose path, next to the
+        // headline timings, because it is what explains them.
+        if (options.verbose) {
+            const auto& sweep = engine.host().prefill_sweep();
+            const uint32_t layers = engine.host().num_layers();
+            const uint32_t per_layer = engine.host().registry().experts_per_layer;
+            std::cout << "[Prefill sweep] layer_loads=" << sweep.layer_loads()
+                      << " experts_streamed=" << sweep.experts_streamed()
+                      << " layers=" << layers
+                      << " experts_per_layer=" << per_layer
+                      << " passes=" << (layers ? sweep.layer_loads() / layers : 0)
+                      << " lookahead=" << engine.host().sweep_lookahead_depth()
+                      << " load_ms=" << (engine.host().sweep_load_ns() / 1000000)
+                      << " io_ms=" << (engine.host().sweep_io_ns() / 1000000)
+                      << " submit_ms=" << (engine.host().direct_io_submit_ns() / 1000000)
+                      << " sqes=" << engine.host().direct_io_requests_submitted()
+                      << " nvme_gib="
+                      << (engine.host().supply_bytes_from_nvme() / (1024.0 * 1024 * 1024))
+                      << "\n";
+        }
+
         if (options.diagnostic) {
             print_routing_reuse(engine);
             print_layer_outcomes(engine);
             std::cout << "Rendered prompt: "
                       << engine.encoder().encode(messages, prompt_options) << "\n";
-            print_ids("Prompt IDs:", engine.encoder().encode_tokens(messages, prompt_options));
             std::cout << "Prompt tokens: " << reply.prompt_tokens << "\n";
-            print_ids("Generated IDs:", reply.token_ids);
+            std::cout << "Generated tokens: " << reply.token_ids.size() << "\n";
             std::cout << "Stop reason: "
                       << aeon::text::stop_reason_name(reply.stop_reason) << "\n";
             std::cout << std::fixed << std::setprecision(2)

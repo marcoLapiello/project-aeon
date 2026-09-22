@@ -74,6 +74,8 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `engine-prefill-window` | The engine's prompt as one layer-major window; sweep eligibility; prefill tok/s | M41 |
 | `prefill-ab` | Serial vs swept prefill at two prompt lengths, tok/s and bytes | M42 |
 | `prefill-sweep-overlap` | Swept prefill with the next layer's reads dispatched before compute | M42 |
+| `prefill-config` | Window/chunk as user settings; workspace derived and allocated at load | M43 |
+| `registry-audit-cost` | Per-request `validate_invariants()`: dispatch cost and its removal | M43 |
 
 ## 4. Milestone cards
 
@@ -333,4 +335,28 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
   2. **The overlap was worth exactly what the plan predicted it would be**, and the double buffer is one layer deep because a layer set is `~0.55 s` of drive against `~1.4 s` of compute — one in flight already keeps the drive busy.
   3. **Compute is now the bound**: with the load hidden, `~56 s` of `73.6 s` at N=512 is the body, i.e. `144 ms/token` against colibri's `31 ms/token` (their `3324 tokens / 103.9 s`). That `4.6x` is the gap that remains, and it is not a supply problem.
 - **Two refuted arms, recorded so they are not retried.** (a) Raising `V4LayerBodyBatchScratch::kMaxTokens` `16 -> 64` (colibri's is 128) changed nothing: `5.27 -> 5.29 tok/s` at N=512. The chunk is a *launch-count* knob and launch count is not the bottleneck. (b) "The sweep is always the prefill" was made true by removing `V4PrefillSweep::worth` — a threshold that silently disabled the sweep on the production path (a `103`-token prompt swept, an `11`-token one did not) while a gate was moved down until it stopped being slow.
+
+### M43: The prefill configuration, and the registry audit that was eating the prefill
+- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `aeon_chat` end-to-end
+- **Class / comparison key**: `Integration / prefill-config`, `Integration / registry-audit-cost`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: three end-to-end `aeon_chat` runs at context `2048`, greedy, `max-new-tokens 256`, Warm `35 GiB` unless noted. The same paragraph repeated N times as the prompt.
+
+  | run | W | C | Warm | prompt tok | gen tok | stop | TTFT | decode |
+  | :--- | ---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: |
+  | 1 | 512 | 128 | 0 | 338 | 234 | eos | `53.3 s` | `2.27 tok/s` |
+  | 2 before | 512 | 128 | 35 GiB | 338 | 234 | eos | `52.4 s` | `3.04 tok/s` |
+  | **2 after** | 512 | 128 | 35 GiB | 338 | 234 | eos | **`39.4 s`** | **`3.58 tok/s`** |
+  | 3 | 1024 | 256 | 35 GiB | 1004 | 153 | eos | `123.7 s` | `3.26 tok/s` |
+
+- **Metrics**:
+  1. **The registry audit was the prefill's hidden cost.** With the audit off, run 2's dispatch preparation fell **`io_ms` `10 162 -> 450 ms`**, TTFT **`52.4 -> 39.4 s` (`-13.0 s`, `-25%`)**, decode **`3.04 -> 3.58 tok/s` (`+18%`)**. `submit_ms` stayed at `61` and `sqes` at `67 884`, so the I/O itself was never the cost — only the bookkeeping around it. The decode gain is the same bug on the decode path (258 reservations per token).
+  2. **`C` is flat, confirmed a third time.** `C = 128 -> 256` gave no throughput (`117 -> 123 ms/prompt-token`) and cost `+87 MiB` scratch and `13` fewer Hot slots (`802 -> 789`).
+  3. **The sweep's load is independent of both knobs.** `load_ms` `4 694` (W=512,C=128) vs `4 776` (W=1024,C=256); one pass, `43` layer loads, `11008` experts, `lookahead = 1` in both.
+  4. **TTFT is linear in prompt tokens at `~120 ms/token`**: `117` (338 tok) vs `123` (1004 tok). Both runs are one pass, so there is no per-window overhead left to amortize.
+- **Correctness / service**: all three runs `eos`, `registry.invariants_hold=true`, `outstanding_leases=0`, `staging_in_use=0`; the replies are coherent (each run correctly detects the repeated paragraph and summarizes it). The audit itself is unchanged in coverage: it still runs **unconditionally at every boundary** (`init`, `begin_prefill_stream`, `end_prefill_stream`, `release_layer`, `set_warm_frozen`) and inside `invariants_hold()`, so every gate that asks the question still gets a full audit. `--validate-registry` restores the per-operation audit for a debugging run.
+- **Conclusion / next gate**: **Step 7's settings are exposed and the workspace is real.** `prefill_window` / `prefill_chunk` are user settings, `V4ModelHost::allocate_prefill_workspace` derives and allocates the carry and the batch scratch at load from them, and the budget's scratch line is the sum of the two derived terms. The finding that matters is the audit: **the prefill was never as compute-bound as M42's subtraction suggested** — a per-request whole-registry scan was 10.2 s of a 39 s prefill and 258 scans per decode token. M42's "`144 ms/token` is the body" is corrected accordingly; the supply and the bookkeeping are now both accounted for, and the remaining `~120 ms/prompt-token` is the next investigation.
+- **One correction to record.** M42 attributed the residual prefill time to body compute by subtracting `load_ns + io_ns` from wall clock. That subtraction was unsound — those are host-side waits on a stream that overlaps with compute — and it is now known to have included this audit. It is superseded by the direct instrumentation above.
+- **Evidence**: `src/infrastructure/core/expert_registry.hpp` (`set_validate_each_request`, `checked_validate`, the nine guarded sites), `src/architecture/deepseek_v4/core/memory_budget.hpp` (`prefill_window`, `prefill_chunk`, `prefill_carry_bytes`, `batch_scratch_allowance_bytes`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`allocate_prefill_workspace`), `src/architecture/deepseek_v4/core/v4_layer_body_batch.hpp` (`kMaxTokens = 256`, `allocate_capacity`, `bytes()`), `src/architecture/deepseek_v4/core/v4_engine.hpp` (`prefill_chunk_for`/`prefill_window_for`), `tools/aeon_chat.cpp` (`--prefill-window`, `--prefill-chunk`, `--validate-registry`, `[Prefill workspace]`, `[Prefill sweep]`)
 - **Evidence**: `tests/bench_prefill_ab.cpp`, `scripts/prefill_ab.sh`, `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp` (`dispatch_layer` / `materialize_layer` / `dispatch_ahead`, `load_ns` / `io_ns` / `lookahead_depth`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`prefill_begin()`, `sweep_load_ns`, `sweep_io_ns`, `sweep_lookahead_depth`), `src/infrastructure/core/supply_telemetry.hpp` (`lifetime_*` counters), `cmake/AeonInfrastructure.cmake` (`bench_prefill_ab`)

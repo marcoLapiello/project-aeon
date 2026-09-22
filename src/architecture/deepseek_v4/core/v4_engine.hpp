@@ -313,29 +313,22 @@ public:
     // --- the prefill window (Step 6 D-a) -------------------------------------
 
     // The body chunk `C` the window runs with — the rows in flight per body
-    // invocation (Step 6 §6b). It is a memory decision and it is **derived**, not
-    // assumed: a chunk issues its `6C` routed-expert requests as one deduplicated
-    // set, and that set must be staged (the arena) and, whenever the sweep is not
-    // running, resident at once (the Hot pool). The body's own row cap bounds it
-    // from above. A configuration that leaves only a few slots therefore degrades
-    // the chunk instead of failing at the arena or starving on leases.
-    uint32_t prefill_chunk_for(uint32_t tokens) const {
-        const uint32_t per_horizon = PrefetchStagingArena::EXPERTS_PER_HORIZON;
-        const uint32_t by_arena = host_.staging_slot_count() / per_horizon;
-        const uint32_t by_pool =
-            std::max<uint32_t>(1, host_.registry().vram_capacity / per_horizon);
-        const uint32_t limit = std::min(
-            std::min(V4LayerBodyBatchScratch::kMaxTokens, by_arena), by_pool);
-        return std::max<uint32_t>(1, std::min(limit, tokens));
+    // invocation (Step 6 §6b). It is the **configured** value
+    // (`AeonRuntimeConfig::prefill_chunk`), not a derived one: with the workspace
+    // allocated at load from that same knob, a derivation here would size the run
+    // differently from the buffer that backs it. The only adjustment is downward,
+    // and only for a prompt shorter than one chunk (a 5-token prompt runs at `C = 5`).
+    uint32_t prefill_chunk_for(uint32_t tokens) const noexcept {
+        const uint32_t configured = host_.prefill_chunk_tokens();
+        return std::max<uint32_t>(1, std::min(configured, tokens));
     }
 
-    // The window `W` for a prompt of `tokens` (Step 6 §6b): the whole prompt unless
-    // `AeonRuntimeConfig::prefill_window` bounds it, in which case the prompt is
-    // `⌈N/W⌉` layer-major passes.
+    // The window `W` for a prompt of `tokens` (Step 6 §6b). The load-time
+    // allocation is for `host_.prefill_window_tokens()`, so a prompt longer than it
+    // runs `⌈N/W⌉` windows of at most that many tokens, and a shorter one is a single
+    // window.
     uint32_t prefill_window_for(uint32_t tokens) const noexcept {
-        const uint32_t configured = options_.runtime.prefill_window;
-        if (configured == 0) return tokens;
-        return std::min(configured, tokens);
+        return std::max<uint32_t>(1, std::min(host_.prefill_window_tokens(), tokens));
     }
 
     // --- the run -------------------------------------------------------------

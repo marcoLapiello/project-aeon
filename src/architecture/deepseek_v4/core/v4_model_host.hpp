@@ -277,10 +277,13 @@ public:
     // the residual being transformed and must survive all 43 layers of a pass.
 
     // The per-layer chunk workspace. `V4LayerBodyBatchScratch` sizes itself from a
-    // layer's own capacities (the indexer's candidate scores and top-k), so it is
-    // re-allocated whenever the layer changes. Reusing the allocation across the
-    // chunks of one layer is the point: a layer-major pass enters each layer once.
+    // layer's own capacities (the indexer's candidate scores and top-k), so left to
+    // itself it would be re-allocated whenever the layer changes. When the window
+    // workspace was allocated at load for the worst case across the layers
+    // (`allocate_prefill_workspace`), that one buffer already covers every layer and
+    // this is a no-op — which is what makes the layer-major pass allocation-free.
     void ensure_batch_scratch(uint32_t layer_id, uint32_t count) {
+        if (prefill_workspace_ready_ && count <= batch_scratch_.token_count()) return;
         if (batch_scratch_count_ == count && batch_scratch_layer_ == layer_id) return;
         batch_scratch_.allocate(layer(layer_id), count);
         batch_scratch_layer_ = layer_id;
@@ -289,6 +292,88 @@ public:
 
     V4LayerBodyBatchScratch& batch_scratch() noexcept { return batch_scratch_; }
     const V4LayerBodyBatchScratch& batch_scratch() const noexcept { return batch_scratch_; }
+
+    // ---- Step 6 item 7: the prefill workspace, derived from the knobs ---------
+    //
+    // The residual carry and the batch scratch are functions of the configured
+    // window `W` and chunk `C`, so both are **derived and allocated once, at load**,
+    // rather than grown lazily on the first window. Two reasons, and the second is
+    // the one that matters:
+    //
+    //   * a window is a known size, so an allocation inside it can only fail after
+    //     work has begun — and a mid-prefill failure has no clean recovery;
+    //   * the budget has to know the figure up front (`vram_prefill_carry_bytes`),
+    //     or the Hot pool is sized against VRAM the workspace then takes.
+    //
+    // The batch scratch covers all 43 layers, so its allocation is the worst-case
+    // layout, not any one layer's. Its exact size is checked against the budget's
+    // allowance here, so a configuration that would overrun fails with a named
+    // message instead of quietly shrinking the expert pool.
+    void allocate_prefill_workspace(uint32_t window_tokens, uint32_t chunk_tokens) {
+        if (window_tokens == 0 || chunk_tokens == 0) {
+            throw std::invalid_argument(
+                "V4ModelHost: the prefill window and chunk must be positive");
+        }
+        if (chunk_tokens > V4LayerBodyBatchScratch::kMaxTokens) {
+            throw std::invalid_argument(
+                "V4ModelHost: prefill chunk " + std::to_string(chunk_tokens) +
+                " exceeds the body's row cap of " +
+                std::to_string(V4LayerBodyBatchScratch::kMaxTokens));
+        }
+
+        ensure_prefill_carry(window_tokens);
+
+        // Worst case across the layers: the composed row-set, the indexer's
+        // candidate scores and its top-k are each the maximum any layer needs.
+        uint32_t max_compressed_capacity = 0;
+        uint32_t max_index_topk = 0;
+        uint32_t max_local_capacity = 0;
+        for (const auto& layer : layers_) {
+            const auto& layout = layer.state_layout();
+            max_compressed_capacity = std::max(max_compressed_capacity, layout.compressed_capacity);
+            max_index_topk = std::max(max_index_topk, layout.index_topk);
+            max_local_capacity = std::max(max_local_capacity, layout.local_capacity);
+        }
+        batch_scratch_.allocate_capacity(max_compressed_capacity, max_index_topk,
+                                         max_local_capacity, chunk_tokens);
+        const size_t allowance = batch_scratch_allowance_bytes(chunk_tokens);
+        if (batch_scratch_.bytes() > allowance) {
+            throw std::runtime_error(
+                "V4ModelHost: the prefill batch scratch is " +
+                std::to_string(batch_scratch_.bytes() / (1024 * 1024)) +
+                " MiB but the budget allows " +
+                std::to_string(allowance / (1024 * 1024)) +
+                " MiB for chunk " + std::to_string(chunk_tokens) +
+                " — raise BATCH_SCRATCH_BYTES_PER_ROW or lower prefill_chunk");
+        }
+
+        prefill_window_tokens_ = window_tokens;
+        prefill_chunk_tokens_ = chunk_tokens;
+        prefill_workspace_ready_ = true;
+    }
+
+    // What was allocated, for the report and the gates.
+    uint32_t prefill_window_tokens() const noexcept { return prefill_window_tokens_; }
+    uint32_t prefill_chunk_tokens() const noexcept { return prefill_chunk_tokens_; }
+    size_t prefill_carry_bytes() const noexcept {
+        const size_t hc_dim = static_cast<size_t>(config_.hc_mult) *
+                              static_cast<size_t>(config_.hidden_size);
+        return static_cast<size_t>(prefill_carry_tokens_) * hc_dim *
+               (sizeof(uint16_t) + sizeof(float));
+    }
+    size_t prefill_batch_scratch_bytes() const noexcept { return batch_scratch_.bytes(); }
+    // The decode workspace's real size (`V4PipelineScratchBuffers` + the routed-expert
+    // scratch), for the report and the load-time check against the budget's allowance.
+    size_t decode_scratch_bytes() const noexcept {
+        return scratch_.bytes() + expert_scratch_.bytes();
+    }
+    // The pinned host staging arena's footprint, so all three prefill buffers can be
+    // reported side by side rather than only the VRAM pair.
+    size_t staging_bytes() const noexcept {
+        if (!staging_ || !experts_ready()) return 0;
+        return static_cast<size_t>(staging_->slot_count()) *
+               loader_.expert_format().payload_bytes;
+    }
 
     // The residual carry: one window's worth of per-token residual, both fp16 and
     // fp32, held in VRAM for the whole layer-major pass. Grows only, so a window
@@ -575,6 +660,12 @@ public:
     // The dispatch half of the same accounting: time spent *submitting* reads, which
     // is what the double buffer pays to keep the drive busy across the compute.
     uint64_t sweep_io_ns() const noexcept { return prefill_sweep_.io_ns(); }
+    // Inside `io_uring_enter` alone, and the SQE count it submitted. When this is
+    // large the cost is the drive's queue, not the CPU.
+    uint64_t direct_io_submit_ns() const noexcept { return supply_.direct_io_submit_ns(); }
+    uint64_t direct_io_requests_submitted() const noexcept {
+        return supply_.direct_io_requests_submitted();
+    }
     // Layers whose reads were in flight when a body started (1 = the double buffer
     // is engaged; 0 = the pool is too small for two layers and loads are serial).
     uint32_t sweep_lookahead_depth() const noexcept {
@@ -632,29 +723,35 @@ private:
         // to the **ceiling** `6C` here, so no transfer ever waits for a slot; the
         // Step 7 sweep picks the smaller concurrency depth.
         vram_pool_.allocate(budget_.hot_vram_slots, format);
+        // A chunk's deduplicated distinct set can never exceed the **layer's** expert
+        // count: dedup collapses `6C` requests onto at most `n_routed_experts`
+        // experts. Sizing to `6C` alone asks for 384 slots at `C = 64` (5.1 GiB
+        // pinned) where 256 will do, so the term is capped by the layer here — and
+        // this is the same ceiling the graph's guard checks against, which is why a
+        // legal wide chunk is no longer refused.
+        const uint32_t experts_per_layer = static_cast<uint32_t>(config_.n_routed_experts);
+        const uint32_t dedup_ceiling = std::min<uint32_t>(
+            PrefetchStagingArena::EXPERTS_PER_HORIZON *
+                std::max<uint32_t>(1, runtime_cfg.prefill_chunk),
+            experts_per_layer);
         uint32_t staging_slots = std::max<uint32_t>(
-            PrefetchStagingArena::TOTAL_STAGING_SLOTS,
-            PrefetchStagingArena::EXPERTS_PER_HORIZON * runtime_cfg.prefill_chunk);
+            PrefetchStagingArena::TOTAL_STAGING_SLOTS, dedup_ceiling);
         // The prefill sweep loads a **whole layer** in one batch, so the arena must
         // hold a layer's distinct experts at once (Step 6 item 6). Sized to that
         // ceiling; the Step 7 sweep picks the smaller concurrency depth.
         if (runtime_cfg.prefill_sweep) {
-            staging_slots = std::max<uint32_t>(
-                staging_slots, static_cast<uint32_t>(config_.n_routed_experts));
+            staging_slots = std::max<uint32_t>(staging_slots, experts_per_layer);
         }
         staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
 
         // The direct reader's submission queue must hold a whole layer's reads at
         // once: `dispatch()` queues every cold request of a batch before it calls
         // `submit_pending_reads()` a single time.
-        size_t batch_requests =
-            direct_requests_per_expert(format) * PrefetchStagingArena::EXPERTS_PER_HORIZON *
-            std::max<uint32_t>(1, runtime_cfg.prefill_chunk);
+        size_t batch_requests = direct_requests_per_expert(format) * dedup_ceiling;
         if (runtime_cfg.prefill_sweep) {
             batch_requests = std::max<size_t>(
                 batch_requests,
-                direct_requests_per_expert(format) *
-                    static_cast<size_t>(config_.n_routed_experts));
+                direct_requests_per_expert(format) * static_cast<size_t>(experts_per_layer));
         }
         const uint32_t io_queue_depth = static_cast<uint32_t>(
             std::max<size_t>(64, batch_requests));
@@ -669,6 +766,10 @@ private:
                        static_cast<uint32_t>(config_.n_routed_experts),
                        budget_.hot_vram_slots, warm_slots,
                        runtime_cfg.preload_warm_host);
+        // The per-request audit is a debugging instrument (see
+        // `AeonRuntimeConfig::validate_registry_each_request`); the boundary audits
+        // and `invariants_hold()` run regardless of it.
+        registry_.set_validate_each_request(runtime_cfg.validate_registry_each_request);
 
         // 12 — Hot, then Warm, filled by batched `O_DIRECT` reads. This is the
         // only step with real mass; the byte-exactness of every route it uses is
@@ -705,6 +806,20 @@ private:
         // borrows the four streams the host owns, so its capacity fallback drains
         // exactly the set that carries expert traffic.
         expert_scratch_.allocate();
+
+        // The decode workspace's real allocations against the budget's allowance
+        // (Step 6 item 7): `scratch_` is allocated far above in this function, so the
+        // two together are what the report's decode term stands for. Checked, not
+        // trusted, in the same way the batch scratch is.
+        const size_t decode_scratch_bytes = scratch_.bytes() + expert_scratch_.bytes();
+        if (decode_scratch_bytes > decode_scratch_allowance_bytes()) {
+            throw std::runtime_error(
+                "V4ModelHost: the decode workspace is " +
+                std::to_string(decode_scratch_bytes / (1024 * 1024)) +
+                " MiB but the budget allows " +
+                std::to_string(decode_scratch_allowance_bytes() / (1024 * 1024)) +
+                " MiB — raise DECODE_SCRATCH_ALLOWANCE_BYTES");
+        }
         // The routing reuse profiler is a separate concern from the supply
         // telemetry and has its own switch: it is reset (which enables it) only
         // when the routing study asks for it, and a null pointer is what the
@@ -721,6 +836,16 @@ private:
         // executor does; it runs only between `prefill_begin` and `prefill_end`.
         prefill_sweep_requested_ = runtime_cfg.prefill_sweep;
         prefill_sweep_.configure(&supply_, &registry_);
+
+        // 16 — the prefill workspace (Step 6 item 7), derived from the configured
+        // window and chunk and allocated **once, here**, so no window can fail
+        // mid-prompt on an allocation and the budget's carry term is realised rather
+        // than merely reserved.
+        allocate_prefill_workspace(
+            runtime_cfg.prefill_window == 0
+                ? runtime_cfg.context_size
+                : std::min(runtime_cfg.prefill_window, runtime_cfg.context_size),
+            runtime_cfg.prefill_chunk > 0 ? runtime_cfg.prefill_chunk : 1);
     }
 
     size_t direct_requests_per_expert(const ExpertFormatDescriptor& format) const noexcept {
@@ -885,6 +1010,11 @@ private:
     half* d_prefill_carry_half_{nullptr};
     float* d_prefill_carry_{nullptr};
     uint32_t prefill_carry_tokens_{0};
+    // Step 6 item 7: the configured knobs and whether the workspace was allocated at
+    // load for them.
+    uint32_t prefill_window_tokens_{0};
+    uint32_t prefill_chunk_tokens_{0};
+    bool prefill_workspace_ready_{false};
 
     UnifiedVRAMExpertPool vram_pool_;
     HostExpertPool host_pool_;

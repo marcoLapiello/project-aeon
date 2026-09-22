@@ -28,9 +28,14 @@ void finish(ExpertRegistry& registry, const aeon::core::ExpertRequestReservation
 
 int main() {
     ExpertRegistry registry(1, 8, 2, 2);
+    // This gate's subject *is* the registry's bookkeeping, so the full audit runs
+    // after every operation here — the fine-grained assertion is the point, and it is
+    // what the production path leaves off for speed (ledger M43).
+    registry.set_validate_each_request(true);
     assert(registry.invariants_hold());
 
     ExpertRegistry layer_order(2, 4, 2, 2);
+    layer_order.set_validate_each_request(true);
     const auto ordered_request = layer_order.reserve_request(0, 2, 1, 2);
     assert(ordered_request.demotion.has_value());
     assert(layer_order.catalog[ordered_request.demotion->victim_gid].layer_id == 0);

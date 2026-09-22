@@ -21,7 +21,6 @@ namespace aeon::core {
 
 // Constant safety margins & architectural parameters
 constexpr size_t VRAM_HEADROOM_SAFETY_BYTES = 300ULL * 1024ULL * 1024ULL; // 300 MB
-
 // Host RAM the engine will never plan to use, held back for the OS and for this
 // process's own non-expert footprint (the graph, the tokenizer, the pinned
 // transport staging arena, and whatever the dense container still holds in page
@@ -43,7 +42,35 @@ constexpr size_t VRAM_HEADROOM_SAFETY_BYTES = 300ULL * 1024ULL * 1024ULL; // 300
 // residency, and it never was.
 constexpr size_t HOST_RAM_RESERVED_BYTES = 10ULL * 1024ULL * 1024ULL * 1024ULL; // 10 GiB
 
-constexpr size_t PIPELINE_SCRATCH_BYTES      = 100ULL * 1024ULL * 1024ULL; // ~100 MB activation scratch
+// VRAM allowance for the body's batch scratch (`V4LayerBodyBatchScratch`), derived
+// from the configured prefill chunk `C`.
+//
+// It is an **allowance**, not a computed size: the exact figure depends on each
+// layer's state layout (the indexer's candidate scores and top-k, the composed
+// row-set), so the host allocates the real buffer at load and checks it against this
+// number, failing with a named message rather than silently eating into the Hot
+// pool. The per-row figure is `1 MiB`, against a measured `~0.69 MiB/row` (a `C = 64`
+// scratch is `44 MiB`), which leaves the allowance ~45% above the real cost and is
+// what makes it safe to state without walking the layer layouts here.
+constexpr size_t BATCH_SCRATCH_BYTES_PER_ROW = 1ULL * 1024ULL * 1024ULL;
+
+inline size_t batch_scratch_allowance_bytes(uint32_t chunk_tokens) {
+    return static_cast<size_t>(chunk_tokens) * BATCH_SCRATCH_BYTES_PER_ROW;
+}
+
+// VRAM allowance for the **decode** path's fixed workspace: `V4PipelineScratchBuffers`
+// (the per-op temporaries, sized by the kernel shapes) plus `V4RoutedExpertScratch`
+// (six experts' accumulators). Neither is a function of a knob — both are fixed by the
+// model — so this is an allowance in the same sense as the batch scratch: the host
+// allocates the real buffers at load and checks them against it, so the figure is
+// verified rather than trusted. Measured, the two together are ≈`5 MiB`; the margin
+// covers a kernel whose padded row count grows.
+constexpr size_t DECODE_SCRATCH_ALLOWANCE_BYTES = 16ULL * 1024ULL * 1024ULL;
+
+inline size_t decode_scratch_allowance_bytes() {
+    return DECODE_SCRATCH_ALLOWANCE_BYTES;
+}
+
 
 struct AeonRuntimeConfig {
     // User-configurable: target context sequence length (tokens)
@@ -105,23 +132,30 @@ struct AeonRuntimeConfig {
     // ideal-LRU hit-rate curve next to the measured Hot hit rate.
     bool profile_routing_reuse{false};
 
+    // Run the registry's full invariant audit after **every** expert reservation and
+    // completion, not only at the phase boundaries. Off by default: the audit is a
+    // whole-registry scan, so per-request it dominates a batch (measured 10.2 s of a
+    // 338-token swept prefill, ledger M43). On, it localises a bookkeeping defect to
+    // the individual operation that caused it. The boundaries and `invariants_hold()`
+    // always audit regardless.
+    bool validate_registry_each_request{false};
+
     // The body chunk `C` the layer-major prefill window runs with — the rows in
-    // flight per body invocation (Step 6 §6b). It is a memory decision: it bounds
-    // the batch scratch and, because a chunk dispatches its `6C` routed-expert
-    // requests as one deduplicated set (Step 6 D1/D4), it bounds the staging arena,
-    // which is sized `6 * prefill_chunk` slots. The default `1` reproduces decode's
-    // `C = 1` shape exactly, so nothing on the certified path moves. Step 7 exposes
-    // it as a setting and sweeps it.
-    uint32_t prefill_chunk{1};
+    // flight per body invocation (Step 6 §6b). User-configurable; validated against
+    // the body's own row cap (`V4LayerBodyBatchScratch::kMaxTokens`) and against the
+    // window. It bounds the batch scratch (allocated at load) and the staging arena
+    // (`min(6C, experts_per_layer)`). Larger = fewer body invocations; measured
+    // nearly flat in throughput, so the default is on the wide side.
+    uint32_t prefill_chunk{64};
 
     // The layer-major prefill **window** `W` (Step 6 §6b): how many prompt tokens
     // one layer-major pass carries in its residual, and therefore how many sweeps a
-    // prompt of `N` tokens pays (`⌈N/W⌉`). `0` means the whole prompt — one pass
-    // over the model, which is §6b's `156 GB` floor and the engine's default. The
-    // carry is `W × 64 KB` of VRAM (the bf16 broadcast and the fp32 residual, ~96 KB
-    // per token with the allocation as built), so a very long prompt is a VRAM
-    // decision and not a free one; Step 7 derives a default bound and sweeps it.
-    uint32_t prefill_window{0};
+    // prompt of `N` tokens pays (`⌈N/W⌉`). User-configurable. `0` means the whole
+    // prompt, bounded by the context — one pass, but a carry allocated for the whole
+    // context. The default matches the reference implementation's segment size
+    // (colibri `V4_PREFILL_SEGMENT = 4096`), which bounds the carry at ~393 MiB
+    // regardless of context and keeps a long prompt at `⌈N/4096⌉` passes.
+    uint32_t prefill_window{4096};
 
     // Step 6 D-b (policy A): freeze the Warm tier during prefill. A prefill touches
     // every expert, so letting the sweep promote from Warm would **move** each
@@ -150,7 +184,6 @@ struct AeonRuntimeConfig {
 struct MemoryBudgetReport {
     bool is_feasible{false};
     std::string rejection_reason;
-
     // Hardware limits
     size_t total_vram_bytes{0};
     size_t free_vram_bytes{0};
@@ -174,6 +207,16 @@ struct MemoryBudgetReport {
     size_t vram_attention_state_bytes{0};
     size_t vram_rope_bytes{0};
     size_t vram_scratch_bytes{0};
+    // The three terms of `vram_scratch_bytes`, reported separately because each has
+    // its own owner: the decode workspace is fixed by the model's kernel shapes, the
+    // batch scratch is a function of the chunk `C`, and the residual carry of the
+    // window `W`.
+    size_t vram_decode_scratch_bytes{0};
+    size_t vram_batch_scratch_bytes{0};
+    // The residual carry alone, derived from the configured prefill window. Reported
+    // separately from the batch-scratch allowance it is summed with, so the window's
+    // cost is visible rather than folded into a single scratch figure.
+    size_t vram_prefill_carry_bytes{0};
     size_t vram_headroom_bytes{VRAM_HEADROOM_SAFETY_BYTES};
     size_t vram_min_active_bytes{0};
     size_t vram_available_for_experts{0};
@@ -222,7 +265,11 @@ struct MemoryBudgetReport {
             << "    - Attention metadata   : " << (double)vram_attention_metadata_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - RoPE tables          : " << (double)vram_rope_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Attention state total: " << (double)vram_attention_state_bytes / (1024 * 1024 * 1024) << " GB\n"
-            << "    - Compute Scratch      : " << (double)vram_scratch_bytes / (1024 * 1024) << " MB\n"
+            << "    - Compute Scratch      : " << (double)vram_scratch_bytes / (1024 * 1024) << " MB"
+            << "  (decode allowance " << (double)vram_decode_scratch_bytes / (1024 * 1024)
+            << " MB + batch allowance " << (double)vram_batch_scratch_bytes / (1024 * 1024)
+            << " MB + residual carry " << (double)vram_prefill_carry_bytes / (1024 * 1024)
+            << " MB; the two allowances are checked against the real allocations at load)\n"
             << "    - Safety Headroom      : " << (double)vram_headroom_bytes / (1024 * 1024) << " MB (Fixed OS/GTT buffer)\n"
             << "    - Active Experts Min   : " << (double)vram_min_active_bytes / (1024 * 1024) << " MB\n"
             << "    - Available for Hot Pool: " << (double)vram_available_for_experts / (1024 * 1024 * 1024) << " GB\n"
@@ -242,6 +289,21 @@ struct MemoryBudgetReport {
         return oss.str();
     }
 };
+
+// The residual carry's bytes for the configured prefill window: the fp16 broadcast
+// and the fp32 copy, per token, over the `hc_mult * hidden_size` stream width.
+// Derived rather than assumed, because it scales with the configured window and at
+// a whole-context window it is gigabytes — not a rounding error on the expert pool.
+inline size_t prefill_carry_bytes(const AeonRuntimeConfig& runtime_cfg,
+                                  const DeepSeekV4Config& model_cfg) {
+    const uint32_t ctx = runtime_cfg.context_size;
+    const uint32_t window = runtime_cfg.prefill_window == 0
+        ? ctx
+        : std::min(runtime_cfg.prefill_window, ctx);
+    const size_t hc_dim = static_cast<size_t>(model_cfg.hc_mult) *
+                          static_cast<size_t>(model_cfg.hidden_size);
+    return static_cast<size_t>(window) * hc_dim * (sizeof(uint16_t) + sizeof(float));
+}
 
 class MemoryBudgetEngine {
 public:
@@ -373,7 +435,26 @@ public:
         report.vram_attention_state_bytes = attention_memory.layer_state_bytes;
         report.vram_rope_bytes = attention_memory.rope_bytes;
         report.vram_kv_bytes = attention_memory.total_bytes();
-        report.vram_scratch_bytes = PIPELINE_SCRATCH_BYTES;
+        // The prefill workspace is **derived from the configured knobs** (Step 6 item
+        // 7): the residual carry is a pure function of the window, and the batch
+        // scratch is an allowance the host checks its real allocation against at load.
+        // The `100 MiB` literal this replaces was wrong in both directions — it
+        // over-counted decode scratch several-fold and did not cover the batch scratch
+        // at all.
+        const size_t carry_bytes = prefill_carry_bytes(runtime_cfg, model_cfg);
+        report.vram_prefill_carry_bytes = runtime_cfg.prefill_sweep ? carry_bytes : 0;
+        report.vram_batch_scratch_bytes = runtime_cfg.prefill_sweep
+            ? batch_scratch_allowance_bytes(std::max<uint32_t>(1, runtime_cfg.prefill_chunk))
+            : 0;
+        // The decode workspace is **not** a knob: `V4PipelineScratchBuffers` and
+        // `V4RoutedExpertScratch` are fixed by the model's kernel shapes, and both
+        // report their real allocation size. The old `100 MiB` literal that stood for
+        // this was wrong in both directions — it over-counted by ~an order of
+        // magnitude *and* ignored the batch scratch entirely.
+        report.vram_decode_scratch_bytes = decode_scratch_allowance_bytes();
+        report.vram_scratch_bytes = report.vram_decode_scratch_bytes +
+                                    report.vram_batch_scratch_bytes +
+                                    report.vram_prefill_carry_bytes;
         report.vram_headroom_bytes = VRAM_HEADROOM_SAFETY_BYTES;
 
         // Minimum active experts needed for execution:
@@ -440,24 +521,54 @@ public:
         report.hot_vram_bytes = static_cast<size_t>(report.hot_vram_slots) *
                                 expert_format.payload_bytes;
 
-        // 8. Calculate persistent Warm capacity. Transport staging is allocated
-        // for Cold requests even when Warm is disabled, but it never counts as a
-        // persistent Warm slot.
-        report.transient_staging_bytes = static_cast<size_t>(12) *
-                         expert_format.payload_bytes;
+        // 8. Calculate persistent Warm capacity.
+        //
+        // Warm and the transport staging arena are **two independent budgets**, not
+        // one pool with a deduction (Step 0 D5): staging is a transit corridor whose
+        // size follows the chunk `C`, and Warm is expert residency. So the requested
+        // `warm_host_bytes` is the Warm budget *in full* — it is not reduced by the
+        // staging figure. What is checked is the **total**: Warm plus staging plus the
+        // fixed reserve must fit the host, or the plan would swap.
+        //
+        // Staging follows the chunk, and the figure matches what the host actually
+        // allocates: `max(12, min(6C, experts_per_layer))` slots. The literal `12`
+        // that used to stand here was decode's shape and understated a `C = 256`
+        // arena (256 slots, 3456 MiB) by ~21x.
+        const uint32_t experts_per_layer =
+            static_cast<uint32_t>(expert_format.experts_per_layer);
+        const uint32_t staging_slots = runtime_cfg.prefill_sweep
+            ? std::max<uint32_t>(12, std::min<uint32_t>(
+                  6u * std::max<uint32_t>(1, runtime_cfg.prefill_chunk), experts_per_layer))
+            : 12;
+        report.transient_staging_bytes =
+            static_cast<size_t>(staging_slots) * expert_format.payload_bytes;
         report.configured_host_budget_bytes = runtime_cfg.warm_host_bytes == 0
             ? report.transient_staging_bytes
             : std::min(runtime_cfg.warm_host_bytes, report.max_allowed_host_ram_bytes);
         const size_t persistent_host_budget = runtime_cfg.warm_host_bytes == 0
             ? 0
-            : report.configured_host_budget_bytes > report.transient_staging_bytes
-                ? report.configured_host_budget_bytes - report.transient_staging_bytes
-                : 0;
+            : report.configured_host_budget_bytes;
         report.persistent_warm_host_budget_bytes = persistent_host_budget;
+
+        // The total, which is where the two budgets meet. `max_allowed_host_ram_bytes`
+        // is already the reserve-subtracted ceiling.
+        const size_t host_total = persistent_host_budget + report.transient_staging_bytes;
+        if (host_total > report.max_allowed_host_ram_bytes) {
+            report.is_feasible = false;
+            report.rejection_reason =
+                "Host plan exceeds the RAM ceiling: Warm " +
+                std::to_string(persistent_host_budget / (1024ULL * 1024 * 1024)) +
+                " GiB + staging " +
+                std::to_string(report.transient_staging_bytes / (1024 * 1024)) +
+                " MiB > " +
+                std::to_string(report.max_allowed_host_ram_bytes / (1024ULL * 1024 * 1024)) +
+                " GiB allowed";
+            return report;
+        }
         if (runtime_cfg.warm_host_bytes > 0 &&
             persistent_host_budget < expert_format.payload_bytes) {
             report.is_feasible = false;
-            report.rejection_reason = "Warm host budget cannot hold one complete expert after reserving transient staging";
+            report.rejection_reason = "Warm host budget cannot hold one complete expert";
             return report;
         }
 

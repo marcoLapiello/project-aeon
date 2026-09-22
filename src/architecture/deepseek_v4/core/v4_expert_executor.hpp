@@ -138,17 +138,31 @@ struct V4RoutedExpertScratch {
 
     void allocate() {
         free();
-        CHECK_HIP(hipMalloc(&d_expert_hidden,
-                            static_cast<size_t>(kernel::kAeonSwizzledMaxExperts) *
-                                kIntermediate * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_contrib,
-                            static_cast<size_t>(kExperts) * kHidden * sizeof(float)));
+        allocate_buffer(d_expert_hidden,
+                        static_cast<size_t>(kernel::kAeonSwizzledMaxExperts) * kIntermediate);
+        allocate_buffer(d_contrib, static_cast<size_t>(kExperts) * kHidden);
     }
+
+    // Exact VRAM this scratch holds. The budget reports it rather than a literal:
+    // the size is a property of the model's constants, not of any knob, but it is
+    // still a real allocation that the Hot pool is sized around.
+    size_t bytes() const noexcept { return bytes_allocated_; }
 
     void free() noexcept {
         if (d_expert_hidden) { (void)hipFree(d_expert_hidden); d_expert_hidden = nullptr; }
         if (d_contrib) { (void)hipFree(d_contrib); d_contrib = nullptr; }
+        bytes_allocated_ = 0;
     }
+
+private:
+    template <typename T>
+    void allocate_buffer(T*& pointer, size_t count) {
+        CHECK_HIP(hipMalloc(&pointer, count * sizeof(T)));
+        bytes_allocated_ += count * sizeof(T);
+    }
+
+    size_t bytes_allocated_{0};
+public:
 };
 
 // The four streams the executor interacts with live in `core/v4_device_streams.hpp`,

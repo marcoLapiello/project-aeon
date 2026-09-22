@@ -291,13 +291,15 @@ public:
         }
         // A chunk issues its `6C` routed requests as one deduplicated set (Step 6
         // D1/D2), each distinct expert held in its own staging slot while in
-        // transit (D4). The arena must therefore have room for the whole set, or a
-        // transfer would collide with a slot another transfer still holds. The host
-        // sizes it from `AeonRuntimeConfig::prefill_chunk`; a caller that runs a
-        // wider chunk than it configured fails here rather than at the arena.
-        if (6u * chunk > host_.staging_slot_count()) {
+        // transit (D4). Dedup can only collapse onto the layer's own experts, so the
+        // real demand is `min(6C, experts_per_layer)` — the host sizes the arena to
+        // that same ceiling, and a caller that runs a wider chunk than it configured
+        // fails here rather than at the arena.
+        const uint32_t staging_needed = std::min<uint32_t>(
+            6u * chunk, static_cast<uint32_t>(host_.config().n_routed_experts));
+        if (staging_needed > host_.staging_slot_count()) {
             throw std::invalid_argument(
-                "V4Graph::forward_window: the chunk needs " + std::to_string(6u * chunk) +
+                "V4Graph::forward_window: the chunk needs " + std::to_string(staging_needed) +
                 " staging slots but the arena has " +
                 std::to_string(host_.staging_slot_count()) +
                 " — raise AeonRuntimeConfig::prefill_chunk");

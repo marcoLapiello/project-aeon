@@ -102,15 +102,14 @@ public:
     // composed row-set check in `compose_local_rows` is the only state bound, and it
     // is sized from this, so raising it costs scratch and changes no contract.
     //
-    // `16` was inherited and never justified. Colibri's equivalent bound is 128
-    // (`V4_PREFILL_CHUNK`, clamp `[1,128]`, `aeon-references/colibri/c/deepseek_v4.c`
-    // ~12073) and it is a *launch-count* knob — the sweep's byte cost does not depend
-    // on it, because the sweep loads whole layers either way. At 16 we issue 8x the
-    // body invocations colibri does for the same prompt, which is compute the sweep
-    // then pays for on top of its loads. The arena's own `6C` ceiling still bounds the
-    // chunk from below (`prefill_chunk_for`), so this is the upper limit, not the
-    // value used.
-    static constexpr uint32_t kMaxTokens = 64;
+    // The reference implementation clamps its equivalent at `128`
+    // (`V4_PREFILL_CHUNK`, `aeon-references/colibri/c/deepseek_v4.c` ~12073), but that
+    // clamp comes from *its* batch kernels' contract, not from the math — here the
+    // only bound is the composed row-set, which is derived from this constant. `256`
+    // is the layer's own expert count and therefore the widest chunk whose `6C`
+    // requests dedup to a whole layer, which makes it the natural ceiling. It is a
+    // *launch-count* knob: the sweep's byte cost does not depend on it.
+    static constexpr uint32_t kMaxTokens = 256;
     static constexpr uint32_t kMPad = 16;
 
     ~V4LayerBodyBatchScratch() { free(); }
@@ -123,17 +122,31 @@ public:
     // length is a property of the layer (the indexer's candidate scores and its
     // selected top-k).
     void allocate(const V4Layer& layer, uint32_t count) {
+        const auto& layout = layer.state_layout();
+        allocate_capacity(layout.compressed_capacity, layout.index_topk,
+                          layout.local_capacity, count);
+    }
+
+    // The same allocation from **explicit** capacities rather than a layer. A
+    // layer-major window enters all 43 layers, and the scratch is one buffer, so it
+    // has to be sized for the worst case across them and allocated once — at load,
+    // from the configured chunk `C` (Step 6 item 7) — rather than re-allocated as
+    // each layer is entered. `allocate(layer, count)` is the per-layer form and is
+    // still what a single-layer caller wants.
+    void allocate_capacity(uint32_t compressed_capacity, uint32_t index_topk,
+                           uint32_t local_capacity, uint32_t count) {
         free();
         if (count == 0 || count > kMaxTokens) {
             throw std::invalid_argument(
                 "V4LayerBodyBatchScratch::allocate: unsupported token count");
         }
         token_count_ = count;
-        const auto& layout = layer.state_layout();
-        index_scores_per_token_ = layout.compressed_capacity;
-        index_topk_per_token_ = layout.index_topk;
-        // The composed row-set is the pre-chunk ring plus the chunk's own rows.
-        max_composed_rows_ = static_cast<size_t>(layout.local_capacity) + kMaxTokens;
+        index_scores_per_token_ = compressed_capacity;
+        index_topk_per_token_ = index_topk;
+        // The composed row-set is the pre-chunk ring plus the chunk's own rows. It
+        // is sized from the row cap rather than from `count`, so the worst-case
+        // `local_capacity` across the layers is what the allocation needs.
+        max_composed_rows_ = static_cast<size_t>(local_capacity) + kMaxTokens;
 
         constexpr uint32_t H = kernel::DSV4_HIDDEN_SIZE;
         constexpr uint32_t HC_DIM = 4 * H;
@@ -257,9 +270,15 @@ public:
         release(composed_keys_);
         release(composed_positions_);
         token_count_ = 0;
+        bytes_allocated_ = 0;
     }
 
     uint32_t token_count() const noexcept { return token_count_; }
+
+    // Exact VRAM this scratch holds. Reported at load, and checked against the
+    // budget's allowance there, so a configuration that would overrun the allowance
+    // fails with a named message instead of silently eating into the Hot pool.
+    size_t bytes() const noexcept { return bytes_allocated_; }
 
     // The chunk's key row for local index `index` (0 = the chunk's first token),
     // written during the pre-attention phase instead of the ring.
@@ -353,8 +372,10 @@ public:
     }
 
 private:
+    // Non-static so the allocation can be accounted: `bytes()` is what the load-time
+    // check and the budget report read.
     template <typename T>
-    static T* alloc_array(size_t count) {
+    T* alloc_array(size_t count) {
         T* pointer = nullptr;
         const hipError_t err = hipMalloc(&pointer, count * sizeof(T));
         if (err != hipSuccess) {
@@ -362,6 +383,7 @@ private:
                 std::string("V4LayerBodyBatchScratch: hipMalloc failed: ") +
                 hipGetErrorString(err));
         }
+        bytes_allocated_ += count * sizeof(T);
         return pointer;
     }
 
@@ -373,6 +395,7 @@ private:
         }
     }
 
+    size_t bytes_allocated_{0};
     uint32_t token_count_{0};
     size_t index_scores_per_token_{0};
     size_t index_topk_per_token_{0};

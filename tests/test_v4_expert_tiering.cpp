@@ -316,6 +316,10 @@ struct TieringGate {
         host_pool.allocate(kHostSlots, format);
         registry.init(format.num_layers, format.experts_per_layer, kVramSlots, kHostSlots,
                       /*preload_warm_host=*/false);
+        // The audit after every operation: this gate is exactly where a bookkeeping
+        // defect should be localised to its cause, so it pays the cost the production
+        // path leaves off (ledger M43).
+        registry.set_validate_each_request(true);
 
         CHECK_HIP(hipStreamCreateWithFlags(&compute_stream, hipStreamNonBlocking));
         CHECK_HIP(hipStreamCreateWithFlags(&sdma_stream, hipStreamNonBlocking));

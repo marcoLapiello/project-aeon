@@ -44,7 +44,7 @@ Oldest to newest. Each new milestone fuses the two older rows into one, so the t
 
 | Work in progress | State | Detail |
 | :--- | :--- | :--- |
-| Expert streaming and chunked prefill | in progress | [EXPERT_STREAMING_EXECUTION_PLAN.md](plans-and-docs/execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) (Steps 0–5 done; Step 6 core, items 4–7 and outcome 5 done — the swept prefill is `2.3–2.9x` serial and the load is overlapped; the Step 7 `W`/`C` sweep and the prefill body's compute bound remain) |
+| Expert streaming and chunked prefill | in progress | [EXPERT_STREAMING_EXECUTION_PLAN.md](plans-and-docs/execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) (Steps 0–5 done; Step 6 core, items 4–8 and outcomes 1–6 done; Step 7's settings done, its budget lines partly; the prefill body's `~120 ms/prompt-token` is the open target) |
 | Session state and swap | open | [SESSION_STATE_AND_SWAP_ANALYSIS.md](plans-and-docs/analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) |
 | Host-memory pressure | open investigation | [HOST_MEMORY_PRESSURE_INVESTIGATION.md](plans-and-docs/analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) |
 | Routing profile and placement study | open | [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) |

@@ -326,7 +326,7 @@ public:
             entry.lease_count++;
             entry.pending_slot_idx = static_cast<int32_t>(destination.vram_slot);
             entry.warm_shadow = true;
-            validate_invariants();
+            checked_validate();
             return ExpertRequestReservation{
                 ExpertRequestKind::WARM_PROMOTION,
                 ExpertTier::WARM_HOST,
@@ -376,7 +376,7 @@ public:
             destination.demotion
         };
 
-        validate_invariants();
+        checked_validate();
         return request;
     }
 
@@ -407,7 +407,7 @@ public:
         vram_slots[static_cast<size_t>(source_slot)] = -1;
         --pending_demotion_count;
         ++demotion_completions;
-        validate_invariants();
+        checked_validate();
     }
 
     void drop_demotion(uint64_t operation_id) {
@@ -425,7 +425,7 @@ public:
         victim->gpu_transfer = ExpertGpuTransfer::NONE;
         victim->demotion_drop_reason = ExpertDemotionDropReason::NONE;
         ++demotion_drops;
-        validate_invariants();
+        checked_validate();
     }
 
     void fail_demotion(uint64_t operation_id) {
@@ -455,7 +455,7 @@ public:
         }
         --pending_demotion_count;
         ++demotion_drops;
-        validate_invariants();
+        checked_validate();
     }
 
     void complete_request(uint64_t operation_id) {
@@ -489,7 +489,7 @@ public:
             vram_slot_reservations[static_cast<size_t>(destination_slot)] = 0;
             push_lru_front(*incoming, warm_host_lru);
             shadow_touch(incoming->global_expert_id);
-            validate_invariants();
+            checked_validate();
             return;
         }
 
@@ -537,7 +537,7 @@ public:
             static_cast<int32_t>(incoming->global_expert_id);
         vram_slot_reservations[static_cast<size_t>(destination_slot)] = 0;
         push_lru_front(*incoming, hot_vram_lru);
-        validate_invariants();
+        checked_validate();
     }
 
     void fail_request(uint64_t operation_id) {
@@ -564,7 +564,7 @@ public:
             incoming->pending_slot_idx = -1;
             incoming->warm_shadow = false;
             push_lru_front(*incoming, warm_host_lru);
-            validate_invariants();
+            checked_validate();
             return;
         }
 
@@ -608,7 +608,7 @@ public:
         incoming->operation = ExpertOperation::NONE;
         incoming->gpu_transfer = ExpertGpuTransfer::NONE;
         incoming->publication = ExpertPublication::PUBLISHED;
-        validate_invariants();
+        checked_validate();
     }
 
     void release_lease(uint32_t gid) {
@@ -806,6 +806,26 @@ public:
 
     bool warm_frozen() const noexcept { return warm_frozen_; }
 
+    // Per-request invariant validation — **off by default**.
+    //
+    // `validate_invariants()` is a full audit of the whole registry (every catalog
+    // entry, every VRAM and host slot, and — for each slot currently reserved — a
+    // rescan of the catalog). It is `O(total_experts + slots)`, and it is called once
+    // per reserved expert, so the cost is quadratic in the batch and linear in the
+    // model: a layer-wide prefill dispatch is 256 reservations and a decode pass is
+    // 258, which measured **10.2 s of a 338-token swept prefill** (ledger M43).
+    //
+    // So it is a debugging instrument, not a production cost. With it off the audit
+    // still runs at every **boundary** — `init`, `begin_prefill_stream`,
+    // `end_prefill_stream`, `release_layer`, `set_warm_frozen` — which is where the
+    // registry actually changes shape, and `invariants_hold()` always runs the full
+    // audit regardless, so a gate that asks the question always gets a real answer.
+    // Turn it on to localise a defect to the individual reservation that caused it.
+    void set_validate_each_request(bool enabled) noexcept {
+        validate_each_request_ = enabled;
+    }
+    bool validate_each_request() const noexcept { return validate_each_request_; }
+
     // Warm-owned experts currently holding an extra VRAM copy. A gate reads this
     // before and after a prefill: it is the shadow half of "Warm preserved", and
     // it must return to 0 when the frozen phase ends.
@@ -856,6 +876,16 @@ public:
         }
     }
 
+    // The per-request path's audit: a no-op unless `set_validate_each_request(true)`.
+    // It exists as a named function so the guarded sites read as a decision rather
+    // than as a missing call — every one of them *could* audit here, and does when
+    // the flag is on.
+    void checked_validate() const {
+        if (validate_each_request_) validate_invariants();
+    }
+
+    // The audit itself. Called unconditionally at the boundaries and by
+    // `invariants_hold()`, and through `checked_validate()` on the per-request path.
     void validate_invariants() const {
         if (vram_slots.size() != vram_capacity || host_slots.size() != host_capacity ||
             vram_slot_reservations.size() != vram_capacity ||
@@ -1367,6 +1397,8 @@ private:
     // `ExpertCatalogEntry::shadow_vram_slot` so a caller can resolve an expert's
     // VRAM copy without scanning the catalog.
     bool warm_frozen_{false};
+    // See `set_validate_each_request`. Off unless a debug run or a gate turns it on.
+    bool validate_each_request_{false};
     // Step 6 item 6: the prefill sweep's streaming mode. Drains Hot on entry, holds
     // a sliding window of whole layer sets in layer order, and requires Hot empty on
     // exit. Implies `warm_frozen_`; decode never sees either flag set.

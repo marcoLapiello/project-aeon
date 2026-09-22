@@ -157,6 +157,17 @@ public:
         return demotion_queue_capacity_;
     }
 
+    // Time spent inside `io_uring_enter` for submissions, and how many SQE
+    // submissions that was. Split out from the rest of `dispatch` because issuing a
+    // whole layer's reads at once (1024 SQEs, ~4 GiB in flight) can block on the
+    // device queue rather than on the CPU — a distinction the total dispatch time
+    // cannot make.
+    uint64_t direct_io_submit_ns() const noexcept { return direct_io_submit_ns_; }
+    uint64_t direct_io_requests_submitted() const noexcept {
+        return direct_io_requests_submitted_;
+    }
+    uint64_t direct_io_submit_calls() const noexcept { return direct_io_submit_calls_; }
+
     PayloadBatch dispatch(
         const std::vector<PayloadRequest>& requests,
         uint64_t current_step,
@@ -377,8 +388,10 @@ public:
         }
 
         if (submitted_direct_io) {
+            const auto submit_started = std::chrono::steady_clock::now();
+            size_t submitted = 0;
             try {
-                direct_io_reader_->submit_pending_reads();
+                submitted = direct_io_reader_->submit_pending_reads();
             } catch (...) {
                 for (auto& state : batch.transfers) {
                     if (state.io_pending) {
@@ -388,6 +401,11 @@ public:
                 }
                 throw;
             }
+            direct_io_submit_ns_ += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - submit_started).count());
+            direct_io_requests_submitted_ += submitted;
+            ++direct_io_submit_calls_;
             const auto submitted_at = std::chrono::steady_clock::now();
             for (const auto& state : batch.transfers) {
                 if (!state.io_pending) continue;
@@ -928,6 +946,9 @@ private:
     PrefetchStagingArena* prefetch_staging_{nullptr};
     SupplyTelemetry* supply_telemetry_{nullptr};
     aeon::io::DirectIOReader* direct_io_reader_{nullptr};
+    uint64_t direct_io_submit_ns_{0};
+    uint64_t direct_io_requests_submitted_{0};
+    uint64_t direct_io_submit_calls_{0};
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion>* direct_io_completions_{nullptr};
     uint64_t* next_direct_io_id_{nullptr};
     hipStream_t compute_stream_{nullptr};
