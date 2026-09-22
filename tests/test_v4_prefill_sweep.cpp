@@ -44,7 +44,14 @@ using aeon::core::V4ModelHost;
 
 constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
 constexpr uint32_t kContext = 256;
-constexpr uint32_t kWindow = 16;
+// The window `W` and the body chunk `C`. `W` must clear
+// `V4PrefillSweep::worth` — the sweep fetches a whole layer, so it is engaged only
+// when the window's routed draws reach the layer's size twice over
+// (`6W >= 2 * experts_per_layer`, i.e. `W >= 86` at 256 experts) and a whole-layer
+// load is no longer an over-fetch. `C` is the body's own row cap, and the chunk is
+// a batch size *inside* a layer, not a partition of the window.
+constexpr uint32_t kWindow = 96;
+constexpr uint32_t kChunk = 16;
 constexpr size_t kWarmBytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
 
 uint32_t g_checks = 0;
@@ -106,7 +113,7 @@ int main() {
     aeon::core::AeonRuntimeConfig runtime;
     runtime.context_size = kContext;
     runtime.warm_host_bytes = kWarmBytes;
-    runtime.prefill_chunk = kWindow;
+    runtime.prefill_chunk = kChunk;
     runtime.prefill_sweep = true;
 
     V4ModelHost host;
@@ -145,8 +152,14 @@ int main() {
     // ---- enter the swept prefill --------------------------------------------
     std::printf("\n[B] Prefill begin (drain Hot, freeze Warm)\n");
     const std::set<uint32_t> warm_before_switch = warm_set(host);
-    host.prefill_begin();
-    const uint32_t shadows_after_drain = host.registry().shadow_resident_count();
+    // No shadow can exist before the switch: a shadow residency is legal only while
+    // Warm is frozen (`validate_invariants` refuses it otherwise), and decode never
+    // freezes. So this is the observable form of "no second ownership crossed over"
+    // — asserted *before* the switch, because the switch's own lookahead creates
+    // shadows legitimately, by design (a Warm expert in the frontier is copied, not
+    // promoted).
+    const uint32_t shadows_before_switch = host.registry().shadow_resident_count();
+    host.prefill_begin(kWindow);
     const bool streaming = host.registry().prefill_streaming();
     // The switch deliberately settles and reaps what the previous phase left in
     // flight, so a demotion the serial reference had already committed can land
@@ -158,7 +171,7 @@ int main() {
     // ---- run the window (the sweep is already active) ------------------------
     std::printf("\n[C] The swept window (layer-major, whole layer sets)\n");
     host.reset_generation_state();
-    (void)graph.forward_window(ids.data(), 0, kWindow, kWindow, host.streams().compute);
+    (void)graph.forward_window(ids.data(), 0, kWindow, kChunk, host.streams().compute);
     const std::vector<uint8_t> swept_logits =
         read_bytes(graph.logits(), static_cast<size_t>(vocab) * sizeof(uint16_t));
 
@@ -168,11 +181,15 @@ int main() {
     std::printf("\n--- results ---\n");
 
     assert_that("B: prefill entered streaming mode", streaming, "streaming");
+    assert_that("B: the window cleared the over-fetch rule (W >= 2P/6)",
+                host.prefill_sweep_engaged(),
+                std::to_string(kWindow) + "-token window, " +
+                    std::to_string(per_layer) + " experts/layer");
     assert_that("B: Hot was drained on entry",
                 host.prefill_sweep().hot_after_drain() == 0,
                 std::to_string(host.prefill_sweep().hot_after_drain()) + " Hot residents");
-    assert_that("B: no shadow survived the drain", shadows_after_drain == 0,
-                std::to_string(shadows_after_drain) + " shadows");
+    assert_that("B: no shadow existed to survive the switch", shadows_before_switch == 0,
+                std::to_string(shadows_before_switch) + " decode-era shadows");
 
     const size_t logits_diff = differing_bytes(serial_logits, swept_logits);
     assert_that("D: swept logits == serial, bit-exact", logits_diff == 0,
@@ -219,8 +236,8 @@ int main() {
     assert_that("C: registry invariants hold", host.registry().invariants_hold(),
                 "invariants_hold()");
 
-    std::printf("\n  window %u tokens over %u layers, %u experts each\n",
-                kWindow, layers, per_layer);
+    std::printf("\n  window %u tokens (chunk %u) over %u layers, %u experts each\n",
+                kWindow, kChunk, layers, per_layer);
     (void)hc_dim;
 
     std::printf("\n================================================================================\n");

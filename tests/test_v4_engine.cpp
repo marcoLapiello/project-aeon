@@ -635,6 +635,99 @@ int main() {
     }
 
     // =========================================================================
+    // H. The prefill strategy follows the window (Step 6 D-a)
+    // =========================================================================
+    //
+    // The engine's prefill is the layer-major window, and the *sweep* — drain Hot,
+    // stream whole layer sets in computation order, release each layer as it
+    // retires — is engaged only when the window clears the over-fetch rule
+    // (`V4PrefillSweep::worth`): the sweep loads a whole layer, so a window whose
+    // routed draws do not reach the layer's size would fetch far more than the
+    // layer-major driver needed. Both claims are asserted, in opposite directions,
+    // because "the sweep ran" alone cannot distinguish the strategy from a code
+    // path that always sweeps or never does.
+    //
+    // What is *not* re-asserted here: byte-equality of the swept path. That is
+    // `test_v4_prefill_sweep`'s subject (ledger M40), at the graph level and
+    // without the engine, so re-running it through `chat` would buy nothing and
+    // cost a second whole-model read. What is new here is that the *engine* chooses
+    // the strategy and that the switch leaves no residue on either side of it.
+    std::printf("\n[H] The prefill strategy follows the window\n");
+    {
+        const uint64_t loads_before = engine.host().prefill_sweep().layer_loads();
+        harness.assert_that("H: no swept prefill has run yet (the short prompts)",
+                            loads_before == 0,
+                            std::to_string(loads_before) + " layer loads");
+
+        // A prompt long enough to clear `6W >= 2 x experts_per_layer` at this
+        // context's 256 experts per layer, built by repetition so the token count
+        // is measured rather than guessed.
+        std::string long_text;
+        std::vector<uint32_t> long_prompt;
+        do {
+            long_text += "The committee reviewed the proposal carefully. ";
+            long_prompt = engine.encoder().encode_tokens({user_message(long_text)},
+                                                         prompt_options);
+        } while (long_prompt.size() < 100);
+
+        harness.assert_that("H: the long prompt clears the sweep's over-fetch rule",
+                            long_prompt.size() >= 86 && long_prompt.size() < kContext,
+                            std::to_string(long_prompt.size()) + " tokens");
+
+        const auto prefill_start = Clock::now();
+        const V4Reply swept = engine.chat({user_message(long_text)}, prompt_options,
+                                          generation_options(1), sampling);
+        const double prefill_seconds = since(prefill_start);
+
+        const uint64_t loads_after = engine.host().prefill_sweep().layer_loads();
+        harness.assert_that("H: the sweep is engaged for a long window",
+                            engine.host().prefill_sweep_engaged() &&
+                                loads_after - loads_before == engine.host().num_layers(),
+                            std::to_string(loads_after - loads_before) + " layer loads, " +
+                                std::to_string(engine.host().prefill_sweep().experts_streamed()) +
+                                " experts streamed");
+        harness.assert_that("H: Hot was drained on entry — nothing crossed over",
+                            engine.host().prefill_sweep().hot_after_drain() == 0,
+                            std::to_string(engine.host().prefill_sweep().hot_after_drain()) +
+                                " Hot residents at the switch");
+        harness.assert_that("H: the switch left nothing behind",
+                            engine.host().outstanding_expert_leases() == 0 &&
+                                engine.host().staging_in_use_slots() == 0 &&
+                                engine.host().registry().invariants_hold() &&
+                                !engine.host().registry().prefill_streaming(),
+                            "leases 0, staging 0, invariants hold, not streaming");
+        harness.assert_that("H: the swept prefill produced a token", !swept.token_ids.empty(),
+                            ids_to_string(swept.token_ids));
+
+        // Step 6 outcome 5, at the engine: how many bytes a prompt of this length
+        // costs and how long it took. Printed rather than asserted — it is a
+        // measurement, and the plan's `⌈N/W⌉ x 156 GB` is the comparison it is for.
+        std::printf("  [note] swept prefill: %zu tokens in %.1f s (%.1f tok/s), %llu experts "
+                    "in %llu loads, frontier %u layers\n",
+                    long_prompt.size(), prefill_seconds,
+                    prefill_seconds > 0.0
+                        ? static_cast<double>(long_prompt.size()) / prefill_seconds : 0.0,
+                    static_cast<unsigned long long>(
+                        engine.host().prefill_sweep().experts_streamed()),
+                    static_cast<unsigned long long>(loads_after - loads_before),
+                    engine.host().prefill_sweep().frontier_depth());
+
+        // And the other direction: a short prompt keeps the layer-major window and
+        // its chunk-wide dedup but does not pre-load whole layers.
+        const V4Reply short_reply = engine.chat({user_message(kUserTurn)}, prompt_options,
+                                                generation_options(1), sampling);
+        harness.assert_that("H: a short window does not sweep",
+                            engine.host().prefill_sweep().layer_loads() == loads_after &&
+                                !engine.host().prefill_sweep_engaged(),
+                            std::to_string(engine.host().prefill_sweep().layer_loads()) +
+                                " layer loads, engaged=" +
+                                (engine.host().prefill_sweep_engaged() ? "true" : "false"));
+        harness.assert_that("H: the short prefill still produced a token",
+                            !short_reply.token_ids.empty(),
+                            ids_to_string(short_reply.token_ids));
+    }
+
+    // =========================================================================
     // G. strip_thinking — pure text, no model
     // =========================================================================
     std::printf("\n[G] strip_thinking\n");

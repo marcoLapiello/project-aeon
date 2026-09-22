@@ -521,8 +521,19 @@ public:
         return prefill_sweep_requested_ && prefill_sweep_.is_feasible();
     }
 
-    void prefill_begin() {
+    // The strategy the last window began with. Feasibility is necessary but not
+    // sufficient: a window too narrow for a whole-layer load to pay keeps the
+    // layer-major driver and the chunk-wide dedup, and does not sweep
+    // (`V4PrefillSweep::worth`). Recorded rather than inferred so a gate can read
+    // which of the two regimes it ran in.
+    bool prefill_sweep_engaged() const noexcept { return sweep_active_; }
+
+    // `window_tokens` is the window `W` the driver is about to run (Step 6 sec. 6b).
+    void prefill_begin(uint32_t window_tokens) {
+        sweep_active_ = false;
         if (!prefill_sweep_enabled()) return;
+        if (!V4PrefillSweep::worth(window_tokens, registry_.experts_per_layer)) return;
+        sweep_active_ = true;
         drain_expert_streams();
         supply_.reap_registry_transfers();
         executor_->release_leases();
@@ -530,17 +541,17 @@ public:
     }
 
     void prefill_before_layer(uint32_t layer) {
-        if (!prefill_sweep_enabled()) return;
+        if (!sweep_active_) return;
         prefill_sweep_.before_layer(layer);
     }
 
     void prefill_after_layer(uint32_t layer) {
-        if (!prefill_sweep_enabled()) return;
+        if (!sweep_active_) return;
         prefill_sweep_.after_layer(layer);
     }
 
     void prefill_end() {
-        if (!prefill_sweep_enabled()) return;
+        if (!sweep_active_) return;
         supply_.reap_registry_transfers();
         prefill_sweep_.end();
     }
@@ -868,6 +879,10 @@ private:
     std::unique_ptr<V4TieredExpertExecutor> executor_;
     V4PrefillSweep prefill_sweep_;
     bool prefill_sweep_requested_{false};
+    // Set by `prefill_begin` for the window it opens, so the per-layer hooks and
+    // `prefill_end` act on the strategy that was chosen for *this* window rather
+    // than re-deciding it (and so a gate can read the choice).
+    bool sweep_active_{false};
 };
 
 } // namespace aeon::core

@@ -13,22 +13,32 @@
 //
 // **It is a binding and not a pipeline.** There is no forward pass here, no
 // sampling rule, no template and no tokenizer: the engine renders with the
-// encoder, drives `generate_token_ids`, and the step that loop calls is exactly
+// encoder, drives `generate_token_ids`, and the steps that loop calls are exactly
 //
-//     V4Graph::forward_token(token_id, position, compute)   // -> logits
+//     V4Graph::forward_window(prompt, 0, N, C, compute)     // prefill -> logits
+//     V4Graph::forward_token(token_id, position, compute)   // decode  -> logits
 //     V4Sampler::select(logits, compute)                    // -> token
 //
-// Two lines, because every other decision was made by the component that owns it.
-// The gate asserts this identity rather than assuming it (§A of the gate), which
+// One line each, because every other decision was made by the component that owns
+// it. The gate asserts this identity rather than assuming it (§A of the gate), which
 // is what keeps "the engine is the binding" from being a claim about the source
 // rather than about the behaviour.
 //
-// **Why the generation loop is `text::generate_token_ids` and not a new one.** It
-// already owns the prefill/decode split, the EOS stop, the `max_new_tokens` cap
-// and the context limit, and `test_text_generation` certifies all four. Writing a
-// second loop here would be the duplication the plan forbids — and worse, it would
-// be a decode loop *in the engine*, which is how a graph grows a second body. The
-// engine's only contribution to the loop is the step it is handed.
+// **Why prefill and decode are two steps and not one flag.** The expert supply's
+// plan (Step 6, §3) established that prefill and decode are two *allocation
+// strategies*: prefill visits each layer once inside a bounded window and streams a
+// whole layer's set in computation order, while decode asks for six experts per
+// layer and keeps them by recency. A single per-token step with a `prefill = true`
+// flag could only ever express the first strategy, which is why the prompt is now
+// handed to `forward_window` as one unit and the flag is gone.
+//
+// **Why the generation loop is still `text::generate_token_ids`.** It already owns
+// the EOS stop, the `max_new_tokens` cap and the context limit, and
+// `test_text_generation` certifies all four; it takes the prefill as a
+// `PromptPrefill` step, so the windowed prefill is a *step* it is handed rather
+// than a second loop. Writing a second loop here would be the duplication the plan
+// forbids — and worse, it would be a decode loop *in the engine*, which is how a
+// graph grows a second body.
 //
 // **The artifact's sampling policy is read, not assumed.** `generation_config.json`
 // ships `do_sample = true, temperature = 1.0, top_p = 1.0` (plan Step 5), so the
@@ -59,8 +69,10 @@
 #include "architecture/deepseek_v4/text/dsv4_prompt_encoder.hpp"
 #include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
 #include "infrastructure/core/json.hpp"
+#include "infrastructure/core/prefetch_staging.hpp"
 #include "infrastructure/text/text_generation.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
@@ -69,7 +81,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
 namespace aeon::core {
 
 // -----------------------------------------------------------------------------
@@ -174,6 +185,12 @@ struct V4EngineOptions {
     // is that *which tier answered did not change the number*, and a byte compare
     // is the only assertion that states it without a tolerance. It perturbs nothing
     // when empty.
+    //
+    // Since the prompt became one layer-major window (Step 6 item 7) it holds one
+    // row per **window** — that window's last position, which is the only head the
+    // window computes — plus one row per generated token, rather than one row per
+    // prompt token. Two runs of the same configuration still write the same
+    // positions in the same order, which is what the byte compare needs.
     std::string dump_logits_path;
 
     bool verbose{false};
@@ -270,24 +287,55 @@ public:
     // --- the binding ---------------------------------------------------------
 
     // One token in, one token out, at an absolute position. This is the whole of
-    // what the engine adds to the loop, and it is public because the gate's first
-    // statement is that `chat` is exactly this composition.
+    // what the engine adds to the decode loop, and it is public because the gate's
+    // first statement is that `chat` is exactly this composition.
     uint32_t advance(uint32_t token_id, uint32_t position) {
         const half* logits = graph_->forward_token(token_id, position, host_.streams().compute);
-        if (logits_dump_.is_open()) {
-            const uint32_t vocab = static_cast<uint32_t>(host_.config().vocab_size);
-            logits_host_.resize(vocab);
-            // The compute stream just wrote the logits, so the copy is ordered after
-            // them on that stream; the synchronize is the readback boundary the
-            // sampler relies on anyway, so the dump adds no ordering of its own.
-            (void)hipMemcpyAsync(logits_host_.data(), logits,
-                                 static_cast<size_t>(vocab) * sizeof(half),
-                                 hipMemcpyDeviceToHost, host_.streams().compute);
-            (void)hipStreamSynchronize(host_.streams().compute);
-            logits_dump_.write(reinterpret_cast<const char*>(logits_host_.data()),
-                               static_cast<std::streamsize>(vocab) * sizeof(half));
-        }
+        if (logits_dump_.is_open()) dump_logits(logits);
         return sampler_->select(logits, host_.streams().compute);
+    }
+
+    // Appends one position's raw fp16 logits to the dump, if one is open. The
+    // compute stream just wrote them, so the copy is ordered after them on that
+    // stream; the synchronize is the readback boundary the sampler relies on
+    // anyway, so the dump adds no ordering of its own.
+    void dump_logits(const half* logits) {
+        const uint32_t vocab = static_cast<uint32_t>(host_.config().vocab_size);
+        logits_host_.resize(vocab);
+        (void)hipMemcpyAsync(logits_host_.data(), logits,
+                             static_cast<size_t>(vocab) * sizeof(half),
+                             hipMemcpyDeviceToHost, host_.streams().compute);
+        (void)hipStreamSynchronize(host_.streams().compute);
+        logits_dump_.write(reinterpret_cast<const char*>(logits_host_.data()),
+                           static_cast<std::streamsize>(vocab) * sizeof(half));
+    }
+
+    // --- the prefill window (Step 6 D-a) -------------------------------------
+
+    // The body chunk `C` the window runs with — the rows in flight per body
+    // invocation (Step 6 §6b). It is a memory decision and it is **derived**, not
+    // assumed: a chunk issues its `6C` routed-expert requests as one deduplicated
+    // set, and that set must be staged (the arena) and, whenever the sweep is not
+    // running, resident at once (the Hot pool). The body's own row cap bounds it
+    // from above. A configuration that leaves only a few slots therefore degrades
+    // the chunk instead of failing at the arena or starving on leases.
+    uint32_t prefill_chunk_for(uint32_t tokens) const {
+        const uint32_t per_horizon = PrefetchStagingArena::EXPERTS_PER_HORIZON;
+        const uint32_t by_arena = host_.staging_slot_count() / per_horizon;
+        const uint32_t by_pool =
+            std::max<uint32_t>(1, host_.registry().vram_capacity / per_horizon);
+        const uint32_t limit = std::min(
+            std::min(V4LayerBodyBatchScratch::kMaxTokens, by_arena), by_pool);
+        return std::max<uint32_t>(1, std::min(limit, tokens));
+    }
+
+    // The window `W` for a prompt of `tokens` (Step 6 §6b): the whole prompt unless
+    // `AeonRuntimeConfig::prefill_window` bounds it, in which case the prompt is
+    // `⌈N/W⌉` layer-major passes.
+    uint32_t prefill_window_for(uint32_t tokens) const noexcept {
+        const uint32_t configured = options_.runtime.prefill_window;
+        if (configured == 0) return tokens;
+        return std::min(configured, tokens);
     }
 
     // --- the run -------------------------------------------------------------
@@ -342,35 +390,63 @@ public:
         V4Reply reply;
         reply.prompt_tokens = static_cast<uint32_t>(prompt.size());
 
+        // The two phases are two strategies (expert-streaming plan Step 6, §3), so
+        // they are two steps and not one with a flag:
+        //
+        //   prefill  the whole prompt through `V4Graph::forward_window` — one
+        //            layer-major pass (or `⌈N/W⌉` of them), which is where the
+        //            swept supply, the chunk-wide deduplicated dispatch and the
+        //            hard Hot drain live;
+        //   decode   one token at a time through `advance` → `forward_token`, on
+        //            the on-demand + LRU + demotion strategy decode owns.
+        //
+        // The loop itself is still `text::generate_token_ids`: it owns the EOS
+        // stop, the `max_new_tokens` cap and the context limit, and all this adds
+        // is the prefill *step* it is handed. The `prefill = true` flag on the
+        // decode step is therefore dropped — every decode step is a decode step.
         double first_token_ms = 0.0;
-        size_t prefill_seen = 0;
         Clock::time_point decode_started{};
         const auto started = Clock::now();
 
-        const auto step = [&](uint32_t token_id, uint32_t position, bool prefill) -> uint32_t {
-            // The phase is set before the forward pass, because the expert dispatch
-            // happens inside it and `TieredExpertSupply` records against whichever
-            // phase is current at that moment. Opening the sink already made this a
-            // no-op when telemetry is off.
-            host_.set_supply_phase(prefill);
-            const uint32_t next = advance(token_id, position);
-            if (!prefill) {
-                host_.record_supply_decode_token();
-            }
-            // TTFT is the moment the *last* prompt token's forward has produced a
-            // token — not the moment the loop was entered, and not the first
-            // prompt token's. The decode clock starts there for the same reason:
-            // the first generated token came out of the prefill, so charging it to
-            // the decode rate would report a rate the decode never ran.
-            if (prefill && ++prefill_seen == prompt.size()) {
+        const uint32_t window = prefill_window_for(static_cast<uint32_t>(prompt.size()));
+        const uint32_t chunk = prefill_chunk_for(static_cast<uint32_t>(prompt.size()));
+
+        const text::PromptPrefill prefill_step =
+            [&](const std::vector<uint32_t>& tokens) -> uint32_t {
+                // The phase is set before the forward pass, because the expert
+                // dispatch happens inside it and `TieredExpertSupply` records against
+                // whichever phase is current at that moment. Opening the sink already
+                // made this a no-op when telemetry is off.
+                host_.set_supply_phase(true);
+                const uint32_t count = static_cast<uint32_t>(tokens.size());
+                const half* logits = nullptr;
+                for (uint32_t offset = 0; offset < count; offset += window) {
+                    const uint32_t span = std::min(window, count - offset);
+                    logits = graph_->forward_window(
+                        tokens.data() + offset, offset, span, std::min(chunk, span),
+                        host_.streams().compute);
+                }
+                if (logits_dump_.is_open()) dump_logits(logits);
+                // TTFT is the moment the *last* prompt token's forward has produced a
+                // token — not the moment the loop was entered, and not the first
+                // prompt token's. The decode clock starts there for the same reason:
+                // the first generated token came out of the prefill, so charging it
+                // to the decode rate would report a rate the decode never ran.
                 first_token_ms = elapsed_ms(started);
                 decode_started = Clock::now();
-            }
-            return next;
-        };
+                return sampler_->select(logits, host_.streams().compute);
+            };
+
+        const text::TokenStep decode_step =
+            [&](uint32_t token_id, uint32_t position, bool /*prefill*/) -> uint32_t {
+                host_.set_supply_phase(false);
+                const uint32_t next = advance(token_id, position);
+                host_.record_supply_decode_token();
+                return next;
+            };
 
         const text::GenerationResult generated =
-            text::generate_token_ids(prompt, loop_options, step);
+            text::generate_token_ids(prompt, loop_options, prefill_step, decode_step);
 
         reply.token_ids = generated.token_ids;
         reply.stop_reason = generated.stop_reason;

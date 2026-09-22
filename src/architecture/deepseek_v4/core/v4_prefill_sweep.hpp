@@ -17,7 +17,7 @@
 //
 //   * `begin()` drains Hot outright. No decode resident survives into prefill,
 //     because not one of them is in the plan the sweep follows. Warm and its LRU
-//     ranking are untouched for the whole sweep.");
+//     ranking are untouched for the whole sweep;
 //   * `before_layer(L)` guarantees layer `L`'s whole set is resident. It is normally
 //     already there, because the lookahead loaded it one or more layers ago;
 //   * `after_layer(L)` bulk-releases layer `L` — its Hot copies and its Warm shadows
@@ -76,6 +76,30 @@ public:
     bool is_feasible() const noexcept {
         return supply_ != nullptr && registry_ != nullptr &&
                registry_->vram_capacity >= registry_->experts_per_layer;
+    }
+
+    // Whether a window of `window_tokens` is worth the swept strategy — feasibility
+    // is necessary, not sufficient.
+    //
+    // The sweep fetches a **whole layer** before that layer runs, deliberately: the
+    // router sits inside the body, so the set is known but the selection is not.
+    // The layer-major window *without* the sweep instead fetches each layer's
+    // distinct set as its body chunks ask for it, and dedup makes that set much
+    // smaller than the layer while the window is narrow — measured at `44` distinct
+    // of `96` draws for a `16`-token window (ledger M38), i.e. `~46%` of `6W`.
+    // Loading all `256` for a window that would have asked for `44` is a `5.8x`
+    // over-fetch, paid in exactly the currency prefill is bound by. So the rule is
+    // the point where the window's routed draws reach the layer's size twice over:
+    // at `6W = 2 x experts_per_layer` the measured distinct set is already `~235` of
+    // `256` (ledger M38's `.46` distinct fraction gives a crossover near `W = 93`),
+    // and above it the whole-layer load is a small, and shrinking, over-fetch.
+    //
+    // Below the threshold the window still runs — layer-major, deduplicated, per
+    // chunk — it simply does not pre-load whole layers. The switch is therefore
+    // derived from the model (`experts_per_layer`) and the window, and carries no
+    // tuned constant.
+    static bool worth(uint32_t window_tokens, uint32_t experts_per_layer) noexcept {
+        return 2ull * experts_per_layer <= 6ull * window_tokens;
     }
 
     // Drain Hot and establish the frontier. The caller must already have reached a

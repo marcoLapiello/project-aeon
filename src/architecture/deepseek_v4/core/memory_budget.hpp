@@ -114,6 +114,15 @@ struct AeonRuntimeConfig {
     // it as a setting and sweeps it.
     uint32_t prefill_chunk{1};
 
+    // The layer-major prefill **window** `W` (Step 6 §6b): how many prompt tokens
+    // one layer-major pass carries in its residual, and therefore how many sweeps a
+    // prompt of `N` tokens pays (`⌈N/W⌉`). `0` means the whole prompt — one pass
+    // over the model, which is §6b's `156 GB` floor and the engine's default. The
+    // carry is `W × 64 KB` of VRAM (the bf16 broadcast and the fp32 residual, ~96 KB
+    // per token with the allocation as built), so a very long prompt is a VRAM
+    // decision and not a free one; Step 7 derives a default bound and sweeps it.
+    uint32_t prefill_window{0};
+
     // Step 6 D-b (policy A): freeze the Warm tier during prefill. A prefill touches
     // every expert, so letting the sweep promote from Warm would **move** each
     // Warm-resident expert into VRAM and empty the tier — destroying exactly the

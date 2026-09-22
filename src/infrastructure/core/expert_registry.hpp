@@ -285,10 +285,10 @@ public:
         // Frozen prefill (Step 6 D-b). Warm's resident set must survive a prefill, so
         // a Warm-resident expert is **copied** into VRAM rather than promoted: the
         // catalog entry keeps `owner == WARM_HOST` and its host slot, and the VRAM
-        // copy isend_prefill_stream()` (or `set_warm_frozen(false)` on the legacy
-        // path) releases the shadows; a shadow is legal **only** while frozen, which
-        // `validate_invariants` enforces so decode admits single ownership alonenership never
-        // sees. `set_warm_frozen(false)` releases every idle shadow.
+        // copy is recorded as a **shadow residency** on that same entry. Leaving the
+        // mode — `end_prefill_stream()`, or `set_warm_frozen(false)` on the legacy
+        // path — releases every idle shadow. A shadow is legal **only** while frozen,
+        // which `validate_invariants` enforces so decode never sees a second owner.
         if (warm_frozen_ && entry.owner == ExpertTier::WARM_HOST) {
             if (entry.shadow_vram_slot >= 0) {
                 // Already shadow-resident in VRAM: a plain hit, no transfer.
