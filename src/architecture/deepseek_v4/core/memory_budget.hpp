@@ -114,6 +114,16 @@ struct AeonRuntimeConfig {
     // it as a setting and sweeps it.
     uint32_t prefill_chunk{1};
 
+    // Step 6 D-b (policy A): freeze the Warm tier during prefill. A prefill touches
+    // every expert, so letting the sweep promote from Warm would **move** each
+    // Warm-resident expert into VRAM and empty the tier — destroying exactly the
+    // "natural selection" decode's Warm hits depend on. With this on, a prefill
+    // copies a Warm expert into VRAM **without** transferring ownership (a shadow
+    // residency) and evicts by **release** rather than demotion, so Warm's resident
+    // set is identical before and after the prefill. On by default, per D-b; a gate
+    // A/Bs it against `false`.
+    bool freeze_warm_during_prefill{true};
+
     // Hardware target device index
     int device_id{0};
 

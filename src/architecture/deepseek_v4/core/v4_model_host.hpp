@@ -408,8 +408,37 @@ public:
     // the generation loop, which already knows whether the token it is about to
     // advance is a prompt token (prefill) or a generated one (decode); this only
     // forwards that fact, it does not derive it. A no-op when the sink is off.
+    //
+    // It also drives the frozen-Warm policy (Step 6 D-b) when
+    // `freeze_warm_during_prefill` is set: prefill enters the frozen mode, decode
+    // leaves it. Leaving settles any in-flight shadow copy first (`reap` is
+    // event-query only, no CPU synchronization) so the idle residencies are visible
+    // before they are released; a copy that is still genuinely in flight is
+    // reclaimed by eviction when it settles.
     void set_supply_phase(bool prefill) {
         telemetry_.set_phase(prefill ? RoutingPhase::Prefill : RoutingPhase::Decode);
+        if (freeze_warm_during_prefill_ && experts_ready()) {
+            if (!prefill) {
+                supply_.reap_registry_transfers();
+            }
+            registry_.set_warm_frozen(prefill);
+        }
+    }
+
+    // Frozen-prefill state, for a gate: whether the registry is in frozen mode and
+    // how many Warm-owned experts currently hold an extra VRAM copy (Step 6 D-b).
+    bool warm_frozen() const noexcept { return registry_.warm_frozen(); }
+    uint32_t shadow_resident_count() const noexcept {
+        return registry_.shadow_resident_count();
+    }
+    int32_t shadow_slot_of(uint32_t gid) const { return registry_.shadow_slot_of(gid); }
+    uint64_t shadow_copies() const noexcept { return registry_.shadow_copies; }
+
+    // Logical Warm bytes the supply served in a phase (Step 6 outcome 3). Requires
+    // the telemetry sink to have been enabled.
+    uint64_t supply_logical_bytes_from_warm(bool prefill) const noexcept {
+        return telemetry_.logical_bytes_from_warm(
+            prefill ? SupplyTelemetryPhase::Prefill : SupplyTelemetryPhase::Decode);
     }
 
     // Per-layer outcome counts (thesis-1 measurement), from the supply telemetry:
@@ -566,6 +595,7 @@ private:
                 : (runtime_cfg.enable_warm_refill
                     ? V4ExpertSupplyCoordinator::DEFAULT_DEMOTION_QUEUE_CAPACITY : 0));
         demotion_queue_capacity_ = supply_.demotion_queue_capacity();
+        freeze_warm_during_prefill_ = runtime_cfg.freeze_warm_during_prefill;
 
         // 14 — the routed-expert scratch and the production executor. The executor
         // borrows the four streams the host owns, so its capacity fallback drains
@@ -730,6 +760,7 @@ private:
     uint32_t context_capacity_{0};
     size_t last_released_dense_bytes_{0};
     uint64_t demotion_queue_capacity_{0};
+    bool freeze_warm_during_prefill_{false};
 
     V4DeviceStreams streams_;
     V4ModelResources resources_;

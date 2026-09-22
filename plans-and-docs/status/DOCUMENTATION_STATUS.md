@@ -94,7 +94,7 @@ Pointers only. Each gate is specified, with its procedure and its result, in the
 
 **Open work** — both extracted from the composition plan on 2026-09-18:
 
-- [Expert Streaming and Chunked Prefill](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md): the routed-expert supply — telemetry, the tier-invariance and starved-pool gates, the demotion-queue A/B, then the layer-major prefill sweep with a chunk-wide deduplicated expert dispatch (**built**; Warm-frozen and the double-buffered sweep remain). Carries item 21's concurrency remainder and item 19's throughput half. Its working document supersedes [the analysis](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md), whose §6 (the prefill supply chain) stays deliberately open.
+- [Expert Streaming and Chunked Prefill](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md): the routed-expert supply — telemetry, the tier-invariance and starved-pool gates, the demotion-queue A/B, then the layer-major prefill sweep with a chunk-wide deduplicated expert dispatch and a Warm tier frozen across the prefill (**all built**; the double-buffered sweep remains). Carries item 21's concurrency remainder and item 19's throughput half. Its working document supersedes [the analysis](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md), whose §6 (the prefill supply chain) stays deliberately open.
 - [Session State and Swap](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md): the session aggregate, registry, residency seam, cold-tier store and R4. Session swap precedes the prefix **matcher**, which is deliberately deferred along with MTP and multi-GPU.
 
 **Measurement gates, settled empirically rather than by reading:**

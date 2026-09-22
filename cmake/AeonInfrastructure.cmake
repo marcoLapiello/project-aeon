@@ -210,6 +210,17 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_prefill_window.cpp TIMEOUT 1800)
 endif()
 
+# --- Step 6: Warm frozen during prefill (D-b, outcome 3) -----------------------
+# Policy A: the prefill sweep must not drain Warm. A gate over the real host and a
+# real Warm tier asserts the resident set is identical before and after a prefill,
+# that the copy was taken from Warm (not bypassed to NVMe), that leaving the phase
+# releases the VRAM copies, and — as the control — that an unfrozen prefill does
+# change Warm, so the assertion measures the policy and not the workload.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_warm_frozen_prefill
+        SOURCES tests/test_v4_warm_frozen_prefill.cpp TIMEOUT 1800)
+endif()
+
 # --- Tier-3 sequence: the long-context lifecycle ------------------------------
 # Item 20. Every earlier layer-body gate shrinks the local window (to 6, 10, 4)
 # and the index top-k so a wrap fits in a short run, and each names the shrinkage

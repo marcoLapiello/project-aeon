@@ -80,6 +80,14 @@ struct ExpertCatalogEntry {
     uint32_t lease_count{0};
     bool in_lru{false};
 
+    // Frozen prefill (Step 6 D-b): a Warm-owned expert can additionally hold a
+    // **shadow** VRAM residency — a copy taken without transferring ownership, so
+    // Warm's resident set survives a prefill. `warm_shadow` marks a copy in
+    // flight; `shadow_vram_slot` is the extra VRAM slot once it lands. Both are
+    // false/-1 outside frozen prefill, so decode's ownership model is untouched.
+    int32_t shadow_vram_slot{-1};
+    bool warm_shadow{false};
+
     uint64_t activation_count{0};
     uint64_t last_step_used{0};
     float moving_frequency{0.0f};
@@ -130,6 +138,10 @@ public:
     uint64_t demotion_attempts{0};
     uint64_t demotion_completions{0};
     uint64_t demotion_drops{0};
+    // Frozen prefill: how many non-destructive Warm copies were issued. A gate
+    // reads it to prove the frozen prefill really read Warm instead of bypassing
+    // it to NVMe, and that the run is therefore non-vacuous.
+    uint64_t shadow_copies{0};
     uint64_t next_operation_id{1};
     uint64_t pending_demotion_count{0};
 
@@ -195,8 +207,12 @@ public:
         demotion_attempts = 0;
         demotion_completions = 0;
         demotion_drops = 0;
+        shadow_copies = 0;
         next_operation_id = 1;
         pending_demotion_count = 0;
+        shadow_slot_of_expert_.assign(total_experts, -1);
+        shadow_lru_.clear();
+        warm_frozen_ = false;
 
         populate_round_robin(preload_warm_host);
         validate_invariants();
@@ -259,6 +275,61 @@ public:
                 0,
                 entry.slot_idx,
                 -1,
+                true,
+                std::nullopt
+            };
+        }
+
+        // Frozen prefill (Step 6 D-b). Warm's resident set must survive a prefill, so
+        // a Warm-resident expert is **copied** into VRAM rather than promoted: the
+        // catalog entry keeps `owner == WARM_HOST` and its host slot, and the VRAM
+        // copy is recorded as a *shadow* residency that decode's ownership never
+        // sees. `set_warm_frozen(false)` releases every idle shadow.
+        if (warm_frozen_ && entry.owner == ExpertTier::WARM_HOST) {
+            if (entry.shadow_vram_slot >= 0) {
+                // Already shadow-resident in VRAM: a plain hit, no transfer.
+                ++hits_hot;
+                shadow_touch(gid);
+                ++entry.lease_count;
+                return ExpertRequestReservation{
+                    ExpertRequestKind::HOT_HIT,
+                    ExpertTier::HOT_VRAM,
+                    gid,
+                    0,
+                    entry.shadow_vram_slot,
+                    -1,
+                    true,
+                    std::nullopt
+                };
+            }
+
+            const uint64_t shadow_operation = next_operation_id++;
+            const VramDestination destination = reserve_vram_destination(
+                gid, shadow_operation, demotion_queue_capacity);
+            const int32_t source_host_slot = entry.slot_idx;
+
+            ++hits_warm;
+            ++shadow_copies;
+            // Out of the Warm LRU while the copy is in flight; back in on
+            // completion. The host slot itself is never reserved or freed, which is
+            // what makes the read non-destructive.
+            remove_from_lru(entry, warm_host_lru, gid);
+            entry.operation = ExpertOperation::PROMOTION_PENDING;
+            entry.operation_id = shadow_operation;
+            entry.gpu_transfer = ExpertGpuTransfer::H2D_PENDING;
+            entry.publication = ExpertPublication::UNPUBLISHED;
+            entry.slot_state = ExpertSlotState::ACTIVE;
+            entry.lease_count++;
+            entry.pending_slot_idx = static_cast<int32_t>(destination.vram_slot);
+            entry.warm_shadow = true;
+            validate_invariants();
+            return ExpertRequestReservation{
+                ExpertRequestKind::WARM_PROMOTION,
+                ExpertTier::WARM_HOST,
+                gid,
+                shadow_operation,
+                static_cast<int32_t>(destination.vram_slot),
+                source_host_slot,
                 true,
                 std::nullopt
             };
@@ -395,6 +466,29 @@ public:
             throw std::logic_error("ExpertRegistry: request completion lost its VRAM reservation");
         }
 
+        // Frozen prefill's non-destructive copy (Step 6 D-b): the VRAM slot becomes
+        // a shadow residency of a Warm-owned expert. Ownership stays Warm — the host
+        // slot is NOT freed and `owner`/`slot_idx` are untouched — so Warm's resident
+        // set is exactly what it was before the copy.
+        if (incoming->warm_shadow) {
+            incoming->operation = ExpertOperation::NONE;
+            incoming->operation_id = 0;
+            incoming->gpu_transfer = ExpertGpuTransfer::NONE;
+            incoming->publication = ExpertPublication::PUBLISHED;
+            incoming->slot_state = ExpertSlotState::ACTIVE;
+            incoming->pending_slot_idx = -1;
+            incoming->warm_shadow = false;
+            incoming->shadow_vram_slot = destination_slot;
+            shadow_slot_of_expert_[incoming->global_expert_id] = destination_slot;
+            vram_slots[static_cast<size_t>(destination_slot)] =
+                static_cast<int32_t>(incoming->global_expert_id);
+            vram_slot_reservations[static_cast<size_t>(destination_slot)] = 0;
+            push_lru_front(*incoming, warm_host_lru);
+            shadow_touch(incoming->global_expert_id);
+            validate_invariants();
+            return;
+        }
+
         auto* victim = find_operation_victim(operation_id);
         if (victim != nullptr) {
             if (victim->gpu_transfer == ExpertGpuTransfer::D2H_PENDING) {
@@ -448,6 +542,28 @@ public:
             throw std::logic_error("ExpertRegistry: request failure does not match a pending request");
         }
 
+        // A failed frozen-prefill copy leaves the Warm entry exactly as it was: the
+        // host slot was never reserved, so only the VRAM reservation is undone.
+        if (incoming->warm_shadow) {
+            const int32_t shadow_destination = incoming->pending_slot_idx;
+            if (shadow_destination >= 0) {
+                vram_slot_reservations[static_cast<size_t>(shadow_destination)] = 0;
+                if (vram_slots[static_cast<size_t>(shadow_destination)] == -1) {
+                    free_vram_slots.push_back(static_cast<uint32_t>(shadow_destination));
+                }
+            }
+            incoming->operation = ExpertOperation::NONE;
+            incoming->operation_id = 0;
+            incoming->gpu_transfer = ExpertGpuTransfer::NONE;
+            incoming->publication = ExpertPublication::PUBLISHED;
+            incoming->slot_state = ExpertSlotState::ACTIVE;
+            incoming->pending_slot_idx = -1;
+            incoming->warm_shadow = false;
+            push_lru_front(*incoming, warm_host_lru);
+            validate_invariants();
+            return;
+        }
+
         const int32_t destination_slot = incoming->pending_slot_idx;
         auto* victim = find_operation_victim(operation_id);
         if (victim != nullptr && victim->gpu_transfer == ExpertGpuTransfer::D2H_PENDING) {
@@ -496,6 +612,36 @@ public:
             throw std::logic_error("ExpertRegistry: releasing an unleased expert");
         }
         --catalog[gid].lease_count;
+    }
+
+    // Enter or leave frozen prefill (Step 6 D-b). Entering changes only how the
+    // next request for a Warm expert resolves; leaving releases the idle shadow
+    // residencies so the VRAM they hold returns to decode's pool. A shadow copy
+    // still in flight is left to settle — `reserve_vram_destination` reclaims a
+    // leftover shadow at any time, so nothing is stranded.
+    void set_warm_frozen(bool frozen) {
+        if (frozen == warm_frozen_) return;
+        warm_frozen_ = frozen;
+        if (!frozen) {
+            release_shadow_residencies();
+        }
+        validate_invariants();
+    }
+
+    bool warm_frozen() const noexcept { return warm_frozen_; }
+
+    // Warm-owned experts currently holding an extra VRAM copy. A gate reads this
+    // before and after a prefill: it is the shadow half of "Warm preserved", and
+    // it must return to 0 when the frozen phase ends.
+    uint32_t shadow_resident_count() const noexcept {
+        return static_cast<uint32_t>(shadow_lru_.size());
+    }
+
+    // The VRAM copy of a Warm-owned expert, or -1. Used by a gate to observe the
+    // frozen prefill without reaching into the catalog.
+    int32_t shadow_slot_of(uint32_t gid) const {
+        if (gid >= shadow_slot_of_expert_.size()) return -1;
+        return shadow_slot_of_expert_[gid];
     }
 
     void reset_counters() {
@@ -577,10 +723,22 @@ public:
         for (uint32_t slot = 0; slot < vram_capacity; ++slot) {
             const int32_t gid = vram_slots[slot];
             if (gid >= 0) {
-                if (static_cast<size_t>(gid) >= catalog.size() ||
-                    catalog[static_cast<size_t>(gid)].owner != ExpertTier::HOT_VRAM ||
-                    catalog[static_cast<size_t>(gid)].slot_idx != static_cast<int32_t>(slot) ||
-                    hot_seen[slot]) {
+                if (static_cast<size_t>(gid) >= catalog.size()) {
+                    throw std::logic_error("ExpertRegistry: VRAM slot names an unknown expert");
+                }
+                // A VRAM slot has two admissible owners: an ordinary Hot expert, or
+                // a Warm expert's **shadow** copy taken during frozen prefill (Step 6
+                // D-b). The map is still bijective under that disjunction — it is the
+                // ownership model that is now explicit rather than the map that is
+                // loosened.
+                const auto& owner_entry = catalog[static_cast<size_t>(gid)];
+                const bool is_hot_owner =
+                    owner_entry.owner == ExpertTier::HOT_VRAM &&
+                    owner_entry.slot_idx == static_cast<int32_t>(slot);
+                const bool is_shadow =
+                    owner_entry.owner == ExpertTier::WARM_HOST &&
+                    owner_entry.shadow_vram_slot == static_cast<int32_t>(slot);
+                if ((!is_hot_owner && !is_shadow) || hot_seen[slot]) {
                     throw std::logic_error("ExpertRegistry: VRAM slot map is not bijective");
                 }
                 hot_seen[slot] = 1;
@@ -627,6 +785,42 @@ public:
             }
         }
 
+        // Shadow residencies: a Warm expert's VRAM copy. The LRU and the per-expert
+        // map must agree with the catalog and with the physical slot map, or a copy
+        // would be unreclaimable (a leak) or reclaimed twice.
+        {
+            std::vector<uint8_t> shadow_seen(total_experts, 0);
+            for (uint32_t gid : shadow_lru_) {
+                if (gid >= total_experts || shadow_seen[gid]) {
+                    throw std::logic_error("ExpertRegistry: shadow LRU contains an invalid expert");
+                }
+                const auto& entry = catalog[gid];
+                if (entry.owner != ExpertTier::WARM_HOST || entry.shadow_vram_slot < 0 ||
+                    static_cast<size_t>(entry.shadow_vram_slot) >= vram_capacity ||
+                    vram_slots[static_cast<size_t>(entry.shadow_vram_slot)] !=
+                        static_cast<int32_t>(gid)) {
+                    throw std::logic_error("ExpertRegistry: shadow LRU disagrees with the catalog");
+                }
+                shadow_seen[gid] = 1;
+            }
+            for (const auto& entry : catalog) {
+                if (entry.shadow_vram_slot >= 0 &&
+                    shadow_seen[entry.global_expert_id] == 0) {
+                    throw std::logic_error(
+                        "ExpertRegistry: shadow residency is not in the shadow LRU");
+                }
+                if (entry.warm_shadow && entry.operation == ExpertOperation::NONE) {
+                    throw std::logic_error(
+                        "ExpertRegistry: an idle entry is flagged as a shadow copy in flight");
+                }
+                if (shadow_slot_of_expert_.size() == total_experts &&
+                    shadow_slot_of_expert_[entry.global_expert_id] != entry.shadow_vram_slot) {
+                    throw std::logic_error(
+                        "ExpertRegistry: shadow slot map disagrees with the catalog");
+                }
+            }
+        }
+
         validate_lru(hot_vram_lru, ExpertTier::HOT_VRAM);
         validate_lru(warm_host_lru, ExpertTier::WARM_HOST);
     }
@@ -636,6 +830,43 @@ private:
         uint32_t vram_slot{0};
         std::optional<ExpertDemotionReservation> demotion;
     };
+
+    // Releases every *idle* shadow residency, returning its VRAM slot to the free
+    // list. An entry with a copy in flight or a live lease is skipped: it will be
+    // reclaimed by `reserve_vram_destination` once it settles.
+    void release_shadow_residencies() {
+        for (auto it = shadow_lru_.begin(); it != shadow_lru_.end();) {
+            auto& entry = catalog[*it];
+            if (entry.operation != ExpertOperation::NONE || entry.lease_count != 0) {
+                ++it;
+                continue;
+            }
+            const int32_t slot = entry.shadow_vram_slot;
+            entry.shadow_vram_slot = -1;
+            shadow_slot_of_expert_[entry.global_expert_id] = -1;
+            if (slot >= 0) {
+                vram_slots[static_cast<size_t>(slot)] = -1;
+                free_vram_slots.push_back(static_cast<uint32_t>(slot));
+            }
+            it = shadow_lru_.erase(it);
+        }
+    }
+
+    // Drops one shadow residency from the catalog and the LRU. The caller owns the
+    // physical slot bookkeeping, because the two callers (a release into the free
+    // list, and an eviction that hands the slot to an incoming expert) need
+    // different things done with it.
+    void release_shadow_residency(ExpertCatalogEntry& entry) {
+        if (entry.shadow_vram_slot < 0) return;
+        shadow_lru_.remove(entry.global_expert_id);
+        shadow_slot_of_expert_[entry.global_expert_id] = -1;
+        entry.shadow_vram_slot = -1;
+    }
+
+    void shadow_touch(uint32_t gid) {
+        shadow_lru_.remove(gid);
+        shadow_lru_.push_front(gid);
+    }
 
     void record_activation(ExpertCatalogEntry& entry, uint64_t current_step) {
         ++entry.activation_count;
@@ -688,6 +919,53 @@ private:
         if (!free_vram_slots.empty()) {
             vram_slot = free_vram_slots.back();
             free_vram_slots.pop_back();
+        } else if (warm_frozen_) {
+            // Frozen prefill: an eviction is a **release**. The victim is a shadow
+            // residency (a Warm expert's prefill copy) when one is available, else an
+            // ordinary Hot resident. No ownership is transferred and no demotion is
+            // attempted, so Warm is neither drained nor overwritten.
+            for (auto it = shadow_lru_.rbegin(); it != shadow_lru_.rend(); ++it) {
+                auto& candidate = catalog[*it];
+                if (candidate.shadow_vram_slot < 0 || candidate.lease_count != 0 ||
+                    candidate.operation != ExpertOperation::NONE ||
+                    candidate.publication != ExpertPublication::PUBLISHED) {
+                    continue;
+                }
+                const uint32_t slot = static_cast<uint32_t>(candidate.shadow_vram_slot);
+                release_shadow_residency(candidate);
+                vram_slots[static_cast<size_t>(slot)] = -1;
+                vram_slot_reservations[static_cast<size_t>(slot)] = operation_id;
+                return VramDestination{slot, std::nullopt};
+            }
+            for (auto it = hot_vram_lru.rbegin(); it != hot_vram_lru.rend(); ++it) {
+                auto& candidate = catalog[*it];
+                if (candidate.global_expert_id == incoming_gid ||
+                    candidate.operation != ExpertOperation::NONE ||
+                    candidate.gpu_transfer != ExpertGpuTransfer::NONE ||
+                    candidate.publication != ExpertPublication::PUBLISHED ||
+                    candidate.lease_count != 0) {
+                    continue;
+                }
+                victim = &candidate;
+                break;
+            }
+            if (victim == nullptr) {
+                throw std::runtime_error(
+                    "ExpertRegistry: no reclaimable Hot VRAM slot is available in "
+                    "frozen prefill");
+            }
+            const uint32_t slot = static_cast<uint32_t>(victim->slot_idx);
+            remove_from_lru(*victim, hot_vram_lru, victim->global_expert_id);
+            vram_slots[static_cast<size_t>(slot)] = -1;
+            victim->owner = ExpertTier::COLD_NVME;
+            victim->slot_idx = -1;
+            victim->pending_slot_idx = -1;
+            victim->publication = ExpertPublication::PUBLISHED;
+            victim->slot_state = ExpertSlotState::UNALLOCATED;
+            victim->operation = ExpertOperation::NONE;
+            victim->gpu_transfer = ExpertGpuTransfer::NONE;
+            vram_slot_reservations[static_cast<size_t>(slot)] = operation_id;
+            return VramDestination{slot, std::nullopt};
         } else {
             for (auto it = hot_vram_lru.rbegin(); it != hot_vram_lru.rend(); ++it) {
                 auto& candidate = catalog[*it];
@@ -702,6 +980,22 @@ private:
                 break;
             }
             if (victim == nullptr) {
+                // A leftover shadow residency — a Warm expert's prefill copy that
+                // outlived the frozen phase — is reclaimable too. Releasing it keeps
+                // the copy from stranding a VRAM slot once decode resumes.
+                for (auto it = shadow_lru_.rbegin(); it != shadow_lru_.rend(); ++it) {
+                    auto& candidate = catalog[*it];
+                    if (candidate.shadow_vram_slot < 0 || candidate.lease_count != 0 ||
+                        candidate.operation != ExpertOperation::NONE ||
+                        candidate.publication != ExpertPublication::PUBLISHED) {
+                        continue;
+                    }
+                    const uint32_t slot = static_cast<uint32_t>(candidate.shadow_vram_slot);
+                    release_shadow_residency(candidate);
+                    vram_slots[static_cast<size_t>(slot)] = -1;
+                    vram_slot_reservations[static_cast<size_t>(slot)] = operation_id;
+                    return VramDestination{slot, std::nullopt};
+                }
                 uint32_t leased_hot = 0;
                 uint32_t pending_hot = 0;
                 for (const auto& entry : catalog) {
@@ -888,6 +1182,13 @@ private:
             }
         }
     }
+
+    // Frozen-prefill shadow state (Step 6 D-b). `shadow_slot_of_expert_` mirrors
+    // `ExpertCatalogEntry::shadow_vram_slot` so a caller can resolve an expert's
+    // VRAM copy without scanning the catalog.
+    bool warm_frozen_{false};
+    std::vector<int32_t> shadow_slot_of_expert_;
+    std::list<uint32_t> shadow_lru_;
 };
 
 } // namespace aeon::core

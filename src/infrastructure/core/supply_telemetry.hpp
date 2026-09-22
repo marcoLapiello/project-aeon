@@ -276,6 +276,17 @@ public:
         dirty_ = true;
     }
 
+    // Logical Warm bytes served in one phase, across every answering tier. Used by
+    // the Step 6 D-b gate: a frozen prefill must have served some requests from Warm
+    // (the non-destructive shadow copy) without draining it.
+    uint64_t logical_bytes_from_warm(SupplyTelemetryPhase phase) const {
+        uint64_t total = 0;
+        for (uint32_t tier = 0; tier < kTierCount; ++tier) {
+            total += summaries_[static_cast<uint32_t>(phase)][tier].logical_bytes_from_warm;
+        }
+        return total;
+    }
+
     void flush() {
         if (!enabled_ || !output_ || !dirty_) return;
         for (uint32_t phase = 0; phase < 3; ++phase) {

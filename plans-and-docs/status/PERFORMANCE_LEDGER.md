@@ -69,6 +69,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `routing-opt` | Belady-OPT vs ideal-LRU: policy headroom | M36 |
 | `prefill-window` | Layer-major window vs serial `forward_token`, byte-exact | M37 |
 | `prefill-batch-dispatch` | Layer-wide deduplicated expert dispatch vs serial, byte-exact | M38 |
+| `warm-frozen-prefill` | Warm resident set preserved across a prefill (D-b policy A) | M39 |
 
 ## 4. Milestone cards
 
@@ -269,3 +270,14 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: byte-exact through the layer-wide, deduplicated dispatch — dedup changes *which copy is read*, never the slot-sum order, so the fixed-order fp32 reduce is unchanged. The mutant sweep (`scripts/mutate_expert_executor.py`) kills `5/5`, including the new `token_map`-indexed slot resolution (`EX-3`)
 - **Conclusion / next gate**: **Step 6 items 4 and D4 built.** The equality half of item 4 (the `6C` set, dedup, and the layer-wide `on_routing_ready_batch`) holds bit-exactly through the real executor; the arena is runtime-sized to the deduped ceiling `6C`, and reaching the smaller concurrency depth is Step 7. Warm-frozen (item 5) and the double-buffered sweep (item 6) remain; throughput is outcome 5
 - **Evidence**: `tests/test_v4_prefill_window.cpp`, `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` (`dispatch_layer_prefetch_batch`), `src/architecture/deepseek_v4/core/v4_expert_executor.hpp` (`on_routing_ready_batch`), `src/infrastructure/core/prefetch_staging.hpp` (runtime `slot_count`), `src/architecture/deepseek_v4/core/memory_budget.hpp` (`prefill_chunk`)
+
+### M39: Warm preserved across a prefill — the frozen-prefill policy (D-b)
+- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers; `test_v4_warm_frozen_prefill`
+- **Class / comparison key**: `Integration / warm-frozen-prefill`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: a real Warm tier of `291` slots (`warm_host_bytes` `4 GiB`, preloaded) at context `256`, `809` Hot slots; one `16`-token layer-major window (`prefill_chunk = 16`) with the phase set to prefill (frozen), then the phase set to decode, then a **control** window of the same shape with the freeze off
+- **Metrics**: Warm resident set `291 → 291` across the frozen prefill (`0` differing of `291`); `51` non-destructive copies, `721,944,576 B` served logically from Warm with `0` NVMe bytes added; leaving the phase released every shadow (`0` held) with Warm still `291`; the unfrozen control changed **`332`** experts and left Warm at `265`. `11` checks, `0` failures; leases `0`, staging `0` in use
+- **Correctness / service**: registry `invariants_hold()` throughout; the VRAM bijectivity invariant now admits exactly two owners per slot (a Hot expert, or a Warm expert's declared shadow), and the shadow LRU and per-expert shadow map are validated against the catalog. Tier-invariance holds with the freeze active: arms `--warm-gib 0` vs `--warm-gib 4` at context `2048` produce **byte-identical** logits (`3,361,280 B`), so freezing Warm changed no number. The mutant sweep (`scripts/mutate_warm_frozen.py`) kills `2/2` — the frozen request promoting normally (drains Warm), and the freeze never engaging
+- **Conclusion / next gate**: **Step 6 item 5 built, outcome 3 met.** Warm survives a prefill intact because the sweep takes a *copy* rather than a *move*; the prefill still gets Warm's bandwidth instead of paying an NVMe read to bypass it. The remaining Step 6 item is the double-buffered sweep (item 6); throughput (outcome 5) is the separate gate. The `291`-slot tier is a correctness configuration, not a throughput one
+- **Evidence**: `tests/test_v4_warm_frozen_prefill.cpp`, `src/infrastructure/core/expert_registry.hpp` (`set_warm_frozen`, shadow residency), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`set_supply_phase`), `src/architecture/deepseek_v4/core/memory_budget.hpp` (`freeze_warm_during_prefill`)
