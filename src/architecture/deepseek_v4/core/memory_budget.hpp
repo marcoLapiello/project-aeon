@@ -124,6 +124,15 @@ struct AeonRuntimeConfig {
     // A/Bs it against `false`.
     bool freeze_warm_during_prefill{true};
 
+    // Step 6 item 6: drive the layer-major prefill window with the **expert sweep**
+    // instead of the per-token dispatch. The sweep drains Hot on entry, holds a
+    // sliding window of whole layer sets (`L, L+1, L+2, …` up to capacity), releases
+    // each layer's whole set as it retires, and leaves Hot empty on exit — so Warm
+    // and its LRU ranking are untouched across the whole prefill and decode resumes
+    // on them. On by default; it is the prefill strategy the plan decided (D-a).
+    // Falls back to the per-token path when the Hot pool cannot hold a whole layer.
+    bool prefill_sweep{true};
+
     // Hardware target device index
     int device_id{0};
 

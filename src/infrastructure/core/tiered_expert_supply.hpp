@@ -400,6 +400,29 @@ public:
         return batch;
     }
 
+    // Releases the staging slots a **streamed** batch borrowed, once its uploads
+    // have landed. The executor does this in `on_routed_consumed`; the prefill sweep
+    // has no such hook, so it calls this as soon as its batch is materialized — the
+    // sweep's loads are the only traffic on the arena at that moment, which is what
+    // makes an immediate release safe.
+    void release_streamed_staging(PayloadBatch& batch) {
+        if (prefetch_staging_ == nullptr) return;
+        for (auto& state : batch.transfers) {
+            if (!state.is_prefetched) continue;
+            const uint32_t staging_idx = state.staging_idx;
+            if (prefetch_staging_->slot_state(staging_idx) !=
+                PrefetchStagingArena::SlotState::GPU_TRANSFER_PENDING) {
+                state.is_prefetched = false;
+                continue;
+            }
+            check_hip(
+                hipEventSynchronize(prefetch_staging_->events[staging_idx]),
+                "hipEventSynchronize(stream staging)");
+            prefetch_staging_->release_after_gpu_transfer(staging_idx);
+            state.is_prefetched = false;
+        }
+    }
+
     void materialize(PayloadBatch& batch) {
         for (auto& state : batch.transfers) {
             if (!state.io_pending) {

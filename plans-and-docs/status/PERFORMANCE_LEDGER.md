@@ -70,6 +70,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `prefill-window` | Layer-major window vs serial `forward_token`, byte-exact | M37 |
 | `prefill-batch-dispatch` | Layer-wide deduplicated expert dispatch vs serial, byte-exact | M38 |
 | `warm-frozen-prefill` | Warm resident set preserved across a prefill (D-b policy A) | M39 |
+| `prefill-sweep` | Layer-ordered swept prefill: drain, whole layer sets, empty on exit | M40 |
 
 ## 4. Milestone cards
 
@@ -281,3 +282,14 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: registry `invariants_hold()` throughout; the VRAM bijectivity invariant now admits exactly two owners per slot (a Hot expert, or a Warm expert's declared shadow), and the shadow LRU and per-expert shadow map are validated against the catalog. Tier-invariance holds with the freeze active: arms `--warm-gib 0` vs `--warm-gib 4` at context `2048` produce **byte-identical** logits (`3,361,280 B`), so freezing Warm changed no number. The mutant sweep (`scripts/mutate_warm_frozen.py`) kills `2/2` — the frozen request promoting normally (drains Warm), and the freeze never engaging
 - **Conclusion / next gate**: **Step 6 item 5 built, outcome 3 met.** Warm survives a prefill intact because the sweep takes a *copy* rather than a *move*; the prefill still gets Warm's bandwidth instead of paying an NVMe read to bypass it. The remaining Step 6 item is the double-buffered sweep (item 6); throughput (outcome 5) is the separate gate. The `291`-slot tier is a correctness configuration, not a throughput one
 - **Evidence**: `tests/test_v4_warm_frozen_prefill.cpp`, `src/infrastructure/core/expert_registry.hpp` (`set_warm_frozen`, shadow residency), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`set_supply_phase`), `src/architecture/deepseek_v4/core/memory_budget.hpp` (`freeze_warm_during_prefill`)
+
+### M40: The prefill sweep — drain, layer-ordered whole sets, empty on exit
+- **Run**: `2026-09-22`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers; `test_v4_prefill_sweep`
+- **Class / comparison key**: `Integration / prefill-sweep`
+- **Platform**: `baseline`, Device 0 only
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: `809` Hot slots, `63` Warm experts (`1 GiB`), a `16`-token layer-major window at context `256`, `prefill_chunk = 16`, `prefill_sweep = true`; staging arena sized to the layer (`256` slots), `io_uring` depth `1024`
+- **Metrics**: Hot **`0`** residents at the drain instant (recorded between `begin_prefill_stream` and the first frontier fill); `11008` experts streamed in `43` loads (`43 × 256`, every layer exactly once); frontier **`2` layers deep**; Hot **`0`** residents and **`0`** shadows at the end; Warm **`0` experts differing** across the sweep; logits **`0` differing of `258560`** bytes vs the serial `forward_token` reference; `13` checks, `0` failures; leases `0`, staging `0` in use
+- **Correctness / service**: `invariants_hold()` throughout. The one new invariant is enforced, not intended: **a shadow residency is legal only while Warm is frozen** (`!warm_frozen_ ⇒ shadow_lru_.empty()`), so decode keeps single ownership. `test_v4_prefill_window` (which now drives the sweep by default) still reports `10` checks, `0` failures — the swept prefill is byte-identical to serial.
+- **Conclusion / next gate**: **Step 6 item 6 built, outcome 6 met.** Prefill is a hard switch to a layer-ordered streaming strategy: drain on entry, whole layer sets resident in computation order, bulk release per layer, empty on exit, Warm and its LRU ranking untouched. LRU is not used in prefill — nothing inside a window is reused, so the only correct release is the whole layer. Throughput (outcome 5) is the separate gate; the loads are issued and materialized in layer order, and overlapping them with compute is bounded by staging depth (§6c item 6).
+- **Evidence**: `tests/test_v4_prefill_sweep.cpp`, `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp`, `src/infrastructure/core/expert_registry.hpp` (`begin_prefill_stream`, `release_layer`, `end_prefill_stream`, the shadow invariant), `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` (`dispatch_layer_stream`, `finish_streamed_batch`), `src/architecture/deepseek_v4/core/v4_model_host.hpp` (`prefill_begin`/`before_layer`/`after_layer`/`end`)

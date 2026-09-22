@@ -312,7 +312,18 @@ public:
         const V4LayerBodyTables tables = host_.tables();
         const uint32_t workspace_tokens = std::min(chunk, count);
 
+        // Step 6 item 6: the window is the swept prefill when the sweep is enabled
+        // (and feasible). It drains Hot on entry, keeps a sliding window of whole
+        // layer sets in layer order, and leaves Hot empty on exit — a hard switch
+        // between the two allocation strategies, not a parameter on one.
+        host_.prefill_begin();
+
         for (uint32_t layer = 0; layer < layers; ++layer) {
+            // The layer's whole set must be resident before its body runs: the
+            // router lives inside the body, so its selection is not known earlier,
+            // and the sweep loaded the set in layer order precisely because it is
+            // the whole layer rather than a prediction.
+            host_.prefill_before_layer(layer);
             host_.ensure_batch_scratch(layer, workspace_tokens);
             V4LayerBodyBatchScratch& workspace = host_.batch_scratch();
 
@@ -331,7 +342,13 @@ public:
             // boundary here; this drain is the per-layer cost D3 says to measure.
             CHECK_HIP(hipStreamSynchronize(stream));
             host_.release_expert_leases();
+            // The layer is dead the moment it retires — a window visits each layer
+            // once — so the sweep releases its whole set and refills the room from
+            // the next layers in order. LRU has nothing to rank here.
+            host_.prefill_after_layer(layer);
         }
+
+        host_.prefill_end();
 
         // The head reads the last position's residual, which is where the serial
         // path leaves it too (`scratch().d_res_in`).

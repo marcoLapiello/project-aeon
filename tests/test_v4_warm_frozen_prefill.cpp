@@ -102,6 +102,11 @@ int main() {
     runtime.context_size = kContext;
     runtime.warm_host_bytes = kWarmBytes;
     runtime.prefill_chunk = kWindow;
+    // This gate covers the **legacy** per-token freeze (`set_supply_phase`), which is
+    // the engine's path today. The swept prefill (`prefill_sweep`) is the stronger
+    // mode and has its own gate (`test_v4_prefill_sweep`); disabling it here keeps
+    // this one testing the freeze alone.
+    runtime.prefill_sweep = false;
     runtime.supply_telemetry_path = kTelemetryPath;
     runtime.run_id = "warm-frozen";
 

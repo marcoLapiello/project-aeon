@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <list>
 #include <optional>
@@ -213,6 +214,7 @@ public:
         shadow_slot_of_expert_.assign(total_experts, -1);
         shadow_lru_.clear();
         warm_frozen_ = false;
+        prefill_stream_ = false;
 
         populate_round_robin(preload_warm_host);
         validate_invariants();
@@ -283,7 +285,9 @@ public:
         // Frozen prefill (Step 6 D-b). Warm's resident set must survive a prefill, so
         // a Warm-resident expert is **copied** into VRAM rather than promoted: the
         // catalog entry keeps `owner == WARM_HOST` and its host slot, and the VRAM
-        // copy is recorded as a *shadow* residency that decode's ownership never
+        // copy isend_prefill_stream()` (or `set_warm_frozen(false)` on the legacy
+        // path) releases the shadows; a shadow is legal **only** while frozen, which
+        // `validate_invariants` enforces so decode admits single ownership alonenership never
         // sees. `set_warm_frozen(false)` releases every idle shadow.
         if (warm_frozen_ && entry.owner == ExpertTier::WARM_HOST) {
             if (entry.shadow_vram_slot >= 0) {
@@ -614,12 +618,184 @@ public:
         --catalog[gid].lease_count;
     }
 
-    // Enter or leave frozen prefill (Step 6 D-b). Entering changes only how the
-    // next request for a Warm expert resolves; leaving releases the idle shadow
-    // residencies so the VRAM they hold returns to decode's pool. A shadow copy
-    // still in flight is left to settle — `reserve_vram_destination` reclaims a
-    // leftover shadow at any time, so nothing is stranded.
+    // --- Prefill streaming (Step 6 item 6) ------------------------------------
+    //
+    // Prefill and decode are two **different allocation strategies**, not one
+    // strategy with a parameter. Decode keeps a persistent, LRU-ranked resident set
+    // and demotes its evictions into Warm so that "natural selection" accumulates.
+    // Prefill streams the whole model through VRAM once per window in layer order:
+    // at any moment it holds a sliding window of whole layer sets, it allocates
+    // only from the free list, and it retires each layer exactly when that layer is
+    // done. Crossing between them is therefore a **hard switch**:
+    //
+    //   begin_prefill_stream()  drains the Hot pool outright — no decode resident
+    //                           survives into prefill, because not one of them is
+    //                           in the plan the sweep follows — then leaves Warm
+    //                           and its LRU ranking untouched for the whole sweep;
+    //   release_layer(L)        returns one computed layer's whole set (its Hot
+    //                           copies *and* its Warm shadows) to the free list;
+    //   end_prefill_stream()    requires the Hot pool to be empty again, which the
+    //                           per-layer release guarantees by construction, and
+    //                           clears the mode so decode resumes on the Warm set
+    //                           the prefill never disturbed.
+    //
+    // Both modes are still expressed over the same catalog, so `invariants_hold()`
+    // checks the switch as tightly as it checks a decode step.
+
+    // Drain Hot and enter streaming. The caller must first have reached a
+    // compute-stream boundary and reaped the registry — a live lease or an in-flight
+    // transfer is a caller defect, not something to drain around.
+    void begin_prefill_stream() {
+        if (prefill_stream_) return;
+        for (const auto& entry : catalog) {
+            if (entry.lease_count != 0) {
+                throw std::logic_error(
+                    "ExpertRegistry: begin_prefill_stream with a live lease — the caller "
+                    "must reach a compute-stream boundary first");
+            }
+            if (entry.operation != ExpertOperation::NONE) {
+                throw std::logic_error(
+                    "ExpertRegistry: begin_prefill_stream with a transfer still in flight — "
+                    "the caller must reap the registry first");
+            }
+        }
+
+        // Drain Hot: every slot is free again and every Hot owner is Cold. Warm is
+        // deliberately untouched — its resident set and its LRU ranking are exactly
+        // what decode resumes on after the prefill.
+        for (uint32_t gid = 0; gid < total_experts; ++gid) {
+            auto& entry = catalog[gid];
+            if (entry.owner == ExpertTier::HOT_VRAM) {
+                if (entry.in_lru) {
+                    remove_from_lru(entry, hot_vram_lru, gid);
+                }
+                entry.owner = ExpertTier::COLD_NVME;
+                entry.slot_idx = -1;
+                entry.slot_state = ExpertSlotState::UNALLOCATED;
+            }
+            entry.pending_slot_idx = -1;
+            entry.warm_shadow = false;
+            entry.shadow_vram_slot = -1;
+        }
+        hot_vram_lru.clear();
+        shadow_lru_.clear();
+        shadow_slot_of_expert_.assign(total_experts, -1);
+        std::fill(vram_slots.begin(), vram_slots.end(), -1);
+        std::fill(vram_slot_reservations.begin(), vram_slot_reservations.end(), 0);
+        free_vram_slots.clear();
+        for (uint32_t slot = vram_capacity; slot-- > 0;) {
+            free_vram_slots.push_back(slot);
+        }
+
+        prefill_stream_ = true;
+        warm_frozen_ = true;
+        validate_invariants();
+    }
+
+    // Leave streaming. The Hot pool must be empty — every layer was released as it
+    // computed — and no shadow may remain, because decode admits single ownership.
+    // A leftover is a driver defect and is refused, not silently cleaned up.
+    void end_prefill_stream() {
+        if (!prefill_stream_) return;
+        for (const auto& entry : catalog) {
+            if (entry.owner == ExpertTier::HOT_VRAM || entry.shadow_vram_slot >= 0) {
+                throw std::logic_error(
+                    "ExpertRegistry: end_prefill_stream with resident Hot experts — every "
+                    "layer must be released as it is computed");
+            }
+            if (entry.lease_count != 0) {
+                throw std::logic_error("ExpertRegistry: end_prefill_stream with a live lease");
+            }
+            if (entry.operation != ExpertOperation::NONE) {
+                throw std::logic_error(
+                    "ExpertRegistry: end_prefill_stream with a pending transfer");
+            }
+        }
+        prefill_stream_ = false;
+        warm_frozen_ = false;
+        validate_invariants();
+    }
+
+    bool prefill_streaming() const noexcept { return prefill_stream_; }
+
+    // Bulk release of one layer's residency, after it has computed. The layer's Hot
+    // copies and Warm shadows both return to the free list; Warm's own host slots
+    // are untouched. Scanning the layer's `experts_per_layer` catalog entries is
+    // nothing against the ~0.5 s read it follows, and it needs no parallel
+    // bookkeeping that could fall out of step with the catalog.
+    void release_layer(uint32_t layer_id) {
+        if (!prefill_stream_) {
+            throw std::logic_error("ExpertRegistry: release_layer outside prefill streaming");
+        }
+        if (layer_id >= num_layers) {
+            throw std::out_of_range("ExpertRegistry: release_layer layer is out of range");
+        }
+        const uint32_t first = layer_id * experts_per_layer;
+        for (uint32_t index = 0; index < experts_per_layer; ++index) {
+            auto& entry = catalog[first + index];
+            if (entry.lease_count != 0) {
+                throw std::logic_error(
+                    "ExpertRegistry: release_layer with a live lease — the caller must "
+                    "release leases at the layer boundary first (Step 0 D3)");
+            }
+            if (entry.operation != ExpertOperation::NONE) {
+                throw std::logic_error(
+                    "ExpertRegistry: release_layer with a transfer still in flight");
+            }
+            if (entry.owner == ExpertTier::HOT_VRAM) {
+                if (entry.in_lru) {
+                    remove_from_lru(entry, hot_vram_lru, entry.global_expert_id);
+                }
+                const int32_t slot = entry.slot_idx;
+                if (slot >= 0) {
+                    vram_slots[static_cast<size_t>(slot)] = -1;
+                    free_vram_slots.push_back(static_cast<uint32_t>(slot));
+                }
+                entry.owner = ExpertTier::COLD_NVME;
+                entry.slot_idx = -1;
+                entry.slot_state = ExpertSlotState::UNALLOCATED;
+            }
+            if (entry.shadow_vram_slot >= 0) {
+                const int32_t slot = entry.shadow_vram_slot;
+                release_shadow_residency(entry);
+                vram_slots[static_cast<size_t>(slot)] = -1;
+                free_vram_slots.push_back(static_cast<uint32_t>(slot));
+            }
+        }
+        validate_invariants();
+    }
+
+    // How many of a layer's experts currently hold a VRAM copy (Hot or shadow). The
+    // lookahead reads it to know how much of a layer is already resident before it
+    // fills the rest.
+    uint32_t layer_resident_count(uint32_t layer_id) const {
+        if (layer_id >= num_layers) return 0;
+        const uint32_t first = layer_id * experts_per_layer;
+        uint32_t resident = 0;
+        for (uint32_t index = 0; index < experts_per_layer; ++index) {
+            const auto& entry = catalog[first + index];
+            if (entry.owner == ExpertTier::HOT_VRAM || entry.shadow_vram_slot >= 0) {
+                ++resident;
+            }
+        }
+        return resident;
+    }
+
+    // Whether one expert currently holds a VRAM copy. The sweep's top-up reads it to
+    // build the list of a layer's still-missing experts.
+    bool expert_resident(uint32_t layer_id, uint32_t expert_id) const {
+        const auto& entry = catalog[get_global_id(layer_id, expert_id)];
+        return entry.owner == ExpertTier::HOT_VRAM || entry.shadow_vram_slot >= 0;
+    }
+
+    // Free VRAM slots. The lookahead stops when a whole layer no longer fits.
+    size_t free_vram_slot_count() const noexcept { return free_vram_slots.size(); }
+
+    // Legacy per-token prefill (the engine's `forward_token` path) freezes Warm
+    // without streaming. The swept prefill (`begin_prefill_stream`) is the stronger
+    // mode and owns the flag while it is active.
     void set_warm_frozen(bool frozen) {
+        if (prefill_stream_) return;
         if (frozen == warm_frozen_) return;
         warm_frozen_ = frozen;
         if (!frozen) {
@@ -821,6 +997,17 @@ public:
             }
         }
 
+        // Single ownership is decode's rule, and the shadow residency is the one
+        // exception to it — legal **only** while the Warm tier is frozen, which is to
+        // say only during prefill. Making that an invariant rather than a convention
+        // is what lets the prefill modes move slots around without either being able
+        // to leak a second ownership into decode.
+        if (!warm_frozen_ && !shadow_lru_.empty()) {
+            throw std::logic_error(
+                "ExpertRegistry: a shadow residency exists outside prefill streaming — "
+                "decode admits single ownership only");
+        }
+
         validate_lru(hot_vram_lru, ExpertTier::HOT_VRAM);
         validate_lru(warm_host_lru, ExpertTier::WARM_HOST);
     }
@@ -919,11 +1106,20 @@ private:
         if (!free_vram_slots.empty()) {
             vram_slot = free_vram_slots.back();
             free_vram_slots.pop_back();
+        } else if (prefill_stream_) {
+            // Prefill streaming: the sweep allocates from the free list only and
+            // releases each layer deterministically, so there is no victim to choose
+            // (the sweep's own order decides what is dead) and no demotion to run
+            // (Warm is frozen). A request that finds no free slot means the lookahead
+            // over-committed — a driver defect, refused rather than evicted around.
+            throw std::runtime_error(
+                "ExpertRegistry: prefill stream has no free VRAM slot for a load "
+                "(the layer lookahead must not exceed capacity)");
         } else if (warm_frozen_) {
-            // Frozen prefill: an eviction is a **release**. The victim is a shadow
-            // residency (a Warm expert's prefill copy) when one is available, else an
-            // ordinary Hot resident. No ownership is transferred and no demotion is
-            // attempted, so Warm is neither drained nor overwritten.
+            // Frozen prefill on the legacy per-token path: an eviction is a
+            // **release**, never a demotion. The victim is a shadow residency (a Warm
+            // expert's prefill copy) when one is available, else an ordinary Hot
+            // resident; either way no ownership moves and Warm is not written to.
             for (auto it = shadow_lru_.rbegin(); it != shadow_lru_.rend(); ++it) {
                 auto& candidate = catalog[*it];
                 if (candidate.shadow_vram_slot < 0 || candidate.lease_count != 0 ||
@@ -980,22 +1176,6 @@ private:
                 break;
             }
             if (victim == nullptr) {
-                // A leftover shadow residency — a Warm expert's prefill copy that
-                // outlived the frozen phase — is reclaimable too. Releasing it keeps
-                // the copy from stranding a VRAM slot once decode resumes.
-                for (auto it = shadow_lru_.rbegin(); it != shadow_lru_.rend(); ++it) {
-                    auto& candidate = catalog[*it];
-                    if (candidate.shadow_vram_slot < 0 || candidate.lease_count != 0 ||
-                        candidate.operation != ExpertOperation::NONE ||
-                        candidate.publication != ExpertPublication::PUBLISHED) {
-                        continue;
-                    }
-                    const uint32_t slot = static_cast<uint32_t>(candidate.shadow_vram_slot);
-                    release_shadow_residency(candidate);
-                    vram_slots[static_cast<size_t>(slot)] = -1;
-                    vram_slot_reservations[static_cast<size_t>(slot)] = operation_id;
-                    return VramDestination{slot, std::nullopt};
-                }
                 uint32_t leased_hot = 0;
                 uint32_t pending_hot = 0;
                 for (const auto& entry : catalog) {
@@ -1187,6 +1367,10 @@ private:
     // `ExpertCatalogEntry::shadow_vram_slot` so a caller can resolve an expert's
     // VRAM copy without scanning the catalog.
     bool warm_frozen_{false};
+    // Step 6 item 6: the prefill sweep's streaming mode. Drains Hot on entry, holds
+    // a sliding window of whole layer sets in layer order, and requires Hot empty on
+    // exit. Implies `warm_frozen_`; decode never sees either flag set.
+    bool prefill_stream_{false};
     std::vector<int32_t> shadow_slot_of_expert_;
     std::list<uint32_t> shadow_lru_;
 };

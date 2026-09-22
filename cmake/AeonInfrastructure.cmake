@@ -221,6 +221,16 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_warm_frozen_prefill.cpp TIMEOUT 1800)
 endif()
 
+# --- Step 6 item 6: the prefill sweep (drain, layer order, empty on exit) ------
+# Prefill and decode are two allocation strategies, so the switch between them is
+# asserted as a switch: the sweep drains Hot on entry, streams whole layer sets in
+# layer order, releases each layer as it retires, and leaves Hot empty on exit with
+# Warm untouched. The result must stay byte-identical to the serial path.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_prefill_sweep
+        SOURCES tests/test_v4_prefill_sweep.cpp TIMEOUT 1800)
+endif()
+
 # --- Tier-3 sequence: the long-context lifecycle ------------------------------
 # Item 20. Every earlier layer-body gate shrinks the local window (to 6, 10, 4)
 # and the index top-k so a wrap fits in a short run, and each names the shrinkage

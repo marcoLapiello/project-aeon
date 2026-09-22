@@ -249,6 +249,51 @@ public:
         sync_state(state);
     }
 
+    // Streaming prefill (Step 6 item 6): load a whole layer's expert set. Unlike
+    // `dispatch_layer_prefetch_batch` this is not driven by a routing result — the
+    // layer is loaded whole, because a prefill chunk touches ~255 of 256 experts and
+    // the set is therefore **known rather than guessed** (plan §2). Staging indices
+    // are the expert's position in `local_expert_ids`, so the caller sizes the arena
+    // to the layer.
+    LayerPrefetchState dispatch_layer_stream(
+        uint32_t layer,
+        const std::vector<uint32_t>& local_expert_ids,
+        std::vector<uint32_t>& leased_experts
+    ) {
+        if (expert_registry_ == nullptr) {
+            throw std::logic_error("V4ExpertSupplyCoordinator: coordinator is not configured");
+        }
+        std::vector<TieredExpertSupply::PayloadRequest> requests;
+        requests.reserve(local_expert_ids.size());
+        for (uint32_t index = 0; index < local_expert_ids.size(); ++index) {
+            if (local_expert_ids[index] >= expert_registry_->experts_per_layer) {
+                throw std::out_of_range(
+                    "V4ExpertSupplyCoordinator: streamed expert id is outside its layer");
+            }
+            requests.push_back(TieredExpertSupply::PayloadRequest{
+                expert_registry_->get_global_id(layer, local_expert_ids[index]),
+                index
+            });
+        }
+        LayerPrefetchState state;
+        state.supply_batch = supply_.dispatch(requests, layer, leased_experts);
+        if (state.supply_batch.transfers.size() != local_expert_ids.size()) {
+            throw std::logic_error(
+                "V4ExpertSupplyCoordinator: supply returned an incomplete layer stream");
+        }
+        state.first_position = layer;
+        state.token_count = 0;
+        sync_state(state);
+        return state;
+    }
+
+    // Hands the staging slots a streamed batch borrowed back to the arena. The
+    // executor releases its own in `on_routed_consumed`; the sweep has no such hook.
+    void finish_streamed_batch(LayerPrefetchState& state) {
+        supply_.release_streamed_staging(state.supply_batch);
+        sync_state(state);
+    }
+
     void reap_registry_transfers() {
         supply_.reap_registry_transfers();
     }

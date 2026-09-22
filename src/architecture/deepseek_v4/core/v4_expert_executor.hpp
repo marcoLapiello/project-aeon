@@ -414,6 +414,13 @@ private:
     // the intended steady state; the counter exists so a gate can say which of the
     // two regimes it ran in.
     void ensure_pool_headroom(size_t incoming_leases = V4RoutedExpertScratch::kExperts) {
+        // During a swept prefill nothing evicts: the sweep allocates from the free
+        // list only and releases whole layers in order, so there is no victim
+        // selection to protect and no drain to run. The guard exists for decode,
+        // where a lease count can starve LRU victim selection.
+        if (registry_.prefill_streaming()) {
+            return;
+        }
         if (leases_.size() + incoming_leases <= registry_.vram_capacity) {
             return;
         }

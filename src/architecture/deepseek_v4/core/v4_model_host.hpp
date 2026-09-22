@@ -70,6 +70,7 @@
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
+#include "architecture/deepseek_v4/core/v4_prefill_sweep.hpp"
 #include "infrastructure/core/supply_telemetry.hpp"
 #include "infrastructure/hip_check.hpp"
 #include "infrastructure/io/aligned_allocator.hpp"
@@ -417,11 +418,21 @@ public:
     // reclaimed by eviction when it settles.
     void set_supply_phase(bool prefill) {
         telemetry_.set_phase(prefill ? RoutingPhase::Prefill : RoutingPhase::Decode);
-        if (freeze_warm_during_prefill_ && experts_ready()) {
-            if (!prefill) {
-                supply_.reap_registry_transfers();
-            }
-            registry_.set_warm_frozen(prefill);
+        if (!freeze_warm_during_prefill_ || !experts_ready()) return;
+        // Only the **transition** matters, and only on the way down does work have to
+        // be done: leaving frozen must be total, because decode admits single
+        // ownership and the invariant refuses a shadow left behind. So the boundary
+        // drains the expert streams (a legate boundary, not the request path) and
+        // reaps, which completes every in-flight copy before the idle shadows are
+        // released. The swept prefill owns this flag while it is running.
+        if (registry_.prefill_streaming() || prefill == supply_phase_prefill_) return;
+        supply_phase_prefill_ = prefill;
+        if (prefill) {
+            registry_.set_warm_frozen(true);
+        } else {
+            drain_expert_streams();
+            supply_.reap_registry_transfers();
+            registry_.set_warm_frozen(false);
         }
     }
 
@@ -496,6 +507,48 @@ public:
         return result;
     }
 
+    // ---- Step 6 item 6: the prefill sweep ------------------------------------
+    //
+    // `forward_window` drives these. The whole switch is local to a window: the
+    // sweep drains Hot on entry, streams the layers in order, and leaves Hot empty on
+    // exit, so a window is self-contained and decode can resume the moment it ends.
+    //
+    // Enabled only when `AeonRuntimeConfig::prefill_sweep` is set **and** the Hot pool
+    // can hold a whole layer (the sweep has no victim to evict). Otherwise the window
+    // drives the per-token dispatch, which is what the engine's `forward_token` path
+    // uses.
+    bool prefill_sweep_enabled() const noexcept {
+        return prefill_sweep_requested_ && prefill_sweep_.is_feasible();
+    }
+
+    void prefill_begin() {
+        if (!prefill_sweep_enabled()) return;
+        drain_expert_streams();
+        supply_.reap_registry_transfers();
+        executor_->release_leases();
+        prefill_sweep_.begin();
+    }
+
+    void prefill_before_layer(uint32_t layer) {
+        if (!prefill_sweep_enabled()) return;
+        prefill_sweep_.before_layer(layer);
+    }
+
+    void prefill_after_layer(uint32_t layer) {
+        if (!prefill_sweep_enabled()) return;
+        prefill_sweep_.after_layer(layer);
+    }
+
+    void prefill_end() {
+        if (!prefill_sweep_enabled()) return;
+        supply_.reap_registry_transfers();
+        prefill_sweep_.end();
+    }
+
+    // Sweep counters, for the gate: how many layer loads ran, how many experts they
+    // streamed, and the deepest frontier the lookahead reached.
+    const V4PrefillSweep& prefill_sweep() const noexcept { return prefill_sweep_; }
+
     // The start of a new sequence. Every layer's ring sentinels, counters and
     // committed-entry positions go back to what a freshly allocated layer holds,
     // so a second conversation cannot read the first one's context.
@@ -506,6 +559,16 @@ public:
     }
 
 private:
+    // Reaches a compute-stream boundary on every stream that can carry expert
+    // traffic. Used by the prefill sweep's switch: entering it frees the whole Hot
+    // pool, so no upload or demotion may still be reading or writing a slot.
+    void drain_expert_streams() {
+        CHECK_HIP(hipStreamSynchronize(streams_.compute));
+        if (streams_.sdma != nullptr) { CHECK_HIP(hipStreamSynchronize(streams_.sdma)); }
+        if (streams_.sdma_cold != nullptr) { CHECK_HIP(hipStreamSynchronize(streams_.sdma_cold)); }
+        if (streams_.demotion != nullptr) { CHECK_HIP(hipStreamSynchronize(streams_.demotion)); }
+    }
+
     uint32_t count_kind(V4AttentionKind kind) const noexcept {
         uint32_t count = 0;
         for (const auto& spec : layer_specs_) {
@@ -537,21 +600,30 @@ private:
         // to the **ceiling** `6C` here, so no transfer ever waits for a slot; the
         // Step 7 sweep picks the smaller concurrency depth.
         vram_pool_.allocate(budget_.hot_vram_slots, format);
-        const uint32_t staging_slots = std::max<uint32_t>(
+        uint32_t staging_slots = std::max<uint32_t>(
             PrefetchStagingArena::TOTAL_STAGING_SLOTS,
             PrefetchStagingArena::EXPERTS_PER_HORIZON * runtime_cfg.prefill_chunk);
+        // The prefill sweep loads a **whole layer** in one batch, so the arena must
+        // hold a layer's distinct experts at once (Step 6 item 6). Sized to that
+        // ceiling; the Step 7 sweep picks the smaller concurrency depth.
+        if (runtime_cfg.prefill_sweep) {
+            staging_slots = std::max<uint32_t>(
+                staging_slots, static_cast<uint32_t>(config_.n_routed_experts));
+        }
         staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
 
-        // The direct reader's submission queue must hold a whole layer-wide batch's
-        // reads at once: `dispatch()` queues every cold request of the batch before
-        // it calls `submit_pending_reads()` a single time, so a queue shallower than
-        // `6C x chunks-per-expert` would overflow on the batch rather than stream it.
-        // Sized to that ceiling beside the arena; the decode default (chunk 1) keeps
-        // the historical 64. (Waving the submission to a smaller depth is a Step 7
-        // concern.)
-        const size_t batch_requests =
+        // The direct reader's submission queue must hold a whole layer's reads at
+        // once: `dispatch()` queues every cold request of a batch before it calls
+        // `submit_pending_reads()` a single time.
+        size_t batch_requests =
             direct_requests_per_expert(format) * PrefetchStagingArena::EXPERTS_PER_HORIZON *
             std::max<uint32_t>(1, runtime_cfg.prefill_chunk);
+        if (runtime_cfg.prefill_sweep) {
+            batch_requests = std::max<size_t>(
+                batch_requests,
+                direct_requests_per_expert(format) *
+                    static_cast<size_t>(config_.n_routed_experts));
+        }
         const uint32_t io_queue_depth = static_cast<uint32_t>(
             std::max<size_t>(64, batch_requests));
         io_reader_ = std::make_unique<aeon::io::DirectIOReader>(
@@ -612,6 +684,11 @@ private:
             supply_, vram_pool_, *staging_, registry_, expert_scratch_, streams_,
             telemetry_, runtime_cfg.profile_routing_reuse ? &reuse_profiler_ : nullptr,
             config_.swiglu_limit);
+
+        // 15 — the prefill sweep (Step 6 item 6). Borrows the same two components the
+        // executor does; it runs only between `prefill_begin` and `prefill_end`.
+        prefill_sweep_requested_ = runtime_cfg.prefill_sweep;
+        prefill_sweep_.configure(&supply_, &registry_);
     }
 
     size_t direct_requests_per_expert(const ExpertFormatDescriptor& format) const noexcept {
@@ -761,6 +838,7 @@ private:
     size_t last_released_dense_bytes_{0};
     uint64_t demotion_queue_capacity_{0};
     bool freeze_warm_during_prefill_{false};
+    bool supply_phase_prefill_{false};
 
     V4DeviceStreams streams_;
     V4ModelResources resources_;
@@ -788,6 +866,8 @@ private:
     V4ExpertSupplyCoordinator supply_;
     V4RoutedExpertScratch expert_scratch_;
     std::unique_ptr<V4TieredExpertExecutor> executor_;
+    V4PrefillSweep prefill_sweep_;
+    bool prefill_sweep_requested_{false};
 };
 
 } // namespace aeon::core
