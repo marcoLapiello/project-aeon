@@ -12,6 +12,16 @@
 #include <string>
 #include <vector>
 
+// The arena's slot count is a **construction parameter**, not a compile-time fact
+// (Step 6 / Step 0 D4). Decode's `C = 1` dispatch double-buffers one token — two
+// banks of six, `TOTAL_STAGING_SLOTS` — but a layer-wide chunk dispatch issues up
+// to `6C` transfers as one set, and each distinct expert's transfer needs its own
+// slot for as long as it is in transit. Sizing that as `NUM_BUFFERS * 6` would
+// silently collide the second distinct expert with the first. The default
+// therefore stays the decode shape (12) so nothing on the certified path moves;
+// a caller that dispatches a chunk constructs the arena large enough for its
+// deduplicated set, and `V4ModelHost` sizes it from the configured prefill chunk.
+
 #ifndef CHECK_HIP
 #define CHECK_HIP(cmd) do { \
     hipError_t err = cmd; \
@@ -43,17 +53,23 @@ public:
     bool is_allocated_{false};
 
     // HIP Events for tracking asynchronous SDMA transfer completion per staging slot
-    hipEvent_t events[TOTAL_STAGING_SLOTS]{};
-    std::array<SlotState, TOTAL_STAGING_SLOTS> slot_states{};
+    hipEvent_t* events{nullptr};
+    std::vector<SlotState> slot_states{};
 
     PrefetchStagingArena() {
         allocate();
     }
 
-    explicit PrefetchStagingArena(const ExpertFormatDescriptor& format)
+    explicit PrefetchStagingArena(const ExpertFormatDescriptor& format,
+                                  uint32_t slots = TOTAL_STAGING_SLOTS)
         : format_(format) {
+        slot_count_ = slots == 0 ? TOTAL_STAGING_SLOTS : slots;
         allocate();
     }
+
+    // The number of staging slots this arena owns. A batch dispatcher must not
+    // assign more distinct staging indices than this.
+    uint32_t slot_count() const noexcept { return slot_count_; }
 
     ~PrefetchStagingArena() {
         free();
@@ -76,9 +92,10 @@ public:
 
     void allocate() {
         if (is_allocated_) return;
+        if (slot_count_ == 0) slot_count_ = TOTAL_STAGING_SLOTS;
 
         format_.validate_payload();
-        size_t total_bytes = static_cast<size_t>(TOTAL_STAGING_SLOTS) * format_.payload_bytes;
+        size_t total_bytes = static_cast<size_t>(slot_count_) * format_.payload_bytes;
         uses_hip_host_malloc_ = false;
 
         // Allocate pinned host memory
@@ -100,10 +117,11 @@ public:
         }
 
         // Create non-blocking HIP events for transfer synchronization
-        for (uint32_t i = 0; i < TOTAL_STAGING_SLOTS; ++i) {
+        events = new hipEvent_t[slot_count_]();
+        slot_states.assign(slot_count_, SlotState::AVAILABLE);
+        available_since_.assign(slot_count_, std::chrono::steady_clock::now());
+        for (uint32_t i = 0; i < slot_count_; ++i) {
             CHECK_HIP(hipEventCreateWithFlags(&events[i], hipEventDisableTiming));
-            slot_states[i] = SlotState::AVAILABLE;
-            available_since_[i] = std::chrono::steady_clock::now();
         }
 
         is_allocated_ = true;
@@ -111,12 +129,14 @@ public:
 
     void free() {
         if (is_allocated_) {
-            for (uint32_t i = 0; i < TOTAL_STAGING_SLOTS; ++i) {
+            for (uint32_t i = 0; i < slot_count_; ++i) {
                 if (events[i]) {
                     (void)hipEventDestroy(events[i]);
                     events[i] = nullptr;
                 }
             }
+            delete[] events;
+            events = nullptr;
             if (h_pinned_base) {
                 if (uses_hip_host_malloc_) {
                     (void)hipHostFree(h_pinned_base);
@@ -130,8 +150,8 @@ public:
             }
             uses_hip_host_malloc_ = false;
             uses_hip_host_register_ = false;
-            slot_states.fill(SlotState::AVAILABLE);
-            available_since_.fill(std::chrono::steady_clock::now());
+            slot_states.assign(slot_count_, SlotState::AVAILABLE);
+            available_since_.assign(slot_count_, std::chrono::steady_clock::now());
             is_allocated_ = false;
         }
     }
@@ -146,7 +166,7 @@ public:
     // transfer completes, or a long run leaks the arena and the next fetch stalls.
     uint32_t in_use_slots() const {
         uint32_t in_use = 0;
-        for (uint32_t i = 0; i < TOTAL_STAGING_SLOTS; ++i) {
+        for (uint32_t i = 0; i < slot_count_; ++i) {
             if (slot_states[i] != SlotState::AVAILABLE) {
                 ++in_use;
             }
@@ -170,7 +190,7 @@ public:
 
     bool try_begin_direct_transfer(uint32_t& slot_idx) {
         if (!is_pinned()) return false;
-        for (uint32_t candidate = 0; candidate < TOTAL_STAGING_SLOTS; ++candidate) {
+        for (uint32_t candidate = 0; candidate < slot_count_; ++candidate) {
             if (slot_states[candidate] == SlotState::AVAILABLE) {
                 begin_direct_transfer(candidate);
                 slot_idx = candidate;
@@ -217,14 +237,14 @@ public:
 
     // Direct pointer to one opaque expert payload staging slot.
     uint8_t* get_slot_ptr(uint32_t slot_idx) {
-        if (slot_idx >= TOTAL_STAGING_SLOTS) {
+        if (slot_idx >= slot_count_) {
             throw std::runtime_error("PrefetchStagingArena: Slot index " + std::to_string(slot_idx) + " out of bounds");
         }
         return h_pinned_base + static_cast<size_t>(slot_idx) * format_.payload_bytes;
     }
 
     const uint8_t* get_slot_ptr(uint32_t slot_idx) const {
-        if (slot_idx >= TOTAL_STAGING_SLOTS) {
+        if (slot_idx >= slot_count_) {
             throw std::runtime_error("PrefetchStagingArena: Slot index " + std::to_string(slot_idx) + " out of bounds");
         }
         return h_pinned_base + static_cast<size_t>(slot_idx) * format_.payload_bytes;
@@ -242,13 +262,14 @@ public:
     }
 
 private:
+    uint32_t slot_count_{TOTAL_STAGING_SLOTS};
     bool uses_hip_host_malloc_{false};
     bool uses_hip_host_register_{false};
     ExpertFormatDescriptor format_{make_current_swizzled_expert_format()};
-    std::array<std::chrono::steady_clock::time_point, TOTAL_STAGING_SLOTS> available_since_{};
+    std::vector<std::chrono::steady_clock::time_point> available_since_{};
 
     void validate_slot(uint32_t slot_idx) const {
-        if (slot_idx >= TOTAL_STAGING_SLOTS) {
+        if (slot_idx >= slot_count_) {
             throw std::runtime_error("PrefetchStagingArena: Slot index " + std::to_string(slot_idx) + " out of bounds");
         }
     }
@@ -267,19 +288,19 @@ private:
         uses_hip_host_malloc_ = other.uses_hip_host_malloc_;
         uses_hip_host_register_ = other.uses_hip_host_register_;
         format_ = other.format_;
-        for (uint32_t i = 0; i < TOTAL_STAGING_SLOTS; ++i) {
-            events[i] = other.events[i];
-            slot_states[i] = other.slot_states[i];
-            available_since_[i] = other.available_since_[i];
-            other.events[i] = nullptr;
-        }
+        slot_count_ = other.slot_count_;
+        events = other.events;
+        slot_states = std::move(other.slot_states);
+        available_since_ = std::move(other.available_since_);
+        other.events = nullptr;
         other.h_pinned_base = nullptr;
         other.uses_hip_host_malloc_ = false;
         other.uses_hip_host_register_ = false;
         other.format_ = make_current_swizzled_expert_format();
         other.is_allocated_ = false;
-        other.slot_states.fill(SlotState::AVAILABLE);
-        other.available_since_.fill(std::chrono::steady_clock::time_point{});
+        other.slot_count_ = TOTAL_STAGING_SLOTS;
+        other.slot_states.clear();
+        other.available_since_.clear();
     }
 };
 

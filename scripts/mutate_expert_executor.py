@@ -30,15 +30,19 @@ MUTATIONS = [
     (
         "EX-2 completed transfers are never reaped",
         """        supply_.reap_registry_transfers();
-        ensure_pool_headroom();""",
-        """        ensure_pool_headroom();""",
+        ensure_pool_headroom();
+        current_layer_ = layer_id;
+        state_ = supply_.dispatch_layer_prefetch(layer_id, position, ids, leases_);""",
+        """        ensure_pool_headroom();
+        current_layer_ = layer_id;
+        state_ = supply_.dispatch_layer_prefetch(layer_id, position, ids, leases_);""",
     ),
     (
         "EX-3 one slot is resolved to the neighbouring expert",
-        """            const int32_t slot = state_.vram_slots[static_cast<size_t>(k)];""",
+        """            const int32_t slot = state_.vram_slots[token_map[static_cast<size_t>(k)]];""",
         """            const int32_t slot =
-                (state_.vram_slots[static_cast<size_t>(k)] + (k == 0 ? 1 : 0)) %
-                static_cast<int32_t>(registry_.vram_capacity);""",
+                (state_.vram_slots[token_map[static_cast<size_t>(k)]] +
+                 (k == 0 ? 1 : 0)) % static_cast<int32_t>(registry_.vram_capacity);""",
     ),
     (
         "EX-4 the shared expert is dropped from the accumulator",

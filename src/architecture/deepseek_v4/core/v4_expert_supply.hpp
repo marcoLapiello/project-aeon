@@ -21,16 +21,36 @@ public:
     static constexpr uint64_t DEFAULT_DEMOTION_QUEUE_CAPACITY =
         TieredExpertSupply::DEFAULT_DEMOTION_QUEUE_CAPACITY;
 
+    // One routed expert per token, the `k` of the top-k selection. An expert is
+    // selected at most once per token (the router's top-k is a set), so a token's
+    // six entries are distinct; only across tokens does an expert repeat.
+    static constexpr uint32_t ROUTED_EXPERTS = 6;
+
+    // The state of one dispatch. It is **the layer's deduplicated set**, not one
+    // token's six experts: the `C = 1` case (decode) deduplicates to exactly six,
+    // and a chunk of `C` tokens collapses its `6C` requests to the layer's union
+    // (Step 6 D2). The parallel per-expert arrays are indexed by position in that
+    // distinct set; `token_indices[t][k]` is the distinct index of token `t`'s
+    // `k`-th expert, so a slot is stage-once and read by every token that chose it
+    // without ever permuting the slot-sum order (step §7).
     struct LayerPrefetchState {
-        std::array<int32_t, 6> vram_slots{-1, -1, -1, -1, -1, -1};
-        std::array<uint32_t, 6> global_expert_ids{0, 0, 0, 0, 0, 0};
-        std::array<uint64_t, 6> operation_ids{0, 0, 0, 0, 0, 0};
-        std::array<bool, 6> is_prefetched{false, false, false, false, false, false};
-        std::array<uint32_t, 6> staging_indices{0, 0, 0, 0, 0, 0};
-        std::array<bool, 6> io_pending{false, false, false, false, false, false};
-        std::array<uint64_t, 6> io_user_data{0, 0, 0, 0, 0, 0};
-        std::array<uint32_t, 6> io_request_counts{0, 0, 0, 0, 0, 0};
+        std::vector<int32_t> vram_slots;
+        std::vector<uint32_t> global_expert_ids;
+        std::vector<uint64_t> operation_ids;
+        std::vector<uint8_t> is_prefetched;
+        std::vector<uint32_t> staging_indices;
+        std::vector<uint8_t> io_pending;
+        std::vector<uint64_t> io_user_data;
+        std::vector<uint32_t> io_request_counts;
         TieredExpertSupply::PayloadBatch supply_batch;
+
+        // The batch shape. Decode leaves this as one token whose six indices are
+        // `0..5`; a chunk fills `token_indices` with one row per token.
+        uint32_t first_position{0};
+        uint32_t token_count{0};
+        std::vector<std::array<uint32_t, ROUTED_EXPERTS>> token_indices;
+
+        size_t expert_count() const noexcept { return supply_batch.transfers.size(); }
     };
 
     V4ExpertSupplyCoordinator() = default;
@@ -120,7 +140,6 @@ public:
         const std::vector<int32_t>& topk_experts,
         std::vector<uint32_t>& leased_experts
     ) {
-        constexpr size_t ROUTED_EXPERTS = 6;
         if (topk_experts.size() != ROUTED_EXPERTS) {
             throw std::invalid_argument(
                 "V4ExpertSupplyCoordinator: expected exactly six routed experts");
@@ -150,6 +169,77 @@ public:
             throw std::logic_error(
                 "V4ExpertSupplyCoordinator: supply returned an incomplete routed batch");
         }
+        state.first_position = pos;
+        state.token_count = 1;
+        state.token_indices.assign(1, std::array<uint32_t, ROUTED_EXPERTS>{0, 1, 2, 3, 4, 5});
+        sync_state(state);
+        return state;
+    }
+
+    // The layer-wide dispatch (Step 6 item 4): a chunk's `6C` requests issued as
+    // **one set**. The requests are deduplicated to the layer's distinct experts,
+    // each distinct expert is staged **once** and read by every token that selected
+    // it, and the per-token index map is what lets the caller rebuild each token's
+    // six expert slots without disturbing the slot-sum order.
+    //
+    // Staging indices are the distinct-set positions `0..D-1`. `D <= 6C`, and the
+    // host sizes the arena to at least that (Step 6 D4), so no transfer waits for a
+    // slot; a caller that under-sizes the arena fails loudly here rather than
+    // silently colliding two experts on one slot.
+    LayerPrefetchState dispatch_layer_prefetch_batch(
+        uint32_t target_l,
+        uint32_t first_position,
+        const std::vector<std::vector<int32_t>>& topk_experts,
+        std::vector<uint32_t>& leased_experts
+    ) {
+        if (topk_experts.empty()) {
+            throw std::invalid_argument(
+                "V4ExpertSupplyCoordinator: a layer-wide dispatch needs at least one token");
+        }
+        if (expert_registry_ == nullptr) {
+            throw std::logic_error("V4ExpertSupplyCoordinator: coordinator is not configured");
+        }
+
+        std::vector<uint32_t> distinct;
+        std::unordered_map<uint32_t, uint32_t> distinct_index;
+        std::vector<std::array<uint32_t, ROUTED_EXPERTS>> token_indices(topk_experts.size());
+
+        for (size_t token = 0; token < topk_experts.size(); ++token) {
+            if (topk_experts[token].size() != ROUTED_EXPERTS) {
+                throw std::invalid_argument(
+                    "V4ExpertSupplyCoordinator: every token must route to six experts");
+            }
+            for (uint32_t k = 0; k < ROUTED_EXPERTS; ++k) {
+                if (topk_experts[token][k] < 0) {
+                    throw std::invalid_argument(
+                        "V4ExpertSupplyCoordinator: routed expert ID cannot be negative");
+                }
+                const uint32_t gid = expert_registry_->get_global_id(
+                    target_l, static_cast<uint32_t>(topk_experts[token][k]));
+                auto found = distinct_index.find(gid);
+                if (found == distinct_index.end()) {
+                    found = distinct_index.emplace(gid, static_cast<uint32_t>(distinct.size())).first;
+                    distinct.push_back(gid);
+                }
+                token_indices[token][k] = found->second;
+            }
+        }
+
+        std::vector<TieredExpertSupply::PayloadRequest> requests;
+        requests.reserve(distinct.size());
+        for (uint32_t index = 0; index < distinct.size(); ++index) {
+            requests.push_back(TieredExpertSupply::PayloadRequest{distinct[index], index});
+        }
+
+        LayerPrefetchState state;
+        state.supply_batch = supply_.dispatch(requests, first_position, leased_experts);
+        if (state.supply_batch.transfers.size() != distinct.size()) {
+            throw std::logic_error(
+                "V4ExpertSupplyCoordinator: supply returned an incomplete layer-wide batch");
+        }
+        state.first_position = first_position;
+        state.token_count = static_cast<uint32_t>(topk_experts.size());
+        state.token_indices = std::move(token_indices);
         sync_state(state);
         return state;
     }
@@ -174,14 +264,23 @@ public:
 
 private:
     void sync_state(LayerPrefetchState& state) const {
-        for (size_t index = 0; index < state.supply_batch.transfers.size(); ++index) {
+        const size_t count = state.supply_batch.transfers.size();
+        state.vram_slots.assign(count, -1);
+        state.global_expert_ids.assign(count, 0);
+        state.operation_ids.assign(count, 0);
+        state.is_prefetched.assign(count, 0);
+        state.staging_indices.assign(count, 0);
+        state.io_pending.assign(count, 0);
+        state.io_user_data.assign(count, 0);
+        state.io_request_counts.assign(count, 0);
+        for (size_t index = 0; index < count; ++index) {
             const auto& transfer = state.supply_batch.transfers[index];
             state.vram_slots[index] = transfer.vram_slot;
             state.global_expert_ids[index] = transfer.global_expert_id;
             state.operation_ids[index] = transfer.operation_id;
-            state.is_prefetched[index] = transfer.is_prefetched;
+            state.is_prefetched[index] = transfer.is_prefetched ? 1u : 0u;
             state.staging_indices[index] = transfer.staging_idx;
-            state.io_pending[index] = transfer.io_pending;
+            state.io_pending[index] = transfer.io_pending ? 1u : 0u;
             state.io_user_data[index] = transfer.io_user_data;
             state.io_request_counts[index] = transfer.io_request_count;
         }

@@ -92,6 +92,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <stdexcept>
@@ -223,47 +224,101 @@ public:
         ensure_pool_headroom();
         current_layer_ = layer_id;
         state_ = supply_.dispatch_layer_prefetch(layer_id, position, ids, leases_);
+        batch_materialized_ = false;
+        batch_draws_ += ids.size();
+        batch_distinct_ += state_.expert_count();
+        observe_layer(layer_id);
+    }
+
+    // The layer-wide dispatch (Step 6 item 4): a chunk's `6C` routed requests
+    // issued as **one deduplicated set**. Same seam, same invariants — the only
+    // difference is that the layer's union is staged once and reused by every
+    // token, instead of each token issuing its own six transfers. `C = 1`
+    // reproduces `on_routing_ready` exactly (the dedup of six distinct ids is the
+    // six ids), so the decode path is not a second code path.
+    void on_routing_ready_batch(uint32_t layer_id,
+                                uint32_t first_position,
+                                const std::vector<std::vector<int32_t>>& ids,
+                                const std::vector<std::vector<float>>& weights) override {
+        (void)weights;
+        if (ids.empty()) {
+            throw std::invalid_argument(
+                "V4TieredExpertExecutor: a layer-wide dispatch needs at least one token");
+        }
+        supply_.reap_registry_transfers();
+        ensure_pool_headroom(static_cast<size_t>(ids.size()) *
+                             V4RoutedExpertScratch::kExperts);
+        current_layer_ = layer_id;
+        state_ = supply_.dispatch_layer_prefetch_batch(layer_id, first_position, ids, leases_);
+        batch_materialized_ = false;
+        batch_draws_ += static_cast<uint64_t>(ids.size()) *
+                        V4RoutedExpertScratch::kExperts;
+        batch_distinct_ += state_.expert_count();
         observe_layer(layer_id);
     }
 
     // `moe_accum` already holds the shared expert's output; it is the accumulator's
     // initial value, and the fixed-order reduce is the single rounding.
+    //
+    // The batch is materialized **once**, on the first token that consumes it, so
+    // the cold-read latency stays overlapped with the shared-expert pass of that
+    // token (the reason the seam splits `on_routing_ready` from
+    // `accumulate_routed` at all). Every later token of the batch reads the same
+    // resident slots through its own index map, and the slot-sum order is
+    // untouched: token `t`'s `k`-th expert is still the `k`-th operand of the
+    // fixed-order reduce, whatever distinct slot it resolves to.
     void accumulate_routed(uint32_t layer_id, uint32_t position,
                            const half* expert_input, const float* expert_weights,
                            half* moe_accum) override {
         (void)layer_id;
-        (void)position;
         if (current_layer_ != layer_id) {
             throw std::logic_error(
                 "V4TieredExpertExecutor: accumulate_routed without a matching "
                 "on_routing_ready");
         }
+        if (position < state_.first_position) {
+            throw std::logic_error(
+                "V4TieredExpertExecutor: consume before the batch's first position");
+        }
+        const uint32_t token_index = position - state_.first_position;
+        if (token_index >= state_.token_count) {
+            throw std::out_of_range(
+                "V4TieredExpertExecutor: token index past the batch's token count");
+        }
 
-        // Waits for the io_uring completions; the submission already happened.
-        supply_.materialize_layer_prefetch(state_);
+        if (!batch_materialized_) {
+            // Waits for the io_uring completions; the submission already happened.
+            supply_.materialize_layer_prefetch(state_);
+            for (size_t index = 0; index < state_.expert_count(); ++index) {
+                if (!state_.is_prefetched[index]) {
+                    continue;
+                }
+                // The upload may be in flight on a side stream. The supply records a
+                // per-transfer event on the stream that carries the upload, and waiting
+                // on it here is what orders this batch's kernels behind the copy — the
+                // one ordering the executor must not skip. Waited once per distinct
+                // expert, not once per token, because the transfer is shared.
+                supply_.mark_gpu_readiness_wait_start(state_.operation_ids[index]);
+                const uint32_t staging_idx = state_.staging_indices[index];
+                CHECK_HIP(hipStreamWaitEvent(
+                    streams_.compute, staging_.events[staging_idx], 0));
+                if (std::find(staging_in_use_.begin(), staging_in_use_.end(), staging_idx) ==
+                    staging_in_use_.end()) {
+                    staging_in_use_.push_back(staging_idx);
+                }
+            }
+            batch_materialized_ = true;
+        }
 
+        const auto& token_map = state_.token_indices[token_index];
         kernel::SwizzledW13ExpertPtrs w13{};
         kernel::SwizzledW2ExpertPtrs w2{};
         for (int k = 0; k < V4RoutedExpertScratch::kExperts; ++k) {
-            const int32_t slot = state_.vram_slots[static_cast<size_t>(k)];
+            const int32_t slot = state_.vram_slots[token_map[static_cast<size_t>(k)]];
             if (slot < 0) {
                 throw std::logic_error(
                     "V4TieredExpertExecutor: the supply returned no VRAM slot for a routed expert");
             }
-            // The upload may be in flight on a side stream. The supply records a
-            // per-transfer event on the stream that carries the upload, and waiting
-            // on it here is what orders this token's kernels behind the copy — the
-            // one ordering the executor must not skip.
-            if (state_.is_prefetched[static_cast<size_t>(k)]) {
-                supply_.mark_gpu_readiness_wait_start(
-                    state_.operation_ids[static_cast<size_t>(k)]);
-                const uint32_t staging_idx =
-                    state_.staging_indices[static_cast<size_t>(k)];
-                CHECK_HIP(hipStreamWaitEvent(
-                    streams_.compute, staging_.events[staging_idx], 0));
-                staging_in_use_.push_back(staging_idx);
-            }
-
             w13.w1[k] = reinterpret_cast<const uint4*>(
                 vram_pool_.get_w1_packed(static_cast<uint32_t>(slot)));
             w13.s1[k] = vram_pool_.get_w1_scale(static_cast<uint32_t>(slot));
@@ -330,6 +385,20 @@ public:
         return leases_.size();
     }
 
+    // Distinct experts of the **last** dispatch, and the tokens it covered. Lets a
+    // gate confirm a chunk really issued one layer-wide batch (`tokens == C`) rather
+    // than a sequence of per-token ones.
+    uint32_t last_dispatch_experts() const noexcept {
+        return static_cast<uint32_t>(state_.expert_count());
+    }
+    uint32_t last_dispatch_tokens() const noexcept { return state_.token_count; }
+
+    // Cumulative `6 x tokens` draws and the distinct experts they collapsed to.
+    // `distinct < draws` is the measurement that dedup happened at all; without it
+    // a byte-exact pass could be a per-token dispatch wearing the batch's name.
+    uint64_t batch_draws() const noexcept { return batch_draws_; }
+    uint64_t batch_distinct() const noexcept { return batch_distinct_; }
+
 private:
     // Keeps the leases this token is holding from starving the next dispatch.
     //
@@ -344,9 +413,8 @@ private:
     // On a pool large enough for `6 x 43` leases this is never reached, which is
     // the intended steady state; the counter exists so a gate can say which of the
     // two regimes it ran in.
-    void ensure_pool_headroom() {
-        constexpr size_t kLayerLeases = V4RoutedExpertScratch::kExperts;
-        if (leases_.size() + kLayerLeases <= registry_.vram_capacity) {
+    void ensure_pool_headroom(size_t incoming_leases = V4RoutedExpertScratch::kExperts) {
+        if (leases_.size() + incoming_leases <= registry_.vram_capacity) {
             return;
         }
         CHECK_HIP(hipStreamSynchronize(streams_.compute));
@@ -378,6 +446,11 @@ private:
 
     uint32_t current_layer_{0};
     V4ExpertSupplyCoordinator::LayerPrefetchState state_;
+    // A layer-wide dispatch is materialized once, when its first token is
+    // consumed; every later token of the batch reads the same resident slots.
+    bool batch_materialized_{false};
+    uint64_t batch_draws_{0};
+    uint64_t batch_distinct_{0};
     std::vector<uint32_t> leases_;
     std::vector<uint32_t> staging_in_use_;
 

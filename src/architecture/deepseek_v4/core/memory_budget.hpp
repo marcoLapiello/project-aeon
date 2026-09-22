@@ -105,6 +105,15 @@ struct AeonRuntimeConfig {
     // ideal-LRU hit-rate curve next to the measured Hot hit rate.
     bool profile_routing_reuse{false};
 
+    // The body chunk `C` the layer-major prefill window runs with — the rows in
+    // flight per body invocation (Step 6 §6b). It is a memory decision: it bounds
+    // the batch scratch and, because a chunk dispatches its `6C` routed-expert
+    // requests as one deduplicated set (Step 6 D1/D4), it bounds the staging arena,
+    // which is sized `6 * prefill_chunk` slots. The default `1` reproduces decode's
+    // `C = 1` shape exactly, so nothing on the certified path moves. Step 7 exposes
+    // it as a setting and sweeps it.
+    uint32_t prefill_chunk{1};
+
     // Hardware target device index
     int device_id{0};
 

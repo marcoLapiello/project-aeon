@@ -289,6 +289,19 @@ public:
                 "V4Graph::forward_window: the chunk must be in [1, " +
                 std::to_string(V4LayerBodyBatchScratch::kMaxTokens) + "]");
         }
+        // A chunk issues its `6C` routed requests as one deduplicated set (Step 6
+        // D1/D2), each distinct expert held in its own staging slot while in
+        // transit (D4). The arena must therefore have room for the whole set, or a
+        // transfer would collide with a slot another transfer still holds. The host
+        // sizes it from `AeonRuntimeConfig::prefill_chunk`; a caller that runs a
+        // wider chunk than it configured fails here rather than at the arena.
+        if (6u * chunk > host_.staging_slot_count()) {
+            throw std::invalid_argument(
+                "V4Graph::forward_window: the chunk needs " + std::to_string(6u * chunk) +
+                " staging slots but the arena has " +
+                std::to_string(host_.staging_slot_count()) +
+                " — raise AeonRuntimeConfig::prefill_chunk");
+        }
         const uint32_t hc_dim = static_cast<uint32_t>(host_.config().hc_mult) *
                                 static_cast<uint32_t>(host_.config().hidden_size);
 

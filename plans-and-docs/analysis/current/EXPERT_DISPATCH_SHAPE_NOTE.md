@@ -58,6 +58,8 @@ Releasing at the layer boundary restores the no-reader-in-flight precondition, w
 
 **Measured, `2026-09-21` (ledger M34): there is no depth to sweep today.** In the single-dispatch path the arena is not a free-list pool — `staging_offset = (layer % 2) * 6` addresses two *fixed* banks by layer parity, so nothing ever waits for a slot. The per-transfer metric named `staging_reuse_wait_ns` is idle time since the slot last freed (mean `26–29 ms` ≈ one layer period), so slots sit idle rather than starve. `depth` only becomes a real parameter once **more than one layer's dispatch overlaps** — which is exactly what Steps 6–7 introduce, and the reason this sizing question is deferred to them rather than resolved now.
 
+**Built for the batch path, `2026-09-22` (ledger M38).** The arena's slot count is now a construction parameter, not the `12` literal: the host sizes it to the **ceiling** `max(12, 6C)` from `AeonRuntimeConfig::prefill_chunk` (`C = 1` keeps the decode shape), and the `io_uring` submission depth is sized the same way because `dispatch()` queues a whole batch's reads before its single `submit_pending_reads()`. A layer-wide batch assigns each distinct expert the staging index of its position in the distinct set, so the slots are structurally collision-free. Reaching the *smaller* target depth above — and the waving that a depth below the distinct count requires — is Step 7.
+
 ### D5 — Two independent budgets
 
 The **expert sweep's residency** (one layer's ~255 experts in **VRAM**) and the **staging arena** (**pinned host**) are separate. Never summed. Conflating them produced D4's 40 GiB error.
@@ -74,8 +76,8 @@ Every constant that *is* the `C = 1` case, and its general form:
 | :--- | :--- | :--- | :--- |
 | `EXPERTS_PER_HORIZON = 6` | `prefetch_staging.hpp` | 6 | distinct experts in flight; ≤ `6C`, bounded by 256 |
 | `NUM_BUFFERS = 2` | `prefetch_staging.hpp` | 2 | 2 (banks), unchanged |
-| `TOTAL_STAGING_SLOTS = 2 × 6 = 12` | `prefetch_staging.hpp` | 12 | `banks × depth` (D4) |
-| `staging_offset = (layer % 2) * 6` | `v4_expert_supply.hpp` | per-token offset | per-batch offset, sized by `depth` |
+| `TOTAL_STAGING_SLOTS = 2 × 6 = 12` | `prefetch_staging.hpp` | 12 | `banks × depth` (D4); now a runtime ctor parameter `max(12, 6C)` |
+| `staging_offset = (layer % 2) * 6` | `v4_expert_supply.hpp` | per-token offset | per-batch distinct-set position (`0…D-1`) in the batch dispatch |
 | `std::array<…, 6>` in `LayerPrefetchState` | `v4_expert_supply.hpp` | 6 | `6C` (deduped ≤256) |
 | `ROUTED_EXPERTS = 6` | `dispatch_layer_prefetch` | 6 | per-token `k` (unchanged); the request *count* becomes `6C` |
 | `staging_in_use_` | `v4_expert_executor.hpp` | one token | one layer's batch |

@@ -582,31 +582,54 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // to be lifted out of the per-token tail and run for the whole chunk first.
     // This is the same decomposition colibri's `coli_v4_block_window_batch_ref`
     // uses (attention for all, then a whole-chunk MoE union).
+    //
+    // All three land together (committed `2026-09-21`): the phase split, the
+    // layer-wide dispatch, and the depth-sized staging arena are one change, not
+    // three. The split alone, with the per-token dispatch, separates
+    // `on_routing_ready` from `on_routed_consumed` and lets the staging arena hand
+    // the same six slots to every token at a layer; the layer-wide dispatch alone,
+    // without the split, cannot know all `C` selections before the first token's
+    // MoE. `on_routing_ready_batch` is what makes the split correct.
 
     // Phase 2a — attention through the FFN RMSNorm, for every token. Each token
     // composes its own row-set, because the row-set is a property of the query's
     // position.
-    // Phase 2.
-    //
-    // Note: the three sub-phases below (attention for all, router for all, one
-    // layer-wide dispatch, MoE for all) are the shape Step 6 item 4 needs, but
-    // they are only valid **together with** a chunk-wide expert dispatch. With the
-    // per-token dispatch they separate `on_routing_ready` from
-    // `on_routed_consumed`, and the staging arena — whose slots are addressed by
-    // layer parity, six per layer — then hands the same six slots to every token at
-    // the layer at once. So the per-token tail is kept until the layer-wide
-    // dispatch lands.
-    std::vector<V4LayerBodyOutput> outputs(count);
+    std::vector<V4LayerBodyRow> views(count);
     for (uint32_t row = 0; row < count; ++row) {
         const uint32_t query_position = start_position + row;
-        V4LayerBodyRow view = workspace.row(row);
-        view.composed_rows = static_cast<int32_t>(compose_local_rows(
+        views[row] = workspace.row(row);
+        views[row].composed_rows = static_cast<int32_t>(compose_local_rows(
             layer, workspace, start_position, row, query_position, stream));
-        view.d_composed_keys = workspace.composed_keys();
-        view.d_composed_positions = workspace.composed_positions();
-        outputs[row] = run_layer_body_attention_tail(
-            layer, view, tables, token_ids[row], query_position, stream,
-            experts, observer, pre[row]);
+        views[row].d_composed_keys = workspace.composed_keys();
+        views[row].d_composed_positions = workspace.composed_positions();
+        run_layer_body_attention_and_norm(layer, views[row], tables, token_ids[row],
+                                          query_position, stream, observer, pre[row]);
+    }
+
+    // Phase 2b — the router for every token. The selections have to reach the host
+    // before the layer's union can be issued as one set; `run_layer_body_router`
+    // already synchronizes to read their top-k back.
+    std::vector<V4LayerBodyOutput> outputs(count);
+    std::vector<std::vector<int32_t>> batch_ids(count);
+    std::vector<std::vector<float>> batch_weights(count);
+    for (uint32_t row = 0; row < count; ++row) {
+        outputs[row] = run_layer_body_router(layer, views[row], token_ids[row],
+                                             start_position + row, stream, observer, pre[row]);
+        batch_ids[row] = outputs[row].topk_indices;
+        batch_weights[row] = outputs[row].topk_weights;
+    }
+
+    // The one layer-wide dispatch: the chunk's `6C` requests as a deduplicated set
+    // (Step 6 item 4 / D1–D2). Leases are released at the layer boundary by the
+    // caller (`V4Graph::forward_window`), which is Step 0 D3.
+    experts.on_routing_ready_batch(static_cast<uint32_t>(layer.layer_id), start_position,
+                                   batch_ids, batch_weights);
+
+    // Phase 2c — the shared expert, the routed accumulate and the FFN post, for
+    // every token.
+    for (uint32_t row = 0; row < count; ++row) {
+        run_layer_body_moe_and_post(layer, views[row], start_position + row, stream,
+                                    experts, observer, pre[row]);
     }
 
     // Commit. Only now may the ring move: every query that could have needed a

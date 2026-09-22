@@ -370,6 +370,29 @@ public:
         return staging_ ? staging_->in_use_slots() : 0;
     }
 
+    // The staging arena's slot count. A batch dispatcher must not assign more
+    // distinct staging indices than this, and the layer-major window refuses a
+    // chunk whose `6C` requests would exceed it.
+    uint32_t staging_slot_count() const noexcept {
+        return staging_ ? staging_->slot_count() : 0;
+    }
+
+    // The shape of the last expert dispatch: tokens covered, and the distinct
+    // experts they resolved to. A gate reads these to show a chunk issued one
+    // layer-wide batch (`tokens == C`) and that dedup collapsed its `6C` draws.
+    uint32_t last_expert_dispatch_tokens() const noexcept {
+        return executor_ ? executor_->last_dispatch_tokens() : 0;
+    }
+    uint32_t last_expert_dispatch_experts() const noexcept {
+        return executor_ ? executor_->last_dispatch_experts() : 0;
+    }
+    uint64_t expert_batch_draws() const noexcept {
+        return executor_ ? executor_->batch_draws() : 0;
+    }
+    uint64_t expert_batch_distinct() const noexcept {
+        return executor_ ? executor_->batch_distinct() : 0;
+    }
+
     // The demotion-queue capacity the supply was configured with, after the derived
     // default and the `demotion_queue_capacity` override are resolved. Reported so a
     // gate can name which arm of the Step 5 A/B it ran.
@@ -478,10 +501,32 @@ private:
         // arena and the reader are built for the *artifact's* format, not the
         // backend's default, so a payload's staging slot is the artifact's own
         // `payload_bytes` wide.
+        //
+        // The arena's slot count is the decode shape unless a prefill chunk is
+        // configured (Step 6 D4): a chunk issues up to `6C` deduplicated transfers
+        // as one set, and each distinct expert needs its own slot in transit. Sized
+        // to the **ceiling** `6C` here, so no transfer ever waits for a slot; the
+        // Step 7 sweep picks the smaller concurrency depth.
         vram_pool_.allocate(budget_.hot_vram_slots, format);
-        staging_ = std::make_unique<PrefetchStagingArena>(format);
+        const uint32_t staging_slots = std::max<uint32_t>(
+            PrefetchStagingArena::TOTAL_STAGING_SLOTS,
+            PrefetchStagingArena::EXPERTS_PER_HORIZON * runtime_cfg.prefill_chunk);
+        staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
+
+        // The direct reader's submission queue must hold a whole layer-wide batch's
+        // reads at once: `dispatch()` queues every cold request of the batch before
+        // it calls `submit_pending_reads()` a single time, so a queue shallower than
+        // `6C x chunks-per-expert` would overflow on the batch rather than stream it.
+        // Sized to that ceiling beside the arena; the decode default (chunk 1) keeps
+        // the historical 64. (Waving the submission to a smaller depth is a Step 7
+        // concern.)
+        const size_t batch_requests =
+            direct_requests_per_expert(format) * PrefetchStagingArena::EXPERTS_PER_HORIZON *
+            std::max<uint32_t>(1, runtime_cfg.prefill_chunk);
+        const uint32_t io_queue_depth = static_cast<uint32_t>(
+            std::max<size_t>(64, batch_requests));
         io_reader_ = std::make_unique<aeon::io::DirectIOReader>(
-            64, true, format.sector_size);
+            io_queue_depth, true, format.sector_size);
 
         // 11 — the registry. It is what decides residency for every request, and
         // it saturates VRAM at construction: every Hot slot is owned from the

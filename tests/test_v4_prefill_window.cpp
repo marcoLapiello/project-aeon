@@ -169,10 +169,19 @@ int main() {
 
     aeon::core::AeonRuntimeConfig runtime;
     runtime.context_size = kContext;
+    // The layer-major window dispatches a chunk's `6C` routed requests as one
+    // deduplicated set (Step 6 item 4), each distinct expert held in a staging slot
+    // while in transit. Configure a prefill chunk at least as large as the window
+    // so the host sizes the arena for it (Step 6 D4); a smaller configuration would
+    // be refused by `forward_window` rather than silently colliding two transfers.
+    runtime.prefill_chunk = kWindow;
 
     V4ModelHost host;
     host.initialize(kModelDir, runtime, /*verbose=*/true);
     V4Graph graph(host);
+
+    std::printf("\n  staging arena: %u slots (chunk %u -> 6C = %u)\n",
+                host.staging_slot_count(), kWindow, 6u * kWindow);
 
     const HostShape shape = shape_of(host);
 
@@ -186,10 +195,15 @@ int main() {
     std::printf("\n[A] The serial reference (the certified path, one token at a time)\n");
     host.reset_generation_state();
     const Snapshot serial = capture_serial(host, graph, ids);
+    const uint64_t serial_draws = host.expert_batch_draws();
+    const uint64_t serial_distinct = host.expert_batch_distinct();
 
     std::printf("\n[B] The layer-major window (one body invocation per layer)\n");
     host.reset_generation_state();
     const Snapshot window = capture_window(host, graph, ids, kWindow);
+    const uint32_t window_batch_tokens = host.last_expert_dispatch_tokens();
+    const uint64_t window_draws = host.expert_batch_draws() - serial_draws;
+    const uint64_t window_distinct = host.expert_batch_distinct() - serial_distinct;
 
     std::printf("\n[C] The same window at a smaller body chunk (several per layer)\n");
     host.reset_generation_state();
@@ -230,6 +244,17 @@ int main() {
 
     assert_that("C: the staging arena drained", host.staging_in_use_slots() == 0,
                 std::to_string(host.staging_in_use_slots()) + " slots in use");
+
+    // D — the dispatch really is the layer-wide one, and it really deduplicates.
+    // Without these a byte-exact pass could be the per-token dispatch under the
+    // batch's name, and `window == serial` would prove nothing about item 4.
+    assert_that("D: the window issued one layer-wide batch",
+                window_batch_tokens == kWindow,
+                std::to_string(window_batch_tokens) + " tokens in the last dispatch");
+    assert_that("D: dedup collapsed the chunk's 6C draws",
+                window_distinct > 0 && window_distinct < window_draws,
+                std::to_string(window_distinct) + " distinct of " +
+                    std::to_string(window_draws) + " draws");
 
     std::printf("\n  window %u tokens, residual compared over %u fp32 values (%u per token)\n",
                 kWindow, shape.hc_dim, shape.hc_dim);
