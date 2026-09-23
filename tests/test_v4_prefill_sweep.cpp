@@ -172,7 +172,7 @@ int main() {
     // shadows legitimately, by design (a Warm expert in the frontier is copied, not
     // promoted).
     const uint32_t shadows_before_switch = host.registry().shadow_resident_count();
-    host.prefill_begin();
+    host.prefill_begin(kWindow);
     const bool streaming = host.registry().prefill_streaming();
     const uint32_t hot_after_drain = host.prefill_sweep().hot_after_drain();
     const std::vector<uint32_t> drained = host.registry().restore_set();
@@ -272,6 +272,25 @@ int main() {
                 std::to_string(host.staging_in_use_slots()) + " slots in use");
     assert_that("C: registry invariants hold", host.registry().invariants_hold(),
                 "invariants_hold()");
+
+    // ---- the prompt-length gate (Step 3) -------------------------------------
+    //
+    // Asserted on the predicate rather than by running a short window: the routed
+    // path below the gate is measured by the A/B, and executing it here would add a
+    // second full prompt's worth of reads to a gate about the switch. What matters
+    // here is that the switch is a function of the window length and of nothing else.
+    std::printf("\n[E] The prompt-length gate\n");
+    const uint32_t gate = host.prefill_sweep_min_tokens();
+    const uint32_t expected_gate = per_layer >= 4 ? per_layer / 4 : 1;
+    assert_that("E: the default gate is the layer width over four",
+                gate == expected_gate,
+                "gate " + std::to_string(gate) + " = E/4 of " + std::to_string(per_layer));
+    assert_that("E: a window at the gate engages the sweep",
+                host.prefill_sweep_engaged_for(gate),
+                "window " + std::to_string(gate));
+    assert_that("E: a window below the gate does not",
+                gate <= 1 || !host.prefill_sweep_engaged_for(gate - 1),
+                "window " + std::to_string(gate > 1 ? gate - 1 : 1));
 
     std::printf("\n  window %u tokens (chunk %u) over %u layers, %u experts each\n",
                 kWindow, kChunk, layers, per_layer);

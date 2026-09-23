@@ -168,13 +168,24 @@ struct AeonRuntimeConfig {
     bool freeze_warm_during_prefill{true};
 
     // Step 6 item 6: drive the layer-major prefill window with the **expert sweep**
-    // instead of the per-token dispatch. The sweep drains Hot on entry, holds a
-    // sliding window of whole layer sets (`L, L+1, L+2, …` up to capacity), releases
-    // each layer's whole set as it retires, and leaves Hot empty on exit — so Warm
-    // and its LRU ranking are untouched across the whole prefill and decode resumes
-    // on them. On by default; it is the prefill strategy the plan decided (D-a).
-    // Falls back to the per-token path when the Hot pool cannot hold a whole layer.
+    // instead of the per-token dispatch. The sweep frees only what it needs on
+    // entry, holds a sliding window of whole layer sets (`L, L+1, L+2, …` up to
+    // capacity), releases each layer's prefill-admitted set as it retires, and
+    // leaves the residents preserved at entry resident on exit — so Warm and its LRU
+    // ranking are untouched across the whole prefill and decode resumes on them. On
+    // by default; it is the prefill strategy the plan decided (D-a). Falls back to
+    // the per-token path when the Hot pool cannot hold a whole layer.
     bool prefill_sweep{true};
+
+    // The **prompt-length gate** for the sweep (Prefill Supply Strategy plan, Step
+    // 3). Below this window length the layer-major window runs the route-aware
+    // cached supply instead of the sweep: a whole-layer load over-reads a short
+    // prompt's small distinct set, so the sweep is the right strategy only for long
+    // ones. Zero (the default) derives the gate from the layer width (`E / 4`), so
+    // it is expressed in the model's own terms rather than as a constant tuned for
+    // one GPU. This is the **only** condition on the switch besides feasibility — a
+    // hidden threshold is exactly what the plan forbids.
+    uint32_t prefill_sweep_min_tokens{0};
 
     // Hardware target device index
     int device_id{0};

@@ -691,10 +691,11 @@ int main() {
     // =========================================================================
     //
     // The engine's prompt is one layer-major window, and the sweep is a **config**
-    // decision rather than a hidden threshold: with `prefill_sweep` on it drains Hot,
-    // streams whole layer sets in computation order, and leaves Hot empty on exit;
-    // with it off none of that happens. The assertion therefore runs in both
-    // directions.
+    // decision rather than a hidden threshold: with `prefill_sweep` on and a prompt
+    // at least the gate long it bounds its drain to what the pass needs, streams whole
+    // layer sets in computation order, and restores the pool on exit; below the gate,
+    // or with the sweep off, none of that happens. The assertion therefore runs in
+    // both directions.
     //
     // **This section is last, and why.** A swept engine is a second `V4ModelHost`, and
     // one host's dense container is ~13 GiB of a 24 GiB card — two cannot be resident
@@ -758,10 +759,10 @@ int main() {
                             std::to_string(loads) + " layer loads, " +
                                 std::to_string(swept_engine.host().prefill_sweep().experts_streamed()) +
                                 " experts streamed");
-        harness.assert_that("H: Hot was drained on entry — nothing crossed over",
-                            swept_engine.host().prefill_sweep().hot_after_drain() == 0,
+        harness.assert_that("H: the drain was bounded — the pool was not flushed",
+                            swept_engine.host().prefill_sweep().hot_after_drain() > 0,
                             std::to_string(swept_engine.host().prefill_sweep().hot_after_drain()) +
-                                " Hot residents at the switch");
+                                " Hot residents preserved at the switch");
         harness.assert_that("H: the switch left nothing behind",
                             swept_engine.host().outstanding_expert_leases() == 0 &&
                                 swept_engine.host().staging_in_use_slots() == 0 &&

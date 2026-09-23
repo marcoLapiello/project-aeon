@@ -315,11 +315,11 @@ public:
         const uint32_t workspace_tokens = std::min(chunk, count);
 
         // Step 6 item 6: the window is the swept prefill whenever the sweep is
-        // enabled and the Hot pool can hold a whole layer. It drains Hot on entry,
-        // keeps a sliding window of whole layer sets in layer order, and leaves Hot
-        // empty on exit — a hard switch between the two allocation strategies, not a
-        // parameter on one.
-        host_.prefill_begin();
+        // enabled and the Hot pool can hold a whole layer; below the prompt-length
+        // gate (Step 3) it is the route-aware cached supply instead. Both are the
+        // same layer-major window — only the expert supply differs. The window length
+        // `count` is what the gate reads.
+        host_.prefill_begin(count);
 
         for (uint32_t layer = 0; layer < layers; ++layer) {
             // The layer's whole set must be resident before its body runs: the

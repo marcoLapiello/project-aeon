@@ -612,21 +612,34 @@ public:
     // on the set it had before.
     //
     // Enabled only when `AeonRuntimeConfig::prefill_sweep` is set **and** the Hot pool
-    // can hold a whole layer (the sweep has no victim to evict). Otherwise the window
-    // drives the per-token dispatch, which is what the engine's `forward_token` path
-    // uses.
+    // can hold a whole layer (the sweep has no victim to evict). This is the
+    // configuration-level feasibility; whether a given window *uses* the sweep also
+    // depends on the prompt-length gate, which `prefill_sweep_engaged_for` applies.
+    // Otherwise the window drives the per-token dispatch, which is what the engine's
+    // `forward_token` path uses.
     bool prefill_sweep_enabled() const noexcept {
         return prefill_sweep_requested_ && prefill_sweep_.is_feasible();
     }
 
-    // The strategy the last window began with. Feasibility is the only condition
-    // (`V4PrefillSweep::is_feasible`); there is no window-size rule, because a hidden
-    // eligibility test is what let the sweep be off on the production path without
-    // saying so. Recorded rather than inferred so a gate can read it.
+    // The prompt-length gate, resolved at load (`E / 4` unless configured). Reported
+    // so a gate can name the switch point.
+    uint32_t prefill_sweep_min_tokens() const noexcept { return sweep_min_tokens_; }
+
+    // Whether a window of `window_tokens` runs the sweep: enabled and feasible, and
+    // at least the gate long. This is the **only** condition on the switch.
+    bool prefill_sweep_engaged_for(uint32_t window_tokens) const noexcept {
+        return prefill_sweep_enabled() && window_tokens >= sweep_min_tokens_;
+    }
+
+    // The strategy the last window began with, chosen from its length: the sweep at
+    // or above the gate, the route-aware cached supply below it. Recorded rather than
+    // inferred so a gate can read it.
     bool prefill_sweep_engaged() const noexcept { return sweep_active_; }
 
-    void prefill_begin() {
-        sweep_active_ = prefill_sweep_enabled();
+    // `window_tokens` is the window length `W`, which the driver is the only one to
+    // know at this point — the gate is read here and nowhere else.
+    void prefill_begin(uint32_t window_tokens) {
+        sweep_active_ = prefill_sweep_engaged_for(window_tokens);
         if (!sweep_active_) return;
         drain_expert_streams();
         supply_.reap_registry_transfers();
@@ -841,6 +854,14 @@ private:
         // 15 — the prefill sweep (Step 6 item 6). Borrows the same two components the
         // executor does; it runs only between `prefill_begin` and `prefill_end`.
         prefill_sweep_requested_ = runtime_cfg.prefill_sweep;
+        // The prompt-length gate (Step 3), resolved once from the layer width: `E / 4`
+        // unless the configuration set it. A derived gate keeps the switch expressed
+        // in the model's own terms instead of a constant for one GPU, and it is still
+        // a visible, overridable setting.
+        sweep_min_tokens_ = runtime_cfg.prefill_sweep_min_tokens > 0
+            ? runtime_cfg.prefill_sweep_min_tokens
+            : std::max<uint32_t>(
+                  1, static_cast<uint32_t>(config_.n_routed_experts) / 4u);
         prefill_sweep_.configure(&supply_, &registry_);
 
         // 16 — the prefill workspace (Step 6 item 7), derived from the configured
@@ -1087,6 +1108,10 @@ private:
     std::unique_ptr<V4TieredExpertExecutor> executor_;
     V4PrefillSweep prefill_sweep_;
     bool prefill_sweep_requested_{false};
+    // The prompt-length gate, resolved at load from `prefill_sweep_min_tokens`
+    // (`E / 4` unless configured). Below it a window runs the route-aware cached
+    // supply. See `prefill_sweep_min_tokens()`.
+    uint32_t sweep_min_tokens_{0};
     // Set by `prefill_begin` for the window it opens, so the per-layer hooks and
     // `prefill_end` act on the strategy that was chosen for *this* window rather
     // than re-deciding it (and so a gate can read the choice).

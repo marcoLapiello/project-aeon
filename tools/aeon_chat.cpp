@@ -71,6 +71,7 @@ struct Options {
     bool validate_registry{false};
     uint32_t prefill_window{4096};
     uint32_t prefill_chunk{64};
+    uint32_t prefill_sweep_min_tokens{0};
 };
 
 void print_usage(const char* executable) {
@@ -97,6 +98,9 @@ void print_usage(const char* executable) {
         << "  --demotion-queue <n>     Demotion-queue capacity (0 = derived from warm refill)\n"
         << "  --prefill-window <n>     Layer-major prefill window W in tokens (0 = the whole prompt)\n"
         << "  --prefill-chunk <n>      Body chunk C in tokens, 1..64 (default: 64)\n"
+        << "  --prefill-sweep-min-tokens <n>\n"
+        << "                           Prompt length at or above which the sweep supplies\n"
+        << "                           experts; below it, the routed cache (0 = E/4)\n"
         << "  --profile-routing        Print the decode routing reuse-distance (ideal-LRU) curve\n"
         << "  --validate-registry      Audit the registry after every expert operation (slow; debug)\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
@@ -201,6 +205,10 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--prefill-chunk") {
             options.prefill_chunk = static_cast<uint32_t>(parse_unsigned(
                 require_value(argc, argv, index, "--prefill-chunk"), "--prefill-chunk"));
+        } else if (argument == "--prefill-sweep-min-tokens") {
+            options.prefill_sweep_min_tokens = static_cast<uint32_t>(parse_unsigned(
+                require_value(argc, argv, index, "--prefill-sweep-min-tokens"),
+                "--prefill-sweep-min-tokens"));
         } else if (argument == "--profile-routing") {
             options.profile_routing = true;
         } else if (argument == "--validate-registry") {
@@ -332,6 +340,7 @@ int main(int argc, char** argv) {
         engine_options.runtime.validate_registry_each_request = options.validate_registry;
         engine_options.runtime.prefill_window = options.prefill_window;
         engine_options.runtime.prefill_chunk = options.prefill_chunk;
+        engine_options.runtime.prefill_sweep_min_tokens = options.prefill_sweep_min_tokens;
 
         aeon::core::V4Engine engine;
         engine.initialize(engine_options);
