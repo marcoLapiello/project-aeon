@@ -41,13 +41,13 @@ fi
 
 echo "[prefill-ab] warm=${WARM_GIB} GiB, sizes: ${SIZES[*]}"
 
-declare -A SERIAL_SWEPT
+declare -A ARM_LINE
 for n in "${SIZES[@]}"; do
-  for arm in serial swept; do
+  for arm in serial swept routed; do
     echo "[prefill-ab] $arm N=$n ..." >&2
     line=$("$BIN" "$arm" "$n" "$MODEL_DIR" "$WARM_GIB" | grep '^RESULT')
     echo "$line"
-    if [ "$arm" = serial ]; then SERIAL_SWEPT[$n,"serial"]="$line"; else SERIAL_SWEPT[$n,"swept"]="$line"; fi
+    ARM_LINE[$n,$arm]="$line"
   done
 done
 
@@ -55,21 +55,16 @@ field() { sed -n "s/.*\b$2=\([0-9.]*\).*/\1/p" <<<"$1"; }
 
 echo
 echo "=============================================================================================="
-echo "  Step 6 outcome 5 — prefill A/B (warm ${WARM_GIB} GiB)"
+echo "  Prefill A/B — serial vs swept vs routed (warm ${WARM_GIB} GiB)"
 echo "=============================================================================================="
-printf '%-7s | %-30s | %-30s | %s\n' "N" "serial (per-token)" "swept (layer-major)" "ratio"
-printf -- '--------+--------------------------------+--------------------------------+--------\n'
+printf '%-6s | %-24s | %-24s | %-24s\n' "N" "serial (per-token)" "swept (whole-layer)" "routed (bank)"
+printf -- '-------+--------------------------+--------------------------+--------------------------\n'
 for n in "${SIZES[@]}"; do
-  s="${SERIAL_SWEPT[$n,"serial"]}"; w="${SERIAL_SWEPT[$n,"swept"]}"
-  st=$(field "$s" seconds); stps=$(field "$s" tok_per_s); sn=$(field "$s" nvme_gib)
-  wt=$(field "$w" seconds); wtps=$(field "$w" tok_per_s); wn=$(field "$w" nvme_gib)
-  wl=$(field "$w" load_s); we=$(field "$w" swept)
-  ratio=$(python3 -c "print(f'{$wtps/max($stps,1e-9):.2f}x')")
-  printf '%-7s | %6.1fs %6.2f tok/s %6.1fG | %6.1fs %6.2f tok/s %6.1fG | %s\n' \
-    "$n" "$st" "$stps" "$sn" "$wt" "$wtps" "$wn" "$ratio"
-  printf '%-7s | %-30s | load %ss of %ss, swept=%s, %s G/1k tok\n' \
-    "" "" "$wl" "$wt" "$we" "$(python3 -c "print(f'{$wn*1024/max($n,1):.1f}')")"
+  s="${ARM_LINE[$n,serial]}"; w="${ARM_LINE[$n,swept]}"; r="${ARM_LINE[$n,routed]}"
+  stps=$(field "$s" tok_per_s); sn=$(field "$s" nvme_gib)
+  wtps=$(field "$w" tok_per_s); wn=$(field "$w" nvme_gib)
+  rtps=$(field "$r" tok_per_s); rn=$(field "$r" nvme_gib)
+  printf '%-6s | %6.2f tok/s %5.1f GiB  | %6.2f tok/s %5.1f GiB  | %6.2f tok/s %5.1f GiB\n' \
+    "$n" "$stps" "$sn" "$wtps" "$wn" "$rtps" "$rn"
 done
-echo "=============================================================================================="
-echo "  reference: colibri 32 tok/s (3324 tok / 103.9 s) on a 2x NVMe mirror; ~0.35 s/layer sweep"
 echo "=============================================================================================="

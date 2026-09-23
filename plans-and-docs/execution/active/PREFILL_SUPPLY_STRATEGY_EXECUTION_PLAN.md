@@ -109,7 +109,7 @@ Each step states its requirement, its gate, and its files. A step is done when i
 
 ### Step 3 — The gate setting and the strategy switch
 
-**Requirement.** Add `AeonRuntimeConfig::prefill_sweep_min_tokens`, defaulting to `E / 4` (≈64), **user-configurable** via `--prefill-sweep-min-tokens <n>`. `V4Graph::forward_window` passes the window length to `V4ModelHost::prefill_begin(count)`; the host selects **sweep** when `count ≥ gate` and **routed** otherwise. The gate is the only condition — no hidden threshold, and the selected strategy is recorded and reportable.
+**Requirement.** Add `AeonRuntimeConfig::prefill_sweep_min_tokens`, defaulting to `3E / 4` (the measured crossover, §6), **user-configurable** via `--prefill-sweep-min-tokens <n>`. `V4Graph::forward_window` passes the window length to `V4ModelHost::prefill_begin(count)`; the host selects **sweep** when `count ≥ gate` and **routed** otherwise. The gate is the only condition — no hidden threshold, and the selected strategy is recorded and reportable.
 
 **Gate.**
 - At `count ≥ gate` the sweep engages (`prefill_sweep_engaged() == true`); at `count < gate` it does not.
@@ -152,11 +152,23 @@ Each step states its requirement, its gate, and its files. A step is done when i
 
 ### Step 6 — The measurement
 
-**Requirement.** Measure the three arms — serial, swept, routed — at fixed `C`, `W`, and config, one pristine process each, across `N ∈ {gate/2, gate, 2·gate, 256, 512}`. Report the crossover and confirm the gate default is on the correct side of it. This is the measurement the plan exists to justify; it does not set a performance target, it locates the switch.
+**Requirement.** Measure the three arms — serial, swept, routed — at fixed `C`, `W`, and config, one pristine process each, across `N ∈ {32, 64, 128, 160, 192, 224, 256, 512}`. Report the crossover and confirm or correct the gate default from it.
 
-**Gate.** A table with, per arm and `N`: seconds, tok/s, NVMe bytes, and the restore cost. The gate default is confirmed or corrected from the table (a correction changes the default, not the mechanism).
+**Result (measured, `warm=0`, ledger M44).** The routed bank wins below the crossover and the sweep above it; the crossover is **≈0.7 E** tokens.
 
-**Files.** `tests/bench_prefill_ab.cpp` (add the `routed` arm), `scripts/prefill_ab.sh`.
+| `N` | serial | swept | routed | winner |
+| ---: | ---: | ---: | ---: | :--- |
+| 32 | 2.52 | 1.02 | **3.14** | routed |
+| 64 | 2.64 | 2.18 | **4.32** | routed |
+| 128 | 2.63 | 4.15 | **5.20** | routed |
+| 160 | — | 5.03 | **5.61** | routed |
+| 192 | — | **6.34** | 5.90 | swept |
+| 256 | — | **7.38** | 6.17 | swept |
+| 512 | — | **8.04** | 7.09 | swept |
+
+The gate default was corrected from the plan's earlier `E / 4` to `3 E / 4`: at 64 the routed bank is `2×` the sweep, so `E / 4` sat far below the crossover. `3 E / 4` is the round fraction above the measured `≈0.7 E`, chosen on the safe side because the sweep is a throughput optimisation the routed path never needs for correctness.
+
+**Files.** `tests/bench_prefill_ab.cpp` (the `routed` arm), `scripts/prefill_ab.sh`, ledger M44.
 
 ---
 

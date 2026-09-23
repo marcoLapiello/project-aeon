@@ -888,14 +888,16 @@ private:
         // 15 — the prefill sweep (Step 6 item 6). Borrows the same two components the
         // executor does; it runs only between `prefill_begin` and `prefill_end`.
         prefill_sweep_requested_ = runtime_cfg.prefill_sweep;
-        // The prompt-length gate (Step 3), resolved once from the layer width: `E / 4`
-        // unless the configuration set it. A derived gate keeps the switch expressed
-        // in the model's own terms instead of a constant for one GPU, and it is still
-        // a visible, overridable setting.
+        // The prompt-length gate (Step 3), resolved once from the layer width, and
+        // **placed at the measured crossover** rather than derived from theory: the
+        // A/B (`scripts/prefill_ab.sh`, ledger M44) puts the routed bank ahead of the
+        // sweep up to about `0.7 E` tokens and the sweep ahead from `0.75 E`, so the
+        // default is `3 E / 4`. It is a visible, overridable setting, and the round
+        // fraction keeps it expressed in the model's own terms.
         sweep_min_tokens_ = runtime_cfg.prefill_sweep_min_tokens > 0
             ? runtime_cfg.prefill_sweep_min_tokens
             : std::max<uint32_t>(
-                  1, static_cast<uint32_t>(config_.n_routed_experts) / 4u);
+                  1, (static_cast<uint32_t>(config_.n_routed_experts) * 3u) / 4u);
         prefill_sweep_.configure(&supply_, &registry_);
 
         // 16 — the prefill workspace (Step 6 item 7), derived from the configured

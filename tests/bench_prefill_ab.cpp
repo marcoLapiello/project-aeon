@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Prefill A/B — serial (per-token) versus the layer-major swept window.
+// Prefill A/B — serial (per-token) versus the two layer-major supplies.
 //
 // ## Why this exists
 //
@@ -20,27 +20,30 @@
 //     serial_bytes(N)  ~  N x 6 draws x 43 layers      (grows with N)
 //     sweep_bytes      ~  43 x experts_per_layer       (constant in N)
 //
+// The **routed bank** (Prefill Supply Strategy plan, Step 4) sits between them: it
+// reads each layer's union once and holds it to the layer boundary, so its cost is
+// `sum_layer |union(N)|`, which grows with N but stays below the sweep's whole-layer
+// load until the union saturates near `E`. Which supply wins is a question of N, and
+// the gate (Step 3) is the switch between them.
+//
 // So this program measures **one arm at a time**, each in its own process with a
 // pristine host, and a driver script tabulates the matrix. That isolation matters:
 // both pools are stateful, so running serial first would leave Warm populated (or
 // Hot drained) for the swept arm, and the comparison would be between a warm run and
 // a cold one.
 //
+// The `swept` and `routed` arms force the strategy with the gate (a gate of 1 always
+// sweeps, a gate above any prompt always routes) so both can be measured at the same
+// N — the production gate is the derived `E / 4`.
+//
 // ## What it does not do
 //
 // It does not assert. It prints, because the numbers are the deliverable and a
 // threshold would turn a measurement into a test that passes. Correctness under the
-// sweep is `test_v4_prefill_sweep`'s subject (byte-identical to serial, ledger
-// M40); this file never re-checks it.
+// sweep is `test_v4_prefill_sweep`'s subject (byte-identical to serial, ledger M40),
+// and under the bank `test_v4_routed_prefill`'s; this file never re-checks it.
 //
-// ## The reference, for scale
-//
-// Colibri (`aeon-references/colibri/c/deepseek_v4.c`) runs the same strategy with
-// `V4_PREFILL_CHUNK = 128` inside `V4_PREFILL_SEGMENT = 4096`, and records
-// **3324 tokens in 103.9 s = 32 tok/s** on a 2x NVMe mirror, at ~0.35 s/layer for
-// the sweep (~0.7 s/layer on one drive). Those are the numbers to compare against.
-//
-// Usage: bench_prefill_ab <arm:serial|swept> <n_tokens> [model_dir] [warm_gib]
+// Usage: bench_prefill_ab <arm:serial|swept|routed> <n_tokens> [model_dir] [warm_gib]
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -94,7 +97,8 @@ std::vector<uint32_t> make_prompt(uint32_t count, uint32_t vocab) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::printf("usage: %s <serial|swept> <n_tokens> [model_dir] [warm_gib]\n", argv[0]);
+        std::printf("usage: %s <serial|swept|routed> <n_tokens> [model_dir] [warm_gib]\n",
+                    argv[0]);
         return 2;
     }
     const std::string arm = argv[1];
@@ -109,6 +113,14 @@ int main(int argc, char** argv) {
     runtime.prefill_sweep = true;
     runtime.prefill_chunk = kChunk;
     runtime.warm_host_bytes = warm_gib * 1024ULL * 1024ULL * 1024ULL;
+    // Force the strategy so both supplies can be measured at the same N. The gate is
+    // what the window reads (Step 3); a gate of one token always sweeps, a gate above
+    // any prompt always routes. The production default is the derived `E / 4`.
+    if (arm == "swept") {
+        runtime.prefill_sweep_min_tokens = 1;
+    } else if (arm == "routed") {
+        runtime.prefill_sweep_min_tokens = 0xFFFFFFFFu;
+    }
 
     V4ModelHost host;
     host.initialize(model_dir, runtime, /*verbose=*/false);
@@ -133,7 +145,7 @@ int main(int argc, char** argv) {
         for (uint32_t position = 0; position < n; ++position) {
             (void)graph.forward_token(ids[position], position, host.streams().compute);
         }
-    } else if (arm == "swept") {
+    } else if (arm == "swept" || arm == "routed") {
         (void)graph.forward_window(ids.data(), 0, n, kChunk, host.streams().compute);
     } else {
         std::printf("unknown arm: %s\n", arm.c_str());

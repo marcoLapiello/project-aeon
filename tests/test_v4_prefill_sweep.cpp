@@ -128,6 +128,8 @@ int main() {
     runtime.warm_host_bytes = kWarmBytes;
     runtime.prefill_chunk = kChunk;
     runtime.prefill_sweep = true;
+    // Force the gate open: this gate is about the swept supply at any window length.
+    runtime.prefill_sweep_min_tokens = 1;
 
     V4ModelHost host;
     host.initialize(kModelDir, runtime, /*verbose=*/true);
@@ -275,22 +277,17 @@ int main() {
 
     // ---- the prompt-length gate (Step 3) -------------------------------------
     //
-    // Asserted on the predicate rather than by running a short window: the routed
-    // path below the gate is measured by the A/B, and executing it here would add a
-    // second full prompt's worth of reads to a gate about the switch. What matters
-    // here is that the switch is a function of the window length and of nothing else.
-    std::printf("\n[E] The prompt-length gate\n");
+    // **Forced open here** (`prefill_sweep_min_tokens = 1`) so this gate is about the
+    // sweep at any window length; the *default* gate and the routed path below it are
+    // `test_v4_routed_prefill`'s subject. What is asserted here is that the switch is
+    // a function of the window length and of the configured gate, and nothing else.
+    std::printf("\n[E] The prompt-length gate (forced open)\n");
     const uint32_t gate = host.prefill_sweep_min_tokens();
-    const uint32_t expected_gate = per_layer >= 4 ? per_layer / 4 : 1;
-    assert_that("E: the default gate is the layer width over four",
-                gate == expected_gate,
-                "gate " + std::to_string(gate) + " = E/4 of " + std::to_string(per_layer));
-    assert_that("E: a window at the gate engages the sweep",
-                host.prefill_sweep_engaged_for(gate),
-                "window " + std::to_string(gate));
-    assert_that("E: a window below the gate does not",
-                gate <= 1 || !host.prefill_sweep_engaged_for(gate - 1),
-                "window " + std::to_string(gate > 1 ? gate - 1 : 1));
+    assert_that("E: the gate is forced open for this gate", gate == 1,
+                "gate " + std::to_string(gate));
+    assert_that("E: any non-empty window engages the sweep",
+                host.prefill_sweep_engaged_for(kWindow),
+                "window " + std::to_string(kWindow));
 
     std::printf("\n  window %u tokens (chunk %u) over %u layers, %u experts each\n",
                 kWindow, kChunk, layers, per_layer);

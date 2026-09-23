@@ -100,7 +100,7 @@ void print_usage(const char* executable) {
         << "  --prefill-chunk <n>      Body chunk C in tokens, 1..64 (default: 64)\n"
         << "  --prefill-sweep-min-tokens <n>\n"
         << "                           Prompt length at or above which the sweep supplies\n"
-        << "                           experts; below it, the routed cache (0 = E/4)\n"
+        << "                           experts; below it, the routed cache (0 = 3E/4)\n"
         << "  --profile-routing        Print the decode routing reuse-distance (ideal-LRU) curve\n"
         << "  --validate-registry      Audit the registry after every expert operation (slow; debug)\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"

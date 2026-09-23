@@ -727,9 +727,12 @@ int main() {
         // Release the 13 GiB before the second host is built.
         engine.free();
 
-        // Direction 2 — the same configuration with the sweep on.
+        // Direction 2 — the same configuration with the sweep on, gate forced open so
+        // this short prompt still exercises the swept supply (the gate's own behavior
+        // is `test_v4_prefill_sweep`'s subject).
         V4EngineOptions swept_options = engine_options;
         swept_options.runtime.prefill_sweep = true;
+        swept_options.runtime.prefill_sweep_min_tokens = 1;
         V4Engine swept_engine;
         swept_engine.initialize(swept_options);
 

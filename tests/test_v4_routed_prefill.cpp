@@ -206,6 +206,15 @@ int main(int argc, char** argv) {
     std::printf("\n--- results ---\n");
 
     const bool bank_engaged = prefill_active;
+    assert_that("A: the default gate is three quarters of the layer width",
+                gate == (per_layer * 3) / 4,
+                "gate " + std::to_string(gate) + " = 3E/4 of " + std::to_string(per_layer));
+    assert_that("A: a window at the gate would engage the sweep",
+                host.prefill_sweep_engaged_for(gate),
+                "window " + std::to_string(gate));
+    assert_that("A: a window below the gate does not",
+                !host.prefill_sweep_engaged_for(gate - 1),
+                "window " + std::to_string(gate - 1));
     assert_that("A: the routed bank is selected exactly when the pool can hold a layer",
                 bank_engaged == routed_expected,
                 std::string("active=") + (bank_engaged ? "true" : "false") +
