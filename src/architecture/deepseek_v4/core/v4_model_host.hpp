@@ -637,33 +637,67 @@ public:
     bool prefill_sweep_engaged() const noexcept { return sweep_active_; }
 
     // `window_tokens` is the window length `W`, which the driver is the only one to
-    // know at this point — the gate is read here and nowhere else.
+    // know at this point — the gate is read here and nowhere else. Both strategies
+    // are prefill supplies; `prefill_sweep` enables them, the length picks which.
     void prefill_begin(uint32_t window_tokens) {
-        sweep_active_ = prefill_sweep_engaged_for(window_tokens);
-        if (!sweep_active_) return;
+        prefill_active_ = prefill_sweep_enabled();
+        sweep_active_ = prefill_active_ && window_tokens >= sweep_min_tokens_;
+        if (!prefill_active_) return;
         drain_expert_streams();
         supply_.reap_registry_transfers();
         executor_->release_leases();
-        prefill_sweep_.begin();
+        if (sweep_active_) {
+            prefill_sweep_.begin();
+        } else {
+            // The routed bank (Step 4): drain one layer's worth of the worst-LRU
+            // residents, keep the rest resident, and admit route-aware. The layer's
+            // union grows into the freed `E` slots and is leased until the layer
+            // retires, so it persists across the layer's chunks without a whole-layer
+            // pre-load.
+            registry_.begin_prefill_stream(
+                registry_.experts_per_layer,
+                ExpertRegistry::PrefillAlloc::BoundedEvict);
+        }
     }
 
     void prefill_before_layer(uint32_t layer) {
-        if (!sweep_active_) return;
-        prefill_sweep_.before_layer(layer);
+        if (!prefill_active_) return;
+        if (sweep_active_) prefill_sweep_.before_layer(layer);
+        // The routed path needs no pre-load: the body's router drives admission, and
+        // the union is held resident by its leases until the layer retires.
     }
 
     void prefill_after_layer(uint32_t layer) {
-        if (!sweep_active_) return;
-        prefill_sweep_.after_layer(layer);
+        if (!prefill_active_) return;
+        if (sweep_active_) {
+            prefill_sweep_.after_layer(layer);
+            return;
+        }
+        // The layer is dead the moment it retires, so its prefill-admitted set is
+        // released while the residents present at entry are spared (Step 1). Unlike
+        // the sweep — which loads a layer in one batch and settles it before the body
+        // — the routed path's **last chunk** may have left an upload in flight, and
+        // the release refuses a pending transfer, so settle and reap it first.
+        drain_expert_streams();
+        supply_.reap_registry_transfers();
+        registry_.release_layer(layer);
     }
 
     void prefill_end() {
-        if (!sweep_active_) return;
+        if (!prefill_active_) return;
         supply_.reap_registry_transfers();
-        prefill_sweep_.end();
-        // The drain was bounded, so the pool still holds the residents present at
-        // entry; reload the ones it did drain — through the normal cold path — so
-        // decode resumes on the pre-prefill set (the plan's restore requirement).
+        if (sweep_active_) {
+            prefill_sweep_.end();
+        } else {
+            // Settle the routed path's in-flight uploads before the mode change: the
+            // end refuses a pending transfer.
+            drain_expert_streams();
+            supply_.reap_registry_transfers();
+            registry_.end_prefill_stream();
+        }
+        // Reload whatever the drain freed, through the normal cold path, so decode
+        // resumes on the set the pool held before the pass (the plan's restore
+        // requirement). Shared by both strategies.
         restore_prefill_residents(loader_.expert_format());
     }
 
@@ -1108,6 +1142,9 @@ private:
     std::unique_ptr<V4TieredExpertExecutor> executor_;
     V4PrefillSweep prefill_sweep_;
     bool prefill_sweep_requested_{false};
+    // Whether the layer-major prefill supply is active at all this window (either
+    // strategy). The length picks the strategy; this says one was chosen.
+    bool prefill_active_{false};
     // The prompt-length gate, resolved at load from `prefill_sweep_min_tokens`
     // (`E / 4` unless configured). Below it a window runs the route-aware cached
     // supply. See `prefill_sweep_min_tokens()`.

@@ -227,14 +227,26 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_warm_frozen_prefill.cpp TIMEOUT 1800)
 endif()
 
-# --- Step 6 item 6: the prefill sweep (drain, layer order, empty on exit) ------
+# --- Step 6 item 6: the prefill sweep (bounded drain, layer order, restore) ----
 # Prefill and decode are two allocation strategies, so the switch between them is
-# asserted as a switch: the sweep drains Hot on entry, streams whole layer sets in
-# layer order, releases each layer as it retires, and leaves Hot empty on exit with
-# Warm untouched. The result must stay byte-identical to the serial path.
+# asserted as a switch: the sweep frees only what the pass needs, streams whole
+# layer sets in layer order, releases each layer as it retires, and restores the
+# switch-point set on exit with Warm untouched. The result must stay byte-identical
+# to the serial path.
 if(AEON_BUILD_TESTS)
     aeon_add_test(test_v4_prefill_sweep
         SOURCES tests/test_v4_prefill_sweep.cpp TIMEOUT 1800)
+endif()
+
+# --- Step 4: the routed bank (cached prefill below the sweep's gate) -----------
+# A window shorter than the gate runs the same layer-major loop with the route-aware
+# cached supply instead of a whole-layer sweep: one layer's worth of the pool is
+# drained, the rest preserved, the per-chunk union held to the layer boundary, and
+# the switch-point set restored on exit. Byte-identical to serial, and cheaper than a
+# sweep below the gate.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_routed_prefill
+        SOURCES tests/test_v4_routed_prefill.cpp TIMEOUT 1800)
 endif()
 
 # --- Tier-3 sequence: the long-context lifecycle ------------------------------

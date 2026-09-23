@@ -125,6 +125,20 @@ struct ExpertRequestReservation {
 
 class ExpertRegistry {
 public:
+    // How a prefill obtains VRAM for its loads. Both policies share the same marks,
+    // restore set, sparing release, and restoring end; only the no-free-slot case
+    // differs.
+    enum class PrefillAlloc : uint8_t {
+        // The sweep: whole-layer loads in layer order. Allocation is free-list only,
+        // because the sweep's order decides what is dead and a preserved resident is
+        // never the pass's to spend — a request with no free slot is a driver defect.
+        FreeListOnly = 0,
+        // The routed bank: route-aware, cached admission. A full free list is met by
+        // releasing the worst-ranked **non-preserved** resident, as decode would evict,
+        // so a layer's working set can be built up to its bank without stalling.
+        BoundedEvict = 1
+    };
+
     uint32_t num_layers{43};
     uint32_t experts_per_layer{256};
     uint32_t total_experts{11008};
@@ -663,7 +677,13 @@ public:
     // pool, which is the original full drain; a strategy that needs only a bounded
     // working set passes its own figure and keeps the remainder resident. Whatever
     // is drained is recorded in `restore_set()` for the caller to reload at the end.
-    void begin_prefill_stream(uint32_t drain_slots = UINT32_MAX) {
+    //
+    // `alloc` chooses how a load with no free slot is answered: the sweep's
+    // free-list-only policy, or the routed bank's release-based eviction.
+    void begin_prefill_stream(
+        uint32_t drain_slots = UINT32_MAX,
+        PrefillAlloc alloc = PrefillAlloc::FreeListOnly
+    ) {
         if (prefill_stream_) return;
         for (const auto& entry : catalog) {
             if (entry.lease_count != 0) {
@@ -716,6 +736,7 @@ public:
         }
 
         prefill_stream_ = true;
+        prefill_alloc_ = alloc;
         warm_frozen_ = true;
         validate_invariants();
     }
@@ -783,7 +804,12 @@ public:
             }
             if (entry.operation != ExpertOperation::NONE) {
                 throw std::logic_error(
-                    "ExpertRegistry: release_layer with a transfer still in flight");
+                    "ExpertRegistry: release_layer with a transfer still in flight "
+                    "(expert=" + std::to_string(entry.global_expert_id) +
+                    ", layer=" + std::to_string(layer_id) +
+                    ", operation=" + std::to_string(static_cast<int>(entry.operation)) +
+                    ", gpu_transfer=" + std::to_string(static_cast<int>(entry.gpu_transfer)) +
+                    ")");
             }
             // A resident **present at prefill entry** is preserved: it was not the
             // pass's to spend, so the per-layer release leaves it Hot. Only a
@@ -1219,20 +1245,24 @@ private:
         if (!free_vram_slots.empty()) {
             vram_slot = free_vram_slots.back();
             free_vram_slots.pop_back();
-        } else if (prefill_stream_) {
-            // Prefill streaming: the sweep allocates from the free list only and
-            // releases each layer deterministically, so there is no victim to choose
-            // (the sweep's own order decides what is dead) and no demotion to run
-            // (Warm is frozen). A request that finds no free slot means the lookahead
-            // over-committed — a driver defect, refused rather than evicted around.
+        } else if (prefill_stream_ && prefill_alloc_ == PrefillAlloc::FreeListOnly) {
+            // The sweep allocates from the free list only and releases each layer
+            // deterministically, so there is no victim to choose (its own order
+            // decides what is dead) and no demotion to run (Warm is frozen). A request
+            // that finds no free slot means the lookahead over-committed — a driver
+            // defect, refused rather than evicted around.
             throw std::runtime_error(
                 "ExpertRegistry: prefill stream has no free VRAM slot for a load "
                 "(the layer lookahead must not exceed capacity)");
-        } else if (warm_frozen_) {
-            // Frozen prefill on the legacy per-token path: an eviction is a
-            // **release**, never a demotion. The victim is a shadow residency (a Warm
-            // expert's prefill copy) when one is available, else an ordinary Hot
-            // resident; either way no ownership moves and Warm is not written to.
+        } else if (prefill_stream_ || warm_frozen_) {
+            // A prefill eviction is a **release**, never a demotion: the victim is a
+            // shadow residency (a Warm expert's prefill copy) when one is available,
+            // else an ordinary Hot resident. Either way no ownership moves and Warm is
+            // not written to. This is the routed bank's admission path, and also the
+            // legacy per-token frozen path.
+            //
+            // A resident **present at prefill entry** is never a victim: it is not the
+            // pass's to spend, and the sparing release would restore it anyway.
             for (auto it = shadow_lru_.rbegin(); it != shadow_lru_.rend(); ++it) {
                 auto& candidate = catalog[*it];
                 if (candidate.shadow_vram_slot < 0 || candidate.lease_count != 0 ||
@@ -1249,6 +1279,7 @@ private:
             for (auto it = hot_vram_lru.rbegin(); it != hot_vram_lru.rend(); ++it) {
                 auto& candidate = catalog[*it];
                 if (candidate.global_expert_id == incoming_gid ||
+                    candidate.resident_at_prefill_begin ||
                     candidate.operation != ExpertOperation::NONE ||
                     candidate.gpu_transfer != ExpertGpuTransfer::NONE ||
                     candidate.publication != ExpertPublication::PUBLISHED ||
@@ -1261,7 +1292,7 @@ private:
             if (victim == nullptr) {
                 throw std::runtime_error(
                     "ExpertRegistry: no reclaimable Hot VRAM slot is available in "
-                    "frozen prefill");
+                    "prefill (every resident is preserved, leased, or in flight)");
             }
             const uint32_t slot = static_cast<uint32_t>(victim->slot_idx);
             remove_from_lru(*victim, hot_vram_lru, victim->global_expert_id);
@@ -1487,6 +1518,8 @@ private:
     // residents preserved at entry on exit. Implies `warm_frozen_`; decode never sees
     // either flag set.
     bool prefill_stream_{false};
+    // How a prefill load with no free slot is answered. See `PrefillAlloc`.
+    PrefillAlloc prefill_alloc_{PrefillAlloc::FreeListOnly};
     // The Hot residents drained at `begin_prefill_stream`, for the caller to reload
     // after `end_prefill_stream`. See `restore_set()`.
     std::vector<uint32_t> restore_set_;
