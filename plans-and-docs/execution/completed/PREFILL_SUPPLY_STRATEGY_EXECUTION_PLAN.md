@@ -1,6 +1,6 @@
 # Prefill Supply Strategy Execution Plan
 
-*Status: complete (Steps 1–7, 2026-09-23). Opened 2026-09-23. Refines Step 6–7 of [EXPERT_STREAMING_EXECUTION_PLAN.md](EXPERT_STREAMING_EXECUTION_PLAN.md); supersedes the supply proposals of [PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md](../../analysis/current/PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) §5.3, §8, §9.4, §9.6 (its multi-GPU material is out of scope here). Measurement is ledger [M44](../../status/PERFORMANCE_LEDGER.md).*
+*Status: complete (Steps 1–7, 2026-09-23). Opened 2026-09-23. Refines Step 6–7 of [EXPERT_STREAMING_EXECUTION_PLAN.md](../active/EXPERT_STREAMING_EXECUTION_PLAN.md); supersedes the supply proposals of [PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md](../../analysis/current/PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) §5.3, §8, §9.4, §9.6 (its multi-GPU material is out of scope here). Measurement is ledger [M44](../../status/PERFORMANCE_LEDGER.md).*
 
 **Subject.** One layer-major batched prefill, two expert-supply strategies chosen by a visible prompt-length gate, and a Hot-pool **restore** that both strategies share.
 

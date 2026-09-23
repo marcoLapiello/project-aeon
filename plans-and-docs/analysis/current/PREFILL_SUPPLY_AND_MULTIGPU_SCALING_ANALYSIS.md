@@ -1,6 +1,6 @@
 # Prefill Supply and Multi-GPU Scaling — a critical review
 
-*Status: open analysis. Written 2026-09-22. Records a brainstorming session on whether the Step 6 prefill sweep and its supply strategy will scale to a multi-GPU rig, and where the sweep's claims are weaker than they read. No code. The actionable sequence stays in [EXPERT_STREAMING_EXECUTION_PLAN.md](../../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md); this document supplies the reasoning and the experiments that plan should absorb.*
+*Status: **absorbed** for §5.3, §8, §9.4, §9.6 — the supply proposals are implemented or superseded by [Prefill Supply Strategy](../../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md), and §9.1's missing arm / §9.4's visible gate are measured there (ledger M44/M44b). **Open for §7, the multi-GPU questions**, which that plan scopes out. Written 2026-09-22; records a brainstorming session on whether the Step 6 prefill sweep and its supply strategy will scale to a multi-GPU rig, and where the sweep's claims are weaker than they read. No code. The remaining actionable sequence is §6–§7's multi-GPU pre-questions; the plan is [EXPERT_STREAMING_EXECUTION_PLAN.md](../../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md).*
 
 **Subject.** The routed-expert supply on the assembled graph, examined in two directions it has not been examined in: (1) whether the swept prefill actually beats a cached (decode-style) supply in the same batched setting, and (2) what happens to both when the hardware scales beyond one GPU. Reference comparison is [Colibri](file:///home/marcolap/aeon-references/colibri), the closest sibling implementation, whose prefill supply differs from ours in one decisive respect.
 
@@ -269,11 +269,11 @@ If spare VRAM exists, A/B D-d (shared pool, drain on entry) against a dedicated 
 
 ## 11. Disposition
 
-| Item | Where it goes |
-| :--- | :--- |
-| Missing arm (§9.1) | New experiment in the plan's open work; **sequence first**. |
-| Overhead attribution (§9.2) | Feeds the plan's open `≈120 ms/prompt-token` investigation. |
-| Reference re-sourcing (§9.3) | Correct the plan's §6 and any target derived from it. |
-| Visible gate (§9.4) | New setting; resolves the plan's removed-threshold misgiving. |
-| Multi-GPU pre-questions (§9.5), bank A/B (§9.6) | New open work under the multi-GPU future direction. |
-| Bank-versus-pool decision record (§8) | Append to the plan's D-d rationale so the choice is explicit. |
+| Item | Where it goes | Status |
+| :--- | :--- | :--- |
+| Missing arm (§9.1) | New experiment in the plan's open work; **sequence first**. | **done** — the `routed` arm, ledger M44/M44b |
+| Overhead attribution (§9.2) | Feeds the plan's open `≈120 ms/prompt-token` investigation. | open (still in [EXPERT_STREAMING plan](../../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) §6) |
+| Reference re-sourcing (§9.3) | Correct the plan's §6 and any target derived from it. | **partly** — the `31 tok/s` claim was retired from the bench; the body/supply split is still owed |
+| Visible gate (§9.4) | New setting; resolves the plan's removed-threshold misgiving. | **done** — `--prefill-sweep-min-tokens`, default `3 E / 4` |
+| Multi-GPU pre-questions (§9.5), bank A/B (§9.6) | New open work under the multi-GPU future direction. | open — this document's remaining subject |
+| Bank-versus-pool decision record (§8) | Append to the plan's D-d rationale so the choice is explicit. | **done** — the routed bank reserves within the pool; D-d updated |

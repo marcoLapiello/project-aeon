@@ -1,6 +1,6 @@
 # Project Aeon — Documentation Status
 
-**Audited: 2026-09-18, on branch `rewrite/graph-v2`.**
+**Audited: 2026-09-23, on branch `main`.**
 
 This file is the navigation point for project state. It is deliberately short: detailed numbers belong in [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md), design rationale in the reference documents, and step-by-step implementation in the plan linked below. [AGENTS.md](../../AGENTS.md) carries the engineering rules.
 
@@ -29,11 +29,12 @@ The graph is **built and speaks**. Each row points at the document that owns the
 | Tier 4 — item 23: the generating loop | closed by P0–P4 | [composition plan](../execution/completed/DSV4_GRAPH_COMPOSITION_PLAN.md) §7 |
 | P0–P4 — executor seam, head end, 43-layer driver, sampler, text binding | built; acceptance criterion met | composition plan §7 |
 | Real-scale state — window 128 and `index_topk` 512 together | certified | plan §Tier 3 |
+| Prefill supply strategy — prompt-length gate, routed bank, Hot-set restore | complete | [Prefill Supply Strategy](../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md); ledger M44/M44b |
 | Pre-rewrite graph and its gate | deleted 2026-09-18, ~5,600 lines | [CODEBASE_MAP.md](CODEBASE_MAP.md) |
 
 | Field | Value |
 | :--- | :--- |
-| Branch | `rewrite/graph-v2` (`main` is the pre-rewrite state, untouched) |
+| Branch | `main` |
 | Default `ctest` | 44 tests |
 
 Gate results, tolerances, mutation tallies and their findings belong to the plan and the ledger. This table is a pointer, not a record.
@@ -50,7 +51,7 @@ Gate results, tolerances, mutation tallies and their findings belong to the plan
 | [EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md) | **Next work.** Expert transfer on the live path: tiering under miss pressure, then chunked prefill with a chunk-wide expert dispatch. |
 | [SESSION_STATE_AND_SWAP_ANALYSIS.md](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) | **Open.** Session aggregate, registry, residency seam, cold-tier store, R4. Session swap before the prefix matcher. |
 | [HOST_MEMORY_PRESSURE_INVESTIGATION.md](../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) | **Open investigation.** Why a large Warm tier never finishes loading on a `62.62 GiB` host. Records the hypotheses that were **refuted** (so they are not retried), the dense-page release that was kept, and the one measurement that would split the problem. No root cause yet. |
-| [PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md](../analysis/current/PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) | **Open.** Critical review of the Step 6 prefill sweep: the missing "batched + cached supply" arm, the small-`N` byte crossover (~94 tokens), Colibri's route-aware prefill bank versus our blind sweep, the VRAM-ownership trade, and what actually scales on multi-GPU (capacity and storage topology, not concurrency). Supplies experiments the plan should absorb; does not re-open numerics. |
+| [PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md](../analysis/current/PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) | **Absorbed (keep for chronology).** Critical review of the Step 6 prefill sweep. Its supply proposals (§5.3, §8, §9.4, §9.6) are implemented or superseded by [Prefill Supply Strategy](../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md); its §9.1 missing arm and §9.4 visible gate are measured (M44/M44b). What it still owns: the **multi-GPU** questions (§7), which remain open and out of the completed plan's scope. Does not re-open numerics. |
 | [SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md](../analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md) | **Open.** Hot-path audit of the supply road. Finds the NVMe read submission is a proper pipelined river, but the swept layer's H2D is host-synchronized in front of its compute (one staging bank forces reads and uploads onto opposite sides of a fence — the plan's open `banks × depth` item), plus two unconditional `O(catalog)` scans per request (`pending_transfer_count`, the no-demotion catalog scan). All estimates reasoned, none measured; §5 names the counters that would settle them. |
 | [KERNEL_COMPUTE_PATH_ANALYSIS.md](../analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md) | **Open.** Compute-path audit of the layer body. Finds the prefill MoE (routed *and* shared expert) still runs per-token GEMV, leaving the routed path at ~`4 FLOP/byte` against a ~`62 FLOP/byte` ridge — the compute half of "batched prefill" is unbuilt (K1); no matrix-core instructions exist in the tree (K2); int4 unpack spends ~2 ALU ops/element (K3); the dense/shared path is 1-token scalar + per-token memset (K4). Proposes phase attribution before any implementation; §6. |
 
@@ -73,6 +74,7 @@ Gate results, tolerances, mutation tallies and their findings belong to the plan
 | [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) | Open | Descriptor-driven artifacts and manifest implemented; factory and second-backend gates remain. |
 | [MODEL_CORRECTNESS_EXECUTION_PLAN.md](../execution/superseded/MODEL_CORRECTNESS_EXECUTION_PLAN.md) | **Superseded** | The staged in-place repair approach, replaced by the plan. Retained for chronology. |
 | [WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) | Complete | Persistent Warm ownership, asynchronous refill, source-tier telemetry. See the [closure report](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_AB_REPORT.md). |
+| [PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md](../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) | Complete | The two-strategy layer-major prefill supply: a visible prompt-length gate (`3 E / 4`) selecting the expert sweep above it and a routed bank below, a bounded Hot drain, and the Hot-set restore both share. Ledger M44/M44b. |
 | [PHASE_0_EXECUTION_PLAN.md](../execution/completed/PHASE_0_EXECUTION_PLAN.md) | Complete | Build, hardware, I/O, overlap, and toy-cache foundations. |
 | [PHASE_1_EXECUTION_PLAN.md](../execution/completed/PHASE_1_EXECUTION_PLAN.md) | Complete | Single-GPU runtime gates. Its correctness portion is superseded by the plan. |
 
@@ -97,7 +99,7 @@ Pointers only. Each gate is specified, with its procedure and its result, in the
 
 **Open work** — both extracted from the composition plan on 2026-09-18:
 
-- [Expert Streaming and Chunked Prefill](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md): the routed-expert supply — telemetry, the tier-invariance and starved-pool gates, the demotion-queue A/B, and the layer-major prefill sweep (chunk-wide deduplicated expert dispatch, a Warm tier frozen across the prefill, a layer-ordered draining sweep, and the engine's prompt bound to that window) — **all built and gated**. Outcome 5 is met with a measured baseline (M42: swept `5.71`/`6.96 tok/s` against serial `2.48`/`2.42` at `N = 256`/`512`, swept bytes constant at `145.1 GiB` vs serial's `1.54 GiB/token`). Open work: the `W`/`C` window sweep, the prefill body's `≈120 ms/prompt-token`, the staging arena's `banks × depth` target, and prefix reuse. Its working document supersedes [the analysis](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md).
+- [Expert Streaming and Chunked Prefill](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md): the routed-expert supply — telemetry, the tier-invariance and starved-pool gates, the demotion-queue A/B, and the layer-major prefill sweep (chunk-wide deduplicated expert dispatch, a Warm tier frozen across the prefill, a layer-ordered draining sweep, and the engine's prompt bound to that window) — **all built and gated**. Outcome 5 is met with a measured baseline (M42: swept `5.71`/`6.96 tok/s` against serial `2.48`/`2.42` at `N = 256`/`512`, swept bytes constant at `145.1 GiB` vs serial's `1.54 GiB/token`). Its prefill **supply** half is complete in [Prefill Supply Strategy](../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) (M44/M44b: the gate, the bounded drain, the routed bank, the restore). Open work (§6): the `W`/`C` window sweep, the prefill body's `≈120 ms/prompt-token`, the staging arena's `banks × depth` target, the cold→warm fill path, the placement policy, and prefix reuse. Its working document supersedes [the analysis](../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md).
 - [Session State and Swap](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md): the session aggregate, registry, residency seam, cold-tier store and R4. Session swap precedes the prefix **matcher**, which is deliberately deferred along with MTP and multi-GPU.
 
 **Measurement gates, settled empirically rather than by reading:**

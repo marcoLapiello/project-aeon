@@ -2,6 +2,8 @@
 
 *Status: active. Opened 2026-09-19. Supersedes [Expert Streaming and Chunked Prefill Analysis](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md) as the working document.*
 
+> The prefill supply half of this plan — the prompt-length gate, the bounded drain with Hot-set restore, and the routed bank below the gate — is **complete** in [Prefill Supply Strategy](../completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) (ledger M44/M44b). What remains open here is §6.
+
 **Subject:** the routed-expert supply on the assembled graph — proving it lossless under pressure, then making it fast in the phase that can be made fast.
 
 **Scope.** The graph's numerics are certified elsewhere and are not re-opened here. The storage layer's own targets, session/prefix state, and KV precision are not this plan's. Measurements are recorded in the [Performance Ledger](../../status/PERFORMANCE_LEDGER.md); this document is the implementation sequence and the open work.
@@ -42,7 +44,7 @@
 | Strategy | What it does | Verdict |
 | :--- | :--- | :--- |
 | **Candidate staging** | fetch experts *predicted* for future layers, ranked by a routing profile | **Weak in both phases.** Hiding a cold read needs far more lead time than one layer's compute, and the pool cannot cover the horizon. |
-| **Expert sweep** | when a chunk touches nearly every expert in a layer, fetch the layer's set once, use it for the whole chunk, then move to the next layer | **Strong in prefill.** No prediction and no lead time — the set is known. |
+| **Expert sweep** | when a chunk touches nearly every expert in a layer, fetch the layer's set once, use it for the whole chunk, then move to the next layer | **Strong in prefill, above the prompt-length gate.** No prediction and no lead time — the set is known. Below the gate a blind whole-layer load over-reads the prompt's smaller distinct set, so the **routed bank** supplies instead; see [Prefill Supply Strategy](../completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md). |
 
 ---
 
@@ -170,7 +172,7 @@ Prefill streams in layer order through the real host, with the swept supply on t
 | **D-a** | **Layer-major within a bounded window `W`.** For each window, visit layers 0…42, each in body chunks `C ≤ W`. Chunk-major is the degenerate `W = C`. | Fetches each layer's expert set **once per window**, not once per chunk. Arbiter: colibri `c/deepseek_v4.c` (segment loop). |
 | **D-b** | **Warm is frozen during prefill.** No promotion, no demotion; a Warm-resident expert is read as a **non-destructive copy** (a shadow residency), and a swept expert's eviction is a **release**. | Promotion is a **move** — it returns the Warm slot to the free list and would destroy the decode set. Release leaks nothing. |
 | **D-c** | **The registry seam is kept.** The sweep goes through `on_routing_ready` / `accumulate_routed`, batched, leases released at the **layer boundary**. | Preserves the certified invariants and the dedup slot-order rule (§5) instead of adding a second path. |
-| **D-d** | **The sweep reuses the Hot pool.** No dedicated prefill bank. | VRAM is binding — dense `12.71 GiB` + KV on a `24 GiB` card. |
+| **D-d** | **The sweep reuses the Hot pool.** No dedicated prefill allocation. | VRAM is binding — dense `12.71 GiB` + KV on a `24 GiB` card. The **routed bank** below the gate reserves one layer's worth *within* the same pool rather than allocating a separate one, so no second allocation exists either; see [Prefill Supply Strategy](../completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md). |
 
 > **Naming.** The window is not any of the three existing "segments" (`HostExpertPool::SEGMENT_SLOTS`, the attention compressor's overlap, a pinned host segment). It is the **layer-major span**; colibri calls the same quantity a *prefill segment*. "Window" is used to avoid the collision.
 
@@ -195,7 +197,7 @@ $$\text{expert bytes} \approx \left\lceil \frac{N}{W} \right\rceil \times 156\,\
 3. Windowed layer-major driver: window → layers 0…42 → body chunks, with a host-owned residual carry.
 4. **Chunk-wide deduplicated expert dispatch:** attention-and-norm for every token, then router for every token, then **one** `on_routing_ready_batch` over the layer's distinct set, then MoE for every token. Dedup resolves each token's `k`-th expert through a per-token index map, so the fixed-order fp32 reduce still sums in `k` order — dedup changes *which copy is read*, never the order. Leases release at the layer boundary.
 5. **Warm-frozen policy (D-b).** A Warm-resident expert is loaded into VRAM as a **shadow residency**: the catalog entry stays `WARM_HOST`, the VRAM copy is recorded in a `shadow_vram_slot` with its own LRU; eviction is a release of the shadow (or of an ordinary Hot resident), never a demotion. `invariants_hold()` admits exactly two owners per slot — a Hot expert, or a Warm expert's declared shadow.
-6. **The layer-ordered sweep** (`V4PrefillSweep`). `begin_prefill_stream()` drains Hot outright; the frontier holds whole layer sets in computation order; each layer is bulk-released as it retires; `end_prefill_stream()` requires Hot empty. Warm and its LRU ranking are untouched for the whole prefill. LRU is not used in prefill — nothing inside a window is reused, so the only correct release is the whole layer. The sweep loads a layer **whole** (its set is known), not a routing prediction. The next layer's reads are **dispatched before the current body runs**, so the previous transfer is complete when awaited; when the pool cannot hold two layers, `dispatch_ahead` is a no-op and the loads fall back to synchronous. Engaged only by the visible `AeonRuntimeConfig::prefill_sweep` (default on) — **no hidden threshold**.
+6. **The layer-ordered sweep** (`V4PrefillSweep`). `begin()` frees only what the pass needs — `2E` when the pool holds two layer sets, else `E`, worst-LRU first — and the registry **preserves** the rest; the frontier holds whole layer sets in computation order; each layer's prefill-admitted set is bulk-released as it retires; `end_prefill_stream()` refuses any prefill-admitted resident left. The drained set is recorded in `restore_set()` and reloaded at `prefill_end` (the restore requirement of [Prefill Supply Strategy](../completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md)). Warm and its LRU ranking are untouched for the whole prefill. LRU is not used in prefill — nothing inside a window is reused, so the only correct release is the whole layer. The sweep loads a layer **whole** (its set is known), not a routing prediction. The next layer's reads are **dispatched before the current body runs**, so the previous transfer is complete when awaited; when the pool cannot hold two layers, `dispatch_ahead` is a no-op and the loads fall back to synchronous. Engaged by the visible `AeonRuntimeConfig::prefill_sweep` (default on) **and** the prompt-length gate `prefill_sweep_min_tokens` (default `3 E / 4`) — **no hidden threshold**.
 7. **The engine's prefill is the window.** `V4Engine::chat` hands the whole prompt to `forward_window` as one unit via a `PromptPrefill` step of `text::generate_token_ids`; the generation loop still owns the EOS stop, the cap and the context limit. `--prefill-window <W>` (default `4096`) and `--prefill-chunk <C>` (default `64`) are user settings read at load; a prompt longer than `W` runs `⌈N/W⌉` windows, a shorter one is a single window at `C = min(C, N)`.
 8. **In-place residual write-back verified.** The body reads only each row's own residual, so the carry is `min(N,W) × 64 KB`, not doubled.
 
@@ -208,7 +210,7 @@ $$\text{expert bytes} \approx \left\lceil \frac{N}{W} \right\rceil \times 156\,\
 | **3** | **Warm preserved** — Warm's resident set is unchanged across a prefill, and the prefill reads it rather than bypassing to NVMe. | **met** |
 | **4** | **No leak** — `invariants_hold()`, `outstanding_leases() == 0`, `staging_in_use == 0` on every run. | **met** |
 | **5** | **Throughput** — prefill tok/s against a measured baseline, and bytes/token against the predicted one model read. | **met** |
-| **6** | **The sweep switch** — Hot drained on entry, whole layer sets streamed in computation order, Hot empty on exit, Warm untouched, byte-identical throughout. | **met** |
+| **6** | **The sweep switch** — a bounded drain on entry, whole layer sets streamed in computation order, the switch-point Hot set restored on exit, Warm untouched, byte-identical throughout. | **met** |
 
 Outcome 5, measured one pristine process per arm (`bench_prefill_ab`):
 
@@ -263,7 +265,7 @@ The swept byte count is **constant at `145.1 GiB`** (one model read) while seria
 | **Anti-circularity** | A test must not compare a kernel against an oracle derived from that kernel's own helper. |
 | **Tiering is mechanism, not strategy** | Holding one request shape as *the* shape. |
 | **Staging is a pipeline buffer, not a working-set store** | Sizing it from the chunk size or the layer's expert set, or summing it with the sweep's VRAM residency. It holds transfers **in transit**. |
-| **Prefill and decode are two strategies, not one parameter** | A resident from one phase crossing into the other, and a recency policy (LRU) applied to prefill. Prefill drains on entry, streams in layer order, and is empty on exit; decode owns recency and demotion. |
+| **Prefill and decode are two strategies, not one parameter** | A resident from one phase crossing into the other, and a recency policy (LRU) applied to prefill. Prefill frees only what it needs on entry, streams in layer order, and restores the switch-point set on exit; decode owns recency and demotion. |
 | **A shadow residency is legal only while Warm is frozen** | A second ownership existing in decode. Asserted in `invariants_hold()`, not merely intended. |
 | **A gate that reads device buffers must synchronize the stream first** | Comparing device buffers without ordering against the non-default compute stream — a plain `hipMemcpy` can return the *previous* run's buffer. |
 
@@ -273,8 +275,8 @@ The swept byte count is **constant at `145.1 GiB`** (one model read) while seria
 
 | Item | State | Detail |
 | :--- | :--- | :--- |
-| **Window half of the `W`/`C` sweep** | **open** | every run to date is one pass (`W ≥ N`); the `⌈N/W⌉` regime and the cost of a second pass are unmeasured. |
-| **Prefill body cost `~120 ms/prompt-token`** | **open — next investigation** | linear in the prompt, measured through `aeon_chat`; not supply and not the registry audit. Colibri's `≈31 ms/token` is the reference. |
+| **Window half of the `W`/`C` sweep** | **open** | every run to date is one pass (`W ≥ N`, including the `W = 1024` M44b matrix); the `⌈N/W⌉` regime and the cost of a second pass are unmeasured. |
+| **Prefill body cost `~120 ms/prompt-token`** | **open — next investigation** | linear in the prompt, measured through `aeon_chat`; not supply and not the registry audit. The `≈31 ms/token` reference is unsourced for this checkpoint (see M44's note) and must be split into body vs supply before it anchors a target. |
 | **Staging arena's `banks × depth` target** | **open** | at the dedup ceiling because a layer-wide dispatch assigns every distinct expert at once (`3.38 GiB` pinned at `C = 256`); the smaller waved ring is unbuilt. |
 | **Prefix reuse (session state and swap)** | **open — not deferrable** | a product requirement: today every turn re-prefills from token 0. |
 | **Routing concentration / frequency policy** | **open** | decides whether frequency-informed placement can help; owned by the [Routing Profile and Placement Study](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) Phase 2. |
