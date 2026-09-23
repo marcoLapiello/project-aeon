@@ -1,6 +1,6 @@
 # Prefill Supply Strategy Execution Plan
 
-*Status: active. Opened 2026-09-23. Refines Step 6–7 of [EXPERT_STREAMING_EXECUTION_PLAN.md](EXPERT_STREAMING_EXECUTION_PLAN.md); supersedes the supply proposals of [PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md](../../analysis/current/PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) §5.3, §8, §9.4, §9.6 (its multi-GPU material is out of scope here).*
+*Status: complete (Steps 1–7, 2026-09-23). Opened 2026-09-23. Refines Step 6–7 of [EXPERT_STREAMING_EXECUTION_PLAN.md](EXPERT_STREAMING_EXECUTION_PLAN.md); supersedes the supply proposals of [PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md](../../analysis/current/PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) §5.3, §8, §9.4, §9.6 (its multi-GPU material is out of scope here). Measurement is ledger [M44](../../status/PERFORMANCE_LEDGER.md).*
 
 **Subject.** One layer-major batched prefill, two expert-supply strategies chosen by a visible prompt-length gate, and a Hot-pool **restore** that both strategies share.
 
@@ -176,7 +176,9 @@ The gate default was corrected from the plan's earlier `E / 4` to `3 E / 4`: at 
 
 **Requirement.** Record the milestone in the Performance Ledger; update `AGENTS.md` if a milestone row transitions; mark the superseded analysis sections per the header.
 
-**Gate.** The ledger entry names the gate default, the drain rule, and the restore result.
+**Result.** Ledger entry **M44** records the crossover table, the corrected gate (`3 E / 4`), and the shared bounded-drain/restore. `AGENTS.md`'s Present table already points at the expert streaming plan for this work, so no row transitions yet; the superseded analysis sections are named in this plan's header.
+
+**Files.** `plans-and-docs/status/PERFORMANCE_LEDGER.md` (M44).
 
 ---
 

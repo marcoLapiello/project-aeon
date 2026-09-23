@@ -254,3 +254,25 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: all three runs `eos`, `registry.invariants_hold=true`, `outstanding_leases=0`, `staging_in_use=0`; the replies are coherent (each run correctly detects the repeated paragraph and summarizes it). The audit still runs **unconditionally at every boundary**; `--validate-registry` restores the per-operation audit for a debugging run.
 - **Conclusion / next gate**: **Step 7's settings are exposed and the workspace is real.** The finding that matters is the audit: **the prefill was never as compute-bound as M42's subtraction suggested** — a per-request whole-registry scan was `10.2 s` of a `39 s` prefill and `258` scans per decode token. The remaining `~120 ms/prompt-token` is linear in the prompt and is the open prefill target.
 - **Evidence**: `src/infrastructure/core/expert_registry.hpp` (`set_validate_each_request`, `checked_validate`), `core/memory_budget.hpp`, `core/v4_model_host.hpp` (`allocate_prefill_workspace`), `tools/aeon_chat.cpp` (`--prefill-window`, `--prefill-chunk`, `--validate-registry`, `[Prefill workspace]`, `[Prefill sweep]`)
+
+### M44: The routed-cached bank, and the measured prefill-supply crossover
+- **Run**: `2026-09-23`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `bench_prefill_ab` + `scripts/prefill_ab.sh`
+- **Class / comparison key**: `Benchmark / prefill-supply`, `Analysis / prefill-gate`
+- **Platform**: `baseline`, Device 0 only, single NVMe; context `2048`, body chunk `C = 16`, no Warm
+- **Workload / configuration**: one arm per process, pristine host each. `serial` = `forward_token` per prompt token; `swept` = `forward_window` with the gate forced to 1; `routed` = the same window with the gate forced above any prompt, so the route-aware cached bank supplies experts. Both batched arms are the same layer-major window; only the supply differs.
+- **Metrics** (tok/s, NVMe GiB):
+
+  | N | serial | swept | routed | winner |
+  | ---: | ---: | ---: | ---: | :--- |
+  | 32 | 2.52 / 57.4 | 1.02 / 141.6 | **3.14 / 38.6** | routed |
+  | 64 | 2.64 / 105.3 | 2.18 / 141.6 | **4.32 / 50.8** | routed |
+  | 128 | 2.63 / 206.1 | 4.15 / 141.6 | **5.20 / 65.9** | routed |
+  | 160 | — | 5.03 / 141.6 | **5.61 / 70.8** | routed |
+  | 192 | — | **6.34 / 141.6** | 5.90 / 73.8 | swept |
+  | 256 | — | **7.38 / 141.6** | 6.17 / 79.5 | swept |
+  | 512 | — | **8.04 / 141.6** | 7.09 / 91.8 | swept |
+
+  The swept byte count is **constant** (`141.6 GiB`, one model read); the routed bank reads the per-layer union, which grows with `N` but stays below the sweep through `N = 512` (`0.111 GiB/token`) because disjoint unions saturate near `E`. The sweep nevertheless *wins on throughput* from `N ≈ 192`: its bulk sequential whole-layer reads beat the routed path's per-expert reservations and scattered reads even while reading more bytes.
+- **Correctness / service**: `test_v4_prefill_sweep` (swept, 16 checks) and `test_v4_routed_prefill` (routed, 18 checks, at the derived `813`-slot pool and the floor `256`-slot pool) are byte-identical to serial; the bounded drain `512 + 301 = 813` and `256 + 0 = 256`; the switch-point Hot set is restored in both; Warm is unchanged; `invariants_hold()`, no lease leak, staging drained. `test_v4_engine` (38 checks) and the CLI run a short prompt end-to-end on the routed path.
+- **Conclusion / next gate**: **The supply strategy is a prompt-length switch, and the crossover is `≈0.7 E` (`≈176` tokens).** Below it the routed bank is the better strategy — at `N = 32` it is `3×` the sweep and the sweep is `2.5×` worse than serial — and above `N ≈ 192` the sweep wins. The plan's provisional `E/4` gate was refuted by this measurement and corrected to `3 E / 4`, the round fraction above the crossover, on the safe side because the sweep is a throughput optimisation the routed path never needs for correctness. **Budget and restore are shared by both strategies** (one `begin_prefill_stream`/`end_prefill_stream` pair, differing only by `PrefillAlloc`): the drain is bounded to `2E` or `E` worst-LRU residents, the rest are preserved, and the drained set is reloaded through the normal cold path at `prefill_end`.
+- **Evidence**: `tests/bench_prefill_ab.cpp`, `scripts/prefill_ab.sh`, `tests/test_v4_routed_prefill.cpp`, `tests/test_v4_prefill_sweep.cpp`, `src/infrastructure/core/expert_registry.hpp` (`PrefillAlloc`, `restore_set`, `resident_at_prefill_begin`), `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp`, `core/v4_model_host.hpp` (`restore_prefill_residents`, `prefill_sweep_min_tokens`), `core/memory_budget.hpp` (`prefill_sweep_min_tokens`)
