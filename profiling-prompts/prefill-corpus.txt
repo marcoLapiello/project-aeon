@@ -1,0 +1,85 @@
+The history of cartography is the study of how maps, from the earliest known
+sketches on clay tablets to the digital atlases of the present day, have been
+made, used, and understood. Maps are not neutral records of the world. Every map
+selects, simplifies, and arranges, and each of those choices carries assumptions
+about what matters. A map of a coastline drawn for sailors will show depths and
+harbours; the same coast drawn for an engineer will show elevation and the paths
+of rivers, and the two may share almost no features at all. For this reason
+historians read maps as arguments rather than as pictures, asking who made them,
+for whom, and what they wished their readers to see.
+
+The earliest surviving maps are modest. Babylonian clay tablets from roughly the
+sixth century before the common era show a flat disc of land ringed by a river
+and set within an outer ocean, and they place the city of Babylon at the centre.
+Whether such a drawing was meant to be navigated or merely contemplated is not
+knowable from the object alone, and the question is typical of the field. Later
+Greek writers approached the problem differently. Eratosthenes, working in
+Alexandria in the third century before the common era, reasoned from the length
+of shadows at two places a known distance apart and produced a value for the
+circumference of the earth that is within a few percent of the modern figure.
+His method was geometric and his result was quantitative, and it marked a shift
+from the symbolic to the measurable that his successors inherited.
+
+Roman practice turned the Greek inheritance toward administration. The surviving
+fragments of Roman road maps suggest long, narrow scrolls, impractical to hold
+in the hand but convenient to unroll along the length of a route, and inscribed
+with the distances between stopping places. These were not representations of
+space so much as instruments of travel. When the empire's road network decayed,
+so did the demand for such instruments, and for several centuries in Europe the
+production of maps narrowed to the schematic diagrams that monasteries drew to
+accompany descriptions of the holy places, in which geography served the needs
+of pilgrimage and the figures of particular cities might be drawn out of
+proportion to any measurable distance between them.
+
+The Chinese tradition developed along its own lines and, in several respects,
+ahead of the European one. The surviving examples of Chinese cartography show
+sustained attention to the systematic grid, to measured distance, and to the
+careful delineation of rivers and coastlines. The invention of printing gave the
+later Chinese maps an advantage that manuscript maps could not match, since a
+single woodblock could yield hundreds of identical copies, each carrying the
+same information to a different reader. That advantage was not simply one of
+volume. A map that can be copied exactly becomes an object that can be corrected
+and compared, and the practice of comparison is the beginning of a shared
+standard.
+
+In Europe the recovery of Ptolemy's geography in the fifteenth century did more
+than supply a set of coordinates. It supplied a method, and, perhaps more
+important, it supplied an authority whose errors were difficult to correct
+because they were embedded in a system. Sailors who had crossed the Atlantic
+found Ptolemy's figures wanting, and the slow, contentious process of replacing
+them with observation is one of the central stories of the age of exploration.
+The instruments that made the replacement possible, the astrolabe, the quadrant,
+and eventually the marine chronometer, were in many cases as expensive to
+develop as the ships they guided, and their adoption was uneven and contested.
+
+Surveying, meanwhile, became a profession. The great national surveys of the
+eighteenth and nineteenth centuries, undertaken for military and fiscal reasons
+and later for the sheer ambition of the thing, produced the first accurate maps
+of entire countries. That work demanded triangulation on a scale no private
+individual could fund, and it established a durable alliance between the map and
+the state. From that alliance came the conventions that later cartographers
+treated as natural: the north at the top, a uniform scale, a measured grid, and
+the systematic suppression of detail judged irrelevant to the purpose at hand.
+
+The twentieth century added two pressures. The first was aerial photography,
+which turned the surface of the earth into something that could be recorded
+rather than only drawn, and which forced a distinction between the base image and
+the map compiled from it. The second was the computer, which made it possible to
+store a description of the world in a form that could be queried, combined, and
+rendered at any scale. The digital map does not resolve the old questions about
+selection and arrangement. It conceals them, since a rendering at the touch of a
+button can hide the fact that someone, somewhere, decided which features would be
+recorded and which would be omitted from the data that everyone now shares.
+
+What has remained constant across all of these changes is the map's position
+between knowledge and action. A map is bound to a decision, whether it is the
+decision of a captain to take one channel rather than another, a minister to tax
+one district more heavily than its neighbour, or a traveller to walk a path that
+seems shorter on the page. It is never a complete account of a place, and it
+would be of little use if it were, since completeness and legibility are usually
+opposed. The historian's task is to recover the purposes that shaped a map, and
+in doing so to recover, as far as the surviving evidence allows, something of the
+worldview of the people who made and used it. That task grows harder as the
+instruments change, because the network of decisions behind a digital map is
+distributed across many hands and is rarely written down. It has not, however,
+become less necessary.

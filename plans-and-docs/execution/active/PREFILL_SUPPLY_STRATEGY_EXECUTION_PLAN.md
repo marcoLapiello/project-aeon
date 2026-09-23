@@ -168,7 +168,22 @@ Each step states its requirement, its gate, and its files. A step is done when i
 
 The gate default was corrected from the plan's earlier `E / 4` to `3 E / 4`: at 64 the routed bank is `2×` the sweep, so `E / 4` sat far below the crossover. `3 E / 4` is the round fraction above the measured `≈0.7 E`, chosen on the safe side because the sweep is a throughput optimisation the routed path never needs for correctness.
 
-**Files.** `tests/bench_prefill_ab.cpp` (the `routed` arm), `scripts/prefill_ab.sh`, ledger M44.
+**Replicated on real prompts and the production configuration (ledger M44b).** The M44 arms above ran a **pseudo-random token stream with no Warm**; since the routed union's size depends on how concentrated the routing is, and that depends on the text, M44b re-runs the same matrix over **natural language** (`profiling-prompts/prefill-corpus.txt`, through the artifact's own tokenizer and encoder) with context `2048`, chunk `C = 128`, window `W = 1024`, and **Warm `35 GiB`**. The ordering is unchanged; the crossover moves down to `≈0.55 E`:
+
+| `N` | serial | swept | routed | winner |
+| ---: | ---: | ---: | ---: | :--- |
+| 32 | 3.46 | 1.32 | **3.88** | routed |
+| 128 | 3.79 | 5.29 | **6.04** | routed |
+| 144 | — | 5.89 | **6.09** | routed |
+| 152 | — | **6.24** | 6.16 | swept |
+| 256 | 3.77 | **7.89** | 6.87 | swept |
+| 1024 | 3.63 | **8.05** | 7.57 | swept |
+
+The default stays `3 E / 4` (`192`), deliberately above both measured crossovers: in no measured configuration does the gate sweep a prompt below its crossover, and the error direction is the cheap one (the swept/routed gap at the gate's edge is `≤5%`, whereas sweeping a `128`-token prompt costs `≈12%`).
+
+**Union concentration is real.** Excluding Hot hits, the routed union is `97.5 GiB` at `N = 512` and `109.0 GiB` at `N = 1024` (`67%` and `75%` of the `145.1 GiB` model) on real text. Uniform top-6 would touch every expert at `1024`, so the sub-100% saturation is genuine routing concentration — corroborated by M35's independent `60.5%` decode Hot hit rate. The percentage is text-dependent and is not a model constant.
+
+**Files.** `tests/bench_prefill_ab.cpp` (the `routed` arm, real-prompt tokenization), `scripts/prefill_ab.sh`, `profiling-prompts/prefill-corpus.txt`, ledger M44/M44b.
 
 ---
 

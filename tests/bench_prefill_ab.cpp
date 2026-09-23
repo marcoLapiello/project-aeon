@@ -34,16 +34,27 @@
 //
 // The `swept` and `routed` arms force the strategy with the gate (a gate of 1 always
 // sweeps, a gate above any prompt always routes) so both can be measured at the same
-// N — the production gate is the derived `E / 4`.
+// N — the production gate is the derived `3 E / 4`.
+//
+// **The prompt is real natural language**, encoded through the artifact's own
+// tokenizer and prompt encoder (`profiling-prompts/prefill-corpus.txt` by default).
+// The routed supply reads a layer's *union*, which depends on how concentrated the
+// text's routing is; a pseudo-random token stream is not a prompt and would not
+// measure it. The configuration matches the production shape: context `2048`, body
+// chunk `C = 128`, layer-major window `W = 1024`, Warm `35 GiB` (set on the command
+// line; `0` to disable).
 //
 // ## What it does not do
 //
 // It does not assert. It prints, because the numbers are the deliverable and a
 // threshold would turn a measurement into a test that passes. Correctness under the
 // sweep is `test_v4_prefill_sweep`'s subject (byte-identical to serial, ledger M40),
-// and under the bank `test_v4_routed_prefill`'s; this file never re-checks it.
+// and under the bank `test_v4_routed_prefill`'s; this file never re-checks it. It is
+// also **prefill-only** — it samples nothing, so the greedy/sampling distinction does
+// not apply here.
 //
 // Usage: bench_prefill_ab <arm:serial|swept|routed> <n_tokens> [model_dir] [warm_gib]
+//                      [prompt_file]
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -51,6 +62,8 @@
 #include "architecture/deepseek_v4/core/memory_budget.hpp"
 #include "architecture/deepseek_v4/core/v4_graph.hpp"
 #include "architecture/deepseek_v4/core/v4_model_host.hpp"
+#include "architecture/deepseek_v4/text/dsv4_prompt_encoder.hpp"
+#include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
 #include "infrastructure/hip_check.hpp"
 
 #include <hip/hip_fp16.h>
@@ -59,6 +72,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -70,34 +86,53 @@ using aeon::core::V4ModelHost;
 using Clock = std::chrono::steady_clock;
 
 constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
+constexpr const char* kPromptFile = "profiling-prompts/prefill-corpus.txt";
 constexpr uint32_t kContext = 2048;
-// The body's own row cap. Colibri's `V4_PREFILL_CHUNK` is 128; ours is 16, which is
-// a *launch-count* difference, not a byte one — the sweep loads whole layers either
-// way. It is called out in the report because the chunk is the knob Step 7 sweeps.
-constexpr uint32_t kChunk = V4LayerBodyBatchScratch::kMaxTokens;
+// The body chunk `C` and the layer-major window `W`. `C = 128` matches the reference
+// implementation's `V4_PREFILL_CHUNK`; `W = 1024` bounds the residual carry. Each `N`
+// is run as a single window here, so `N <= W` always — which is the measured regime.
+constexpr uint32_t kChunk = 128;
+constexpr uint32_t kWindow = 1024;
+static_assert(kChunk <= V4LayerBodyBatchScratch::kMaxTokens,
+              "the body chunk must fit the batch scratch");
 
 double since(const Clock::time_point& start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
 }
 
-// A deterministic, in-vocabulary prompt. Pseudo-random so the router sees a mix of
-// routings rather than one token's repeated, and drawn from the middle of the
-// vocabulary so it never lands on a special id.
-std::vector<uint32_t> make_prompt(uint32_t count, uint32_t vocab) {
-    std::vector<uint32_t> ids(count);
-    uint32_t state = 12345u;
-    for (uint32_t i = 0; i < count; ++i) {
-        state = state * 1664525u + 1013904223u;
-        ids[i] = 100u + (state % (vocab - 200u));
+// The **natural-language** corpus the prefill is run over. A real prompt matters
+// here: the routed supply reads a layer's *union*, and the union's size is a
+// property of how concentrated the routing is, which depends on the text. A
+// pseudo-random token stream is not a prompt, and a union measured on one answers a
+// question nobody asked.
+std::string read_text_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("bench_prefill_ab: cannot open prompt file " + path);
     }
-    return ids;
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// Encode a natural-language prompt through the artifact's own tokenizer and prompt
+// encoder — the same path the engine uses — so the ids are the ones a real request
+// would carry, chat framing included.
+std::vector<uint32_t> encode_prompt(const std::string& model_dir, const std::string& text) {
+    aeon::text::Dsv4Tokenizer tokenizer;
+    tokenizer.load(model_dir + "/tokenizer.aeon");
+    aeon::text::Dsv4PromptEncoder encoder(tokenizer);
+    aeon::text::Dsv4PromptMessage message;
+    message.role = aeon::text::Dsv4Role::User;
+    message.content = text;
+    aeon::text::Dsv4PromptOptions options;
+    return encoder.encode_tokens({message}, options);
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::printf("usage: %s <serial|swept|routed> <n_tokens> [model_dir] [warm_gib]\n",
+        std::printf("usage: %s <serial|swept|routed> <n_tokens> [model_dir] [warm_gib] "
+                    "[prompt_file]\n",
                     argv[0]);
         return 2;
     }
@@ -105,6 +140,7 @@ int main(int argc, char** argv) {
     const uint32_t n = static_cast<uint32_t>(std::atoi(argv[2]));
     const std::string model_dir = argc > 3 ? argv[3] : kModelDir;
     const uint64_t warm_gib = argc > 4 ? static_cast<uint64_t>(std::atoi(argv[4])) : 0;
+    const std::string prompt_file = argc > 5 ? argv[5] : kPromptFile;
 
     aeon::core::select_compute_device(true);
 
@@ -112,10 +148,11 @@ int main(int argc, char** argv) {
     runtime.context_size = kContext;
     runtime.prefill_sweep = true;
     runtime.prefill_chunk = kChunk;
+    runtime.prefill_window = kWindow;
     runtime.warm_host_bytes = warm_gib * 1024ULL * 1024ULL * 1024ULL;
     // Force the strategy so both supplies can be measured at the same N. The gate is
     // what the window reads (Step 3); a gate of one token always sweeps, a gate above
-    // any prompt always routes. The production default is the derived `E / 4`.
+    // any prompt always routes. The production default is the derived `3 E / 4`.
     if (arm == "swept") {
         runtime.prefill_sweep_min_tokens = 1;
     } else if (arm == "routed") {
@@ -126,12 +163,17 @@ int main(int argc, char** argv) {
     host.initialize(model_dir, runtime, /*verbose=*/false);
     V4Graph graph(host);
 
-    const uint32_t vocab = static_cast<uint32_t>(host.config().vocab_size);
     const uint32_t layers = host.num_layers();
     const uint32_t per_layer = host.registry().experts_per_layer;
     const double model_bytes = static_cast<double>(layers) * per_layer * 14'155'776.0;
 
-    const std::vector<uint32_t> ids = make_prompt(n, vocab);
+    std::vector<uint32_t> ids = encode_prompt(model_dir, read_text_file(prompt_file));
+    if (ids.size() < n) {
+        throw std::runtime_error(
+            "bench_prefill_ab: the prompt file encodes to " + std::to_string(ids.size()) +
+            " tokens, fewer than the requested " + std::to_string(n));
+    }
+    ids.resize(n);
 
     const uint64_t b0n = host.supply_bytes_from_nvme();
     const uint64_t b0h = host.supply_bytes_from_host();
@@ -162,14 +204,15 @@ int main(int argc, char** argv) {
     const double io_s = static_cast<double>(host.sweep_io_ns()) / 1e9;
 
     // One machine-readable line so the driver script can tabulate without parsing
-    // prose, plus the parts a reader needs to attribute the seconds.
+    // prose, plus the parts a reader needs to attribute the seconds. The configuration
+    // is echoed so a reader can tell two runs apart.
     std::printf("RESULT arm=%s n=%u seconds=%.3f tok_per_s=%.3f nvme_gib=%.3f warm_gib=%.3f "
                 "h2d_gib=%.3f requests=%llu load_s=%.3f io_s=%.3f lookahead=%u swept=%d "
-                "model_gib=%.3f\n",
+                "chunk=%u window=%u model_gib=%.3f\n",
                 arm.c_str(), n, seconds, static_cast<double>(n) / seconds,
                 nvme / 1073741824.0, warmb / 1073741824.0, h2d / 1073741824.0,
                 static_cast<unsigned long long>(requests), load_s, io_s,
                 host.sweep_lookahead_depth(), host.prefill_sweep_engaged() ? 1 : 0,
-                model_bytes / 1073741824.0);
+                kChunk, kWindow, model_bytes / 1073741824.0);
     return 0;
 }

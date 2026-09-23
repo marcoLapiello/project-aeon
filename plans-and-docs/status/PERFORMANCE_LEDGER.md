@@ -276,3 +276,29 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: `test_v4_prefill_sweep` (swept, 16 checks) and `test_v4_routed_prefill` (routed, 18 checks, at the derived `813`-slot pool and the floor `256`-slot pool) are byte-identical to serial; the bounded drain `512 + 301 = 813` and `256 + 0 = 256`; the switch-point Hot set is restored in both; Warm is unchanged; `invariants_hold()`, no lease leak, staging drained. `test_v4_engine` (38 checks) and the CLI run a short prompt end-to-end on the routed path.
 - **Conclusion / next gate**: **The supply strategy is a prompt-length switch, and the crossover is `≈0.7 E` (`≈176` tokens).** Below it the routed bank is the better strategy — at `N = 32` it is `3×` the sweep and the sweep is `2.5×` worse than serial — and above `N ≈ 192` the sweep wins. The plan's provisional `E/4` gate was refuted by this measurement and corrected to `3 E / 4`, the round fraction above the crossover, on the safe side because the sweep is a throughput optimisation the routed path never needs for correctness. **Budget and restore are shared by both strategies** (one `begin_prefill_stream`/`end_prefill_stream` pair, differing only by `PrefillAlloc`): the drain is bounded to `2E` or `E` worst-LRU residents, the rest are preserved, and the drained set is reloaded through the normal cold path at `prefill_end`.
 - **Evidence**: `tests/bench_prefill_ab.cpp`, `scripts/prefill_ab.sh`, `tests/test_v4_routed_prefill.cpp`, `tests/test_v4_prefill_sweep.cpp`, `src/infrastructure/core/expert_registry.hpp` (`PrefillAlloc`, `restore_set`, `resident_at_prefill_begin`), `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp`, `core/v4_model_host.hpp` (`restore_prefill_residents`, `prefill_sweep_min_tokens`), `core/memory_budget.hpp` (`prefill_sweep_min_tokens`)
+
+#### M44b: The same A/B on real prompts and the production configuration
+- **Run**: `2026-09-23`; same hardware and model; `AEON_WARM_GIB=35 bash scripts/prefill_ab.sh 32 64 128 136 144 152 160 192 224 256 512 1024`
+- **Why**: M44's arms ran a **pseudo-random token stream with no Warm**. The routed supply reads a layer's *union*, whose size depends on how concentrated the routing is, and that depends on the text — so M44's union figures answer a question nobody asked. This run replaces the LCG ids with **natural language** through the artifact's own tokenizer and prompt encoder (`profiling-prompts/prefill-corpus.txt`), and uses the production shape: context `2048`, chunk `C = 128` (the reference's own chunk), window `W = 1024`, **Warm `35 GiB`**.
+- **Metrics** (tok/s / cold NVMe GiB):
+
+  | N | serial | swept | routed | winner |
+  | ---: | ---: | ---: | ---: | :--- |
+  | 32 | 3.46 / 29.6 | 1.32 / 106.4 | **3.88 / 26.3** | routed |
+  | 64 | 3.82 / 44.4 | 2.84 / 106.4 | **5.02 / 37.0** | routed |
+  | 128 | 3.79 / 72.6 | 5.29 / 106.4 | **6.04 / 50.2** | routed |
+  | 136 | — | 6.04 / 106.4 | 6.04 / 51.1 | tie |
+  | 144 | — | 5.89 / 106.4 | **6.09 / 52.1** | routed |
+  | 152 | — | **6.24 / 106.4** | 6.16 / 53.1 | swept |
+  | 160 | 3.81 / 88.6 | **6.58 / 106.4** | 6.30 / 53.8 | swept |
+  | 192 | 3.81 / 109.2 | **7.28 / 106.4** | 6.56 / 58.8 | swept |
+  | 256 | 3.77 / 143.0 | **7.89 / 106.4** | 6.87 / 63.7 | swept |
+  | 512 | 3.73 / 258.4 | **8.27 / 106.4** | 7.46 / 73.2 | swept |
+  | 1024 | 3.63 / 476.1 | **8.05 / 106.4** | 7.57 / 81.7 | swept |
+
+  1. **The ordering is unchanged; the crossover moves.** With Warm and real text the two supplies are within noise from `N ≈ 136` and the sweep takes over by `N ≈ 152` — i.e. `≈0.55 E`, below M44's synthetic `≈0.7 E`. The direction of the switch is the same in both configs, which is what the gate rests on.
+  2. **Warm shifts the sweep's bytes.** The swept cold figure fell `141.6 -> 106.4 GiB` (Warm serves the rest as shadow copies), and serial's cold fell by `~35 GiB` per arm because its demotions now land in a real Warm tier (`warm_gib 235` at `N = 224`).
+  3. **The routed union is `cold + warm`, and it saturates well below the model.** Excluding Hot hits (uncounted), the routed union is `97.5 GiB` at `N = 512` and `109.0 GiB` at `N = 1024` — `67%` and `75%` of the `145.1 GiB` model. Under a uniform top-6 of 256 a `1024`-token layer would touch essentially every expert (`D = 256 (1 − e^{−24}) ≈ 100%`), so the sub-100% saturation is a **genuine routing concentration**, corroborated by M35's independent decode measurement (`60.5%` Hot hit rate at `779` slots). It is *not* a synthetic artifact — but the percentage is text-dependent and must not be quoted as a model constant.
+- **Correctness / service**: same gates as M44; no code change, only the benchmark's prompt source and configuration.
+- **Conclusion / next gate**: **The gate default `3 E / 4` (`192`) is confirmed, deliberately on the safe side of both measurements.** The realistic crossover (`≈140`) is below it and the synthetic one (`≈176–192`) at it, so in no measured config does the gate sweep a prompt below its crossover. The error direction is also the cheap one: at the gate's edge the swept/routed gap is `≤5%`, whereas sweeping a `128`-token prompt would cost `≈12%` against the routed bank. Real-text union concentration is now measured, not assumed — and it is the reason the routed bank stays below the sweep's constant `106.4 GiB` through `N = 1024`.
+- **Evidence**: `profiling-prompts/prefill-corpus.txt`, `tests/bench_prefill_ab.cpp` (tokenizer/encoder prompt path), `cmake/AeonInfrastructure.cmake` (`bench_prefill_ab` sources)

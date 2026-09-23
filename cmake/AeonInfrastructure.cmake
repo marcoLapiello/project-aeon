@@ -27,7 +27,12 @@ if(AEON_BUILD_BENCHMARKS)
     # its baseline in the same process, and neither arm scales the same way (the
     # sweep's bytes are constant in the prompt, serial's grow linearly), so the bench
     # measures both at several prompt lengths and prints tok/s and bytes for each.
-    aeon_add_benchmark(bench_prefill_ab SOURCES tests/bench_prefill_ab.cpp)
+    # The prompt is real natural language, so the tokenizer and encoder are linked in.
+    aeon_add_benchmark(bench_prefill_ab
+        SOURCES
+            tests/bench_prefill_ab.cpp
+            src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
+            src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp)
 endif()
 
 # --- Backend kernels and artifact format -------------------------------------
