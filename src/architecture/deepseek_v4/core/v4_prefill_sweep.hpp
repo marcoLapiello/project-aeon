@@ -114,6 +114,14 @@ public:
     // Drain Hot and establish the frontier. The caller must already have reached a
     // compute-stream boundary and reaped the registry.
     //
+    // The drain is **bounded**, not a full flush: the sweep needs room for one
+    // layer's set (`E`), or for two when the pool can hold the lookahead as well
+    // (`2E`). So it frees `2E` when `H >= 2E`, else `E` — the worst-LRU residents
+    // first — and leaves the remainder **preserved** (the registry marks it). An
+    // `H < E` pool is infeasible and never reaches here. Freeing only what the pass
+    // needs is what lets decode's set survive the prefill; whatever is genuinely
+    // freed is recorded as the registry's restore set and reloaded at the end.
+    //
     // Layer 0's reads are **issued here, not waited for**: `before_layer(0)` — which
     // the driver calls immediately after — materializes them. Nothing is gained in
     // this particular gap, and it is what makes the loop below uniform.
@@ -127,9 +135,14 @@ public:
                 std::to_string(registry_ ? registry_->experts_per_layer : 0) +
                 "; a swept prefill is infeasible");
         }
-        registry_->begin_prefill_stream();
+        const uint32_t per_layer = registry_->experts_per_layer;
+        const uint32_t drain = registry_->vram_capacity >= 2u * per_layer
+            ? 2u * per_layer
+            : per_layer;
+        registry_->begin_prefill_stream(drain);
         // Recorded at the exact switch point, before the frontier refills: this is
-        // the observable proof that no decode resident crossed into prefill.
+        // the observable proof that the drain freed only what the pass needs, and
+        // that the preserved residents are the ones decode resumes on.
         hot_after_drain_ = registry_->published_hot_slots();
         active_ = true;
         dispatch_ahead(0);

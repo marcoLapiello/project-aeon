@@ -66,7 +66,7 @@ The routed bank is `E` under every `H`. On the floor (`H = E`) the bank is the w
 
 Four additions to `ExpertRegistry`, no strategy-specific variants:
 
-1. **`resident_at_prefill_begin`** — a per-catalog-entry mark, set on every `HOT_VRAM` resident when the prefill opens. Only Hot residents can carry it: a Warm shadow exists **only during** frozen prefill and every one is cleared at entry (`begin_prefill_stream()` resets `warm_shadow`/`shadow_vram_slot`), so at prefill open there are no shadows to mark, and the mark cannot be derived from or applied to them.
+1. **`resident_at_prefill_begin`** — a per-catalog-entry mark, set on every `HOT_VRAM` resident when the prefill opens and cleared when one is drained, so a mark means exactly *preserved resident*. Only Hot residents can carry it: a Warm shadow exists **only during** frozen prefill and every one is cleared at entry (`begin_prefill_stream()` resets `warm_shadow`/`shadow_vram_slot`), so at prefill open there are no shadows to mark, and the mark cannot be derived from or applied to them.
 2. **`restore_set_`** — the gids the prefill drained at entry, recorded in drain order. By construction these are the Hot residents that were drained — never shadows, which do not exist at entry.
 3. **A release that spares pre-existing residents** — the per-layer release frees only residents **admitted during the prefill**, never one marked in (1). Without this the partial drain is decorative: the layer release would free the preserved experts anyway and the restore would have saved nothing.
 4. **An end that re-admits `restore_set_`** — reads the drained gids back from Cold and clears the marks. The routed strategy and the sweep share this end.
@@ -86,16 +86,16 @@ Each step states its requirement, its gate, and its files. A step is done when i
 **Gate.**
 - `invariants_hold()` passes at every boundary with marks set and cleared.
 - A drain-then-restore round trip leaves the catalog byte-for-byte identical to before (same owners, same slots, same LRU order for preserved experts).
-- `restore_set_` is empty and all marks cleared on a pool where `H ≤ E` and nothing was preserved.
-- Unit test: construct a registry, mark a subset, partially drain, release a layer that overlaps the marked subset, assert the marked experts survive, then end and assert the pre-prefill set is resident.
+- A **full** drain (`drain_slots` covering the pool) preserves nothing: `preserved_resident_count() == 0`, `restore_set()` holds every resident, and every mark is cleared after `end_prefill_stream()`.
+- Unit test: construct a registry, drain a bounded subset, release a layer that overlaps the preserved residents, assert the preserved experts survive and the prefill-admitted ones go, then end and assert the pre-prefill set is resident after the restore reload.
 
-**Files.** `src/infrastructure/core/expert_registry.hpp`; new/extended `tests/test_dynamic_expert_pool.cpp` coverage.
+**Files.** `src/infrastructure/core/expert_registry.hpp`; `tests/test_expert_registry_warm_state.cpp`.
 
 ---
 
 ### Step 2 — Bounded drain for the sweep
 
-**Requirement.** `begin_prefill_stream()` drains `min(2E, H−E)` slots when `H ≥ 2E`, or `H` when `H ≤ E`, instead of the whole pool; residents not drained are marked (Step 1) and preserved. The sweep's per-layer release spares marked residents. `end_prefill_stream()` re-admits `restore_set_`.
+**Requirement.** `V4PrefillSweep::begin()` drains `2E` when `H ≥ 2E`, else `E` — the worst-LRU residents first — instead of the whole pool; the remainder is preserved (Step 1). The sweep's per-layer release spares preserved residents, and `V4ModelHost::prefill_end()` reloads `restore_set_` through the normal cold path so the pool returns to its switch-point set.
 
 **Gate.**
 - Sweep output is byte-identical to serial (existing sweep correctness test), for `H ≥ 2E` and for `E ≤ H < 2E`.
@@ -103,7 +103,7 @@ Each step states its requirement, its gate, and its files. A step is done when i
 - After `prefill_end()`, the Hot set equals the pre-prefill set (`--dump-logits` run plus a residency comparison).
 - No leak: `invariants_hold()`, `outstanding_leases() == 0`, `staging_in_use == 0`.
 
-**Files.** `src/infrastructure/core/expert_registry.hpp`, `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp`, `tests/test_v4_prefill_sweep.cpp`.
+**Files.** `src/infrastructure/core/expert_registry.hpp`, `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp`, `src/architecture/deepseek_v4/core/v4_model_host.hpp`, `tests/test_v4_prefill_sweep.cpp`.
 
 ---
 

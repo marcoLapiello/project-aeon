@@ -1,23 +1,26 @@
 // -----------------------------------------------------------------------------
-// Step 6 item 6 — the prefill sweep: drain, layer-ordered streaming, empty on exit.
+// Step 6 item 6 — the prefill sweep: bounded drain, layer-ordered streaming, restore.
 //
 // Prefill and decode are two allocation strategies, not one with a parameter, so
 // the switch between them is asserted as a switch. Through the real host (43
 // layers, the real supply, a real Warm tier):
 //
-//   A. DRAIN. Entering a swept prefill empties the Hot pool outright — no decode
-//      resident survives, because none of them is in the plan the sweep follows.
+//   A. BOUNDED DRAIN. Entering a swept prefill frees only what the pass needs —
+//      `2E` when the pool can hold two layer sets, else `E` — worst-LRU first. The
+//      remaining residents are **preserved** and survive the whole pass.
 //   B. WARM PRESERVED. Warm's resident set is identical before and after the whole
 //      swept window, because the sweep allocates Hot from the free list only and
 //      releases by layer; it never promotes from Warm and never demotes into it.
-//   C. EMPTY ON EXIT. The last layer's release leaves Hot empty, so the window
-//      hands decode a clean pool. No shadow survives (decode admits single
+//   C. RESTORED ON EXIT. The window hands decode back the set it had before the
+//      pass: the preserved residents never left, and the drained set is reloaded
+//      through the normal cold path. No shadow survives (decode admits single
 //      ownership), no lease leaks, and the registry invariants hold throughout.
-//   D. NON-VACUOUS AND CORRECT. The window streams every layer exactly once
-//      (`experts_streamed == layers x experts_per_layer`), the lookahead holds more
-//      than one layer's worth (so it is a sliding window, not depth 1), and the
-//      result is still **byte-identical** to the certified serial path — a residency
-//      policy that changed a number would not be a residency policy.
+//   D. NON-VACUOUS AND CORRECT. Every layer is visited exactly once and its missing
+//      experts streamed once (`streamed + preserved == layers x experts_per_layer`),
+//      the lookahead holds more than one layer's worth (so it is a sliding window,
+//      not depth 1), and the result is still **byte-identical** to the certified
+//      serial path — a residency policy that changed a number would not be a
+//      residency policy.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -74,6 +77,17 @@ std::set<uint32_t> warm_set(const V4ModelHost& host) {
     return experts;
 }
 
+std::set<uint32_t> hot_set(const V4ModelHost& host) {
+    std::set<uint32_t> experts;
+    const auto& catalog = host.registry().catalog;
+    for (uint32_t gid = 0; gid < catalog.size(); ++gid) {
+        if (catalog[gid].owner == ExpertTier::HOT_VRAM) {
+            experts.insert(gid);
+        }
+    }
+    return experts;
+}
+
 size_t set_difference_size(const std::set<uint32_t>& a, const std::set<uint32_t>& b) {
     size_t differing = 0;
     for (uint32_t gid : a) {
@@ -105,7 +119,7 @@ size_t differing_bytes(const std::vector<uint8_t>& a, const std::vector<uint8_t>
 
 int main() {
     std::printf("================================================================================\n");
-    std::printf("  Step 6 item 6 — the prefill sweep: drain, layer order, empty on exit\n");
+    std::printf("  Step 6 item 6 — the prefill sweep: bounded drain, layer order, restore\n");
     std::printf("================================================================================\n");
     aeon::core::select_compute_device(true);
 
@@ -149,7 +163,7 @@ int main() {
         read_bytes(graph.logits(), static_cast<size_t>(vocab) * sizeof(uint16_t));
 
     // ---- enter the swept prefill --------------------------------------------
-    std::printf("\n[B] Prefill begin (drain Hot, freeze Warm)\n");
+    std::printf("\n[B] Prefill begin (bounded drain, freeze Warm)\n");
     const std::set<uint32_t> warm_before_switch = warm_set(host);
     // No shadow can exist before the switch: a shadow residency is legal only while
     // Warm is frozen (`validate_invariants` refuses it otherwise), and decode never
@@ -160,10 +174,24 @@ int main() {
     const uint32_t shadows_before_switch = host.registry().shadow_resident_count();
     host.prefill_begin();
     const bool streaming = host.registry().prefill_streaming();
-    // The switch deliberately settles and reaps what the previous phase left in
-    // flight, so a demotion the serial reference had already committed can land
-    // here. Warm's baseline for the *sweep* is therefore taken after the switch,
-    // not before it.
+    const uint32_t hot_after_drain = host.prefill_sweep().hot_after_drain();
+    const std::vector<uint32_t> drained = host.registry().restore_set();
+    const std::set<uint32_t> preserved = hot_set(host);
+    // The set the drain actually saw at the switch point: what it preserved, plus
+    // what it freed (which the window must hand back). Referenced from the drain
+    // itself rather than a pre-switch capture, because the switch reaps in-flight
+    // transfers before it drains, so a pre-switch capture would differ by whatever
+    // the reap settled.
+    std::set<uint32_t> switch_hot = preserved;
+    switch_hot.insert(drained.begin(), drained.end());
+    bool preserved_disjoint_from_drained = true;
+    for (uint32_t gid : drained) {
+        if (preserved.find(gid) != preserved.end()) {
+            preserved_disjoint_from_drained = false;
+        }
+    }
+    // Warm's baseline for the *sweep* is taken after the switch, not before it, for
+    // the same settling reason.
     const std::set<uint32_t> warm_before = warm_set(host);
     const size_t switch_drift = set_difference_size(warm_before_switch, warm_before);
 
@@ -176,13 +204,26 @@ int main() {
 
     const std::set<uint32_t> warm_after = warm_set(host);
     const size_t warm_drift = set_difference_size(warm_before, warm_after);
+    const std::set<uint32_t> hot_after = hot_set(host);
 
     std::printf("\n--- results ---\n");
 
     assert_that("B: prefill entered streaming mode", streaming, "streaming");
-    assert_that("B: Hot was drained on entry",
-                host.prefill_sweep().hot_after_drain() == 0,
-                std::to_string(host.prefill_sweep().hot_after_drain()) + " Hot residents");
+    const uint32_t vram_capacity = host.registry().vram_capacity;
+    const uint32_t expected_drain = vram_capacity >= 2u * per_layer
+        ? 2u * per_layer
+        : per_layer;
+    assert_that("B: the drain was bounded to the pass's need",
+                drained.size() == expected_drain && hot_after_drain > 0,
+                std::to_string(drained.size()) + " drained, " +
+                    std::to_string(hot_after_drain) + " preserved");
+    assert_that("B: preserved and drained partition the switch-point pool",
+                preserved_disjoint_from_drained &&
+                    static_cast<size_t>(hot_after_drain) + drained.size() ==
+                        vram_capacity,
+                std::to_string(hot_after_drain) + " preserved + " +
+                    std::to_string(drained.size()) + " drained = " +
+                    std::to_string(vram_capacity));
     assert_that("B: no shadow existed to survive the switch", shadows_before_switch == 0,
                 std::to_string(shadows_before_switch) + " decode-era shadows");
 
@@ -191,8 +232,8 @@ int main() {
                 std::to_string(logits_diff) + " differing of " +
                     std::to_string(serial_logits.size()));
 
-    assert_that("D: every layer streamed exactly once",
-                host.prefill_sweep().experts_streamed() ==
+    assert_that("D: every layer's set streamed once (minus what was preserved)",
+                host.prefill_sweep().experts_streamed() + hot_after_drain ==
                     static_cast<uint64_t>(layers) * per_layer,
                 std::to_string(host.prefill_sweep().experts_streamed()) + " experts in " +
                     std::to_string(host.prefill_sweep().layer_loads()) + " loads");
@@ -200,9 +241,10 @@ int main() {
                 host.prefill_sweep().frontier_depth() > 1,
                 std::to_string(host.prefill_sweep().frontier_depth()) + " layers deep");
 
-    assert_that("C: Hot is empty again after the window",
-                host.registry().published_hot_slots() == 0,
-                std::to_string(host.registry().published_hot_slots()) + " Hot residents");
+    assert_that("C: the Hot set is restored to its switch-point set",
+                hot_after == switch_hot,
+                std::to_string(hot_after.size()) + " Hot, expected " +
+                    std::to_string(switch_hot.size()));
     assert_that("C: no shadow survives the window",
                 host.registry().shadow_resident_count() == 0,
                 std::to_string(host.registry().shadow_resident_count()) + " shadows");

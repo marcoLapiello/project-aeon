@@ -606,8 +606,10 @@ public:
     // ---- Step 6 item 6: the prefill sweep ------------------------------------
     //
     // `forward_window` drives these. The whole switch is local to a window: the
-    // sweep drains Hot on entry, streams the layers in order, and leaves Hot empty on
-    // exit, so a window is self-contained and decode can resume the moment it ends.
+    // sweep frees only what the pass needs on entry, streams the layers in order, and
+    // leaves the residents that were present at entry (plus the restored drain set)
+    // on exit, so a window is self-contained and decode can resume the moment it ends
+    // on the set it had before.
     //
     // Enabled only when `AeonRuntimeConfig::prefill_sweep` is set **and** the Hot pool
     // can hold a whole layer (the sweep has no victim to evict). Otherwise the window
@@ -646,6 +648,10 @@ public:
         if (!sweep_active_) return;
         supply_.reap_registry_transfers();
         prefill_sweep_.end();
+        // The drain was bounded, so the pool still holds the residents present at
+        // entry; reload the ones it did drain — through the normal cold path — so
+        // decode resumes on the pre-prefill set (the plan's restore requirement).
+        restore_prefill_residents(loader_.expert_format());
     }
 
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
@@ -912,6 +918,57 @@ private:
                 destinations.push_back(host_pool_.get_expert_slot_ptr(slot));
             }
             read_experts_direct_blocking(expert_ids, destinations);
+        }
+    }
+
+    // Reloads the Hot residents a prefill drained, so the pool returns to the set it
+    // held before the pass (the plan's restore requirement). The gids come from the
+    // registry's `restore_set()`; each is admitted through the normal cold path —
+    // reserve a slot, read the payload, publish it — which is the same machinery
+    // decode uses, so nothing here is a second code path. It runs at a boundary (the
+    // prefill has already ended), so its blocking reads are off the hot path, and it
+    // is batched exactly like `preload_hot_experts`.
+    void restore_prefill_residents(const ExpertFormatDescriptor& format) {
+        const std::vector<uint32_t> restore = registry_.restore_set();
+        if (restore.empty()) return;
+        const uint32_t per_layer = registry_.experts_per_layer;
+        const size_t batch = std::max<size_t>(
+            1, io_reader_->submission_capacity() / direct_requests_per_expert(format));
+        for (size_t start = 0; start < restore.size(); start += batch) {
+            const size_t end = std::min(restore.size(), start + batch);
+            std::vector<uint32_t> operation_ids;
+            std::vector<int32_t> slots;
+            std::vector<std::pair<uint32_t, uint32_t>> expert_ids;
+            std::vector<aeon::io::AlignedBuffer> buffers;
+            operation_ids.reserve(end - start);
+            for (size_t i = start; i < end; ++i) {
+                const uint32_t gid = restore[i];
+                const auto request = registry_.reserve_request(
+                    gid, 0, demotion_queue_capacity_);
+                if (request.kind != ExpertRequestKind::COLD_MISS || request.vram_slot < 0) {
+                    throw std::runtime_error(
+                        "V4ModelHost: a drained prefill resident was not cold at restore");
+                }
+                operation_ids.push_back(request.operation_id);
+                slots.push_back(request.vram_slot);
+                expert_ids.emplace_back(gid / per_layer, gid % per_layer);
+                buffers.emplace_back(format.payload_bytes, format.sector_size);
+            }
+            std::vector<uint8_t*> destinations;
+            destinations.reserve(buffers.size());
+            for (auto& buffer : buffers) {
+                destinations.push_back(static_cast<uint8_t*>(buffer.data()));
+            }
+            read_experts_direct_blocking(expert_ids, destinations);
+            for (size_t i = 0; i < slots.size(); ++i) {
+                vram_pool_.upload_from_host_expert(
+                    static_cast<uint32_t>(slots[i]), destinations[i], streams_.compute);
+            }
+            CHECK_HIP(hipStreamSynchronize(streams_.compute));
+            for (size_t i = 0; i < operation_ids.size(); ++i) {
+                registry_.complete_request(operation_ids[i]);
+                registry_.release_lease(restore[start + i]);
+            }
         }
     }
 
