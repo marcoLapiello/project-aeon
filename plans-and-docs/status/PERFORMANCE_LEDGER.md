@@ -69,7 +69,6 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `prefill-config` | Window/chunk as user settings; workspace derived and allocated at load | M43 |
 | `registry-audit-cost` | Per-request `validate_invariants()`: dispatch cost and its removal | M43 |
 | `supply-split` | Exposed-load split (io wait / H2D enqueue / H2D drain) for prefill and decode | M45 |
-| `c4-direct-vram` | Can the NVMe DMA straight into VRAM? (probe: no — `EFAULT` on `pread` and `io_uring`) | M46 |
 
 ## 4. Milestone cards
 
@@ -325,25 +324,3 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: no correctness claim — an attribution run. The strategies are the certified ones (M44's gates); the bench prints the engaged strategy per row.
 - **Conclusion / next gate**: Four findings. (1) **The swept-layer H2D is exposed and is pure PCIe**: `4.1–5.4 s/window` at `≈26 GiB/s` (the Gen4 x16 ceiling), i.e. `6.5–8.4%` of the window, serialized in front of the body. (2) **The disk is not idle** — the sweep's `io_wait` is `0.27–2.07 s` (`98%` hidden); the earlier "banks = 1 idles the disk ~6–7 s" inference is **refuted**, and so are the per-slot-sync (`≈0`) and `O(catalog)` (`≈0.15%`) cost estimates. (3) **`banks = 2` does not fix the exposed upload** — it speeds the reads, which are already hidden; only issuing each expert's upload during the previous body (C2/C3) does. (4) **The largest supply cost is decode's NVMe wait** (`36–63%` of every token), which redirects the work from the transfer path to residency/placement.
 - **Evidence**: `tests/bench_supply_split.cpp`, `scripts/supply_split.sh`, `src/infrastructure/core/tiered_expert_supply.hpp` (`io_wait_ns`, `h2d_enqueue_ns`, `h2d_drain_ns`, `reset_transfer_counters`), `core/v4_model_host.hpp`, `plans-and-docs/analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md` §8
-
-### M46: The C4 probe — the NVMe cannot write directly into VRAM (idea retired)
-- **Run**: `2026-09-24`; branch `main`; RX 7900 XTX (`gfx1100`), single NVMe (Gen4 x4, `~6.33 GB/s` reference); `tools/aeon_c4_probe.cpp` (`build/bin/aeon_c4_probe`)
-- **Class / comparison key**: `Probe / c4-direct-vram`
-- **Platform**: `baseline`, Device 0 only. Preconditions measured green beforehand: **32 GiB BAR aperture**, `CONFIG_PCI_P2PDMA=y`, `amdgpu.pcie_p2p=Y`, GPU↔GPU P2P matrix all-YES.
-- **Workload / configuration**: 256 MiB span, 5 reps at distinct file offsets. Export a `hipMalloc` region as a dma-buf (`hipMemGetHandleForAddressRange`), `mmap` it through the BAR, verify the alias in both directions, then attempt an `O_DIRECT` read straight into it — by `pread`, by the production `io_uring` path (`DirectIOReader`), and by a buffered read, each with controls.
-- **Metrics**:
-
-  | Stage | Result |
-  | :--- | :--- |
-  | dma-buf export + mmap (4096-aligned) | ok |
-  | mapping aliases VRAM (GPU→CPU and CPU→GPU) | ok, both directions |
-  | BAR bandwidth, CPU-visible | write `13.05 GiB/s`, read `0.01 GiB/s` |
-  | reference: `pread(O_DIRECT)` → pinned host | `36.79 ms`, `6.79 GiB/s` |
-  | bounce control: `pread` → host → BAR copy | `55.15 ms`, `4.53 GiB/s` |
-  | **`pread(O_DIRECT)` → VRAM** | **FAILED, `EFAULT`** |
-  | control: `pread(O_DIRECT)` → anonymous host | ok (O_DIRECT itself is fine) |
-  | buffered `pread` → VRAM | ok (copies through the page cache) |
-  | **`io_uring` `O_DIRECT` → VRAM** (production mechanism) | **REJECTED, `cqe.res = -14` (`-EFAULT`)** |
-- **Correctness / service**: not applicable — a capability probe, not a run. The controls are what make it a conclusion: `O_DIRECT` into host memory succeeds (so the refusal is specific to the VRAM mapping), and the alias checks pass (so the mapping really is VRAM, not a broken one).
-- **Conclusion / next gate**: **C4 is closed as `NOT_SUPPORTED`.** The kernel cannot pin a BAR/dma-buf VMA, so no bus address reaches the NVMe controller and `get_user_pages` fails with `EFAULT` before any DMA is programmed — the role `nvidia-fs` plays for GPUDirect Storage, absent here. It is a platform/driver limitation with **no userspace workaround**. The accepted buffered fallback (`≥55 ms` per 256 MiB) is **~20% slower** than the current two-hop DMA path (`≈46 ms`), so it is not a substitute either. Consequence: the `3.44 GiB` pinned staging and the second PCIe hop **stay**; the host-pressure investigation and C3/C2 must solve their problems differently.
-- **Evidence**: `tools/aeon_c4_probe.cpp`, `cmake/AeonInfrastructure.cmake` (`aeon_c4_probe`), `plans-and-docs/analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md` §9
