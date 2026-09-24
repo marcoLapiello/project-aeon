@@ -68,6 +68,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `prefill-ab` | Serial vs swept prefill at two prompt lengths, tok/s and bytes | M42 |
 | `prefill-config` | Window/chunk as user settings; workspace derived and allocated at load | M43 |
 | `registry-audit-cost` | Per-request `validate_invariants()`: dispatch cost and its removal | M43 |
+| `supply-split` | Exposed-load split (io wait / H2D enqueue / H2D drain) for prefill and decode | M45 |
 
 ## 4. Milestone cards
 
@@ -302,3 +303,24 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: same gates as M44; no code change, only the benchmark's prompt source and configuration.
 - **Conclusion / next gate**: **The gate default `3 E / 4` (`192`) is confirmed, deliberately on the safe side of both measurements.** The realistic crossover (`≈140`) is below it and the synthetic one (`≈176–192`) at it, so in no measured config does the gate sweep a prompt below its crossover. The error direction is also the cheap one: at the gate's edge the swept/routed gap is `≤5%`, whereas sweeping a `128`-token prompt would cost `≈12%` against the routed bank. Real-text union concentration is now measured, not assumed — and it is the reason the routed bank stays below the sweep's constant `106.4 GiB` through `N = 1024`.
 - **Evidence**: `profiling-prompts/prefill-corpus.txt`, `tests/bench_prefill_ab.cpp` (tokenizer/encoder prompt path), `cmake/AeonInfrastructure.cmake` (`bench_prefill_ab` sources)
+
+### M45: The exposed-load split — where a batched window's transfer time actually goes
+- **Run**: `2026-09-24`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `bench_supply_split` + `scripts/supply_split.sh`
+- **Class / comparison key**: `Benchmark / supply-split`, `Analysis / supply-hot-path`
+- **Platform**: `baseline`, Device 0 only, single NVMe; context `2048`, `C = 128`, `W = 1024`, gate `3E/4 = 192`, `797` Hot slots
+- **Workload / configuration**: one process, model loaded **once**, a fresh session per length (`reset_generation_state`), the **gate-selected** strategy (not forced), 64 greedy decode tokens per length. Two Warm sizes (`0`, `35 GiB`) in separate processes. New supply-level counters: `io_wait` (host blocked on NVMe completions), `h2d_enqueue` (CPU submit of the H2D copies), `h2d_drain` (host blocked on those copies; sweep-only).
+- **Metrics** (prefill: wall_s / tok/s / cold GiB / `io_wait_s` / `h2d_drain_s`):
+
+  | Warm | N | strategy | wall_s | tok/s | nvme_GiB | io_wait_s | h2d_drain_s |
+  | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
+  | 0 | 64 | routed | 15.000 | 4.27 | 49.64 | **8.355** | 0.000 |
+  | 0 | 256 | swept | 34.588 | 7.40 | 141.37 | **2.065** | **4.566** |
+  | 0 | 512 | swept | 63.589 | 8.05 | 141.37 | **0.531** | **5.357** |
+  | 35 | 64 | routed | 12.294 | 5.21 | 36.95 | **6.150** | 0.000 |
+  | 35 | 256 | swept | 32.436 | 7.89 | 106.42 | **0.277** | **4.061** |
+  | 35 | 512 | swept | 62.311 | 8.22 | 106.40 | **0.265** | **4.067** |
+
+  Decode (per token): `io_wait` `222–252 ms` of a `~400 ms` token (Warm 0) and `69–99 ms` of a `~275 ms` token (Warm 35); `h2d_enqueue` `0.5–1.6 ms`; `h2d_drain` `0`; `submit` `0.16–0.46 ms`; NVMe `440–1703 MiB/token`.
+- **Correctness / service**: no correctness claim — an attribution run. The strategies are the certified ones (M44's gates); the bench prints the engaged strategy per row.
+- **Conclusion / next gate**: Four findings. (1) **The swept-layer H2D is exposed and is pure PCIe**: `4.1–5.4 s/window` at `≈26 GiB/s` (the Gen4 x16 ceiling), i.e. `6.5–8.4%` of the window, serialized in front of the body. (2) **The disk is not idle** — the sweep's `io_wait` is `0.27–2.07 s` (`98%` hidden); the earlier "banks = 1 idles the disk ~6–7 s" inference is **refuted**, and so are the per-slot-sync (`≈0`) and `O(catalog)` (`≈0.15%`) cost estimates. (3) **`banks = 2` does not fix the exposed upload** — it speeds the reads, which are already hidden; only issuing each expert's upload during the previous body (C2/C3) does. (4) **The largest supply cost is decode's NVMe wait** (`36–63%` of every token), which redirects the work from the transfer path to residency/placement.
+- **Evidence**: `tests/bench_supply_split.cpp`, `scripts/supply_split.sh`, `src/infrastructure/core/tiered_expert_supply.hpp` (`io_wait_ns`, `h2d_enqueue_ns`, `h2d_drain_ns`, `reset_transfer_counters`), `core/v4_model_host.hpp`, `plans-and-docs/analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md` §8

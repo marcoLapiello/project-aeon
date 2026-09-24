@@ -33,6 +33,16 @@ if(AEON_BUILD_BENCHMARKS)
             tests/bench_prefill_ab.cpp
             src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
             src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp)
+
+    # Supply-chain hot-path analysis, Step 1: where a batched window's exposed load
+    # goes. Loads the model once, runs the gate-selected strategy per length in a
+    # fresh session, and prints the drive / H2D-enqueue / H2D-drain split for prefill
+    # and for a short greedy decode. Attribution, not a strategy A/B — see the header.
+    aeon_add_benchmark(bench_supply_split
+        SOURCES
+            tests/bench_supply_split.cpp
+            src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
+            src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp)
 endif()
 
 # --- Backend kernels and artifact format -------------------------------------

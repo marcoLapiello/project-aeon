@@ -168,6 +168,37 @@ public:
     }
     uint64_t direct_io_submit_calls() const noexcept { return direct_io_submit_calls_; }
 
+    // The transfer split, accumulated over **every** caller of this supply — the
+    // swept prefill and decode both drive `dispatch`/`materialize`, so one set of
+    // counters attributes both phases without a second instrumentation path.
+    //
+    //   io_wait_ns_      host time blocked waiting for NVMe completions (`materialize`)
+    //   h2d_enqueue_ns_  CPU time to submit the H2D copies and record their events
+    //   h2d_drain_ns_    host time blocked waiting for those copies to land
+    //                    (`release_streamed_staging`'s per-slot event sync; sweep-only)
+    //   h2d_drain_calls_ how many `hipEventSynchronize` calls that took
+    //
+    // The three answer two different questions: `io_wait` vs `h2d_drain` says whether
+    // the exposed load is disk-bound or PCIe-bound, and `h2d_drain_calls_` says how
+    // much of the drain is the copy versus the per-slot driver round-trips.
+    uint64_t io_wait_ns() const noexcept { return io_wait_ns_; }
+    uint64_t h2d_enqueue_ns() const noexcept { return h2d_enqueue_ns_; }
+    uint64_t h2d_drain_ns() const noexcept { return h2d_drain_ns_; }
+    uint64_t h2d_drain_calls() const noexcept { return h2d_drain_calls_; }
+
+    // Zeroes every transfer counter above so a caller can slice one phase (prefill,
+    // then decode) without re-instantiating the supply. Counters only — no state is
+    // reset, and the registry/arena are untouched.
+    void reset_transfer_counters() noexcept {
+        direct_io_submit_ns_ = 0;
+        direct_io_requests_submitted_ = 0;
+        direct_io_submit_calls_ = 0;
+        io_wait_ns_ = 0;
+        h2d_enqueue_ns_ = 0;
+        h2d_drain_ns_ = 0;
+        h2d_drain_calls_ = 0;
+    }
+
     PayloadBatch dispatch(
         const std::vector<PayloadRequest>& requests,
         uint64_t current_step,
@@ -425,6 +456,7 @@ public:
     // makes an immediate release safe.
     void release_streamed_staging(PayloadBatch& batch) {
         if (prefetch_staging_ == nullptr) return;
+        const auto drain_started = std::chrono::steady_clock::now();
         for (auto& state : batch.transfers) {
             if (!state.is_prefetched) continue;
             const uint32_t staging_idx = state.staging_idx;
@@ -436,9 +468,11 @@ public:
             check_hip(
                 hipEventSynchronize(prefetch_staging_->events[staging_idx]),
                 "hipEventSynchronize(stream staging)");
+            ++h2d_drain_calls_;
             prefetch_staging_->release_after_gpu_transfer(staging_idx);
             state.is_prefetched = false;
         }
+        h2d_drain_ns_ += elapsed_ns(drain_started);
     }
 
     void materialize(PayloadBatch& batch) {
@@ -447,6 +481,7 @@ public:
                 continue;
             }
 
+            const auto io_wait_started = std::chrono::steady_clock::now();
             const size_t request_count = state.io_request_count;
             for (size_t chunk = 0; chunk < request_count; ++chunk) {
                 const uint64_t request_id = state.io_user_data + chunk;
@@ -515,6 +550,8 @@ public:
             }
 
             const uint32_t staging_idx = state.staging_idx;
+            io_wait_ns_ += elapsed_ns(io_wait_started);
+            const auto h2d_enqueue_started = std::chrono::steady_clock::now();
             prefetch_staging_->complete_io(staging_idx);
             prefetch_staging_->begin_gpu_transfer(staging_idx);
             wait_for_demotion_dependency(state.operation_id, sdma_cold_stream_);
@@ -529,6 +566,7 @@ public:
             record_h2d_event(
                 state.operation_id, sdma_cold_stream_, staging_idx, true,
                 static_cast<int32_t>(staging_idx), state.vram_slot);
+            h2d_enqueue_ns_ += elapsed_ns(h2d_enqueue_started);
 
             state.is_prefetched = true;
             state.io_pending = false;
@@ -939,6 +977,11 @@ private:
         }
     }
 
+    static uint64_t elapsed_ns(std::chrono::steady_clock::time_point started) noexcept {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+    }
+
     PayloadSource source_;
     ExpertPayloadPool* payload_pool_{nullptr};
     HostExpertPool* host_pool_{nullptr};
@@ -949,6 +992,10 @@ private:
     uint64_t direct_io_submit_ns_{0};
     uint64_t direct_io_requests_submitted_{0};
     uint64_t direct_io_submit_calls_{0};
+    uint64_t io_wait_ns_{0};
+    uint64_t h2d_enqueue_ns_{0};
+    uint64_t h2d_drain_ns_{0};
+    uint64_t h2d_drain_calls_{0};
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion>* direct_io_completions_{nullptr};
     uint64_t* next_direct_io_id_{nullptr};
     hipStream_t compute_stream_{nullptr};

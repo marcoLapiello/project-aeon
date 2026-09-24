@@ -719,6 +719,20 @@ public:
     uint64_t direct_io_requests_submitted() const noexcept {
         return supply_.direct_io_requests_submitted();
     }
+    uint64_t direct_io_submit_calls() const noexcept {
+        return supply_.direct_io_submit_calls();
+    }
+    // The transfer split (see `TieredExpertSupply`): host time blocked on NVMe
+    // completions (`io_wait`), CPU time to submit the H2D copies (`h2d_enqueue`), and
+    // host time blocked on those copies landing (`h2d_drain`, plus `h2d_drain_calls`
+    // event syncs). Unlike the sweep-scoped `sweep_load_ns`, these accumulate across
+    // **both** phases, which is what lets one bench attribute prefill and decode from
+    // the same counters. `reset_supply_transfer_counters` slices between them.
+    uint64_t supply_io_wait_ns() const noexcept { return supply_.io_wait_ns(); }
+    uint64_t supply_h2d_enqueue_ns() const noexcept { return supply_.h2d_enqueue_ns(); }
+    uint64_t supply_h2d_drain_ns() const noexcept { return supply_.h2d_drain_ns(); }
+    uint64_t supply_h2d_drain_calls() const noexcept { return supply_.h2d_drain_calls(); }
+    void reset_supply_transfer_counters() noexcept { supply_.reset_transfer_counters(); }
     // Layers whose reads were in flight when a body started (1 = the double buffer
     // is engaged; 0 = the pool is too small for two layers and loads are serial).
     uint32_t sweep_lookahead_depth() const noexcept {

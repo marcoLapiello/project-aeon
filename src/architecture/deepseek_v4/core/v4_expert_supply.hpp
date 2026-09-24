@@ -143,6 +143,16 @@ public:
         return supply_.direct_io_submit_calls();
     }
 
+    // The transfer split (see `TieredExpertSupply`): host time blocked on NVMe
+    // completions, CPU time to submit H2D, and host time blocked on the H2D
+    // copies landing. Both phases drive the same supply, so one set serves the
+    // prefill and decode attribution alike.
+    uint64_t io_wait_ns() const noexcept { return supply_.io_wait_ns(); }
+    uint64_t h2d_enqueue_ns() const noexcept { return supply_.h2d_enqueue_ns(); }
+    uint64_t h2d_drain_ns() const noexcept { return supply_.h2d_drain_ns(); }
+    uint64_t h2d_drain_calls() const noexcept { return supply_.h2d_drain_calls(); }
+    void reset_transfer_counters() noexcept { supply_.reset_transfer_counters(); }
+
     LayerPrefetchState dispatch_layer_prefetch(
         uint32_t target_l,
         uint32_t pos,
