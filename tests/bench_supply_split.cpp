@@ -214,6 +214,12 @@ int main(int argc, char** argv) {
     runtime.prefill_chunk = kChunk;
     runtime.prefill_window = kWindow;
     runtime.warm_host_bytes = warm_gib * 1024ULL * 1024ULL * 1024ULL;
+    // Phase 1 A/B (supply-chain hot-path plan): the sweep's staging banks. `1` is the
+    // pre-Phase-1 shape (the blocking drain), `2` (the config default) the
+    // deferred-drain headroom. Env-overridable so the A/B needs no rebuild.
+    if (const char* banks_env = std::getenv("AEON_SWEEP_BANKS")) {
+        runtime.prefill_sweep_staging_banks = static_cast<uint32_t>(std::atoi(banks_env));
+    }
 
     V4ModelHost host;
     host.initialize(model_dir, runtime, /*verbose=*/false);
@@ -248,11 +254,25 @@ int main(int argc, char** argv) {
         static_cast<double>(layers) * per_layer * 14'155'776.0 / 1073741824.0;
     const uint32_t gate = host.prefill_sweep_min_tokens();
 
+    // P1.2 requirement: the pinned staging figure a gate reads is the figure
+    // allocated. The budget report and the arena share `staging_slot_count`, so this
+    // is the cross-check that they have not drifted.
+    const size_t staging_slot_bytes = host.staging_slot_count() *
+        host.loader().expert_format().payload_bytes;
+    if (staging_slot_bytes != host.budget().transient_staging_bytes) {
+        throw std::runtime_error(
+            "bench_supply_split: staging budget " +
+            std::to_string(host.budget().transient_staging_bytes) +
+            " bytes does not match the arena's " + std::to_string(staging_slot_bytes));
+    }
+
     std::printf(
         "[supply-split] model=%.1f GiB layers=%u E=%u warm=%llu GiB decode=%u tokens "
-        "gate=%u sweep_engaged_for_window=%d\n",
+        "gate=%u sweep_engaged_for_window=%d banks=%u staging_slots=%u staging=%.2f GiB\n",
         model_gib, layers, per_layer, static_cast<unsigned long long>(warm_gib),
-        decode_tokens, gate, host.prefill_sweep_enabled() ? 1 : 0);
+        decode_tokens, gate, host.prefill_sweep_enabled() ? 1 : 0,
+        host.sweep_staging_banks(), host.staging_slot_count(),
+        static_cast<double>(staging_slot_bytes) / 1073741824.0);
 
     std::vector<PrefillRow> prefill;
     std::vector<DecodeRow> decode;

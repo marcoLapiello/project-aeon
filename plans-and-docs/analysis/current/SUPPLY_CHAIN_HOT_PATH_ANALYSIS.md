@@ -1,6 +1,6 @@
 # Supply-Chain Hot-Path Analysis — is the feed a river or a bucket?
 
-*Status: open analysis — **largely measured and settled**. Written 2026-09-22; deepened 2026-09-23 in a second source pass; **measured 2026-09-24** (Step 1 §8, Step 2 §9). A two-round audit of the expert supply's transfer path and its per-request bookkeeping, in answer to two questions: (1) is the NVMe→VRAM feed a continuous stream or an interrupted one; (2) which substeps on that road are expensive enough to be worth removing. Source read: `direct_io_reader.hpp`, `tiered_expert_supply.hpp`, `prefetch_staging.hpp`, `expert_registry.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp`, `v4_expert_executor.hpp`, `v4_model_host.hpp`, `memory_budget.hpp`, `bench_prefill_ab.cpp`. Instrumentation added: `TieredExpertSupply` transfer counters + `tests/bench_supply_split.cpp` + `scripts/supply_split.sh`; probe added: `tools/aeon_c4_probe.cpp`. **Headline: the transfer path is near its ceiling; the remaining in-scope lever is C2/C3 (§8.6), and the largest measured supply cost — decode's NVMe wait (§8.5) — has a remedy that is out of scope here.***
+*Status: open analysis — **largely measured and settled**. Written 2026-09-22; deepened 2026-09-23 in a second source pass; **measured 2026-09-24** (Step 1 §8, Step 2 §9, Phase 1 §10). A two-round audit of the expert supply's transfer path and its per-request bookkeeping, in answer to two questions: (1) is the NVMe→VRAM feed a continuous stream or an interrupted one; (2) which substeps on that road are expensive enough to be worth removing. Source read: `direct_io_reader.hpp`, `tiered_expert_supply.hpp`, `prefetch_staging.hpp`, `expert_registry.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp`, `v4_expert_executor.hpp`, `v4_model_host.hpp`, `memory_budget.hpp`, `bench_prefill_ab.cpp`. Instrumentation added: `TieredExpertSupply` transfer counters + `tests/bench_supply_split.cpp` + `scripts/supply_split.sh`; probe added: `tools/aeon_c4_probe.cpp`. **Headline: the transfer path is near its ceiling; the exposed swept-layer H2D `4.1–5.4 s/window` was then removed in Phase 1 (§10) by a deferred drain — `3.2–3.5 s/window` recovered, at both Warm 0 and Warm 30 — but only with a second staging bank that costs `+3.44 GiB` pinned, which does not fit the production Warm shape; the shipping form is C2's per-expert recycling (Phase 2). The largest measured supply cost — decode's NVMe wait (§8.5) — has a remedy that is out of scope here.***
 
 **Subject.** The mechanics of moving a routed expert from NVMe into VRAM — the read submission, the staging corridor, the H2D, and the registry bookkeeping around all three. This is the *how fast can the bytes arrive* question, not the *which bytes should arrive* strategy question, which the [prefill supply review](PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) and the [prefill supply strategy plan](PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) own.
 
@@ -25,7 +25,7 @@ So the drive is kept busy across layers (the double buffer works), but the **PCI
 
 The second pass sharpens the bucket in two ways that matter for what to fix:
 
-- **The same fence does *not* idle the disk — the H2D copy is what it exposes.** This was the second pass's sharpest *prediction* and the measurement (§8) **refuted the disk half of it**: the sweep's `io_wait` is ≈`0.3 s` per window, so the reads are essentially fully hidden by the double buffer and the drive is never starved. What the one-bank fence does expose is the **H2D copy itself**: `4.1–5.4 s` per swept window, at the PCIe Gen4 x16 ceiling (`~26 GiB/s`), serialized in front of the body because the next layer's reads cannot start until these slots drain. So the lever is the **upload**, not the reads — and a second bank (C1) does not by itself fix it (§5.2).
+- **The same fence does *not* idle the disk — the H2D copy is what it exposes.** This was the second pass's sharpest *prediction* and the measurement (§8) **refuted the disk half of it**: the sweep's `io_wait` is ≈`0.3 s` per window, so the reads are essentially fully hidden by the double buffer and the drive is never starved. What the one-bank fence does expose is the **H2D copy itself**: `4.1–5.4 s` per swept window, at the PCIe Gen4 x16 ceiling (`~26 GiB/s`), serialized in front of the body because the next layer's reads cannot start until these slots drain. So the lever is the **upload**, not the reads — and a second bank (C1) does not by itself fix it (§5.2). **Phase 1 (§10) then showed it *is* the fix once coupled with a deferred drain**: the second bank is the headroom that lets the copies stay in flight through the body, and it recovered `3.2–3.5 s/window` — but it costs a whole extra pinned bank, which does not fit the host-memory budget, so C2 is the shipping form.
 - **The boundary is a serial three-leg critical path, not one leg.** Per layer, before the body can start, the host serially does: (1) wait the layer's reads, (2) enqueue and host-wait the layer's H2D, (3) release staging, (4) *then* issue the next layer's reads, (5) *then* the `O(catalog)` bookkeeping of §4. With the reads hidden (`io_wait`≈0) and the bookkeeping negligible (§4), the exposed leg is **(2)** — the H2D drain. That is the measured target.
 
 ---
@@ -69,7 +69,7 @@ Estimated cost (from figures, **not measured**): `3.44 GiB` per layer at a PCIe 
 
 **This is not a mystery; it is the plan's open item.** The plan already lists *"the staging arena's `banks × depth` target — the smaller waved ring is unbuilt."* This analysis gives that item a mechanism: **with `banks = 1`, the read leg and the upload leg of consecutive layers cannot overlap.** Raised to `banks = 2` (the decode path's shape), `L+1`'s reads could fill bank B while `L`'s H2D drains bank A, and the upload would overlap the read instead of the body.
 
-**Measured (§8), with one correction.** The exposed upload is real and is `4.1–5.4 s` per swept window — but the mechanism is narrower than "reads and uploads cannot overlap": the window's `io_wait` is ≈`0.3 s`, so the reads *are* fully hidden and the drive is never starved. The one bank exposes the **H2D copy** (the next layer's reads need these slots, so they wait), not the disk. And `banks = 2` does not fix that either — it lets the *next reads* start sooner, not the *upload* move off the critical path. The fix that actually hides it is issuing each expert's upload as its read lands, **during the previous body** (C3, §5.2), which the rolling corridor (C2) implements cheaply.
+**Measured (§8), with one correction.** The exposed upload is real and is `4.1–5.4 s` per swept window — but the mechanism is narrower than "reads and uploads cannot overlap": the window's `io_wait` is ≈`0.3 s`, so the reads *are* fully hidden and the drive is never starved. The one bank exposes the **H2D copy** (the next layer's reads need these slots, so they wait), not the disk. `banks = 2` *alone* does not fix that either — it lets the *next reads* start sooner, not the *upload* move off the critical path. **Phase 1 (§10) resolved this:** the upload does move off the critical path, but only when the second bank is combined with a **deferred drain** — the sweep leaves layer `L`'s copies in flight, orders nothing on the compute stream itself, and lets the body's MoE dispatch join each pending transfer and wait on its per-expert event before the MoE reads the weights. Ordering the *whole body* behind the copies instead recovers nothing (the copy simply moves from in front of the compute to in front of attention), which is the subtlest part of the result. The remaining work is to get that overlap without a whole extra bank — C2's per-expert recycling.
 
 **Second, smaller exposure:** `begin()` drains Hot and immediately `dispatch_ahead(0)`, so layer `0` has no lookahead at its own `before_layer(0)` and is always fully exposed. Once per window; negligible at large `N`, material at small `N`.
 
@@ -182,7 +182,7 @@ Everything above is reasoned, not measured. The counters already exist for most 
 The findings that recover *throughput* (as opposed to removing waste) are these, and they are not mutually exclusive:
 
 - **(C2) A rolling staging corridor** — the option the first pass missed. Reads **and** H2D are both per-expert (13.5 MiB, 4 chunks), so instead of `wait-all-reads → enqueue-all-H2D → wait-all-H2D → release-all`, do it per expert: as expert *i*'s chunks land, issue its H2D; as its upload event fires, free slot *i*; a concurrent path refills slot *i* with `L+1`'s data. This uses only a **handful** of surplus slots rather than a second full bank, and it does not double pinned memory. **§8 corrects the reason it matters:** not disk overlap (the disk is already hidden) but **moving each expert's upload into the previous body's shadow**, which is what actually removes the `4.1–5.4 s` exposed H2D. It is compatible with the [host-memory pressure](HOST_MEMORY_PRESSURE_INVESTIGATION.md) constraint that `banks = 2` fights.
-- **(C1) `banks = 2`** — **§8 refutes this as a standalone fix.** It lets the next layer's reads begin sooner, but the reads are already `98%` hidden (`io_wait ≤ 2.1 s`), so there is nothing for it to recover; it does not move *this* layer's upload off the pre-body critical path, which is the actual `4.1–5.4 s`. Do not build it alone; fold its slot-recycling idea into C2/3. Its two costs (§3: pinned memory doubled; ring depth to re-check) then do not need to be paid.
+- **(C1) `banks = 2`** — **refuted as a standalone fix (§8), confirmed as half of the coupled fix (§10).** Alone it only lets the next layer's reads begin sooner, and the reads are already `98%` hidden (`io_wait ≤ 2.1 s`), so there is nothing for it to recover. But the second bank is exactly the headroom a **deferred drain** needs: with it, the sweep leaves layer `L`'s copies in flight through `body(L)` instead of host-blocking on them first, and the body's own MoE dispatch supplies the ordering. Measured (§10): `h2d_drain 4.25 → 0.006 s`, `wall −3.2/−3.5 s` at Warm 0 **and** Warm 30, with `io_wait` and decode unmoved. Its cost is real and is why the default stays `1`: `+3.44 GiB` of non-reclaimable pinned memory, which at the production Warm shape (~35 GiB, also pinned) pushes the 62 GiB reference box into swap even though the budget check passes. **Phase 2's per-expert slot recycling is what makes the win shippable** without the whole extra bank.
 - **(C5) Collapse 256 H2D copies into one** — all experts in a layer share `payload_bytes`, and if the free-list allocation yields contiguous VRAM runs the 256 `hipMemcpyAsync` calls become one 3.44 GiB copy. Per-call driver overhead is ~few µs × 256 ≈ `1–3 ms/layer`. Only worth it if contiguity can be arranged; otherwise nice-to-have.
 - **(C4) Is the H2D avoidable at all on gfx1100?** **Closed — §9 measured it: `NOT_SUPPORTED`.** The preconditions were green (32 GiB BAR, `CONFIG_PCI_P2PDMA=y`, `pcie_p2p=Y`), VRAM exports as a dma-buf and maps correctly, and the mapping verifiably aliases VRAM — but the kernel refuses it as a direct-I/O destination: `pread(O_DIRECT)` → `EFAULT`, and the production `io_uring` read → `cqe.res = -14`. `get_user_pages` cannot pin a BAR/dma-buf VMA, so no bus address reaches the NVMe controller. The accepted buffered path bounces through the page cache at `13 GiB/s` CPU writes and is *slower* than the current two-hop DMA path. **No userspace workaround; the pinned staging and the second hop stay.**
 
@@ -212,8 +212,8 @@ Ordered by confidence-to-effort, not by size. Every "fix" here is unstarted and 
 | 4 | **`O(1)` reap** (§4.4c) | `reap_registry_transfers` | ~280 MB memmove/window | swap-and-pop | XS | low |
 | 5 | **Drop duplicate event** (§4.4b) | `record_h2d_event` | 22 k create/destroy/window | complete inline at the batch sync | M | med |
 | 6 | **Measure first** (§5.1) | `bench_supply_split` + supply counters | — | **done (§8)** | S | none |
-| 7 | **Rolling corridor** (§5.2 C2) | `materialize` + sweep | measured: hides the `4.1–5.4 s` exposed H2D (§8) — *not* disk idle | per-expert read → H2D during the previous body → release | L | med |
-| 8 | **`banks = 2`** (§5.2 C1) | `V4ModelHost` staging sizing | **refuted as a standalone fix** (§8): reads are already hidden | do not build alone; fold into C2 | M | pinned-mem coupling, SQ/CQ |
+| 7 | **Rolling corridor** (§5.2 C2) | `materialize` + sweep | **the shipping form of §10's win** — same overlap from a bounded surplus instead of a whole extra bank | per-expert read → H2D during the previous body → release | L | med |
+| 8 | **`banks = 2`** (§5.2 C1) | `V4ModelHost` staging sizing | **coupled with the deferred drain it recovers the whole exposed H2D (§10); standalone it does not** (§8) | implemented; opt-in (`prefill_sweep_staging_banks`), default `1` — C2 removes the need | M | pinned-mem coupling (`+3.44 GiB`), SQ/CQ |
 | 9 | **id→index map** (§4.4d) | `find`/`ensure_registry_transfer` | ~200 k cmp/layer, but total dispatch CPU ≈0.15% (§8) | `unordered_map` index | S | low value |
 | 10 | **Single H2D copy** (§5.2 C5) | `materialize` | ~1–3 ms/layer | contiguous copy | M | low value |
 | 11 | **Large-BAR NVMe→VRAM** (§5.2 C4) | spike — **done (§9)** | **`NOT_SUPPORTED`, measured** — kernel refuses VRAM as an O_DIRECT target | closed, no workaround | — | settled |
@@ -279,7 +279,7 @@ These are corrections to this document, not to the code:
 1. **"`banks = 1` also idles the disk ~6–7 s/window" (§1, §3) — refuted.** The swept window's `io_wait` is `0.27–2.07 s`, and `2.07 s` is only at `N = 256` (where the body is short). At `N = 512` it is `0.53 s` (Warm 0) / `0.27 s` (Warm 35). The disk's service time is `≈24 s` of a `63.6 s` window (38% busy), and it is `98%` hidden — the double buffer works exactly as designed. **The drive is never starved; the reads are a river within the layer too.** Only the *upload* is exposed. (`io_wait` is high — `6–8 s`, ~50% — only on the **routed** path at `N = 64`, which is a different strategy with per-expert scattered reads.)
 2. **"256 host syncs cost 55–215 ms/window" (§4.4a) — refuted.** The window does make `10 723` syncs (`~249`/layer), but the `4.1–5.4 s` they spend is the PCIe copy time they absorb, not round-trip overhead. Collapsing them to one saves ≈`0`. The item is correct in principle and worthless in practice **unless the copies themselves are overlapped**.
 3. **"The `O(catalog)` scans are ~5–15 ms/layer → 215–645 ms/window" (§4) — refuted as a magnitude.** Total non-I/O dispatch CPU across a whole window is bounded by `h2d_enqueue + submit ≈ 70–100 ms`. The scans may well exist, but they are ≈`0.15%` of the window. §4 should be **deprioritised**, as §4.3 already hedged (M43's audit fix was the real win here, and it is already in).
-4. **`banks = 2` does not fix the exposed upload (new, §3/§5.2).** The measurement forces this distinction: a second bank lets the *next layer's reads* start during this layer's drain, but the reads are already hidden. It does **not** move *this layer's upload* off the pre-body critical path. The fix that does is issuing each expert's upload when its read lands, *during the previous body* (C3), which the rolling corridor (C2) is the cheap implementation of.
+4. **`banks = 2` alone does not fix the exposed upload.** The measurement forces this distinction: a second bank lets the *next layer's reads* start during this layer's drain, but the reads are already hidden. Alone it does **not** move *this layer's upload* off the pre-body critical path. **Partly superseded by §10:** coupled with a deferred drain, the second bank *does* move the upload off the critical path — the copies stay in flight through the body, and the body's MoE dispatch orders their weights per expert. The correction is the **coupling**, not the bank; and because the bank is unaffordable at the production Warm shape, C2's per-expert recycling is the form that ships.
 
 ### 8.5 What the measurement bounds — and what it hands off
 
@@ -295,9 +295,9 @@ This is a **characterization of the transfer path**, and it is in scope: decode 
 
 | Item | Before §8 | After §8 |
 | :--- | :--- | :--- |
-| **C1 `banks = 2`** | the fix for the exposed load | **does not fix the exposed upload**; only helps reads, which are already hidden. Drop as a standalone fix. |
-| **C2 rolling corridor** | cheaper alternative to C1 | **the right shape**, but for C3's reason (per-expert upload during the previous body), not for disk overlap. Worth building; ~`4–5.4 s/window` on swept prefill. |
-| **C3 completion-driven upload** | "the real prize" | **confirmed as the prize** for the swept path, with a measured ceiling of `4.1–5.4 s/window` (`6.5–8.4%`). |
+| **C1 `banks = 2`** | the fix for the exposed load | standalone: only helps reads, already hidden (§8). **Coupled with a deferred drain: recovers the whole exposed upload (§10), but unaffordable at the production Warm shape.** |
+| **C2 rolling corridor** | cheaper alternative to C1 | **now the shipping form**: §10's win needs a whole second bank (`+3.44 GiB` pinned, which swaps the box); C2's per-expert recycling gets the same overlap from a bounded surplus. |
+| **C3 completion-driven upload** | "the real prize" | **confirmed and partly delivered** — §10 recovered `3.2–3.5 s/window` (`5–11%`) by deferring the drain; C2 completes it at a shippable memory cost. |
 | **C4 large-BAR NVMe→VRAM** | possibly transformative | **closed — `NOT_SUPPORTED` (§9).** Measured on the production `io_uring` path: `-EFAULT`. The pinned staging and the second hop stay. |
 | **§4 `O(catalog)` scans** | new open-work item | **deprioritised — ~0.15% of the window.** |
 | **Decode disk wait** | not considered | measured at `36–63%` of every token, but its **remedy is residency — out of scope** (the "which bytes" question). Recorded as a hand-off to the routing/placement study; **not** an item this analysis acts on. |
@@ -374,5 +374,57 @@ Two further facts fall out of the probe and are worth keeping:
 **C4 is closed as `NOT_SUPPORTED`, measured on the production mechanism, with the cause identified and the workaround ruled out.** The pinned staging arena and the two-hop path stay. Concretely:
 
 - The `3.44 GiB` pinned staging **cannot be removed** by this route — the host-memory pressure investigation must solve that differently.
-- The `4.1–5.4 s/window` exposed H2D **cannot be removed** by this route either; C3/C2 (issuing the upload during the previous body) remains the only lever, and it keeps the second hop by construction.
+- The `4.1–5.4 s/window` exposed H2D **cannot be removed** by this route either; issuing the upload during the previous body remains the only lever, and it keeps the second hop by construction. **§10 then recovered `3.2–3.5 s` of it.**
 - The spike was **worth running**: it converts a plausible, preconditions-green idea into a settled negative in about half a day, and it retires the largest "maybe" in this document.
+
+---
+
+## 10. Measured — Phase 1, the deferred drain (2026-09-24)
+
+*Status: **measured.** The first fix of the execution plan was built and A/B'd. The overlap is real; the memory cost is the blocker. Plan: [SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md](../../execution/active/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md).*
+
+### 10.1 What was built
+
+Three changes, all in the sweep's supply path:
+
+- **A second layer-sized staging bank.** With `prefill_sweep_staging_banks = 2`, the arena is `2E` slots instead of `E` (`3.44 → 6.75 GiB` pinned at `E = 256`), and layer `L`'s reads land in bank `L % 2` — one bank in flight, one bank the lookahead reads into. Both the budget report and the arena call the same `staging_slot_count` helper, so the printed figure is the allocated figure.
+- **A deferred drain.** `V4PrefillSweep::materialize_layer` no longer calls `release_streamed_staging`; it settles the reads, keeps the copies in flight, **orders nothing on the compute stream itself**, and holds the batch as a `resident_state_` until `after_layer` returns the bank. `after_layer` then resumes the resident bank, reaps (which promotes the completed uploads out of `PROMOTION_PENDING`) and releases the layer.
+- **Ordering left to the consumer.** This is the load-bearing detail. The body's MoE dispatch (`on_routing_ready_batch`) joins a transfer that is still `PROMOTION_PENDING` by its `operation_id`, and `V4TieredExpertExecutor::accumulate_routed` waits on that transfer's per-expert event before the MoE reads the weights; a transfer the registry has already reaped is complete by definition. **Ordering the whole body** behind the copies instead (a single `hipStreamWaitEvent` on the compute stream) recovers **nothing** — measured — because it puts the copy back in front of the attention and router it is meant to hide behind.
+
+### 10.2 Results
+
+`scripts/supply_split.sh` (one model load, gate-selected strategy, 64-token greedy decode), single runs, one process at a time. Warm 30 GiB added because the production shape is where the memory question bites.
+
+**Prefill, swept arm** (`h2d_drain`/`io_wait` host-blocked; `nvme` cold bytes):
+
+| Warm | N | banks | wall_s | tok/s | io_wait_s | **h2d_drain_s** | disp_ms | submit_ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 256 | 1 | 33.811 | 7.57 | 0.678 | **4.566** | 567.4 | 31.5 |
+| 0 | 256 | 2 | **30.574** | 8.37 | 1.741 | **0.006** | 536.6 | 31.6 |
+| 0 | 512 | 1 | 63.593 | 8.05 | 0.526 | **5.357** | 791.6 | 30.0 |
+| 0 | 512 | 2 | **59.087** | 8.67 | 0.525 | **0.006** | 790.2 | 31.6 |
+| 30 | 256 | 1 | 32.913 | 7.78 | 0.421 | **4.230** | 481.8 | 25.1 |
+| 30 | 256 | 2 | **29.400** | 8.71 | 0.416 | **0.006** | 625.1 | 22.8 |
+| 30 | 512 | 1 | 62.280 | 8.22 | 0.311 | **4.247** | 697.5 | 25.8 |
+| 30 | 512 | 2 | **59.055** | 8.67 | 0.313 | **0.006** | 855.7 | 22.4 |
+
+**Decode** (64 greedy tokens) is unchanged in every pairing (`ms/tok` within noise; `h2d_drain` was already `0`). `io_wait` is unchanged, which is the proof the reads were not the problem.
+
+### 10.3 What the measurement establishes
+
+1. **The exposed upload is removable, and this removes it.** `h2d_drain 4.2–5.4 s → 0.006 s`, and `wall_s` falls by a comparable amount: `−3.24 s` at `N = 256`, `−4.51 s` at `N = 512` (Warm 0); `−3.51 s` / `−3.23 s` at Warm 30. That is `5–11%` of the swept window, matching §8.6's predicted ceiling.
+2. **The win holds with an active Warm tier.** User prediction confirmed: Warm 30 shows the same absolute saving as Warm 0. The overlap is a function of the copy overlapping the body, which does not depend on where the bytes came from.
+3. **`io_wait` does not rise.** The reads were hidden before and stay hidden; nothing was merely moved from the copy to the disk. `io_wait` at `N = 512` is `0.53 s` (Warm 0) / `0.31 s` (Warm 30) in both arms.
+4. **The ordering must be the consumer's, not the driver's.** The first attempt ordered the whole body behind the copies and recovered **zero**. The fix is not "wait somewhere else" but "don't wait at all on the driver side; let the per-expert consumer wait" — which is what the decode path already does.
+5. **`disp_ms` rises slightly** (`698 → 856 ms` at Warm 30, `N = 512`) — more transfers in flight at once makes the `O(catalog)` scans of §4 costlier. Still ≈`0.4%` of the window, and it now has a *reason* to exist: Phase 3's `O(1)` count becomes worth doing if the in-flight population grows.
+
+### 10.4 The blocker, and the consequence
+
+**`banks = 2` costs `+3.44 GiB` of non-reclaimable pinned host memory.** At Warm 0 that is fine. At the production Warm shape it is not: Warm 35 GiB is *also* pinned, so `35 + 6.75 = 41.75 GiB` pinned plus the ~13 GiB of process/driver/dense footprint the budget does not model pushed the 62 GiB machine to ~50 GiB used **and 5 GiB of swap** during the measurement — the sweep did not complete.
+
+Two findings fall out, one about this document and one about the budget:
+
+- **The default must stay `banks = 1`.** The overlap is proven but not yet affordable. `prefill_sweep_staging_banks` ships with default `1` (the engine's original memory shape) and the second bank is an explicit opt-in for the A/B.
+- **The host-reserve model is under-sized** (`HOST_RAM_RESERVED_BYTES = 10 GiB`). The budget check *passed* `35 + 6.75 = 41.75 ≤ 52` and the machine still swapped, so the unmodelled overhead is `> 10 GiB`. This belongs to the open [host-memory pressure investigation](HOST_MEMORY_PRESSURE_INVESTIGATION.md) — it is a data point for it, not a defect in this plan.
+
+**Consequence for the plan:** Phase 1's win is **conditional on Phase 2**. Per-expert slot recycling (C2) recovers the same overlap from a bounded surplus (a handful of slots) instead of a whole `E`-slot bank, which is what makes it fit both the memory budget and the host-memory investigation's constraint. Phase 2 is therefore **mandatory, not optional** — it is how Phase 1's result ships.

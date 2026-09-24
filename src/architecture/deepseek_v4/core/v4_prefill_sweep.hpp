@@ -54,14 +54,31 @@
 // `ensure_layer` loads each layer at its own boundary: the strategy degrades to the
 // serial form rather than failing.
 //
+// ## The deferred drain
+//
+// A layer's H2D copies are **not waited for on the host**, and their staging bank is
+// returned at `after_layer` rather than at the layer's own boundary. The copy therefore
+// overlaps the layer's attention and router — the work the layer body does before its
+// MoE — instead of fronting it: the sweep used to block ~0.12 s per layer on it.
+// Ordering is the **consumer's**, not the driver's: the body's MoE dispatch joins each
+// still-pending transfer and the executor waits on its per-expert event before the MoE
+// reads the weights, while a transfer the registry has already reaped is complete by
+// definition. Ordering the whole body here instead would recover nothing, because it
+// would put the copy back in front of the very work it hides behind.
+//
+// The bank cannot be reused before it is returned, which is why the arena must hold
+// **two** layer-sized banks when this is on: the bank in flight and the bank the
+// lookahead reads into. With one bank the sweep degrades to the blocking drain, exactly
+// as before.
+//
 // ## What this is not
 //
 // The lookahead loads a layer **whole**, not a routing prediction. It can: the
 // router lives inside the layer body, after attention, so layer `L+1`'s *selection*
 // is unknown while `L` computes — but its *set* is the whole layer, which is known,
 // which is exactly why the sweep is strong in prefill and candidate staging is weak
-// (§2). The loads are issued and materialized in layer order; overlapping them with
-// compute is a separate concern, bounded by the staging depth (D4).
+// (§2). The loads are issued and materialized in layer order; overlapping the upload
+// with compute is the deferred drain above, bounded by the staging banks.
 //
 // ## Why not LRU here
 //
@@ -89,9 +106,20 @@ public:
     V4PrefillSweep(const V4PrefillSweep&) = delete;
     V4PrefillSweep& operator=(const V4PrefillSweep&) = delete;
 
-    void configure(V4ExpertSupplyCoordinator* supply, ExpertRegistry* registry) {
+    // `staging_banks` is how many layer-sized banks the arena holds (`1` = the
+    // pre-Phase-1 shape, `2` = the deferred drain's headroom). It only decides which
+    // bank a layer's reads land in: layer `L` uses bank `L % staging_banks`, so with
+    // two banks the layer whose copies are still in flight and the layer being read
+    // ahead never share a slot. The bank count must match the arena the host built.
+    void configure(V4ExpertSupplyCoordinator* supply, ExpertRegistry* registry,
+                   uint32_t staging_banks = 1) {
         supply_ = supply;
         registry_ = registry;
+        staging_banks_ = staging_banks == 0 ? 1u : staging_banks;
+        // Whether the drain can be deferred: it needs a second bank to read the
+        // lookahead into while this layer's uploads are still in flight. With one bank
+        // the sweep keeps the blocking drain — the pre-Phase-1 shape.
+        deferred_drain_ = staging_banks_ > 1;
     }
     // True when a swept prefill is possible at all: a layer's whole set must fit in
     // VRAM, since the sweep has no victim to evict and no demotion to fall back on.
@@ -177,8 +205,26 @@ public:
     // Retire layer `layer`. The room it frees is what the layer after `layer + 1`
     // was waiting for; if the pool was too small to hold two layers the next
     // dispatch was skipped at `before_layer` and `ensure_layer` picks it up then.
+    //
+    // The staging bank is returned **here**, not at the layer's own `before_layer`.
+    // The driver synchronizes the compute stream at this boundary (Step 0 D3), so the
+    // layer's H2D copies have landed by now — the reclaim's event sync is instant, and
+    // the copy spent the layer's body in flight instead of fronting it. The extra
+    // `reap_registry_transfers` is what promotes the layer's completed uploads out of
+    // `PROMOTION_PENDING` before `release_layer` refuses a live transfer.
     void after_layer(uint32_t layer) {
         if (!active_) return;
+        // The resident bank belongs to the layer being retired: the driver calls
+        // `before_layer(L)` then `after_layer(L)`, so a mismatch is a driver defect and
+        // is refused rather than silently reclaiming the wrong bank.
+        if (resident_valid_ && resident_layer_ != layer) {
+            throw std::logic_error(
+                "V4PrefillSweep: layer " + std::to_string(layer) +
+                " retired while layer " + std::to_string(resident_layer_) +
+                "'s staging bank is still resident");
+        }
+        reclaim_resident_staging();
+        supply_->reap_registry_transfers();
         registry_->release_layer(layer);
         ++layers_released_;
         update_frontier();
@@ -194,8 +240,11 @@ public:
         if (pending_valid_) {
             const uint32_t layer = pending_layer_;
             materialize_layer();
+            reclaim_resident_staging();
+            supply_->reap_registry_transfers();
             registry_->release_layer(layer);
         }
+        reclaim_resident_staging();
         active_ = false;
         leases_.clear();
         registry_->end_prefill_stream();
@@ -260,7 +309,8 @@ private:
             return;
         }
 
-        pending_state_ = supply_->dispatch_layer_stream(layer, missing, leases_);
+        pending_state_ = supply_->dispatch_layer_stream(
+            layer, missing, leases_, staging_base_for(layer));
         pending_layer_ = layer;
         pending_valid_ = true;
         ++layer_loads_;
@@ -270,16 +320,38 @@ private:
                 std::chrono::steady_clock::now() - started).count());
     }
 
-    // Wait for the dispatched layer's reads and hand its staging slots back. With the
-    // double buffer engaged the wait is short by construction: the reads were issued
-    // one layer's compute ago.
+    // Wait for the dispatched layer's reads, leave its uploads in flight, and hold the
+    // batch resident. With the double buffer engaged the wait is short by construction:
+    // the reads were issued one layer's compute ago.
+    //
+    // With a deferred drain the host does **not** order the compute stream here, so the
+    // body may launch while the copies are still in flight and the slots are held until
+    // `after_layer` returns them. Blocking (or ordering the whole body) here would put
+    // the copy in front of the attention and router it is meant to hide behind, which
+    // recovers nothing at all. With one bank there is no room to hold the copies
+    // through the body, so the drain is the blocking one, as before.
     void materialize_layer() {
         if (!pending_valid_) return;
+        // Defensive: only the mismatch path can find a resident still held here (the
+        // normal flow returns it in `after_layer`), but returning it beats leaking a
+        // bank.
+        reclaim_resident_staging();
         const auto started = std::chrono::steady_clock::now();
         supply_->materialize_layer_prefetch(pending_state_);
-        // The sweep has no `on_routed_consumed` hook, so it hands the arena's slots
-        // back itself — its loads are the only staging traffic at this point.
-        supply_->finish_streamed_batch(pending_state_);
+        if (!deferred_drain_) {
+            // One bank: no room to hold the copies through the body, so the drain is
+            // the blocking one and the slots are returned before the next dispatch —
+            // the pre-Phase-1 shape.
+            supply_->finish_streamed_batch(pending_state_);
+        }
+        // With a deferred drain nothing more is done here: the copies stay in flight
+        // and **nothing** is ordered on the compute stream. Ordering is the consumer's:
+        // the body's MoE dispatch joins each still-pending transfer and the executor
+        // waits on its per-expert event before the MoE reads the weights
+        // (`V4TieredExpertExecutor::accumulate_routed`), while a transfer the registry
+        // has already reaped is complete by definition. Ordering the whole body here
+        // instead would put the copy in front of attention and the router — the work
+        // it is meant to hide behind — and recover nothing at all.
         load_ns_ += static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - started).count());
@@ -291,8 +363,36 @@ private:
             registry_->release_lease(gid);
         }
         leases_.clear();
+        if (deferred_drain_) {
+            resident_state_ = std::move(pending_state_);
+            resident_layer_ = pending_layer_;
+            resident_valid_ = true;
+        }
         pending_valid_ = false;
         update_frontier();
+    }
+
+    // Hand a materialized layer's staging bank back to the arena. Its uploads have
+    // landed by the time this runs (the driver synchronized the compute stream at the
+    // boundary), so the per-slot event sync inside is instant and charges ~nothing to
+    // `h2d_drain_ns_`.
+    void reclaim_resident_staging() {
+        if (!resident_valid_) return;
+        const auto started = std::chrono::steady_clock::now();
+        supply_->finish_streamed_batch(resident_state_);
+        load_ns_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+        resident_valid_ = false;
+    }
+
+    // The staging bank this layer's reads land in. With one bank it is always 0 (the
+    // pre-Phase-1 shape, where each layer's slots are freed before the next dispatch);
+    // with two the layers alternate, so the layer in flight and the layer being read
+    // ahead never share a slot.
+    uint32_t staging_base_for(uint32_t layer) const noexcept {
+        if (staging_banks_ <= 1 || registry_ == nullptr) return 0u;
+        return (layer % staging_banks_) * registry_->experts_per_layer;
     }
 
     // Start the next layer's reads if the pool can hold them alongside the current
@@ -328,6 +428,18 @@ private:
     V4ExpertSupplyCoordinator::LayerPrefetchState pending_state_{};
     uint32_t pending_layer_{0};
     bool pending_valid_{false};
+    // The layer whose reads are settled and whose uploads are ordered behind the
+    // compute stream, but whose staging bank is still held: the deferred-drain state.
+    // `after_layer` returns it, so the upload overlaps the body instead of fronting it.
+    V4ExpertSupplyCoordinator::LayerPrefetchState resident_state_{};
+    uint32_t resident_layer_{0};
+    bool resident_valid_{false};
+    // Layer-sized staging banks the arena holds. `1` restores the pre-Phase-1 shape;
+    // `2` is the headroom the deferred drain reads into. Must match the host's arena.
+    uint32_t staging_banks_{1};
+    // `staging_banks_ > 1`: whether the drain is deferred to `after_layer`. Derived so
+    // the two uses of the bank count cannot disagree.
+    bool deferred_drain_{false};
     std::vector<uint32_t> leases_;
     uint64_t layer_loads_{0};
     uint64_t experts_streamed_{0};

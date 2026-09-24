@@ -463,6 +463,11 @@ public:
         return staging_ ? staging_->slot_count() : 0;
     }
 
+    // Layer-sized staging banks the sweep's arena holds (`2` = the deferred drain's
+    // headroom, `1` = the pre-Phase-1 shape). Reported so a run log can name the
+    // pinned-memory cost the overlap is bought with.
+    uint32_t sweep_staging_banks() const noexcept { return sweep_staging_banks_; }
+
     // The shape of the last expert dispatch: tokens covered, and the distinct
     // experts they resolved to. A gate reads these to show a chunk issued one
     // layer-wide batch (`tokens == C`) and that dedup collapsed its `6C` draws.
@@ -799,19 +804,22 @@ private:
         // pinned) where 256 will do, so the term is capped by the layer here — and
         // this is the same ceiling the graph's guard checks against, which is why a
         // legal wide chunk is no longer refused.
+        //
+        // The prefill sweep loads a **whole layer** in one batch, and with the deferred
+        // drain it holds one layer's uploads in flight while the lookahead reads the
+        // next, so it needs `banks * experts_per_layer` slots (Step 6 item 6; Phase 1 of
+        // the supply-chain hot-path plan). `staging_slot_count` is shared with the
+        // budget report, so the figure the plan prints is the figure allocated here.
         const uint32_t experts_per_layer = static_cast<uint32_t>(config_.n_routed_experts);
         const uint32_t dedup_ceiling = std::min<uint32_t>(
             PrefetchStagingArena::EXPERTS_PER_HORIZON *
                 std::max<uint32_t>(1, runtime_cfg.prefill_chunk),
             experts_per_layer);
-        uint32_t staging_slots = std::max<uint32_t>(
-            PrefetchStagingArena::TOTAL_STAGING_SLOTS, dedup_ceiling);
-        // The prefill sweep loads a **whole layer** in one batch, so the arena must
-        // hold a layer's distinct experts at once (Step 6 item 6). Sized to that
-        // ceiling; the Step 7 sweep picks the smaller concurrency depth.
-        if (runtime_cfg.prefill_sweep) {
-            staging_slots = std::max<uint32_t>(staging_slots, experts_per_layer);
-        }
+        const uint32_t staging_slots =
+            aeon::core::staging_slot_count(runtime_cfg, experts_per_layer);
+        sweep_staging_banks_ = runtime_cfg.prefill_sweep
+            ? std::max<uint32_t>(1, runtime_cfg.prefill_sweep_staging_banks)
+            : 1u;
         staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
 
         // The direct reader's submission queue must hold a whole layer's reads at
@@ -915,7 +923,10 @@ private:
             ? runtime_cfg.prefill_sweep_min_tokens
             : std::max<uint32_t>(
                   1, (static_cast<uint32_t>(config_.n_routed_experts) * 3u) / 4u);
-        prefill_sweep_.configure(&supply_, &registry_);
+        // The sweep's bank count must match the arena's (`sweep_staging_banks_`, set
+        // where the arena is built), or a layer's reads would collide with the bank
+        // still in flight.
+        prefill_sweep_.configure(&supply_, &registry_, sweep_staging_banks_);
 
         // 16 — the prefill workspace (Step 6 item 7), derived from the configured
         // window and chunk and allocated **once, here**, so no window can fail
@@ -1161,6 +1172,11 @@ private:
     std::unique_ptr<V4TieredExpertExecutor> executor_;
     V4PrefillSweep prefill_sweep_;
     bool prefill_sweep_requested_{false};
+    // Layer-sized staging banks the sweep's arena holds, resolved at load from
+    // `prefill_sweep_staging_banks`. `2` is the deferred drain's headroom; `1` is the
+    // pre-Phase-1 shape. Handed to the sweep so its per-layer bank index matches the
+    // arena it reads into.
+    uint32_t sweep_staging_banks_{1};
     // Whether the layer-major prefill supply is active at all this window (either
     // strategy). The length picks the strategy; this says one was chosen.
     bool prefill_active_{false};

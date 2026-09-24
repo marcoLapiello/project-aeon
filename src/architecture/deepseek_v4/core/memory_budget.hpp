@@ -3,6 +3,7 @@
 #include "architecture/deepseek_v4/core/config.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_state.hpp"
 #include "infrastructure/core/expert_format.hpp"
+#include "infrastructure/core/prefetch_staging.hpp"
 
 #include <hip/hip_runtime.h>
 #include <sys/sysinfo.h>
@@ -188,10 +189,42 @@ struct AeonRuntimeConfig {
     // forbids.
     uint32_t prefill_sweep_min_tokens{0};
 
+    // The layer-sized staging **banks** the arena holds when `prefill_sweep` is on
+    // (Phase 1 of the supply-chain hot-path plan). Two banks are what the sweep's
+    // deferred drain needs: one layer's H2D copies stay in flight through its body
+    // while the lookahead reads the next layer into the other bank.
+    //
+    // The default is **1**, the pre-Phase-1 shape and the byte-for-byte memory shape
+    // the engine has always had, because the second bank costs `+3.44 GiB` of
+    // non-reclaimable **pinned** host memory (`E = 256`: 3.44 -> 6.75 GiB). Measured
+    // on the 62 GiB reference box, that cost is not affordable at the production Warm
+    // shape: Warm 35 GiB is itself pinned, so `35 + 6.75 = 41.75 GiB` pinned plus the
+    // ~13 GiB the 10 GiB host reserve does not cover pushes the machine into swap. The
+    // deferred drain's win was measured at Warm 0 (-4.5 s of a 63.6 s window at
+    // N = 512), so it is real — but it is only shippable once Phase 2's per-expert slot
+    // recycling gets the same overlap out of a bounded surplus instead of a whole
+    // extra bank. Until then this stays an explicit opt-in for the A/B.
+    uint32_t prefill_sweep_staging_banks{1};
+
     // Hardware target device index
     int device_id{0};
 
 };
+
+// The staging arena's slot count, shared by the budget report and the arena's own
+// construction so the reported `transient_staging_bytes` is exactly what is
+// allocated. A chunk's deduplicated distinct set is at most the layer width, and the
+// sweep additionally holds `prefill_sweep_staging_banks` layer-sized banks for its
+// deferred drain. Decode's shape (`TOTAL_STAGING_SLOTS`) is the floor.
+inline uint32_t staging_slot_count(const AeonRuntimeConfig& cfg, uint32_t experts_per_layer) {
+    const uint32_t chunk_ceiling = std::min<uint32_t>(
+        6u * std::max<uint32_t>(1, cfg.prefill_chunk), experts_per_layer);
+    const uint32_t base = std::max<uint32_t>(
+        PrefetchStagingArena::TOTAL_STAGING_SLOTS, chunk_ceiling);
+    if (!cfg.prefill_sweep) return base;
+    const uint32_t sweep_banks = std::max<uint32_t>(1, cfg.prefill_sweep_staging_banks);
+    return std::max<uint32_t>(base, sweep_banks * experts_per_layer);
+}
 
 struct MemoryBudgetReport {
     bool is_feasible{false};
@@ -543,15 +576,14 @@ public:
         // fixed reserve must fit the host, or the plan would swap.
         //
         // Staging follows the chunk, and the figure matches what the host actually
-        // allocates: `max(12, min(6C, experts_per_layer))` slots. The literal `12`
-        // that used to stand here was decode's shape and understated a `C = 256`
-        // arena (256 slots, 3456 MiB) by ~21x.
+        // allocates: `max(12, min(6C, experts_per_layer))` slots, plus the sweep's
+        // layer-sized banks. The literal `12` that used to stand here was decode's
+        // shape and understated a `C = 256` arena (256 slots, 3456 MiB) by ~21x, and
+        // the sweep's over-allocation would understate it again. Both the report and
+        // the arena call `staging_slot_count`, so the two cannot drift.
         const uint32_t experts_per_layer =
             static_cast<uint32_t>(expert_format.experts_per_layer);
-        const uint32_t staging_slots = runtime_cfg.prefill_sweep
-            ? std::max<uint32_t>(12, std::min<uint32_t>(
-                  6u * std::max<uint32_t>(1, runtime_cfg.prefill_chunk), experts_per_layer))
-            : 12;
+        const uint32_t staging_slots = staging_slot_count(runtime_cfg, experts_per_layer);
         report.transient_staging_bytes =
             static_cast<size_t>(staging_slots) * expert_format.payload_bytes;
         report.configured_host_budget_bytes = runtime_cfg.warm_host_bytes == 0

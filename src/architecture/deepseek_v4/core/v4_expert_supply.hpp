@@ -273,12 +273,15 @@ public:
     // `dispatch_layer_prefetch_batch` this is not driven by a routing result — the
     // layer is loaded whole, because a prefill chunk touches ~255 of 256 experts and
     // the set is therefore **known rather than guessed** (plan §2). Staging indices
-    // are the expert's position in `local_expert_ids`, so the caller sizes the arena
-    // to the layer.
+    // are `staging_base + position` in `local_expert_ids`, so the caller sizes the
+    // arena to the layer and picks the bank: the sweep alternates banks by layer
+    // parity, which is what lets one layer's copies stay in flight through its body
+    // while the next layer's reads fill the other bank.
     LayerPrefetchState dispatch_layer_stream(
         uint32_t layer,
         const std::vector<uint32_t>& local_expert_ids,
-        std::vector<uint32_t>& leased_experts
+        std::vector<uint32_t>& leased_experts,
+        uint32_t staging_base = 0
     ) {
         if (expert_registry_ == nullptr) {
             throw std::logic_error("V4ExpertSupplyCoordinator: coordinator is not configured");
@@ -292,7 +295,7 @@ public:
             }
             requests.push_back(TieredExpertSupply::PayloadRequest{
                 expert_registry_->get_global_id(layer, local_expert_ids[index]),
-                index
+                staging_base + index
             });
         }
         LayerPrefetchState state;
@@ -309,6 +312,13 @@ public:
 
     // Hands the staging slots a streamed batch borrowed back to the arena. The
     // executor releases its own in `on_routed_consumed`; the sweep has no such hook.
+    //
+    // The sweep defers this past the layer body (see `V4PrefillSweep`): the copy is
+    // left in flight with no host wait, the body's MoE dispatch joins the pending
+    // transfer and the executor orders the weights behind it per expert, and this runs
+    // at the layer boundary — where the driver has synchronized the compute stream, so
+    // the per-slot event sync inside is instant and charges ~nothing to
+    // `h2d_drain_ns_`.
     void finish_streamed_batch(LayerPrefetchState& state) {
         supply_.release_streamed_staging(state.supply_batch);
         sync_state(state);

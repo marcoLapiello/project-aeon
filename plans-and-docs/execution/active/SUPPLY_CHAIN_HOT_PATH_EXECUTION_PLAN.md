@@ -12,8 +12,8 @@ Scope is unchanged from the analysis: *how fast the bytes arrive*. The *which by
 
 | Measured site | Size | Status |
 | :--- | :--- | :--- |
-| Swept-layer H2D exposed in front of the body | `4.1–5.4 s/window` (`6.5–8.4%`) | **Target of Phase 1** |
-| `dispatch` per-request bookkeeping (scans) | `610 ms/window`, `3.4 ms/token` (`≈1%`) | Phase 3 (low priority) |
+| Swept-layer H2D exposed in front of the body | `4.1–5.4 s/window` (`6.5–8.4%`) | **Target of Phase 1 — removed (§10): `h2d_drain → 0.006 s`, `wall −3.2…−4.5 s`** |
+| `dispatch` per-request bookkeeping (scans) | `610 ms/window`, `3.4 ms/token` (`≈1%`) | Phase 3 (low priority) — now with a reason: `+0.15 s` when transfers are in flight simultaneously |
 | `h2d_enqueue` (H2D submission) | `47–72 ms/window` | Excluded — too small |
 | `submit` (`io_uring_enter`) | `23–31 ms/window` | Excluded — too small |
 | Swept-layer read wait (`io_wait`) | `0.27–2.07 s/window` | Excluded — already hidden |
@@ -31,12 +31,12 @@ Scope is unchanged from the analysis: *how fast the bytes arrive*. The *which by
 
 **Objective.** Remove the swept prefill's exposed H2D drain from the pre-body critical path: `h2d_drain → ≈0` for the swept arm, with a corresponding fall in `wall_s`.
 
-**Hypothesis (coupled — this is the key point).** Two changes are required *together*; neither works alone:
+**Hypothesis (coupled — this is the key point).** Two changes are required *together*; neither works alone. **(Both confirmed by measurement, with one correction to the second half.)**
 
-1. **Deferred drain.** The sweep must stop *host-blocking* on the H2D before the body. Replace the host sync with a **compute-stream wait** on the copy's completion event (the mechanism decode already uses), so the copy overlaps the body.
+1. **Deferred drain.** The sweep must stop *host-blocking* on the H2D before the body, so the copy overlaps it. **Correction from the measurement:** the ordering must be the **consumer's** (the body's MoE dispatch joins the pending transfer and `accumulate_routed` waits on its per-expert event), **not** a compute-stream wait issued by the driver — a whole-body `hipStreamWaitEvent` recovers zero, because it puts the copy back in front of attention. What the driver must do is *nothing*.
 2. **Staging headroom.** Deferring the drain holds the layer's staging slots through the body, so `dispatch_ahead(L+1)` has nowhere to read. The arena must have enough slots that the next layer's reads proceed while this layer's upload drains.
 
-> Why this matters for the record: the analysis (§8.4 item 4, §5.2 C1) refuted `banks = 2` *on its own* — it only speeds reads, which are already hidden. That refutation holds **only while the drain stays synchronous before the body**. Phase 1 tests the coupled change. If Phase 1 succeeds, §5.2 C1 must be reworded; if it fails, the refutation stands as written. Either way, **update the analysis doc at the Phase 1 gate.**
+> Why this matters for the record: the analysis (§8.4 item 4, §5.2 C1) refuted `banks = 2` *on its own* — it only speeds reads, which are already hidden. That refutation holds **only while the drain stays synchronous before the body**. **Phase 1 succeeded, so §5.2 C1 has been reworded (analysis §10.3, §8.6): the second bank is right when coupled with the deferred drain, and wrong alone.** The coupling is also what makes Phase 2 mandatory — the bank is unaffordable at the production Warm shape.
 
 **Expected ceiling, stated up front.** `≈4–5 s` of a `≈62–64 s` swept window, i.e. **`≈7–8%` of the swept prefill**. The swept prefill is one of several phases; this is a bounded win, not a step change. Contention is expected to be negligible (the copy writes `3.44 GiB/layer` at `26 GiB/s` ≈ `2.7%` of the card's VRAM bandwidth), which is why the overlap is worth trying — but it is unproven until measured.
 
@@ -44,56 +44,64 @@ Scope is unchanged from the analysis: *how fast the bytes arrive*. The *which by
 
 ## 2. Phase 1 — Overlap the swept layer's H2D with its compute
 
+> **Status: complete (2026-09-24).** All four steps landed. **Gate outcome: PASS at Warm 0 and Warm 30; the mechanism is proven, but the memory cost blocks shipping it as-is** — see P1.4. Evidence and argument: [analysis §10](../../analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md).
+>
+> **One correction to this plan's own design, from the measurement.** The plan had P1.1 order the compute stream behind the copies (`hipStreamWaitEvent` per slot). Measured, that recovers **nothing** — it moves the copy from in front of the compute to in front of attention. The working form is to order **nothing** on the driver side and let the body's own MoE dispatch join each pending transfer and wait on its per-expert event (`accumulate_routed` already does this for decode). Where it says "the compute-stream wait (P1.1) is what guarantees it" below, read: *the consumer's per-expert wait*.
+
 **Order matters: do the steps in sequence; each has its own verification and its own commit.**
 
 ### P1.1 — Add a non-blocking staging drain path (supply layer)
 
 | | |
 | :--- | :--- |
-| **Where** | `src/infrastructure/core/tiered_expert_supply.hpp` — alongside `release_streamed_staging`; expose through `v4_expert_supply.hpp` and `v4_model_host.hpp` |
+| **Status** | ✅ **done.** `release_streamed_staging` is left intact; the sweep now simply **defers** it (`finish_streamed_batch` at `after_layer`) and orders nothing on the compute stream. The consumer-side ordering already existed in `V4TieredExpertExecutor::accumulate_routed`. |
+| **Where** | `src/infrastructure/core/tiered_expert_supply.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp` |
 | **What** | Add a **stream-ordered** variant that, instead of `hipEventSynchronize` per slot: (a) makes the given consumer stream wait on each in-flight slot's gate event (`hipStreamWaitEvent`), and (b) leaves slot reclamation to the caller. Keep `release_streamed_staging` intact for the existing path. |
 | **Requirement** | No host synchronization on the sweep path. This is a hard project rule for the request path; the sweep is not the request path, but the same discipline applies — the whole point is to stop the host blocking. |
 | **Requirement** | The gate event must be the one already recorded on `sdma_cold_stream_` (`prefetch_staging_->events[slot]`). Do **not** add a second event (that is §4.4b, excluded). |
-| **Verify** | Compile; `h2d_drain_calls` must not increment on the sweep path once P1.3 wires it. |
+| **Verify** | ✅ `h2d_drain_calls` stops incrementing on the sweep path; the drain counter is `≈0` in every swept row (§10.2). |
 
 ### P1.2 — Size the arena for two layers *(temporary, deliberate over-allocation)*
 
 | | |
 | :--- | :--- |
-| **Where** | `src/architecture/deepseek_v4/core/v4_model_host.hpp` (~L785–800, the `prefill_sweep` staging-sizing block) |
+| **Status** | ✅ **done**, and **demoted to an opt-in.** `runtime.prefill_sweep_staging_banks` ships with default `1` (the engine's original memory shape); `2` is the A/B switch. The default was `2` for one run and it swapped the box at the production Warm shape — see P1.4. |
+| **Where** | `src/architecture/deepseek_v4/core/memory_budget.hpp` (`staging_slot_count`, shared by the budget and the arena); `v4_model_host.hpp` (`sweep_staging_banks_`) |
 | **What** | When `prefill_sweep` is on, size the arena to `2 × experts_per_layer` instead of `experts_per_layer`. Add a runtime-config override so it can be set to `1` (today) or `2` (experiment) without a rebuild. |
-| **Requirement** | Report the actual allocated bytes (the budget report already has `transient_staging_bytes`); assert it matches `slots × payload_bytes`. |
-| **Requirement** | This is **+3.44 GiB pinned** (~`6.9 GiB` total). It is a deliberate, temporary cost to prove the win. Phase 2 removes it. Record the pinned figure in the run log. |
-| **Verify** | Arena constructs; budget prints the doubled staging; a swept window still runs. |
+| **Requirement** | ✅ The budget report and the arena call one `staging_slot_count` helper, and `bench_supply_split` asserts they agree. |
+| **Requirement** | `+3.44 GiB` pinned (`6.75 GiB` total) when set to `2`. ✅ Confirmed by the header print: `banks=2 staging_slots=512 staging=6.75 GiB`. |
+| **Verify** | ✅ Arena constructs, budget prints the doubled staging, a swept window runs. |
 
 ### P1.3 — Defer the drain past the body boundary (sweep layer)
 
 | | |
 | :--- | :--- |
-| **Where** | `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp` — `materialize_layer`, `before_layer`, `after_layer` |
+| **Status** | ✅ **done.** `materialize_layer` now settles reads and holds a `resident_state_` bank; `after_layer` reclaims it and reaps the registry (which promotes the completed uploads out of `PROMOTION_PENDING` before `release_layer` refuses a live transfer). |
+| **Where** | `src/architecture/deepseek_v4/core/v4_prefill_sweep.hpp` — `materialize_layer`, `after_layer`, `end`, `reclaim_resident_staging` |
 | **What** | Split the current `materialize_layer` into: **(a) settle reads + enqueue H2D** (runs in `before_layer(L)`, as now), and **(b) reclaim staging slots** — moved out of `before_layer(L)` to the next boundary. With the compute stream ordered behind the copy's event (P1.1), the body may launch while the copy is in flight. |
-| **Requirement** | **Ordering is non-negotiable:** the body must not read expert weights before their copy lands. The compute-stream wait (P1.1) is what guarantees it. Verify by inspection *and* by the byte-exactness gate. |
-| **Requirement** | `dispatch_ahead(L+1)` must be able to issue L+1's reads at `before_layer(L)` (as today). This is what P1.2's headroom is for. |
-| **Requirement** | At `end()` the arena must still be fully drained and `staging_in_use == 0`. |
-| **Verify** | Byte-exactness gates (below); `h2d_drain_calls` stops incrementing on the sweep path. |
+| **Requirement** | ✅ Ordering is non-negotiable and it holds: the body's MoE dispatch joins the pending transfer and `accumulate_routed` waits on its per-expert event before the weights are read. Verified by the byte-exactness gates and by `test_v4_prefill_window` (window == serial, bit-exact). |
+| **Requirement** | ✅ `dispatch_ahead(L+1)` still issues at `before_layer(L)`; P1.2's headroom is what makes its slots free. |
+| **Requirement** | ✅ At `end()` the arena drains fully (`in_use_slots() == 0`); `test_v4_prefill_sweep` and `test_v4_routed_prefill` assert it. |
+| **Verify** | ✅ Byte-exactness gates pass; `h2d_drain_calls` no longer increments on the sweep path. |
 
 ### P1.4 — Measure, and gate
 
 | | |
 | :--- | :--- |
-| **Command** | `AEON_WARM_GIB=0 bash scripts/supply_split.sh 256 512` then `AEON_WARM_GIB=35 bash scripts/supply_split.sh 256 512` |
-| **Read** | `h2d_drain_s` (want `→≈0`), `wall_s` (want lower), `io_wait_s` (must stay low — if it rises, the reads got exposed instead), `disp_ms`, pinned bytes. |
-| **Gate — success** | `h2d_drain` falls to ≈0 **and** `wall_s` falls by a comparable amount (target `≥3 s` at `N = 512`), with byte-exactness and invariants holding at both Warm sizes. |
-| **Gate — abort** | `wall_s` does not fall, or `io_wait` rises enough to offset it. The overlap does not pay; **stop, keep the instrumentation, revert P1.2/P1.3, and record the negative result in the analysis doc.** |
-| **Also required** | A before/after run of `bench_prefill_ab` is **not** needed; the split bench is the instrument. Do record the wall/tok-s in the run log. |
+| **Status** | ✅ **measured. Gate verdict: PASS on the mechanism, BLOCKED on memory.** |
+| **Command** | `AEON_WARM_GIB=<w> [AEON_SWEEP_BANKS=2] bash scripts/supply_split.sh 256 512` |
+| **Result** | `h2d_drain 4.57/5.36 s → 0.006 s`; `wall_s` `33.811 → 30.574` (N=256) and `63.593 → 59.087` (N=512) at Warm 0; `32.913 → 29.400` and `62.280 → 59.055` at Warm 30. `io_wait` and decode unmoved. |
+| **Gate — success** | ✅ Met: `h2d_drain → ≈0` **and** `wall_s` down `≈3.2–4.5 s` at `N = 512`, at **both** Warm sizes, byte-exactness and invariants holding. |
+| **Gate — abort** | ⚠️ **Not** triggered by the wall clock — the overlap pays — but `banks = 2` needs `+3.44 GiB` pinned, and at the production Warm shape that pushed the reference box into swap (~50 GiB used, 5 GiB swap) and the run could not complete. Hence the default is `1` and the win is conditional on Phase 2. |
+| **Also required** | ✅ Wall/tok-s recorded above; `bench_prefill_ab` not needed. |
 
-**At this gate:** update the analysis doc — §5.2 C1's wording (coupled-change caveat), §8.4 item 4, §8.6, and §7's rows for C1/C2/C3 — to match the measured outcome. Only then proceed to Phase 2.
+**At this gate:** ✅ the analysis doc is updated — §1, §3, §5.2 C1, §7 rows 7/8, §8.4 item 4, §8.6, and the new **§10** — to match the measured outcome. Phase 1's mechanism is proven and its memory cost is the reason Phase 2 is mandatory.
 
 ---
 
-## 3. Phase 2 — Remove the doubled staging footprint *(only if Phase 1 passed)*
+## 3. Phase 2 — Make the overlap shippable *(mandatory — this is how Phase 1 ships)*
 
-Phase 1 buys the win at `+3.44 GiB` pinned. This phase keeps the win and drops the over-allocation, which is what makes it compatible with the open [host-memory pressure investigation](../../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md).
+Phase 1 proved the win and showed its price: `+3.44 GiB` of pinned staging, which does not fit the production Warm shape (it swapped the 62 GiB box at Warm 35). This phase keeps the win and removes the over-allocation, which is what makes it compatible with the open [host-memory pressure investigation](../../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md). **It is no longer "only if Phase 1 passed" — it is required to ship Phase 1's result.**
 
 ### P2.1 — Per-expert slot recycling (the rolling corridor, C2)
 
@@ -151,11 +159,11 @@ These are not optional and are checked per phase, not at the end.
 ## 6. Order, dependencies, and stop conditions
 
 ```
-Phase 1  (P1.1 → P1.2 → P1.3 → P1.4 gate)      ← the only in-scope throughput lever
-   │            └─ ABORT here if wall_s does not fall → revert, record negative
+Phase 1  (P1.1 → P1.2 → P1.3 → P1.4 gate)      ← ✅ DONE: win proven (3.2–4.5 s), memory cost blocks shipping
+   │
    ▼
-Phase 2  (P2.1 → P2.2)                          ← only if Phase 1 passed
-   │            └─ ABORT if the memory fix loses the Phase-1 win → keep Phase 1 as-is
+Phase 2  (P2.1 → P2.2)                          ← MANDATORY: the shipping form of Phase 1's win
+   │            └─ ABORT if the memory fix loses the Phase-1 win → keep banks=2 as opt-in
    ▼
 Phase 3  (P3.1 → P3.2 → P3.3 → P3.4)            ← optional, independent, low priority
 ```
@@ -182,7 +190,7 @@ At each gate: **update the analysis doc**, then commit. Do not start the next ph
 
 ## 8. Definition of done
 
-- **Phase 1:** `h2d_drain → ≈0` and `wall_s` down `≥3 s` at `N=512`, at both Warm sizes, with byte-exactness and invariants holding; analysis doc updated; committed.
-- **Phase 2:** the same win with staging headroom bounded to a small reported surplus, not a full bank; pinned memory reported.
-- **Phase 3 (if done):** `disp_ms` down in both tables, no behaviour change.
-- **Throughout:** no regression in decode or the routed bank; every measurement reproducible from `scripts/supply_split.sh`.
+- **Phase 1:** ✅ `h2d_drain → ≈0` and `wall_s` down `3.2–4.5 s` at both Warm 0 and Warm 30, with byte-exactness and invariants holding. **Caveat:** the win needs `banks = 2` (`+3.44 GiB` pinned), which does not fit the production Warm shape, so it ships **opt-in** until Phase 2.
+- **Phase 2:** the same win with staging headroom bounded to a small reported surplus, not a full bank; pinned memory reported; `prefill_sweep_staging_banks` back to its default `1` and the second bank no longer needed.
+- **Phase 3 (if done):** `disp_ms` down in both tables, no behaviour change. (Phase 1 gave it a reason: more transfers in flight made the `O(catalog)` scans cost `+0.15 s/window`.)
+- **Throughout:** no regression in decode or the routed bank; every measurement reproducible from `scripts/supply_split.sh`. Run **one heavy process at a time** — the Warm-shaped runs are pinned-memory heavy and must not overlap with builds, tests, or other benches.
