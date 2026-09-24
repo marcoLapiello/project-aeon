@@ -151,6 +151,7 @@ public:
     uint64_t h2d_enqueue_ns() const noexcept { return supply_.h2d_enqueue_ns(); }
     uint64_t h2d_drain_ns() const noexcept { return supply_.h2d_drain_ns(); }
     uint64_t h2d_drain_calls() const noexcept { return supply_.h2d_drain_calls(); }
+    uint64_t dispatch_cpu_ns() const noexcept { return supply_.dispatch_cpu_ns(); }
     void reset_transfer_counters() noexcept { supply_.reset_transfer_counters(); }
 
     LayerPrefetchState dispatch_layer_prefetch(

@@ -1,6 +1,6 @@
 # Supply-Chain Hot-Path Analysis — is the feed a river or a bucket?
 
-*Status: open analysis — **largely measured and settled**. Written 2026-09-22; deepened 2026-09-23 in a second source pass; **measured 2026-09-24** (Step 1 §8, Step 2 §9). A two-round audit of the expert supply's transfer path and its per-request bookkeeping, in answer to two questions: (1) is the NVMe→VRAM feed a continuous stream or an interrupted one; (2) which substeps on that road are expensive enough to be worth removing. Source read: `direct_io_reader.hpp`, `tiered_expert_supply.hpp`, `prefetch_staging.hpp`, `expert_registry.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp`, `v4_expert_executor.hpp`, `v4_model_host.hpp`, `memory_budget.hpp`, `bench_prefill_ab.cpp`. Instrumentation added: `TieredExpertSupply` transfer counters + `tests/bench_supply_split.cpp` + `scripts/supply_split.sh`; probe added: `tools/aeon_c4_probe.cpp`. **Headline: the prefill transfer path is near its ceiling; the largest remaining supply cost is decode's NVMe wait (§8.5).***
+*Status: open analysis — **largely measured and settled**. Written 2026-09-22; deepened 2026-09-23 in a second source pass; **measured 2026-09-24** (Step 1 §8, Step 2 §9). A two-round audit of the expert supply's transfer path and its per-request bookkeeping, in answer to two questions: (1) is the NVMe→VRAM feed a continuous stream or an interrupted one; (2) which substeps on that road are expensive enough to be worth removing. Source read: `direct_io_reader.hpp`, `tiered_expert_supply.hpp`, `prefetch_staging.hpp`, `expert_registry.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp`, `v4_expert_executor.hpp`, `v4_model_host.hpp`, `memory_budget.hpp`, `bench_prefill_ab.cpp`. Instrumentation added: `TieredExpertSupply` transfer counters + `tests/bench_supply_split.cpp` + `scripts/supply_split.sh`; probe added: `tools/aeon_c4_probe.cpp`. **Headline: the transfer path is near its ceiling; the remaining in-scope lever is C2/C3 (§8.6), and the largest measured supply cost — decode's NVMe wait (§8.5) — has a remedy that is out of scope here.***
 
 **Subject.** The mechanics of moving a routed expert from NVMe into VRAM — the read submission, the staging corridor, the H2D, and the registry bookkeeping around all three. This is the *how fast can the bytes arrive* question, not the *which bytes should arrive* strategy question, which the [prefill supply review](PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) and the [prefill supply strategy plan](PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) own.
 
@@ -8,7 +8,7 @@
 
 **What the second pass added.** The first pass found the feed's shape (reads a river, swept-layer H2D a bucket) and the two `O(catalog)` scans. The second pass read every call site and found that the bucket is worse than described (§3): `banks = 1` also *appeared to* **idle the disk** across the same fence (**refuted in §8** — only the upload is exposed), and the H2D is enqueued a full body *after* its bytes are ready. It also promoted several first-pass footnotes into named, mechanically-provable cost sites (§4.4) and added the structural options the first pass did not consider (§5.2).
 
-**What the measurement (§8) changed.** Step 1 was built and run, and it **decides** the C1/C2/C3 question — partly against this document. Read §1 and §3's corrections with §8, and see §8's "what the measurement refuted" list: the disk-idle half of the `banks = 1` claim is **refuted** (the sweep's `io_wait` is ≈0.3 s; the disk is fully hidden), the per-slot-sync overhead (§4.4a) is **≈0** (the 5.4 s is PCIe copy bandwidth, not driver round-trips), and the `O(catalog)` scans (§4) are **already negligible** (≈25 ms/window). The one claim that survived, and that the data sharpens, is §3's: the swept-layer **H2D copy is exposed** — `4.1–5.4 s/window`, at the PCIe Gen4 x16 ceiling. The measurement also **redirects** the work: the largest measured supply cost is **decode's** NVMe wait (36–62% of every token), which the prefill-focused first pass did not look at.
+**What the measurement (§8) changed.** Step 1 was built and run, and it **decides** the C1/C2/C3 question — partly against this document. Read §1 and §3's corrections with §8, and see §8's "what the measurement refuted" list: the disk-idle half of the `banks = 1` claim is **refuted** (the sweep's `io_wait` is ≈0.3 s; the disk is fully hidden), the per-slot-sync overhead (§4.4a) is **≈0** (the 5.4 s is PCIe copy bandwidth, not driver round-trips), and the `O(catalog)` scans (§4) are **already negligible** (≈25 ms/window). The one claim that survived, and that the data sharpens, is §3's: the swept-layer **H2D copy is exposed** — `4.1–5.4 s/window`, at the PCIe Gen4 x16 ceiling. The measurement also **bounds** what is left: the largest measured supply cost is **decode's** NVMe wait (36–62% of every token), which the prefill-focused first pass did not look at — but its remedy is *which bytes are resident*, out of scope here, so §8.5 records it and hands it off.
 
 ---
 
@@ -217,7 +217,7 @@ Ordered by confidence-to-effort, not by size. Every "fix" here is unstarted and 
 | 9 | **id→index map** (§4.4d) | `find`/`ensure_registry_transfer` | ~200 k cmp/layer, but total dispatch CPU ≈0.15% (§8) | `unordered_map` index | S | low value |
 | 10 | **Single H2D copy** (§5.2 C5) | `materialize` | ~1–3 ms/layer | contiguous copy | M | low value |
 | 11 | **Large-BAR NVMe→VRAM** (§5.2 C4) | spike — **done (§9)** | **`NOT_SUPPORTED`, measured** — kernel refuses VRAM as an O_DIRECT target | closed, no workaround | — | settled |
-| 12 | **Decode disk wait** (§8.5) | residency, not transfer | **`36–63%` of every decode token** | routing-aware residency; a different analysis | ? | — |
+| 12 | **Decode disk wait** (§8.5) | residency, not transfer | measured `36–63%`/token | **out of scope** — which bytes are resident; hand-off to the routing/placement study | — | — |
 
 | Cross-cutting | Where it goes |
 | :--- | :--- |
@@ -281,7 +281,7 @@ These are corrections to this document, not to the code:
 3. **"The `O(catalog)` scans are ~5–15 ms/layer → 215–645 ms/window" (§4) — refuted as a magnitude.** Total non-I/O dispatch CPU across a whole window is bounded by `h2d_enqueue + submit ≈ 70–100 ms`. The scans may well exist, but they are ≈`0.15%` of the window. §4 should be **deprioritised**, as §4.3 already hedged (M43's audit fix was the real win here, and it is already in).
 4. **`banks = 2` does not fix the exposed upload (new, §3/§5.2).** The measurement forces this distinction: a second bank lets the *next layer's reads* start during this layer's drain, but the reads are already hidden. It does **not** move *this layer's upload* off the pre-body critical path. The fix that does is issuing each expert's upload when its read lands, *during the previous body* (C3), which the rolling corridor (C2) is the cheap implementation of.
 
-### 8.5 What the measurement redirected
+### 8.5 What the measurement bounds — and what it hands off
 
 The biggest measured supply cost is **not in the prefill** — it is **decode's disk wait**, which the prefill-focused first pass did not examine:
 
@@ -289,7 +289,7 @@ The biggest measured supply cost is **not in the prefill** — it is **decode's 
 - Decode reads `440–1 700 MiB/token` from NVMe (6 experts × 43 layers × 13.5 MiB = `3.48 GiB` if all cold, so `12–49%` of the draws miss). Warm serves a comparable volume (`~1 045 MiB/token`), so Warm roughly halves the cold traffic.
 - Decode's `h2d_enqueue` (`0.5–1.6 ms`) and `submit` (`0.16–0.46 ms`) are negligible; `h2d_drain` is `0`.
 
-So the throughput question has moved: **a perfect prefill upload fix is worth single-digit percent; eliminating decode's disk wait is worth up to `~1.5×` (Warm 35) to `~2.5×` (Warm 0).** That is a routing/placement/caching question (which bytes are resident), not a transfer-path question — it belongs with the [routing profile and placement study](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md), and it is where the next measurement should go.
+This is a **characterization of the transfer path**, and it is in scope: decode uses the same channels, so its split is the honest measure of what those channels cost in the other phase. What is **not** in scope is the remedy its size suggests. Making decode read fewer bytes is the *which bytes should arrive* question — explicitly excluded by this document's §Subject, and owned by the [routing profile and placement study](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md). So the finding is recorded and **handed off**, not acted on: within this document's scope the remaining lever is C2/C3 (§8.6), and decode's residual is bounded by how fast the path can serve whatever demand exists — which the numbers above say is already the drive, hidden behind nothing left to remove on the copy side.
 
 ### 8.6 Revised disposition of the structural items
 
@@ -300,11 +300,11 @@ So the throughput question has moved: **a perfect prefill upload fix is worth si
 | **C3 completion-driven upload** | "the real prize" | **confirmed as the prize** for the swept path, with a measured ceiling of `4.1–5.4 s/window` (`6.5–8.4%`). |
 | **C4 large-BAR NVMe→VRAM** | possibly transformative | **closed — `NOT_SUPPORTED` (§9).** Measured on the production `io_uring` path: `-EFAULT`. The pinned staging and the second hop stay. |
 | **§4 `O(catalog)` scans** | new open-work item | **deprioritised — ~0.15% of the window.** |
-| **New: decode disk wait** | not considered | **the largest measured supply cost (`36–63%` of every token). Promote above C1–C4.** |
+| **Decode disk wait** | not considered | measured at `36–63%` of every token, but its **remedy is residency — out of scope** (the "which bytes" question). Recorded as a hand-off to the routing/placement study; **not** an item this analysis acts on. |
 
 ### 8.7 Consequence for the document
 
-§3's *mechanism* and §8's *magnitude* together say: the prefill transfer path is **already close to its ceiling** — the drive is hidden and the only exposed leg is the irreducible PCIe copy, worth single-digit percent. The document's prefill framing was correct about the shape and wrong about the disk. The work that remains worth doing on this path is small and specific (C3/C2 for `4–5.4 s`), and the **large** remaining supply cost is decode's NVMe wait — a residency question, and the subject of a different analysis.
+§3's *mechanism* and §8's *magnitude* together say: the prefill transfer path is **already close to its ceiling** — the drive is hidden and the only exposed leg is the irreducible PCIe copy, worth single-digit percent. The document's prefill framing was correct about the shape and wrong about the disk. The work that remains worth doing on this path is small and specific (C3/C2 for `4–5.4 s`). The largest measured supply cost, decode's NVMe wait, is **outside this document's subject** — its remedy is which bytes are resident, not how fast they arrive — and is handed to the routing/placement study rather than acted on here.
 
 ---
 

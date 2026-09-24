@@ -185,6 +185,10 @@ public:
     uint64_t h2d_enqueue_ns() const noexcept { return h2d_enqueue_ns_; }
     uint64_t h2d_drain_ns() const noexcept { return h2d_drain_ns_; }
     uint64_t h2d_drain_calls() const noexcept { return h2d_drain_calls_; }
+    // CPU time in `dispatch`'s per-request loop: registry reservation, the two
+    // `O(catalog)` scans, and the transfer record-keeping. The region the analysis's
+    // §4 estimated and that no other counter covers.
+    uint64_t dispatch_cpu_ns() const noexcept { return dispatch_cpu_ns_; }
 
     // Zeroes every transfer counter above so a caller can slice one phase (prefill,
     // then decode) without re-instantiating the supply. Counters only — no state is
@@ -197,6 +201,7 @@ public:
         h2d_enqueue_ns_ = 0;
         h2d_drain_ns_ = 0;
         h2d_drain_calls_ = 0;
+        dispatch_cpu_ns_ = 0;
     }
 
     PayloadBatch dispatch(
@@ -229,6 +234,13 @@ public:
             return reservation_priority(left) < reservation_priority(right);
         });
 
+        // Everything the per-request loop costs on the CPU: the registry reservation,
+        // the two `O(catalog)` occupancy/demotion scans, and the transfer record-
+        // keeping. Measured here because none of the other counters cover it —
+        // `h2d_enqueue` covers only the upload block and `submit` only
+        // `io_uring_enter`, so without this the scans are unattributed on both the
+        // prefill and decode paths.
+        const auto dispatch_cpu_started = std::chrono::steady_clock::now();
         for (const size_t request_index : request_order) {
             const auto& payload_request = requests[request_index];
             const uint32_t expert_id = payload_request.global_expert_id;
@@ -417,6 +429,7 @@ public:
                 throw;
             }
         }
+        dispatch_cpu_ns_ += elapsed_ns(dispatch_cpu_started);
 
         if (submitted_direct_io) {
             const auto submit_started = std::chrono::steady_clock::now();
@@ -996,6 +1009,7 @@ private:
     uint64_t h2d_enqueue_ns_{0};
     uint64_t h2d_drain_ns_{0};
     uint64_t h2d_drain_calls_{0};
+    uint64_t dispatch_cpu_ns_{0};
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion>* direct_io_completions_{nullptr};
     uint64_t* next_direct_io_id_{nullptr};
     hipStream_t compute_stream_{nullptr};

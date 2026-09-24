@@ -124,6 +124,7 @@ struct SupplySplit {
     uint64_t h2d_enqueue_ns{0};
     uint64_t h2d_drain_ns{0};
     uint64_t h2d_drain_calls{0};
+    uint64_t dispatch_cpu_ns{0};
     uint64_t submit_ns{0};
     uint64_t submit_calls{0};
     uint64_t requests{0};
@@ -139,6 +140,7 @@ SupplySplit read_split(V4ModelHost& host) {
     s.h2d_enqueue_ns = host.supply_h2d_enqueue_ns();
     s.h2d_drain_ns = host.supply_h2d_drain_ns();
     s.h2d_drain_calls = host.supply_h2d_drain_calls();
+    s.dispatch_cpu_ns = host.supply_dispatch_cpu_ns();
     s.submit_ns = host.direct_io_submit_ns();
     s.submit_calls = host.direct_io_submit_calls();
     s.requests = host.supply_requests();
@@ -154,6 +156,7 @@ SupplySplit diff(const SupplySplit& after, const SupplySplit& before) {
     d.h2d_enqueue_ns = after.h2d_enqueue_ns - before.h2d_enqueue_ns;
     d.h2d_drain_ns = after.h2d_drain_ns - before.h2d_drain_ns;
     d.h2d_drain_calls = after.h2d_drain_calls - before.h2d_drain_calls;
+    d.dispatch_cpu_ns = after.dispatch_cpu_ns - before.dispatch_cpu_ns;
     d.submit_ns = after.submit_ns - before.submit_ns;
     d.submit_calls = after.submit_calls - before.submit_calls;
     d.requests = after.requests - before.requests;
@@ -325,20 +328,20 @@ int main(int argc, char** argv) {
         "=============================================================="
         "==========================================================\n");
     std::printf(
-        "%-5s %-8s %8s %7s %9s %9s %9s %9s %9s %6s %6s\n",
+        "%-5s %-8s %8s %7s %9s %9s %9s %9s %9s %9s %6s %6s\n",
         "N", "strategy", "wall_s", "tok/s", "nvme_GiB", "io_wait_s", "h2denq_ms",
-        "h2ddrn_s", "submit_ms", "drains", "hot");
+        "h2ddrn_s", "disp_ms", "submit_ms", "drains", "hot");
     for (const auto& r : prefill) {
         std::printf(
-            "%-5u %-8s %8.3f %7.2f %9.2f %9.3f %9.1f %9.3f %9.1f %6llu %6u\n",
+            "%-5u %-8s %8.3f %7.2f %9.2f %9.3f %9.1f %9.3f %9.1f %9.1f %6llu %6u\n",
             r.n, r.swept ? "swept" : "routed", r.seconds,
             static_cast<double>(r.n) / r.seconds, gib(r.split.nvme_bytes),
             s(r.split.io_wait_ns), ms(r.split.h2d_enqueue_ns), s(r.split.h2d_drain_ns),
-            ms(r.split.submit_ns), static_cast<unsigned long long>(r.split.h2d_drain_calls),
-            r.hot_slots);
+            ms(r.split.dispatch_cpu_ns), ms(r.split.submit_ns),
+            static_cast<unsigned long long>(r.split.h2d_drain_calls), r.hot_slots);
     }
-    std::printf("\n  note: io_wait/h2d_drain are host-blocked; h2denq/submit are CPU "
-                "submit cost; nvme = cold bytes only.\n");
+    std::printf("\n  note: io_wait/h2d_drain are host-blocked; disp/h2denq/submit are CPU "
+                "cost; nvme = cold bytes only.\n");
 
     std::printf("\n");
     std::printf(
@@ -349,19 +352,20 @@ int main(int argc, char** argv) {
         "=============================================================="
         "==========================================================\n");
     std::printf(
-        "%-5s %6s %9s %8s %12s %11s %11s %11s %7s\n",
+        "%-5s %6s %9s %8s %12s %11s %11s %11s %11s %7s\n",
         "N", "steps", "ms/tok", "nvme_MiB", "io_wait_us", "h2denq_us", "h2ddrn_us",
-        "submit_us", "warm_MiB");
+        "disp_us", "submit_us", "warm_MiB");
     for (const auto& r : decode) {
         const double per_tok = r.steps > 0 ? 1000.0 * r.seconds / r.steps : 0.0;
         const double steps = r.steps > 0 ? r.steps : 1.0;
         std::printf(
-            "%-5u %6u %9.2f %8.2f %12.1f %11.1f %11.1f %11.1f %7.2f%s\n",
+            "%-5u %6u %9.2f %8.2f %12.1f %11.1f %11.1f %11.1f %11.1f %7.2f%s\n",
             r.n, r.steps, per_tok,
             static_cast<double>(r.split.nvme_bytes) / 1048576.0 / steps,
             static_cast<double>(r.split.io_wait_ns) / 1000.0 / steps,
             static_cast<double>(r.split.h2d_enqueue_ns) / 1000.0 / steps,
             static_cast<double>(r.split.h2d_drain_ns) / 1000.0 / steps,
+            static_cast<double>(r.split.dispatch_cpu_ns) / 1000.0 / steps,
             static_cast<double>(r.split.submit_ns) / 1000.0 / steps,
             static_cast<double>(r.split.warm_bytes) / 1048576.0 / steps,
             r.stopped_early ? "  (eos)" : "");
