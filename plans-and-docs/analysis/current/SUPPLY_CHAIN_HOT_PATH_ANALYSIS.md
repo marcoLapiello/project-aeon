@@ -1,6 +1,6 @@
 # Supply-Chain Hot-Path Analysis — is the feed a river or a bucket?
 
-*Status: open analysis — **now measured in part**. Written 2026-09-22; deepened 2026-09-23 in a second source pass; **measured 2026-09-24** (Step 1 below, §8). A two-round audit of the expert supply's transfer path and its per-request bookkeeping, in answer to two questions: (1) is the NVMe→VRAM feed a continuous stream or an interrupted one; (2) which substeps on that road are expensive enough to be worth removing. Source read: `direct_io_reader.hpp`, `tiered_expert_supply.hpp`, `prefetch_staging.hpp`, `expert_registry.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp`, `v4_expert_executor.hpp`, `v4_model_host.hpp`, `memory_budget.hpp`, `bench_prefill_ab.cpp`. Instrumentation added: `TieredExpertSupply` transfer counters + `tests/bench_supply_split.cpp` + `scripts/supply_split.sh`.*
+*Status: open analysis — **largely measured and settled**. Written 2026-09-22; deepened 2026-09-23 in a second source pass; **measured 2026-09-24** (Step 1 §8, Step 2 §9). A two-round audit of the expert supply's transfer path and its per-request bookkeeping, in answer to two questions: (1) is the NVMe→VRAM feed a continuous stream or an interrupted one; (2) which substeps on that road are expensive enough to be worth removing. Source read: `direct_io_reader.hpp`, `tiered_expert_supply.hpp`, `prefetch_staging.hpp`, `expert_registry.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp`, `v4_expert_executor.hpp`, `v4_model_host.hpp`, `memory_budget.hpp`, `bench_prefill_ab.cpp`. Instrumentation added: `TieredExpertSupply` transfer counters + `tests/bench_supply_split.cpp` + `scripts/supply_split.sh`; probe added: `tools/aeon_c4_probe.cpp`. **Headline: the prefill transfer path is near its ceiling; the largest remaining supply cost is decode's NVMe wait (§8.5).***
 
 **Subject.** The mechanics of moving a routed expert from NVMe into VRAM — the read submission, the staging corridor, the H2D, and the registry bookkeeping around all three. This is the *how fast can the bytes arrive* question, not the *which bytes should arrive* strategy question, which the [prefill supply review](PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) and the [prefill supply strategy plan](PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) own.
 
@@ -184,7 +184,7 @@ The findings that recover *throughput* (as opposed to removing waste) are these,
 - **(C2) A rolling staging corridor** — the option the first pass missed. Reads **and** H2D are both per-expert (13.5 MiB, 4 chunks), so instead of `wait-all-reads → enqueue-all-H2D → wait-all-H2D → release-all`, do it per expert: as expert *i*'s chunks land, issue its H2D; as its upload event fires, free slot *i*; a concurrent path refills slot *i* with `L+1`'s data. This uses only a **handful** of surplus slots rather than a second full bank, and it does not double pinned memory. **§8 corrects the reason it matters:** not disk overlap (the disk is already hidden) but **moving each expert's upload into the previous body's shadow**, which is what actually removes the `4.1–5.4 s` exposed H2D. It is compatible with the [host-memory pressure](HOST_MEMORY_PRESSURE_INVESTIGATION.md) constraint that `banks = 2` fights.
 - **(C1) `banks = 2`** — **§8 refutes this as a standalone fix.** It lets the next layer's reads begin sooner, but the reads are already `98%` hidden (`io_wait ≤ 2.1 s`), so there is nothing for it to recover; it does not move *this* layer's upload off the pre-body critical path, which is the actual `4.1–5.4 s`. Do not build it alone; fold its slot-recycling idea into C2/3. Its two costs (§3: pinned memory doubled; ring depth to re-check) then do not need to be paid.
 - **(C5) Collapse 256 H2D copies into one** — all experts in a layer share `payload_bytes`, and if the free-list allocation yields contiguous VRAM runs the 256 `hipMemcpyAsync` calls become one 3.44 GiB copy. Per-call driver overhead is ~few µs × 256 ≈ `1–3 ms/layer`. Only worth it if contiguity can be arranged; otherwise nice-to-have.
-- **(C4) Is the H2D avoidable at all on gfx1100?** A bounded spike, flagged so it is not missed: on RDNA3 with Resizable BAR, VRAM is CPU-addressable through the BAR window. *If* the platform routes NVMe→BAR-VRAM DMA as PCIe peer-to-peer (by no means guaranteed on consumer boards — it often hairpins through the root complex into DRAM and back), an `O_DIRECT` read could target a VRAM address directly and delete **both** the pinned staging and the H2D copy, crossing PCIe once under the storage path. Transformative if real; half a day to falsify. Flag, do not plan on.
+- **(C4) Is the H2D avoidable at all on gfx1100?** **Closed — §9 measured it: `NOT_SUPPORTED`.** The preconditions were green (32 GiB BAR, `CONFIG_PCI_P2PDMA=y`, `pcie_p2p=Y`), VRAM exports as a dma-buf and maps correctly, and the mapping verifiably aliases VRAM — but the kernel refuses it as a direct-I/O destination: `pread(O_DIRECT)` → `EFAULT`, and the production `io_uring` read → `cqe.res = -14`. `get_user_pages` cannot pin a BAR/dma-buf VMA, so no bus address reaches the NVMe controller. The accepted buffered path bounces through the page cache at `13 GiB/s` CPU writes and is *slower* than the current two-hop DMA path. **No userspace workaround; the pinned staging and the second hop stay.**
 
 The recommended experiment order is: measure (5.1 items 1–2) → cheap provable removals (4.4 a–d) → rolling corridor vs `banks = 2` (5.2) → the BAR spike (5.2 C4) if it is worth a half-day.
 
@@ -216,7 +216,7 @@ Ordered by confidence-to-effort, not by size. Every "fix" here is unstarted and 
 | 8 | **`banks = 2`** (§5.2 C1) | `V4ModelHost` staging sizing | **refuted as a standalone fix** (§8): reads are already hidden | do not build alone; fold into C2 | M | pinned-mem coupling, SQ/CQ |
 | 9 | **id→index map** (§4.4d) | `find`/`ensure_registry_transfer` | ~200 k cmp/layer, but total dispatch CPU ≈0.15% (§8) | `unordered_map` index | S | low value |
 | 10 | **Single H2D copy** (§5.2 C5) | `materialize` | ~1–3 ms/layer | contiguous copy | M | low value |
-| 11 | **Large-BAR NVMe→VRAM** (§5.2 C4) | spike only | removes the `4.1–5.4 s` H2D + `3.44 GiB` pinned (§8) | measure, do not plan | ? | platform-dependent |
+| 11 | **Large-BAR NVMe→VRAM** (§5.2 C4) | spike — **done (§9)** | **`NOT_SUPPORTED`, measured** — kernel refuses VRAM as an O_DIRECT target | closed, no workaround | — | settled |
 | 12 | **Decode disk wait** (§8.5) | residency, not transfer | **`36–63%` of every decode token** | routing-aware residency; a different analysis | ? | — |
 
 | Cross-cutting | Where it goes |
@@ -298,10 +298,81 @@ So the throughput question has moved: **a perfect prefill upload fix is worth si
 | **C1 `banks = 2`** | the fix for the exposed load | **does not fix the exposed upload**; only helps reads, which are already hidden. Drop as a standalone fix. |
 | **C2 rolling corridor** | cheaper alternative to C1 | **the right shape**, but for C3's reason (per-expert upload during the previous body), not for disk overlap. Worth building; ~`4–5.4 s/window` on swept prefill. |
 | **C3 completion-driven upload** | "the real prize" | **confirmed as the prize** for the swept path, with a measured ceiling of `4.1–5.4 s/window` (`6.5–8.4%`). |
-| **C4 large-BAR NVMe→VRAM** | possibly transformative | still worth the spike, now precisely bounded: it would remove the `4.1–5.4 s` H2D **and** the `3.44 GiB` pinned staging — but that is still single-digit percent of prefill, and it does nothing for decode (whose cost is the drive, not the copy). |
+| **C4 large-BAR NVMe→VRAM** | possibly transformative | **closed — `NOT_SUPPORTED` (§9).** Measured on the production `io_uring` path: `-EFAULT`. The pinned staging and the second hop stay. |
 | **§4 `O(catalog)` scans** | new open-work item | **deprioritised — ~0.15% of the window.** |
 | **New: decode disk wait** | not considered | **the largest measured supply cost (`36–63%` of every token). Promote above C1–C4.** |
 
 ### 8.7 Consequence for the document
 
-§3's *mechanism* and §8's *magnitude* together say: the prefill transfer path is **already close to its ceiling** — the drive is hidden and the only exposed leg is the irreducible PCIe copy, worth single-digit percent. The document's prefill framing was correct about the shape and wrong about the disk. The work that remains worth doing on this path is small and specific (C3/C2 for `4–5.4 s`, C4 as a bounded spike), and the **large** remaining supply cost is decode's NVMe wait — a residency question, and the subject of a different analysis.
+§3's *mechanism* and §8's *magnitude* together say: the prefill transfer path is **already close to its ceiling** — the drive is hidden and the only exposed leg is the irreducible PCIe copy, worth single-digit percent. The document's prefill framing was correct about the shape and wrong about the disk. The work that remains worth doing on this path is small and specific (C3/C2 for `4–5.4 s`), and the **large** remaining supply cost is decode's NVMe wait — a residency question, and the subject of a different analysis.
+
+---
+
+## 9. Measured — the C4 probe (Step 2, 2026-09-24)
+
+*Status: **measured and closed.** C4 is dead on this platform.* Tool: `tools/aeon_c4_probe.cpp` (`aeon_c4_probe`, built under `AEON_BUILD_BENCHMARKS`).
+
+### 9.1 The question, and the preconditions
+
+C4 asked whether the NVMe could DMA straight into VRAM, deleting the pinned staging and the second PCIe hop. Three of the four preconditions measured green beforehand:
+
+| Precondition | State |
+| :--- | :--- |
+| Large BAR aperture | ✅ **32 GiB** (`resource0` = `0x17800000000`–`0x17FFFFFFFFF`) |
+| Kernel P2P DMA | ✅ `CONFIG_PCI_P2PDMA=y` |
+| Driver P2P | ✅ `amdgpu.pcie_p2p=Y`; GPU↔GPU matrix all-YES |
+| **NVMe accepts a VRAM buffer as a read destination** | ❓ — what the probe tested |
+
+The GPU↔GPU matrix being all-YES does **not** answer the fourth: that path uses the GPU's own copy engine, whereas C4 needs the *NVMe controller* to write into the GPU's BAR — a different kernel path (`get_user_pages` → `dma_map_sgtable` on a dma-buf page).
+
+### 9.2 Result
+
+256 MiB span, 5 reps at distinct file offsets, RX 7900 XTX, single NVMe:
+
+```
+[1] dma-buf export               : ok  (via hipMemGetHandleForAddressRange)
+[1] mmap the dma-buf             : ok  (ptr 4096-aligned)
+[2] GPU write -> CPU read        : ok (mapping aliases VRAM)
+[2] CPU write -> GPU read        : ok
+[3] BAR bandwidth (CPU-visible)  : write 13.05 GiB/s, read 0.01 GiB/s
+[6] pread -> pinned host (ref)   : 36.79 ms  6.79 GiB/s  (disk ceiling)
+[5] pread -> host -> BAR copy    : 55.15 ms  4.53 GiB/s  (bounce control)
+[4] pread -> VRAM (the target)   : FAILED (Bad address)          <-- EFAULT
+[4a] control: pread -> anon host : ok (O_DIRECT itself works here)
+[4b]     buffered pread -> VRAM  : ok (buffered path accepts VRAM)
+[4c] io_uring O_DIRECT -> VRAM   : REJECTED (cqe.res=-14)         <-- EFAULT
+```
+
+**Verdict: `NOT_SUPPORTED`.** Two independent rejections with the same cause:
+
+- `pread(O_DIRECT)` into the VRAM mapping → `EFAULT` (`Bad address`).
+- The **production mechanism**, `io_uring` `IORING_OP_READ` with `O_DIRECT` into the same mapping → `cqe.res = -14` (`-EFAULT`).
+
+### 9.3 What the controls establish
+
+The controls are what make this a conclusion rather than a failed experiment:
+
+- **[4a] `O_DIRECT` into an anonymous host mapping succeeds.** So `O_DIRECT` itself, the file, the alignment, and the span size are all fine — the failure is **specific to the VRAM mapping**.
+- **[4b] A *buffered* read into the same VRAM mapping succeeds.** So the mapping is a valid, writable user address; what the kernel refuses is using it as a **direct-I/O destination**. The buffered path "works" only because it copies through the page cache first and then writes to the BAR from the CPU.
+- **The alias checks ([2]) pass in both directions**, so the mapping really is VRAM — the rejection is not an artifact of a broken mapping.
+
+### 9.4 The mechanism, and why it cannot be worked around from userspace
+
+`O_DIRECT` must translate the destination into a **bus address** for the NVMe controller. For ordinary host memory that is `get_user_pages` → `dma_map_sgtable`. For the BAR/dma-buf mapping, the VMA has no ordinary `struct page` that the block layer will pin, so `get_user_pages` fails and the request is rejected with `EFAULT` before any DMA is programmed. Making it work needs a kernel-side P2P-aware direct-I/O path (the role `nvidia-fs` plays for GPUDirect Storage) — **which does not exist here**, and cannot be added from userspace. This is a platform/driver limitation, not a tuning problem.
+
+### 9.5 Even the fallback that *does* work is worse than what we have
+
+Suppose one used the accepted buffered path ([4b]). It costs `≥ 55.15 ms` per 256 MiB (the measured bounce control: disk read, then CPU write across the BAR at `13 GiB/s`). The **current** leg costs `36.79 ms` (read) `+ ~9.6 ms` (DMA copy at `26 GiB/s`) `≈ 46 ms`. So the CPU-mediated "direct" path is **~20% slower** than the two-hop DMA path we already run — and that is before counting its page-cache traffic and its extra non-reclaimable footprint.
+
+Two further facts fall out of the probe and are worth keeping:
+
+- **CPU reads from VRAM are unusable: `0.01 GiB/s`** (uncached, non-posted). Any design that has the CPU touch VRAM contents is off the table for bulk data.
+- **CPU writes to VRAM are decent: `13 GiB/s`** (posted/write-combined). This is the only CPU-mediated direction that is within sight of the DMA path, and it is still half of it.
+
+### 9.6 Consequence
+
+**C4 is closed as `NOT_SUPPORTED`, measured on the production mechanism, with the cause identified and the workaround ruled out.** The pinned staging arena and the two-hop path stay. Concretely:
+
+- The `3.44 GiB` pinned staging **cannot be removed** by this route — the host-memory pressure investigation must solve that differently.
+- The `4.1–5.4 s/window` exposed H2D **cannot be removed** by this route either; C3/C2 (issuing the upload during the previous body) remains the only lever, and it keeps the second hop by construction.
+- The spike was **worth running**: it converts a plausible, preconditions-green idea into a settled negative in about half a day, and it retires the largest "maybe" in this document.

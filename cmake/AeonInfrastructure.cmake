@@ -23,6 +23,15 @@ if(AEON_BUILD_BENCHMARKS)
     # Request shape and queue-width investigation.
     aeon_add_benchmark(bench_model_direct_io SOURCES tests/bench_model_direct_io.cpp)
 
+    # Supply-chain hot-path analysis, Step 2 (C4): can the NVMe write straight into
+    # VRAM? Exports a `hipMalloc` region as a dma-buf, maps it through the BAR, and
+    # attempts an `O_DIRECT` pread into it, with a hand-written bounce control that
+    # makes a silent kernel bounce distinguishable from a true direct read. A
+    # yes/no capability probe with a timing tiebreak, not a benchmark — see the
+    # file header and the analysis §9.
+    aeon_add_executable(aeon_c4_probe SOURCES tools/aeon_c4_probe.cpp)
+    target_link_libraries(aeon_c4_probe PRIVATE hsa-runtime64)
+
     # Step 6 outcome 5: the swept prefill against its baseline. A speed claim needs
     # its baseline in the same process, and neither arm scales the same way (the
     # sweep's bytes are constant in the prompt, serial's grow linearly), so the bench
