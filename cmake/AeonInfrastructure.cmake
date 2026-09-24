@@ -273,6 +273,19 @@ if(AEON_BUILD_TESTS)
         SOURCES tests/test_v4_routed_prefill.cpp TIMEOUT 1800)
 endif()
 
+# --- Supply-chain portability: the two sensitivity gates -----------------------
+# The transfer corridor must be fast because it is demand-driven, not because it was
+# tuned to one machine. A. DEPTH INSENSITIVITY: run one swept window at several
+# staging depths and require the throughput to be flat above the floor the design
+# needs. B. BEHAVIOUR SYMMETRY: require the work (layers, experts, token) to be
+# identical across those depths, with only the timing free to move. Neither gate
+# compares against a bandwidth, a latency, or any device figure, so the verdict is
+# the shape of the curve and holds on hardware faster or slower than the reference.
+if(AEON_BUILD_TESTS)
+    aeon_add_test(test_v4_staging_depth
+        SOURCES tests/test_v4_staging_depth.cpp TIMEOUT 1800)
+endif()
+
 # --- Tier-3 sequence: the long-context lifecycle ------------------------------
 # Item 20. Every earlier layer-body gate shrinks the local window (to 6, 10, 4)
 # and the index top-k so a wrap fits in a short run, and each names the shrinkage

@@ -99,35 +99,52 @@ Scope is unchanged from the analysis: *how fast the bytes arrive*. The *which by
 
 ---
 
-## 3. Phase 2 — Make the overlap shippable *(mandatory — this is how Phase 1 ships)*
+## 3. Phase 2 — Make the corridor a budget, and the overlap shippable *(mandatory)*
 
-Phase 1 proved the win and showed its price: `+3.44 GiB` of pinned staging, which does not fit the production Warm shape (it swapped the 62 GiB box at Warm 35). This phase keeps the win and removes the over-allocation, which is what makes it compatible with the open [host-memory pressure investigation](../../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md). **It is no longer "only if Phase 1 passed" — it is required to ship Phase 1's result.**
+Phase 1 proved the win and showed its price: `+3.44 GiB` of pinned staging, which does not fit the production Warm shape (it swapped the 62 GiB box at Warm 35). This phase removes the over-allocation, which is what makes it compatible with the open [host-memory pressure investigation](../../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md), **and** removes the last fitted constant from the supply's behaviour.
 
-### P2.1 — Per-expert slot recycling (the rolling corridor, C2)
+**The goal is a property, not a number.** The corridor must be fast *because it is demand-driven*, so its speed does not depend on any figure tuned to one machine's SSD, PCIe link, or GPU. The two sensitivity gates of P2.3 are how that is judged, and they are already built and committed:
 
-| | |
-| :--- | :--- |
-| **Where** | `src/infrastructure/core/tiered_expert_supply.hpp` (`dispatch` / the new drain), `v4_prefill_sweep.hpp` (`dispatch_ahead` / the new settle step) |
-| **What** | Recycle each staging slot the moment **its own** expert's copy completes, and let the next layer's reads refill that slot — instead of holding all `E` slots for the whole layer and freeing them as a block. Reads *and* copies are already per-expert (`13.5 MiB`, `4` chunks), so this is a granularity change, not a redesign. |
-| **Target** | Headroom reduced from one full bank (`E` slots) to a **bounded, reported surplus** (`S` slots, sized ~ the read-vs-copy pipeline depth). Pick `S` small (start `≤16`), and report it. |
-| **Requirement** | The in-flight accounting must stay exact: a slot may not be reused while its copy is outstanding. This is what `SlotState` already encodes — do not bypass it. |
-| **Requirement** | Pinned memory must be **measured and reported**, not assumed: `S × payload_bytes` on top of `E × payload_bytes`. |
-| **Verify** | Byte-exactness gates; `in_use_slots() == 0` at `prefill_end`; the wall/`h2d_drain` from P1.4 **survive** (this is the acceptance test — the memory optimisation must not cost the win). |
+> **Status 2026-09-24 — the gates were built and run (analysis [§11](../../analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md)).** Result: **Gate B (behaviour symmetry) PASSES** — across depths `256/384/512` the work is byte-identical (`token 86`, `43` layers, `10718` experts). **Gate A (depth insensitivity) FAILS**, spread `1.134×`: `256 → 384` changes nothing, then `512` drops `13%` because at `2E` the drain flips from blocking to deferred. And **`64/128/192` cannot run at all** — a swept dispatch binds a whole layer's set, so the arena must hold `E` slots. **Depth is a floor, not a budget; that is the thing to fix.**
 
-### P2.2 — Re-check the submission ring
+**The premise this phase originally carried is wrong, and §11.4 is why.** "Per-expert slot recycling turns `2E` into `E + S`" does not hold in this structure. `V4Graph::forward_window` synchronizes the compute stream at every layer boundary — it must, because `release_layer` frees the VRAM slots the body just read from — so the **host cannot run ahead of the compute**. `L+1`'s reads are dispatched at one instant, before `body(L)`, and they need `E` destinations while `L`'s copies still hold `E`. `2E` is that instant's demand, not slack. So P2.1 below is **necessary but not sufficient**; P2.2 is what makes the corridor `E + S`.
+
+### P2.1 — Demand-driven staging pool (the corridor, C2)
 
 | | |
 | :--- | :--- |
-| **Where** | `src/architecture/deepseek_v4/core/v4_model_host.hpp` — `io_queue_depth` sizing (~L803–812); `src/infrastructure/io/direct_io_reader.hpp` — the SQ-full guard |
-| **What** | Confirm whether P2.1 ever has **two layers' reads** outstanding at once. If it does, `io_queue_depth` must cover `2 × requests_per_expert × E`, and the CQ (`2 × SQ`) must be re-checked. |
-| **Requirement** | Do not rely on the `submit_read` guard firing as the safety mechanism — size the ring correctly and keep the guard as an assertion. |
-| **Verify** | `direct_io_submit_calls` / `direct_io_requests_submitted` consistent; no SQ-full throw across a full window. |
+| **Where** | `src/infrastructure/core/tiered_expert_supply.hpp` (`dispatch`/`materialize` and the reaper), `prefetch_staging.hpp` (`acquire`/`release` beside `SlotState`), `v4_expert_supply.hpp` (`dispatch_layer_stream`) |
+| **What** | Replace the **positional banks** (`staging_base = (layer % banks) × E`) with a **free-slot pool**: a staging index is *acquired* when its read is submitted and *released* when its copy completes, exactly like the VRAM pool. The release hook already exists — the reaper queries each `h2d_event` and `complete_request`s on success. |
+| **Why it is the portable shape** | The arena stops being a schedule (`E` per bank) and becomes a **resource**: above the pipeline minimum, more slots only give the lookahead more room. This is the same demand-driven style the VRAM frontier already uses (it holds as many whole layers as the pool allows — measured frontier `44`), which is the one part of the design that is already hardware-independent. |
+| **Requirement** | The in-flight accounting must stay exact: a slot may not be reused while its read *or* its copy is outstanding. `SlotState` already encodes this — do not bypass it. |
+| **Requirement** | Reads may not be submitted faster than slots are free, so the wave must be replaced by **paced submission** driven by slot availability (this is what removes the `E`-at-once demand). |
+| **Verify** | Byte-exactness gates; `in_use_slots() == 0` at `prefill_end`; P1.4's wall/`h2d_drain` **survive**; **Gate B still passes**. |
+
+### P2.2 — Lift the per-layer park (epoch-tagged VRAM slots)
+
+| | |
+| :--- | :--- |
+| **Where** | `src/architecture/deepseek_v4/core/v4_graph.hpp` (the `hipStreamSynchronize` + `release_expert_leases` + `prefill_after_layer` block in `forward_window`); `src/infrastructure/core/expert_registry.hpp` (`release_layer`) |
+| **What** | Stop parking the host at every layer boundary. `release_layer(L)` marks `L`'s VRAM slots **reusable once the compute stream passes the marker recorded at `L`'s end`**, and a slot's reuse waits on a stream query instead of a host synchronize. The host side then advances as **events** complete, which is what lets P2.1's pool actually run ahead and what makes the supply self-pacing on whichever leg is slowest. |
+| **Why it is needed** | Without it the pool released mid-body cannot be refilled until the next boundary, so P2.1 alone would be layer-granular — better shaped, same depth. This is the piece that turns the floor into a budget. |
+| **Requirement** | Slot reuse must be *strictly* ordered behind the body's last read of that slot; the lease/slot lifetime here is the correctness gate (`trap 41`). No kernel may read a slot after its epoch allows reuse. |
+| **Requirement** | Moving the extra cost from pinned **host** RAM to VRAM is the point: the second layer's residency is `2E` of the Hot pool (`512` of `797` slots here), a resource the sweep already dominates, instead of `+3.44 GiB` of the scarce pinned memory. |
+| **Verify** | All byte-exactness gates (`test_v4_prefill_window`, `test_v4_prefill_sweep`, `test_v4_routed_prefill`, `test_v4_engine`); `in_use_slots() == 0` at `prefill_end`; no lease leak; decode and the routed bank unmoved. |
+
+### P2.3 — The sensitivity gates (the acceptance test) — *built*
+
+| | |
+| :--- | :--- |
+| **Where** | `tests/test_v4_staging_depth.cpp`; arena resize in `prefetch_staging.hpp` + `V4ModelHost::resize_staging_slots` |
+| **Gate A — depth insensitivity** | ❌ **fails today** (spread `1.134×`). ✅ **Done when** throughput is flat across a **wide** depth range, including depths **well below `E`** — the floor is gone. Hardware-independent: it compares depths, not rates. |
+| **Gate B — behaviour symmetry** | ✅ **passes today** (`token 86`, `43` layers, `10718` experts identical at every depth). **Must keep passing** — it is the guard that the fix does not make the work depend on the resource. |
+| **Command** | `./build/bin/test_v4_staging_depth` (defaults `64 128 192 256 384 512`); optional depth list as arguments |
 
 ---
 
 ## 4. Phase 3 — Dispatch bookkeeping *(low priority; independent; do last)*
 
-Measured at **`≈1%`** of both prefill (`610 ms/window`) and decode (`3.4 ms/token`). Real, small, and **independent of Phases 1–2** — it may be done any time, or skipped. Every fix is local and mechanical.
+Measured at **`≈1%`** of both prefill (`610 ms/window`) and decode (`3.4 ms/token`). Real, small, and **independent of Phases 1–2** — it may be done any time, or skipped. Every fix is local and mechanical. Note Phase 1 gave it a reason to exist after all: with the deferred drain more transfers are in flight at once, and `disp_ms` rose from `698` to `856 ms` (`Warm 30`, `N = 512`, analysis §10.3).
 
 | # | Item | Where | Change | Requirement |
 | :-- | :--- | :--- | :--- | :--- |
@@ -153,19 +170,24 @@ These are not optional and are checked per phase, not at the end.
 7. **Both strategies unaffected.** The routed bank and decode must not regress; they share `dispatch`/`materialize`, so re-measure decode in the same runs.
 8. **One commit per phase**, with the measured before/after in the message. Conventional-commit prefix (`perf:`, `refactor:`, …).
 9. **Ledger rule.** Record in the performance ledger **only** if the change moves the **end-to-end** path and the measurement is of the engine running real prompts. A hardware/capability probe (like C4) does **not** qualify.
+10. **One heavy process at a time.** The Warm-shaped and multi-window runs are pinned-memory heavy; a model load plus a window can exceed the host's real headroom even when the budget check passes (analysis §10.4). Never run a bench, a test, and a build concurrently.
+11. **Portability is a gate, not a claim.** Any step that touches the corridor's sizing or scheduling must re-run `./build/bin/test_v4_staging_depth`: **Gate B must pass** (the work is identical across depths) and **Gate A must not regress**. A change that makes throughput depend *more* on the depth is a regression even if it is faster at one depth — that is the fitted-constant failure this plan exists to remove.
 
 ---
 
 ## 6. Order, dependencies, and stop conditions
 
 ```
-Phase 1  (P1.1 → P1.2 → P1.3 → P1.4 gate)      ← ✅ DONE: win proven (3.2–4.5 s), memory cost blocks shipping
+Phase 1  (P1.1 → P1.2 → P1.3 → P1.4)          ← ✅ DONE: win proven (3.2–4.5 s/window); memory cost blocks shipping
    │
    ▼
-Phase 2  (P2.1 → P2.2)                          ← MANDATORY: the shipping form of Phase 1's win
-   │            └─ ABORT if the memory fix loses the Phase-1 win → keep banks=2 as opt-in
+Phase 2  (P2.3 built → P2.1 → P2.2 → P2.3 must pass)   ← MANDATORY: the corridor becomes a budget
+   │            ├─ Gate A: ❌ fails today (1.134x); ✅ done when flat across a wide depth range,
+   │            │          including depths well below E (the floor is gone)
+   │            ├─ Gate B: ✅ passes today (identical work at every depth) — must keep passing
+   │            └─ ABORT if P2.2's slot-lifetime change cannot hold byte-exactness
    ▼
-Phase 3  (P3.1 → P3.2 → P3.3 → P3.4)            ← optional, independent, low priority
+Phase 3  (P3.1 → P3.2 → P3.3 → P3.4)          ← optional, independent, low priority
 ```
 
 At each gate: **update the analysis doc**, then commit. Do not start the next phase with a stale doc.
@@ -177,7 +199,7 @@ At each gate: **update the analysis doc**, then commit. Do not start the next ph
 | Item | Why it is not in this plan |
 | :--- | :--- |
 | **C4 — NVMe directly into VRAM** | Measured `NOT_SUPPORTED` (analysis §9): `EFAULT` on `pread(O_DIRECT)` **and** on the production `io_uring` path. `get_user_pages` cannot pin a BAR VMA; no userspace workaround. |
-| **`banks = 2` alone** | Refuted (§8.4): reads are already `98%` hidden, so a second bank alone recovers nothing. *Coupling caveat:* Phase 1 tests it **combined with** a deferred drain — see §1. |
+| **`banks = 2` alone** | Refuted (§8.4): reads are already `98%` hidden, so a second bank alone recovers nothing. **Resolved:** Phase 1 measured it **coupled with** a deferred drain — the coupling is the fix, and the bank is only its headroom (analysis §10.3). |
 | **Batched H2D sync (§4.4a)** | Refuted payoff: collapsing `10 723` syncs to one saves `≈0`; the syncs absorb copy time. Subsumed by Phase 1 if the copy is overlapped. |
 | **Duplicate per-expert HIP event (§4.4b)** | Bounded by `h2d_enqueue` (`47–72 ms/window`). Solve only as a side effect of P1.1, never as its own task. |
 | **Single H2D copy (C5)** | Submission is not the cost (`h2d_enqueue` small); the bandwidth is already at the PCIe ceiling. |
@@ -191,6 +213,6 @@ At each gate: **update the analysis doc**, then commit. Do not start the next ph
 ## 8. Definition of done
 
 - **Phase 1:** ✅ `h2d_drain → ≈0` and `wall_s` down `3.2–4.5 s` at both Warm 0 and Warm 30, with byte-exactness and invariants holding. **Caveat:** the win needs `banks = 2` (`+3.44 GiB` pinned), which does not fit the production Warm shape, so it ships **opt-in** until Phase 2.
-- **Phase 2:** the same win with staging headroom bounded to a small reported surplus, not a full bank; pinned memory reported; `prefill_sweep_staging_banks` back to its default `1` and the second bank no longer needed.
+- **Phase 2:** the corridor is a **budget, not a schedule** — Gate A flat across a wide depth range *including depths well below `E`*, and Gate B still passing, with P1.4's win (`h2d_drain → ≈0`, `wall` down) surviving at a pinned cost that fits the production Warm shape; `prefill_sweep_staging_banks` no longer selects behaviour; pinned memory reported.
 - **Phase 3 (if done):** `disp_ms` down in both tables, no behaviour change. (Phase 1 gave it a reason: more transfers in flight made the `O(catalog)` scans cost `+0.15 s/window`.)
 - **Throughout:** no regression in decode or the routed bank; every measurement reproducible from `scripts/supply_split.sh`. Run **one heavy process at a time** — the Warm-shaped runs are pinned-memory heavy and must not overlap with builds, tests, or other benches.

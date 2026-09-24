@@ -463,8 +463,43 @@ public:
         return staging_ ? staging_->slot_count() : 0;
     }
 
-    // Layer-sized staging banks the sweep's arena holds (`2` = the deferred drain's
-    // headroom, `1` = the pre-Phase-1 shape). Reported so a run log can name the
+    // Re-size the staging arena at runtime: a **depth** change, not a format change.
+    // The depth is a resource budget the transfer corridor consumes, not a behaviour
+    // constant — above the minimum the design needs, more slots only give the
+    // lookahead more room to run ahead, and the throughput must not change. This is
+    // what lets a host size the corridor from its remaining RAM instead of from a
+    // figure tuned on one machine, and it is what the depth-sensitivity gate varies.
+    //
+    // Preconditions, refused rather than assumed: every staging slot free and no
+    // expert lease outstanding. The resize destroys and recreates the per-slot
+    // events, so nothing may still reference one — which is exactly the state a
+    // window boundary leaves behind. `prefill_active_` is deliberately **not** the
+    // guard: it records the strategy the last window chose and stays set afterwards
+    // (gates read it), so it does not mean "a window is running now". The two state
+    // conditions below are the exact ones, and an in-progress window cannot satisfy
+    // both while a caller outside the engine is on the stack.
+    bool resize_staging_slots(uint32_t slots) {
+        if (staging_ == nullptr) return false;
+        if (staging_->in_use_slots() != 0) return false;
+        if (outstanding_expert_leases() != 0) return false;
+        if (slots < PrefetchStagingArena::TOTAL_STAGING_SLOTS) return false;
+
+        staging_->resize(slots);
+        const uint32_t per_layer = static_cast<uint32_t>(config_.n_routed_experts);
+        sweep_staging_banks_ = per_layer == 0
+            ? 1u
+            : std::max<uint32_t>(1u, slots / per_layer);
+        prefill_sweep_.configure(&supply_, &registry_, sweep_staging_banks_);
+        // The budget report is the plan's figure; keep it equal to the allocation so
+        // the two cannot drift after a resize.
+        budget_.transient_staging_bytes =
+            static_cast<size_t>(slots) * staging_->payload_bytes();
+        return true;
+    }
+
+    // Layer-sized staging banks the sweep's arena holds, derived from the arena's
+    // actual depth (`slots / experts_per_layer`; `1` is the pre-Phase-1 shape, `2+`
+    // the deferred drain's headroom). Reported so a run log can name the
     // pinned-memory cost the overlap is bought with.
     uint32_t sweep_staging_banks() const noexcept { return sweep_staging_banks_; }
 
@@ -704,6 +739,9 @@ public:
         // resumes on the set the pool held before the pass (the plan's restore
         // requirement). Shared by both strategies.
         restore_prefill_residents(loader_.expert_format());
+        // `prefill_active_`/`sweep_active_` deliberately stay set: they record the
+        // strategy the window chose, for the gates that read the choice afterwards.
+        // `prefill_begin` re-decides both for the next window.
     }
 
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
@@ -817,9 +855,15 @@ private:
             experts_per_layer);
         const uint32_t staging_slots =
             aeon::core::staging_slot_count(runtime_cfg, experts_per_layer);
-        sweep_staging_banks_ = runtime_cfg.prefill_sweep
-            ? std::max<uint32_t>(1, runtime_cfg.prefill_sweep_staging_banks)
-            : 1u;
+        // The sweep's bank count is **derived from the arena it actually has**, not
+        // from a configured constant: `staging_slots / experts_per_layer` whole
+        // layer-sized banks. A depth change moves the arena and this derivation
+        // together, so there is no second place for the two to disagree (see
+        // `resize_staging_slots`). The constant that used to live here encoded "one
+        // layer reading, one layer copying" and was a tuning figure, not a fact.
+        sweep_staging_banks_ = experts_per_layer == 0
+            ? 1u
+            : std::max<uint32_t>(1u, staging_slots / experts_per_layer);
         staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
 
         // The direct reader's submission queue must hold a whole layer's reads at

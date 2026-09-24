@@ -428,3 +428,50 @@ Two findings fall out, one about this document and one about the budget:
 - **The host-reserve model is under-sized** (`HOST_RAM_RESERVED_BYTES = 10 GiB`). The budget check *passed* `35 + 6.75 = 41.75 ≤ 52` and the machine still swapped, so the unmodelled overhead is `> 10 GiB`. This belongs to the open [host-memory pressure investigation](HOST_MEMORY_PRESSURE_INVESTIGATION.md) — it is a data point for it, not a defect in this plan.
 
 **Consequence for the plan:** Phase 1's win is **conditional on Phase 2**. Per-expert slot recycling (C2) recovers the same overlap from a bounded surplus (a handful of slots) instead of a whole `E`-slot bank, which is what makes it fit both the memory budget and the host-memory investigation's constraint. Phase 2 is therefore **mandatory, not optional** — it is how Phase 1's result ships.
+
+---
+
+## 11. Measured — the portability sensitivity gates (2026-09-24)
+
+*Status: **measured.** Gate B passes, Gate A fails. The instruments exist and are reusable; the failure is the work item.*
+
+### 11.1 Why gates instead of a profile
+
+The obvious next measurement is the pipeline's slot-occupancy profile over a window, which would say how much corridor room exists. It was rejected: that figure is **fitted to this box** and decides nothing on a machine with a faster SSD, a PCIe-5 link, or a slower GPU. The requirement is a supply chain that is fast *because it is demand-driven*, not because a constant happens to suit the reference machine, so the thing to test is a **property**, not a rate. Both gates below are property tests, and neither compares against a bandwidth, a latency, or any device figure — the verdict is the *shape* of the curve, so it holds on hardware faster or slower than this one.
+
+### 11.2 What was built
+
+- **`tests/test_v4_staging_depth.cpp`** (new gate): one model load, then one identical swept window at each staging depth in `64 128 192 256 384 512`, each in a fresh session with the counters reset. It asserts the two properties below and prints the sweep.
+- **`V4ModelHost::resize_staging_slots(slots)`** (new): re-sizes the arena at runtime, guarded by the two exact preconditions (every slot free, no lease outstanding — the resize recreates the per-slot events) and keeping `transient_staging_bytes` equal to the allocation. This is the capability the portability story needs: the depth is a **budget the host can set**, not a figure fixed at load.
+- **The sweep's bank count is now derived from the arena it actually has** — `slots / experts_per_layer` — instead of a configured constant. The `2` that used to select "one layer reading, one layer copying" is gone from the control flow; it is now an emergent consequence of the depth. This is the one fitted constant that lived in the behaviour, and it no longer does.
+
+### 11.3 Results
+
+`./build/bin/test_v4_staging_depth`, one swept window, `N = 256`, 43 layers × 256 experts, Warm 0, one process:
+
+| depth | slots | banks | wall_s | io_wait_s | **drain_s** | layers | experts | token | note |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 64 | — | — | — | — | — | — | — | — | below the swept dispatch's floor |
+| 128 | — | — | — | — | — | — | — | — | below the swept dispatch's floor |
+| 192 | — | — | — | — | — | — | — | — | below the swept dispatch's floor |
+| 256 | 256 | 1 | 34.755 | 2.122 | **4.212** | 43 | 10718 | 86 | swept |
+| 384 | 384 | 1 | 35.032 | 2.113 | **4.647** | 43 | 10718 | 86 | swept |
+| 512 | 512 | 2 | 30.880 | 1.060 | **0.006** | 43 | 10718 | 86 | swept |
+
+### 11.4 What the gates establish
+
+1. **Gate B — behaviour symmetry — PASSES.** The token, the layer loads, the experts streamed and the layers released are **identical at every depth that ran**. The pipeline's *work* is resource-invariant: it does the same thing whatever the depth, so the logic is not reading a resource as a policy. This is the good half of portability and it already holds.
+2. **Gate A — depth insensitivity — FAILS, at exactly one place, and it is a behaviour threshold.** The spread is `1.134×`. `256 → 384` (a `+50%` arena) changes **nothing** — same regime, same time — and then `512` drops `13%` because at `2E` the drain flips from host-blocking to deferred. So the throughput does not depend on the depth continuously; it depends on which **algorithm** the depth selects. A design whose speed is set by a stage change hidden behind an arena size is the definition of fitted: on a machine where the copy is cheap relative to the reads, `2E` is the wrong threshold and there is nothing to notice it with.
+3. **The floor is the deeper problem.** Three of six depths cannot run at all: a swept dispatch binds a whole layer's distinct set at once, so the arena must hold `E` slots before the window can start. **Depth is therefore a floor, not a budget** — the smallest corridor the design will accept is one whole layer's worth of pinned memory, which is precisely the `3.44 GiB` that does not fit the production Warm shape (§10.4). This is the same fact as Phase 1's memory blocker, seen from the other side.
+
+> **The premise that per-expert recycling alone would fix it was wrong, and this is why.** The obvious reading of "a bounded surplus instead of a whole bank" is that recycling slots at expert granularity lets `E + S` replace `2E`. It does not, in this structure: `V4Graph::forward_window` synchronizes the compute stream at every layer boundary (it must — `release_layer` frees the VRAM slots the body just read from), so the **host cannot run ahead of the compute**. The reads for `L+1` are dispatched at one instant, before `body(L)`, and they need `E` destinations while `L`'s copies still hold `E`. The `2E` is that instant's demand, not a slack choice. Making it `E + S` requires the host side to advance as **events** complete, which is the work restated in Phase 2.
+
+### 11.5 Consequence
+
+Phase 2 is restated by these gates rather than by a profile, and it now has pass/fail criteria instead of a fitted constant:
+
+- **Gate A must pass over a wide range**, down to depths well below `E`. That is the operational meaning of "the corridor is a budget".
+- **Gate B must keep passing** — it is the regression guard that the fix does not make the work depend on the resource.
+- Neither gate mentions this hardware, so the same two commands decide the question on any machine.
+
+The instruments are cheap (one model load, three windows) and already committed, so every later step is measured against a property rather than a number.

@@ -127,6 +127,24 @@ public:
         is_allocated_ = true;
     }
 
+    // Re-size the arena in place. Only the **depth** changes: the payload width, the
+    // sector size, and the format are the artifact's, not a policy. The depth is a
+    // resource budget the corridor consumes, so a host that wants to give it more or
+    // less room changes this and nothing else.
+    //
+    // The caller must have drained every slot and synchronized every stream that
+    // could still reference a slot event, because this destroys and recreates them.
+    // `V4ModelHost::resize_staging_slots` is the guarded entry point.
+    void resize(uint32_t slots) {
+        if (slots == 0) {
+            throw std::invalid_argument("PrefetchStagingArena: cannot resize to zero slots");
+        }
+        if (slots == slot_count_ && is_allocated_) return;
+        free();
+        slot_count_ = slots;
+        allocate();
+    }
+
     void free() {
         if (is_allocated_) {
             for (uint32_t i = 0; i < slot_count_; ++i) {
