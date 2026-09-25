@@ -614,23 +614,36 @@ Same gate, one swept window, `N = 256`, 43 layers:
 
 ### 15.3 What it establishes
 
-1. **The depth is now derived, and it evaluates to `1` here — correctly.** ~`285` preserved residents leave `512` of `797` slots, i.e. two layers, i.e. one ahead of the one computing. The number is no longer written down; it is what the resources allow, and it would grow on a larger pool.
-2. **Gate A's algorithm step is gone.** The `1E` and `2E` shapes now derive the *same* depth and run within `2.5%` of each other, where the pre-Phase-2 gap was `13%`. The size no longer selects a different algorithm — which is exactly R6's target, and it was reached by moving the work rather than by removing the need for a second room.
+1. **The depth is derived, and at steady state it is `0` — not `1`.** The reported `1` is the **window maximum**, seeded at the start when the whole pool is briefly free. Mid-window, with one layer computing:
 
-### 15.4 Finding: the second staging bank no longer appears to buy throughput
+   | depth | `derived` (max) | `derived` (mid) | vram free | staging free | queued | preserved |
+   | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+   | 256 (`1E`) | 1 | **0** | `14 sl` (~0 layers) | `7 sl` | 1 | **539** |
+   | 384 | 1 | **0** | `14 sl` | `135 sl` | 1 | **539** |
+   | 512 (`2E`) | 1 | **0** | `16 sl` | `192 sl` | 1 | **466** |
 
-This is the important consequence, and it is **tentative**:
+2. **VRAM, not staging, is the binding constraint — decisively.** At `2E` mid-window there are `192` free **staging** slots but only `16` free **VRAM** slots. Staging could hold most of another layer; VRAM cannot hold any. So the derived depth is `0` and the queue only holds its one entry because it was seeded at the window start.
+3. **The pool is dominated by preserved decode residency.** `466–539` of `797` slots (`58–68%`) are residents the sweep must **not** spend (the prefill supply strategy's promise: decode resumes on the set it had). That leaves ~2 layers of VRAM total, one of which is computing — hence at most one layer ahead, and at steady state none.
+4. **Gate A's algorithm step is gone.** Over three runs the `1E`/`2E` gap is `32.02` vs `31.09 s` — about `3%`, consistent and real but no longer the `13%` cliff it was. The size no longer flips an algorithm; it changes the shape (`2E` overlaps in separate slots, `1E` cannot) and buys ~`3%`.
 
-| | `1E` | `2E` |
+### 15.4 The 4-block pipeline is not reachable by supply-chain work
+
+The target shape — `L` computing │ `L+1` resident │ `L+2` copying │ `L+3` reading — needs **four** layers of VRAM state live at once. This pool holds ~two (797 slots, minus `466–539` preserved, is ~`2E`). So the limit is **residency, not the corridor**: no amount of staging, pumping, or depth derivation can put four layers in a pool that fits two.
+
+That places the remaining lookahead headroom in the **which-bytes** question — how much decode residency the prefill may spend — which is the [routing profile and placement study](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)'s subject, and was already the documented hand-off. Within this analysis's scope the corridor is now shaped correctly and its cost is measurable.
+
+### 15.5 Finding: the second staging bank buys ~`3%`, not the `13%` it used to
+
+Over three runs (`N = 256`):
+
+| | `1E` (`256`) | `2E` (`512`) |
 | :--- | ---: | ---: |
-| wall (`N=256`) | `31.90 s` | `31.11 s` |
-| gap | — | **`2.5%`** |
-| corridor fill (read ∥ copy) | `0/43` | `41/43` |
+| wall | `31.86 / 32.19 / 32.02 s` | `31.06 / 31.23 / 30.99 s` |
+| mean | `32.02` | `31.09` |
+| gap | — | **`~3%`** |
 
-The bank still changes the **shape** (`2E` overlaps in separate slots, `1E` cannot) but no longer the **speed**, because P2.3's within-body pump gives `1E` the same effective overlap — each expert's copy runs as its own read lands, during the previous body. So the `+3.44 GiB` of pinned memory that P2.1 made unconditional may now be **removable**: reverting the default to `1E` would recover it and answer the [host-memory pressure investigation](HOST_MEMORY_PRESSURE_INVESTIGATION.md).
+Before Phase 2 the same comparison was `13%`. The bank still changes the **shape** (`2E` shows `41/43` overlapped layer-bodies, `1E` shows `0/43`) but most of the *speed* now comes from P2.3's within-body pump, which works at either depth. The `+3.44 GiB` of pinned memory therefore buys ~`3%` — a worse trade than it was, and worth re-testing at larger `N` and with Warm before deciding whether to keep the `2E` default or revert to `1E` and recover the memory.
 
-**Not a conclusion yet.** It is one window length at Warm 0. Before acting it must be re-tested at larger `N` and with a Warm tier, because a longer body changes the read/copy balance and Warm changes where the bytes come from. Until then `2E` stays the default.
+### 15.6 Remaining Phase-2 item
 
-### 15.5 Remaining Phase-2 item
-
-`< E` is still not reached: reads are submitted as **one wave of `E`**, so the arena cannot go below one layer's worth of slots. Pacing the submission (issue each read as a slot frees) is the remaining step, and it now has the per-token hook it needs — the same pump, pointed at submission rather than completion.
+`< E` is still not reached: reads are submitted as **one wave of `E`**, so the arena cannot go below one layer's worth of slots. Pacing the submission (issue each read as a slot frees) is the remaining step, and it now has the per-token hook it needs. Note that on this pool it would buy **nothing today** — the constraint is VRAM residency (§15.4), not staging — so it is a portability item (R6), not a throughput one.

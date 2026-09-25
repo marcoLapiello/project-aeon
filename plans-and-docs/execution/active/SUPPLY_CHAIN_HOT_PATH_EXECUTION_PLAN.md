@@ -135,23 +135,25 @@ Implements the §0 spec. Each step is independently verifiable and independently
 
 | | |
 | :--- | :--- |
-| **Status** | ✅ **shipped 2026-09-25.** The single-slot lookahead is replaced by a queue whose depth is computed. **Gate A now PASSES** (`1.028×`, `1.032×` over two runs). |
+| **Status** | ✅ **shipped 2026-09-25.** The single-slot lookahead is replaced by a queue whose depth is computed. **Gate A passes** (`1.038×`, `1.035×`, `1.047×` over three runs). |
 | **Fixes** | The hardcoded one-layer lookahead (`pending_valid_`/`resident_valid_`). |
 | **Where** | `v4_prefill_sweep.hpp` (`LookaheadEntry`, `std::deque ahead_`, `derived_lookahead_capacity()`, `dispatch_ahead`, `materialize_entry`/`materialize_front`, `pump`); `v4_expert_supply.hpp` (`staging_free_slots()`); `v4_model_host.hpp` (`sweep_derived_ahead_capacity()`) |
 | **Change** | The lookahead is a **queue**, and its length is `min(free VRAM blocks, free staging blocks)` recomputed at every boundary. `dispatch_ahead` fills it up to that budget; `pump` drains **every** queued layer; `before_layer` materializes the front. A layer that is already resident (a preserved resident) is skipped without consuming budget. |
 | **Requirement** | R5 ✅ Depth is a function of the free blocks at this instant; no constant. |
 | **Requirement** | R3 ✅ A layer enters the queue when a block frees, not on a schedule. |
 | **Verify** | ✅ Byte-exactness gates (`16`/`18`/`10`/`38`), token unchanged; **Gate A passes**; Gates B and C hold. |
-| **Result** | Spread `1.131× → 1.028×` (and `1.032×` on a repeat). `1E` `32.204 → 31.869 s`, `2E` `30.654 → 31.112 s`. Derived depth reports **`1`** in both — computed from the resources, which is what they allow here (~285 preserved residents leave 512 of 797 slots → 2 layers). |
+| **Result** | Spread `1.131× → ~1.04×`. The depth is **derived**, not written down. The reported `1` is the window **maximum** (seeded when the whole pool is briefly free); mid-window it is **`0`**. |
+| **Limiter — VRAM, not staging** | Mid-window: `vram_free` `14–16 sl` (~0 layers) vs `staging_free` `7 sl` (`1E`) / `192 sl` (`2E`). So the extra bank is **not** the binding resource. `466–539` of `797` slots (`58–68%`) are **preserved decode residents** the sweep must not spend: the pool fits ~2 layers, one of which computes. |
+| **Out of reach here** | The 4-block pipeline (`L` computing │ `L+1` resident │ `L+2` copying │ `L+3` reading) needs **four** layers of VRAM state live. The limit is **residency, not the corridor** — a *which-bytes* question, handed to the [routing/placement study](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md). |
 
-> **Implication to test before anything is reverted.** With P2.2+P2.3+P2.4, `1E` and `2E` now run **within ~2.5% of each other** (`31.9` vs `31.1 s`), whereas before Phase 2 the gap was `13%`. The derived depth is `1` in both configurations, and the wall times have converged — so **the second staging bank no longer appears to buy throughput.** If that holds at larger `N` and with Warm, then P2.1's `2E` default can go back to `1E` and recover the `+3.44 GiB` of pinned memory, which is what the [host-memory pressure investigation](../../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) wants. **Not yet verified at those shapes — it is the next measurement, not a conclusion.** Note also that `2E` still shows the corridor fill (`41/43` overlapped) while `1E` shows `0/43`, so the bank still changes the *shape*; what it no longer changes is the *speed*.
+> **`1E` vs `2E`, three runs at `N=256`:** `31.86/32.19/32.02 s` vs `31.06/31.23/30.99 s` — means `32.02` vs `31.09`, a consistent **`~3%`**, down from `13%` before Phase 2. The bank still changes the **shape** (`2E` `41/43` overlapped, `1E` `0/43`) but most of the speed now comes from P2.3's within-body pump, which works at either depth. So `2E` costs `+3.44 GiB` pinned for `~3%` — a worse trade than it was. **Re-test at larger `N` and with Warm** before deciding whether to keep `2E` or revert to `1E` and recover the memory.
 
 ### P2.5 — The portability gates must pass *(acceptance)* — ✅ **A passes, B/C hold**
 
 | | |
 | :--- | :--- |
 | **Where** | `tests/test_v4_staging_depth.cpp` |
-| **Gate A** | ✅ **passes** (`1.028×`/`1.032×`). Was `1.144×` before Phase 2. **`< E` is still not reached** — reads are submitted as one wave of `E`, so the floor is unchanged; pacing them is the remaining item. |
+| **Gate A** | ✅ **passes** (`~1.04×`). Was `1.144×` before Phase 2. **`< E` is still not reached** — reads are submitted as one wave of `E`. Note it would buy nothing on this pool (VRAM residency is the limit), so it is a portability item (R6), not a throughput one. |
 | **Gate B** | ✅ passes — identical work at every depth. |
 | **Gate C** | ✅ passes — `2E` overlaps (`41/43`), reduced depths do not. |
 | **Command** | `./build/bin/test_v4_staging_depth` (defaults `64 128 192 256 384 512`) |

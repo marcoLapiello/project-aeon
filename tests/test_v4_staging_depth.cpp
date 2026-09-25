@@ -105,7 +105,21 @@ struct Row {
     // moved off the boundary into the previous layer's body.
     uint64_t copies_pumped{0};
     // The lookahead length the free blocks allowed at the sample — derived, not fixed (R5).
-    uint32_t derived_depth{0};};
+    uint32_t derived_depth{0};
+    // The same, at the mid-window steady state (the max is seeded at the start, when
+    // the whole pool is briefly free, and is not representative).
+    uint32_t derived_depth_mid{0};
+    // Components of that derivation, taken from one representative steady-state layer
+    // (the middle of the window), so a reader can see **what limits the depth** and
+    // **what it is relative to**.
+    uint32_t vram_free_slots{0};
+    uint32_t staging_free_slots{0};
+    uint32_t vram_free_layers{0};
+    uint32_t staging_free_layers{0};
+    uint32_t ahead_count{0};
+    uint32_t hot_preserved{0};
+    uint32_t sample_layer{0};
+};
 
 } // namespace
 
@@ -204,6 +218,7 @@ int main(int argc, char** argv) {
         // Corridor fill: a sample is "overlapped" when a read is landing in one
         // staging block while a copy drains another — the pipeline working. One block
         // pinned at `E` with the other at zero is the parking lot.
+        const uint32_t mid_layer = host.num_layers() / 2;
         for (const auto& sample : host.sweep_occupancy()) {
             ++row.layers_sampled;
             if (sample.staging_reading > 0 && sample.staging_copying > 0) {
@@ -212,6 +227,17 @@ int main(int argc, char** argv) {
             row.peak_reserved_ahead = std::max(row.peak_reserved_ahead,
                                                sample.vram_reserved_ahead);
             row.derived_depth = std::max(row.derived_depth, sample.derived_capacity);
+            // Keep the middle of the window as the representative steady-state sample.
+            if (sample.layer == mid_layer) {
+                row.sample_layer = sample.layer;
+                row.vram_free_slots = sample.vram_free_slots;
+                row.staging_free_slots = sample.staging_free_slots;
+                row.vram_free_layers = sample.vram_free_layers;
+                row.staging_free_layers = sample.staging_free_layers;
+                row.ahead_count = sample.ahead_count;
+                row.hot_preserved = sample.hot_preserved;
+                row.derived_depth_mid = sample.derived_capacity;
+            }
         }
 
         row.ran = true;
@@ -323,6 +349,28 @@ int main(int argc, char** argv) {
                 !is_default || r->layers_overlapped > 0, detail);
         }
     }
+
+    // ---- The derived depth, broken into its components -----------------------
+    // "Lookahead" is ambiguous without saying **relative to what**. The columns
+    // answer it: mid-window, while one layer computes, how many whole layer-blocks of
+    // VRAM and of staging are free, how many layers are queued ahead, and how many
+    // Hot residents are preserved (and so shrink the pool the depth is derived from).
+    std::printf("%s\n", std::string(104, '=').c_str());
+    std::printf("  DERIVED DEPTH — mid-window, one layer computing\n");
+    std::printf("%s\n", std::string(104, '=').c_str());
+    std::printf("%-6s %-9s %-9s %-11s %-11s %-11s %-11s %-9s %s\n",
+                "depth", "derived", "mid", "vram_free", "stg_free", "vram_lyrs",
+                "stg_lyrs", "queued", "preserved");
+    for (const Row& r : rows) {
+        if (!r.ran) continue;
+        std::printf("%-6u %-9u %-9u %-11s %-11s %-11u %-11u %-9u %u\n",
+                    r.depth, r.derived_depth, r.derived_depth_mid,
+                    (std::to_string(r.vram_free_slots) + " sl").c_str(),
+                    (std::to_string(r.staging_free_slots) + " sl").c_str(),
+                    r.vram_free_layers, r.staging_free_layers,
+                    r.ahead_count, r.hot_preserved);
+    }
+    std::printf("\n");
 
     // ---- Reported, not asserted: the floor the design imposes ----------------
     // A pipelined corridor would accept a depth well below one layer's set. That it

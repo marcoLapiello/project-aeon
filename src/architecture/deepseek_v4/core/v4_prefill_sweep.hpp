@@ -290,6 +290,17 @@ public:
         // The lookahead length the free blocks allowed at this sample — derived, not
         // fixed (R5). Zero means a resource was exhausted.
         uint32_t derived_capacity{0};
+        // The components of `derived_capacity`, so the gate can show **what limits it**
+        // and **what it is relative to**: the computing layer, or the staging queue.
+        uint32_t vram_free_slots{0};
+        uint32_t staging_free_slots{0};
+        uint32_t vram_free_layers{0};
+        uint32_t staging_free_layers{0};
+        // Layers whose reads are dispatched and not yet materialized — the queue depth.
+        uint32_t ahead_count{0};
+        // Hot residents held **preserved** (not the sweep's to spend); they are what
+        // shrinks the pool the lookahead is derived from.
+        uint32_t hot_preserved{0};
     };
 
     const std::vector<BlockOccupancy>& occupancy_samples() const noexcept {
@@ -536,6 +547,15 @@ private:
             sample.vram_reserved_ahead += static_cast<uint32_t>(entry.state.expert_count());
         }
         sample.derived_capacity = derived_lookahead_capacity();
+        sample.ahead_count = static_cast<uint32_t>(ahead_.size());
+        sample.hot_preserved = registry_->published_hot_slots();
+        const uint32_t per_layer = registry_->experts_per_layer;
+        sample.vram_free_slots = static_cast<uint32_t>(registry_->free_vram_slot_count());
+        sample.staging_free_slots = counts.free;
+        if (per_layer > 0) {
+            sample.vram_free_layers = sample.vram_free_slots / per_layer;
+            sample.staging_free_layers = sample.staging_free_slots / per_layer;
+        }
         occupancy_samples_.push_back(sample);
     }
 
