@@ -235,6 +235,22 @@ public:
         }
     }
 
+    // Non-blocking counterpart to `wait_for_completion`: returns a completion the CQ
+    // already holds, and `false` when none has arrived. No syscall is needed — the
+    // kernel publishes completions by advancing the CQ tail in shared memory — so this
+    // is a pure peek, cheap enough to call from a per-token pump. A caller that must
+    // not block (the supply's mid-body pump) uses this instead of the waiting form.
+    bool try_completion(DirectIOCompletion& out) {
+        const uint32_t head = __atomic_load_n(cring_head_, __ATOMIC_ACQUIRE);
+        const uint32_t tail = __atomic_load_n(cring_tail_, __ATOMIC_ACQUIRE);
+        if (head == tail) return false;
+        const struct io_uring_cqe* cqe = &cqes_[head & cring_mask_];
+        out.user_data = cqe->user_data;
+        out.result = cqe->res;
+        __atomic_store_n(cring_head_, head + 1, __ATOMIC_RELEASE);
+        return true;
+    }
+
     std::vector<DirectIOCompletion> wait_for_completions(size_t count) {
         std::vector<DirectIOCompletion> completions;
         completions.reserve(count);

@@ -210,6 +210,16 @@ public:
         record_occupancy(layer);
     }
 
+    // The mid-body pump (plan P2.3): enqueue the lookahead layer's copies as its own
+    // reads land, instead of in one block at the next boundary. Called from the
+    // executor's per-token hook — the only host activity inside a body — so the
+    // lookahead's VRAM block fills during this layer's body rather than after it.
+    // Non-blocking: experts still being read are simply left for the next call.
+    size_t pump() {
+        if (!active_ || !pending_valid_) return 0;
+        return supply_->pump_layer_prefetch(pending_state_);
+    }
+
     // Retire layer `layer`. The room it frees is what the layer after `layer + 1`
     // was waiting for; if the pool was too small to hold two layers the next
     // dispatch was skipped at `before_layer` and `ensure_layer` picks it up then.
@@ -221,7 +231,6 @@ public:
     // `reap_registry_transfers` is what promotes the layer's completed uploads out of
     // `PROMOTION_PENDING` before `release_layer` refuses a live transfer.
     void after_layer(uint32_t layer) {
-        if (!active_) return;
         // The resident bank belongs to the layer being retired: the driver calls
         // `before_layer(L)` then `after_layer(L)`, so a mismatch is a driver defect and
         // is refused rather than silently reclaiming the wrong bank.

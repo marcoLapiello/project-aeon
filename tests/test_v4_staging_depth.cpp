@@ -101,6 +101,9 @@ struct Row {
     // Staging slots freed by their own copy's completion event (P2.2) rather than as
     // a boundary block.
     uint64_t released_on_completion{0};
+    // Copies the mid-body pump issued (P2.3) — the lookahead layer's uploads that
+    // moved off the boundary into the previous layer's body.
+    uint64_t copies_pumped{0};
 };
 
 } // namespace
@@ -195,6 +198,7 @@ int main(int argc, char** argv) {
         row.io_wait_s = static_cast<double>(host.supply_io_wait_ns()) / 1e9;
         row.drain_s = static_cast<double>(host.supply_h2d_drain_ns()) / 1e9;
         row.released_on_completion = host.supply_staging_released_on_completion();
+        row.copies_pumped = host.supply_copies_pumped();
 
         // Corridor fill: a sample is "overlapped" when a read is landing in one
         // staging block while a copy drains another — the pipeline working. One block
@@ -218,22 +222,22 @@ int main(int argc, char** argv) {
         "  DEPTH SWEEP — one swept window, N=%u, %u layers x %u experts, one process\n",
         kLength, host.num_layers(), per_layer);
     std::printf("%s\n", std::string(104, '=').c_str());
-    std::printf("%-6s %-6s %-5s %-8s %-8s %-8s %-8s %-8s %-7s %s\n",
+    std::printf("%-6s %-6s %-5s %-8s %-8s %-8s %-8s %-8s %-8s %s\n",
                 "depth", "slots", "banks", "wall_s", "io_wait", "drain_s",
-                "samples", "overlap", "rel-compl", "note");
+                "samples", "overlap", "pumped", "note");
     for (const Row& r : rows) {
         if (!r.ran) {
-            std::printf("%-6u %-6s %-5s %-8s %-9s %-8s %-8s %-8s %-7s %s\n",
+            std::printf("%-6u %-6s %-5s %-8s %-9s %-8s %-8s %-8s %-8s %s\n",
                         r.depth, "-", "-", "-", "-", "-", "-", "-", "-",
                         r.note.c_str());
             continue;
         }
-        std::printf("%-6u %-6u %-5u %-8.3f %-9.3f %-8.3f %-8u %-8s %-7llu %s\n",
+        std::printf("%-6u %-6u %-5u %-8.3f %-9.3f %-8.3f %-8u %-8s %-8llu %s\n",
                     r.depth, r.staging_slots, r.banks, r.wall_s, r.io_wait_s, r.drain_s,
                     r.layers_sampled,
                     (std::to_string(r.layers_overlapped) + "/" +
                      std::to_string(r.layers_sampled)).c_str(),
-                    static_cast<unsigned long long>(r.released_on_completion),
+                    static_cast<unsigned long long>(r.copies_pumped),
                     r.note.c_str());
     }
     std::printf("\n");

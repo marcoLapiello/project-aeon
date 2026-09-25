@@ -114,19 +114,22 @@ Implements the §0 spec. Each step is independently verifiable and independently
 | **Requirement** | R3 ✅ Release is triggered by the copy event, not the layer boundary. |
 | **Requirement** | In-flight accounting stays exact: no reuse while the read *or* the copy is outstanding (`SlotState`, unbypassed). |
 | **Verify** | ✅ `in_use_slots() == 0` at `prefill_end`; byte-exactness gates pass (`16`/`18`/`10`/`38`); **`staging_released_on_completion` = `10198` at `2E`, `0` at `1E`** — the release really does come from the completion path. |
-| **Honest result** | **No wall-time change** (`30.913` vs `30.641 s`, within noise; `drain_s` `0.000`). This is expected and not a failure: the host is parked per layer, so *when* within the boundary a slot frees cannot move throughput. P2.2's value is **structural** — the arena is now a completion-drained free-list, which is the prerequisite for P2.3 (copy on read-completion) and P2.4 (lookahead from free blocks). It does **not** by itself lower the `E` floor. |
+| **Honest result** | **No wall-time change** (`30.913` vs `30.641 s`, within noise; `drain_s` `0.000`) — **as expected; a throughput claim was never made for this step.** P2.2 is the **structural prerequisite** for P2.3 (copy on read-completion) and P2.4 (lookahead from free blocks): the arena is now a completion-drained free-list in which each expert's slot is individually tracked and releaseable. It does **not** by itself lower the `E` floor (that is the read wave). |
 
-### P2.3 — Copy into VRAM as soon as a read lands
+### P2.3 — Copy into VRAM as soon as a read lands — ✅ **done**
 
 | | |
 | :--- | :--- |
+| **Status** | ✅ **shipped 2026-09-25.** Real win: `−2.7 s` at `1E`, and Gate A's spread cut from `1.133×` to `1.055×`. |
 | **Fixes** | `L+1` sitting in staging with its VRAM block empty until the boundary. |
-| **Where** | `tiered_expert_supply.hpp` (`materialize`), `v4_prefill_sweep.hpp` (`dispatch_ahead` / `before_layer`) |
-| **Change** | Enqueue each expert's copy the moment its read completes. The copy has **two conditions**: the read has landed **and** its destination VRAM block is free. Whichever comes second starts it — if the read lands first and no VRAM block is free, the copy simply **waits**; nothing breaks. While it waits its staging slot stays held (the data is still the copy's source), so a stalled copy back-pressures the staging pool. The boundary only *enqueues*; it never *settles*. |
-| **Requirement** | R1. The destination block's protection is a **stream event**, never a host synchronize. |
-| **Requirement** | R4. No host sync added on the supply path. |
-| **Requirement** | The wait must not leak or deadlock: a copy held for a free block resumes when the block frees, and P2.4's depth accounts for **both** free blocks and free staging slots. |
-| **Verify** | Byte-exactness gates (esp. `test_v4_prefill_window`, window == serial bit-exact); readout shows `L+1` resident earlier. |
+| **Where** | `direct_io_reader.hpp` (`try_completion`), `tiered_expert_supply.hpp` (`materialize_available`, `enqueue_expert_copy`, `copies_pumped()`), `v4_expert_supply.hpp` (`pump_layer_prefetch`), `v4_prefill_sweep.hpp` (`pump`), `v4_expert_executor.hpp` (`set_supply_pump`), `v4_model_host.hpp` (wiring) |
+| **Change** | A **non-blocking** materialize: drain everything the CQ already holds, then enqueue each expert's copy as soon as **its own** reads have all landed; leave the rest. Driven by the executor's **per-token hook** — the only host activity inside a body — which is what makes "as its read lands" possible without breaking the per-layer park. |
+| **Requirement** | R1 ✅ The copy is a stream-ordered `upload_from_host_expert` on `sdma_cold_stream_`, as before; no host sync added. |
+| **Requirement** | R3 ✅ Copies advance on read completion, not the boundary. |
+| **Requirement** | R4 ✅ `try_completion` is a pure CQ peek — no syscall, no wait. |
+| **Verify** | ✅ Byte-exactness gates (`16`/`18`/`10`/`38`), token unchanged; `copies_pumped` = `8345` at `1E`, `8238` at `2E`. |
+| **Result** | `1E`: `34.896 → 32.204 s` (`drain 4.708 → 1.613 s`); `384`: `35.027 → 32.350 s`; `2E`: `30.913 → 30.654 s` (already overlapped, so neutral). **Gate A spread `1.133× → 1.055×`.** |
+| **Why `1E` gained** | With the pump, `L+1`'s copies run **during `body(L)`** as its reads land, and P2.2's completion release frees the slots immediately — so even one staging block now pipelines read→copy within a body. The boundary drain shrinks to the residue (`1.6 s` of `4.7 s`). |
 
 ### P2.4 — Derive the lookahead from free blocks
 
@@ -144,7 +147,7 @@ Implements the §0 spec. Each step is independently verifiable and independently
 | | |
 | :--- | :--- |
 | **Where** | `tests/test_v4_staging_depth.cpp` |
-| **Gate A** | ❌ fails today (`1.144×`). **Target:** flat across a wide depth range. **Reaching `< E` is a hypothesis** (R6's gradient), not a committed outcome — the blocker is paced reads, which need the park lifted. |
+| **Gate A** | ❌ fails today, but **much closer**: spread `1.055×` (was `1.144×` before P2.3). **Target:** flat across a wide depth range. **Reaching `< E` is a hypothesis** (R6's gradient), not a committed outcome — the blocker is paced reads. |
 | **Gate B** | ✅ passes today. **Must keep passing.** |
 | **Gate C** | ✅ **added with P2.1**, passes: the default `2E` shape shows `42/43` layer-bodies with a read and a copy in flight at once; `1E` shows `0/43`. |
 | **Command** | `./build/bin/test_v4_staging_depth` (default `64 128 192 256 384 512`) |
@@ -192,8 +195,8 @@ Phase 1  ✅ DONE — H2D overlapped (3.2–4.5 s/window); memory cost blocks sh
 Phase 2  MANDATORY — the corridor becomes a demand-driven pipeline
    │   P2.1  ✅ DONE  arena is 2E unconditionally + corridor-fill readout (Gate C)
    │   P2.2  ✅ DONE  release each staging slot on its copy event (R3); no throughput change alone
-   │   P2.3  copy into VRAM as each read lands, event-gated              (R1, R3)  ← next
-   │   P2.4  lookahead derived from free blocks                          (R5)
+   │   P2.3  ✅ DONE  copy into VRAM as each read lands, pumped per token (R1/R3): −2.7 s at 1E
+   │   P2.4  lookahead derived from free blocks                          (R5)  ← next
    │   P2.5  gates: A must pass over a wide range incl. < E; B/C must hold
    │   └─ ABORT if any step cannot hold byte-exactness → keep it opt-in, record negative
    ▼

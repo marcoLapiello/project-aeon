@@ -791,6 +791,8 @@ public:
     uint64_t supply_staging_released_on_completion() const noexcept {
         return supply_.staging_released_on_completion();
     }
+    // Copies the mid-body pump issued (P2.3).
+    uint64_t supply_copies_pumped() const noexcept { return supply_.copies_pumped(); }
     void reset_supply_transfer_counters() noexcept { supply_.reset_transfer_counters(); }
     // Layers whose reads were in flight when a body started (1 = the double buffer
     // is engaged; 0 = the pool is too small for two layers and loads are serial).
@@ -984,6 +986,10 @@ private:
         // where the arena is built), or a layer's reads would collide with the bank
         // still in flight.
         prefill_sweep_.configure(&supply_, &registry_, sweep_staging_banks_);
+        // P2.3: let the per-token hook pump the swept lookahead's copies. The executor
+        // does not know about the sweep, so it gets a callback; the sweep ignores the
+        // call when it is not driving a window.
+        executor_->set_supply_pump([this] { (void)prefill_sweep_.pump(); });
 
         // 16 — the prefill workspace (Step 6 item 7), derived from the configured
         // window and chunk and allocated **once, here**, so no window can fail

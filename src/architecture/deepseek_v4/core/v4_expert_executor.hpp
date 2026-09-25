@@ -97,6 +97,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <functional>
 #include <vector>
 
 #ifndef CHECK_HIP
@@ -378,11 +379,19 @@ public:
     void on_routed_consumed(uint32_t layer_id, uint32_t position) override {
         (void)layer_id;
         (void)position;
+        // Mid-body supply pump (plan P2.3): the only host activity inside a body, so
+        // it is where the swept lookahead's copies are issued as their reads land. Set
+        // by the host; a no-op when the sweep is not driving the window.
+        if (supply_pump_) supply_pump_();
         for (const uint32_t staging_idx : staging_in_use_) {
             staging_.release_after_gpu_transfer(staging_idx);
         }
         staging_in_use_.clear();
     }
+
+    // Installed by `V4ModelHost` so the per-token hook can advance the prefill sweep's
+    // lookahead supply without the executor knowing about the sweep.
+    void set_supply_pump(std::function<void()> pump) { supply_pump_ = std::move(pump); }
 
     // The token boundary: the caller has a compute-stream boundary here (sampling
     // must read the logits back), so every lease held for this token can be handed
@@ -474,6 +483,8 @@ private:
     uint64_t batch_distinct_{0};
     std::vector<uint32_t> leases_;
     std::vector<uint32_t> staging_in_use_;
+    // Mid-body pump, installed by the host; empty when no sweep is driving.
+    std::function<void()> supply_pump_;
 
     // Reports the layer just dispatched to the two measurement consumers, each of
     // which owns its own switch: the supply telemetry (answering-tier mix, always

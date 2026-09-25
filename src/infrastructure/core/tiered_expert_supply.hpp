@@ -198,6 +198,11 @@ public:
         return staging_released_on_completion_;
     }
 
+    // Copy enqueues issued by the **non-blocking pump** (P2.3) rather than by the
+    // blocking `materialize`. A numerator against the streamed expert count: it says
+    // how much of a layer's upload was moved off the boundary into the previous body.
+    uint64_t copies_pumped() const noexcept { return copies_pumped_; }
+
     // Zeroes every transfer counter above so a caller can slice one phase (prefill,
     // then decode) without re-instantiating the supply. Counters only — no state is
     // reset, and the registry/arena are untouched.
@@ -211,6 +216,7 @@ public:
         h2d_drain_calls_ = 0;
         dispatch_cpu_ns_ = 0;
         staging_released_on_completion_ = 0;
+        copies_pumped_ = 0;
     }
 
     PayloadBatch dispatch(
@@ -585,26 +591,104 @@ public:
 
             const uint32_t staging_idx = state.staging_idx;
             io_wait_ns_ += elapsed_ns(io_wait_started);
-            const auto h2d_enqueue_started = std::chrono::steady_clock::now();
-            prefetch_staging_->complete_io(staging_idx);
-            prefetch_staging_->begin_gpu_transfer(staging_idx);
-            wait_for_demotion_dependency(state.operation_id, sdma_cold_stream_);
-            payload_pool_->upload_from_host_expert(
-                static_cast<uint32_t>(state.vram_slot),
-                prefetch_staging_->get_slot_ptr(staging_idx),
-                sdma_cold_stream_
-            );
-            check_hip(
-                hipEventRecord(prefetch_staging_->events[staging_idx], sdma_cold_stream_),
-                "hipEventRecord(cold H2D)");
-            record_h2d_event(
-                state.operation_id, sdma_cold_stream_, staging_idx, true,
-                static_cast<int32_t>(staging_idx), state.vram_slot);
-            h2d_enqueue_ns_ += elapsed_ns(h2d_enqueue_started);
-
-            state.is_prefetched = true;
-            state.io_pending = false;
+            enqueue_expert_copy(state, staging_idx);
         }
+    }
+
+    // Enqueue one expert's H2D copy out of its (already landed) staging slot, and
+    // mark the transfer done. Shared by the blocking `materialize` and the
+    // non-blocking `materialize_available` so the two cannot diverge — the copy's
+    // stream, its gate event, and the registry record are identical either way.
+    void enqueue_expert_copy(PayloadTransfer& state, uint32_t staging_idx) {
+        const auto h2d_enqueue_started = std::chrono::steady_clock::now();
+        prefetch_staging_->complete_io(staging_idx);
+        prefetch_staging_->begin_gpu_transfer(staging_idx);
+        wait_for_demotion_dependency(state.operation_id, sdma_cold_stream_);
+        payload_pool_->upload_from_host_expert(
+            static_cast<uint32_t>(state.vram_slot),
+            prefetch_staging_->get_slot_ptr(staging_idx),
+            sdma_cold_stream_
+        );
+        check_hip(
+            hipEventRecord(prefetch_staging_->events[staging_idx], sdma_cold_stream_),
+            "hipEventRecord(cold H2D)");
+        record_h2d_event(
+            state.operation_id, sdma_cold_stream_, staging_idx, true,
+            static_cast<int32_t>(staging_idx), state.vram_slot);
+        h2d_enqueue_ns_ += elapsed_ns(h2d_enqueue_started);
+
+        state.is_prefetched = true;
+        state.io_pending = false;
+    }
+
+    // The **non-blocking** materialize (plan P2.3 / R3): move every completion the CQ
+    // already holds into the store, then enqueue the copy for each expert whose reads
+    // have *all* landed, and return how many were enqueued. Experts whose reads are
+    // still in flight are left for the next call; nothing is waited on.
+    //
+    // This is what lets a layer's copies be issued as its reads land — during the
+    // previous layer's body — instead of in one block at the boundary. It is called
+    // from the per-token pump, which is the only host activity inside a body.
+    size_t materialize_available(PayloadBatch& batch) {
+        if (direct_io_completions_ == nullptr) return 0;
+        if (direct_io_reader_ != nullptr) {
+            aeon::io::DirectIOCompletion completion;
+            while (direct_io_reader_->try_completion(completion)) {
+                direct_io_completions_->emplace(completion.user_data, completion);
+            }
+        }
+
+        size_t enqueued = 0;
+        for (auto& state : batch.transfers) {
+            if (!state.io_pending) continue;
+
+            // Every chunk present? If not, this expert is still reading; leave it.
+            bool complete = true;
+            for (size_t chunk = 0; chunk < state.io_request_count; ++chunk) {
+                if (direct_io_completions_->find(state.io_user_data + chunk) ==
+                    direct_io_completions_->end()) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (!complete) continue;
+
+            const auto io_wait_started = std::chrono::steady_clock::now();
+            for (size_t chunk = 0; chunk < state.io_request_count; ++chunk) {
+                const uint64_t request_id = state.io_user_data + chunk;
+                auto completion_it = direct_io_completions_->find(request_id);
+                const auto completed_at = std::chrono::steady_clock::now();
+                if (auto* transfer = find_registry_transfer(state.operation_id)) {
+                    if (transfer->io_submitted_at.time_since_epoch().count() != 0) {
+                        transfer->nvme_read_service_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                completed_at - transfer->io_submitted_at).count());
+                    }
+                }
+                const auto completion = completion_it->second;
+                direct_io_completions_->erase(completion_it);
+                if (completion.result < 0) {
+                    mark_registry_request_failed(state.operation_id, "nvme_read_failure");
+                    throw std::runtime_error(
+                        "TieredExpertSupply: direct expert read failed: " +
+                        std::string(strerror(-completion.result)));
+                }
+                const size_t chunk_offset = chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
+                const size_t expected_bytes = std::min(
+                    aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
+                    expert_payload_bytes_ - chunk_offset);
+                if (completion.result != static_cast<int32_t>(expected_bytes)) {
+                    mark_registry_request_failed(state.operation_id, "nvme_short_read");
+                    throw std::runtime_error(
+                        "TieredExpertSupply: direct expert read returned a short payload");
+                }
+            }
+            io_wait_ns_ += elapsed_ns(io_wait_started);
+            enqueue_expert_copy(state, state.staging_idx);
+            ++enqueued;
+        }
+        copies_pumped_ += static_cast<uint64_t>(enqueued);
+        return enqueued;
     }
 
     PendingTransfer& ensure_registry_transfer(uint64_t operation_id, uint32_t gid) {
@@ -1043,6 +1127,7 @@ private:
     uint64_t h2d_drain_calls_{0};
     uint64_t dispatch_cpu_ns_{0};
     uint64_t staging_released_on_completion_{0};
+    uint64_t copies_pumped_{0};
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion>* direct_io_completions_{nullptr};
     uint64_t* next_direct_io_id_{nullptr};
     hipStream_t compute_stream_{nullptr};

@@ -156,6 +156,7 @@ public:
     uint64_t staging_released_on_completion() const noexcept {
         return supply_.staging_released_on_completion();
     }
+    uint64_t copies_pumped() const noexcept { return supply_.copies_pumped(); }
     void reset_transfer_counters() noexcept { supply_.reset_transfer_counters(); }
 
     LayerPrefetchState dispatch_layer_prefetch(
@@ -326,6 +327,16 @@ public:
     void finish_streamed_batch(LayerPrefetchState& state) {
         supply_.release_streamed_staging(state.supply_batch);
         sync_state(state);
+    }
+
+    // The non-blocking half of `materialize_layer_prefetch` — enqueue a copy for each
+    // expert of `state` whose reads have all landed, and return without waiting (P2.3).
+    // The per-token pump calls this on the **lookahead** layer, so its VRAM block is
+    // filled during the previous layer's body instead of at the next boundary.
+    size_t pump_layer_prefetch(LayerPrefetchState& state) {
+        const size_t enqueued = supply_.materialize_available(state.supply_batch);
+        if (enqueued > 0) sync_state(state);
+        return enqueued;
     }
 
     void reap_registry_transfers() {

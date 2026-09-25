@@ -540,9 +540,47 @@ Same gate, one swept window, `N = 256`, 43 layers:
 
 1. **The release really is completion-driven at the default shape.** `10198` of the `10718` streamed experts had their slot freed by their own copy's event, not by the boundary block. The remaining `520` are the preserved residents, which never enter the staging arena.
 2. **At `1E` it is `0` by construction** — that path still drains synchronously (`finish_streamed_batch` in `materialize_layer`, gated by `deferred_drain_`), so the slots are already `AVAILABLE` when the reaper looks. P2.2 is inert where Phase 1's deferred drain is off, which is consistent.
-3. **No throughput change: `30.913` vs `30.641 s`.** This is a *negative* result and it is expected. The host is parked at every layer boundary, so *when* inside a boundary a slot becomes free cannot move the critical path. P2.2's value is **structural**: the arena is now a completion-drained free-list, which is the shape P2.3 (copy on read-completion) and P2.4 (lookahead from free blocks) are written against.
-4. **It does not lower the `E` floor, and it was not expected to.** The floor is the read *wave*, not the release timing — reads are still dispatched as one set of `E` at the boundary. Lowering it needs paced submission, which needs a host that runs during the body.
+3. **No throughput change: `30.913` vs `30.641 s` — as expected, and that was never this step's purpose.** P2.2 is a **structural prerequisite**, not a throughput change. The host is parked at every layer boundary, so *when* inside a boundary a slot becomes free cannot move the critical path; a throughput claim was never made for it. What it delivers is the shape P2.3 and P2.4 are written against: the arena is now a **completion-drained free-list** with each expert's slot individually tracked and releaseable, which is exactly what a per-expert copy-gate and a free-slot-derived lookahead need.
+4. **It does not lower the `E` floor, and it was not expected to.** The floor is the read *wave*, not the release timing — reads are still dispatched as one set of `E` at the boundary. Lowering it needs paced submission.
 
 ### 13.4 Consequence
 
 The remaining Phase-2 lever is **P2.3**: the copy currently happens at the boundary, so `L+1` sits in staging with an empty VRAM block for most of a body. Moving the copy to read-completion is the step with a throughput argument, and P2.2 is what makes it expressible (each expert's slot is now individually tracked and releaseable).
+
+---
+
+## 14. Measured — the mid-body copy pump (2026-09-25)
+
+*Status: **measured, and the first Phase-2 step with a real win.** Plan step P2.3.*
+
+### 14.1 What was added
+
+The obstacle is the per-layer **park**: the host synchronizes the compute stream at every boundary, so it cannot act inside a body. But it *is* active inside a body — the per-token MoE calls. So the pump is driven from there:
+
+- **`DirectIOReader::try_completion`** — a pure CQ peek. No syscall, no wait (the kernel publishes completions by advancing the CQ tail in shared memory), cheap enough for a per-token call.
+- **`TieredExpertSupply::materialize_available`** — the non-blocking materialize: drain everything the CQ already holds, then enqueue the copy for each expert whose reads have *all* landed; leave the rest untouched. Shares `enqueue_expert_copy` with the blocking path so the two cannot diverge.
+- **`V4TieredExpertExecutor::set_supply_pump`** — a callback the host wires to `V4PrefillSweep::pump`, invoked from the per-token `on_routed_consumed`. The executor does not know about the sweep; a no-op when no sweep is driving.
+
+### 14.2 Results
+
+Same gate, one swept window, `N = 256`, 43 layers:
+
+| depth | banks | wall_s (before → after) | drain_s (before → after) | pumped |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 1 | **34.896 → 32.204** | **4.708 → 1.613** | 8345 |
+| 384 | 1 | **35.027 → 32.350** | **4.891 → 1.827** | 8229 |
+| 512 | 2 | 30.913 → 30.654 | 0.000 → 0.000 | 8238 |
+
+### 14.3 What it establishes
+
+1. **A win where there was none, and at the depth that lacked overlap.** The pump is worth `−2.7 s` at `1E` (`−8%`) and `−2.7 s` at `384`, but ~`0` at `2E` — because `2E` already had the cross-layer overlap and the pump merely re-orders work that was already hidden.
+2. **Gate A's spread collapses from `1.133×` to `1.055×`.** That is the algorithm step between `1E` and `2E` shrinking from `13%` to `5.5%`. The size still selects *something*, but far less — which is exactly the direction R6 wants, and it is now within a hair of the gate's `5%` tolerance.
+3. **The mechanism at `1E` is P2.3 and P2.2 together.** At one block the arena cannot hold two layers, so the cross-layer overlap is impossible; but it no longer needs to be, because `L+1`'s copies now run **during `body(L)`** as its individual reads land, and P2.2 frees each slot on its own copy event. The pipeline became **within-body** rather than across-layer. The boundary drain shrinking `4.7 → 1.6 s` is that: most of the upload already happened while the body ran.
+4. **`copies_pumped` ≈ `8300` at every depth** — ~`77%` of the `10718` streamed experts had their copy issued mid-body rather than at a boundary. The device genuinely does the work off the boundary now.
+
+### 14.4 Consequence
+
+This is the first step that **weakens the depth-vs-algorithm coupling** rather than just describing it. What remains for Gate A:
+
+- The residual `5.5%` is the `2E`-only cross-layer overlap: at `2E`, `L`'s copy and `L+1`'s read are in flight together, which one block cannot do. P2.4 (lookahead from free blocks) is what could close it, by deriving the depth so the two-room shape is reached from the pool rather than chosen by the arena size.
+- `< E` is still not reached, and the blocker is unchanged: reads are still submitted as **one wave of `E`**. Pacing them needs the same per-token pump pointed at submission rather than completion — a natural extension now that the hook exists.
