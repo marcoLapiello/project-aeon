@@ -498,9 +498,9 @@ public:
     }
 
     // Layer-sized staging banks the sweep's arena holds, derived from the arena's
-    // actual depth (`slots / experts_per_layer`; `1` is the pre-Phase-1 shape, `2+`
-    // the deferred drain's headroom). Reported so a run log can name the
-    // pinned-memory cost the overlap is bought with.
+    // actual depth (`slots / experts_per_layer`). The default is `2` (R2); the
+    // derivation exists so a runtime resize moves the arena and the sweep's bank
+    // indexing together, with no second place for the two to disagree.
     uint32_t sweep_staging_banks() const noexcept { return sweep_staging_banks_; }
 
     // The shape of the last expert dispatch: tokens covered, and the distinct
@@ -747,6 +747,15 @@ public:
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
     // streamed, and the deepest frontier the lookahead reached.
     const V4PrefillSweep& prefill_sweep() const noexcept { return prefill_sweep_; }
+
+    // The corridor's **fill** per layer — staging slots reading, staging slots
+    // copying, and the lookahead layer's reserved-but-not-yet-arrived VRAM experts.
+    // The pipeline model (supply-chain plan §0) says a healthy two-block corridor
+    // shows `reading` and `copying` both non-zero while a body runs; one pinned at `E`
+    // with the other at zero is the parking lot. Empty unless a sweep ran.
+    const std::vector<V4PrefillSweep::BlockOccupancy>& sweep_occupancy() const noexcept {
+        return prefill_sweep_.occupancy_samples();
+    }
 
     // Nanoseconds the sweep spent inside its layer loads (`dispatch` + `materialize`
     // + release), against the wall clock of the window. The split is what says
@@ -1216,11 +1225,11 @@ private:
     std::unique_ptr<V4TieredExpertExecutor> executor_;
     V4PrefillSweep prefill_sweep_;
     bool prefill_sweep_requested_{false};
-    // Layer-sized staging banks the sweep's arena holds, resolved at load from
-    // `prefill_sweep_staging_banks`. `2` is the deferred drain's headroom; `1` is the
-    // pre-Phase-1 shape. Handed to the sweep so its per-layer bank index matches the
-    // arena it reads into.
-    uint32_t sweep_staging_banks_{1};
+    // Layer-sized staging banks the sweep's arena holds, derived from the arena's
+    // depth (`slots / experts_per_layer`). The default is `2` — two layer-blocks, one
+    // the read destination and one the copy source — and it is deliberately **not** a
+    // config knob, because a settable depth lets a resource select the algorithm (R6).
+    uint32_t sweep_staging_banks_{2};
     // Whether the layer-major prefill supply is active at all this window (either
     // strategy). The length picks the strategy; this says one was chosen.
     bool prefill_active_{false};

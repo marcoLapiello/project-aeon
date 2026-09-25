@@ -91,16 +91,17 @@ The swept layer's H2D no longer blocks the host before the body: `materialize_la
 
 Implements the §0 spec. Each step is independently verifiable and independently committable.
 
-### P2.1 — `staging_blocks = 2` in both scenarios, + block-occupancy readout
+### P2.1 — `staging_blocks = 2` in both scenarios, + block-occupancy readout — ✅ **done**
 
 | | |
 | :--- | :--- |
+| **Status** | ✅ **shipped 2026-09-25.** `2E` is now unconditional (the config knob is gone) and the corridor's fill is observable. |
 | **Fixes** | §0.5 — scenario 2 (`hot < 2E`) currently has **zero** overlap. |
-| **Where** | `memory_budget.hpp` (`staging_slot_count`), `v4_model_host.hpp` (`sweep_staging_banks_` / arena sizing), `tests/test_v4_staging_depth.cpp` (readout) |
-| **Change** | Today the default is **`1 × E`** (`256` slots) — the `2 × E` runs were the `AEON_SWEEP_BANKS=2` opt-in. Make `2 × E` **unconditional** whenever `prefill_sweep` is on, in **both** scenarios and regardless of `vram_blocks`; drop the config knob as a behaviour selector. Add a per-layer readout: staging slots in use, VRAM blocks reserved-but-empty. |
-| **Requirement** | R2. `staging_blocks` must not depend on `vram_blocks`. |
-| **Requirement** | R8. Report the pinned bytes; `transient_staging_bytes` must equal `slots × payload_bytes`. |
-| **Verify** | Both scenarios run a swept window; readout shows the read and copy blocks both occupied in scenario 2; byte-exactness gates pass. |
+| **Where** | `memory_budget.hpp` (`staging_slot_count`), `prefetch_staging.hpp` (`StateCounts`), `tiered_expert_supply.hpp` / `v4_expert_supply.hpp` (passthrough), `v4_prefill_sweep.hpp` (`BlockOccupancy`, per-layer sample), `v4_model_host.hpp` (`sweep_occupancy()`), `tests/test_v4_staging_depth.cpp` (Gate C) |
+| **Change** | `staging_slot_count` returns `max(base, 2E)` whenever `prefill_sweep` is on; `prefill_sweep_staging_banks` is **removed** (a settable depth lets a resource select the algorithm — R6). The A/B and the gate now change depth through `resize_staging_slots`. New: `PrefetchStagingArena::StateCounts` (free / reading / copying) sampled once per layer into `V4PrefillSweep::occupancy_samples()`. |
+| **Requirement** | R2 ✅ `staging_blocks` does not depend on `vram_blocks`. |
+| **Requirement** | R8 ✅ `transient_staging_bytes` == `slots × payload_bytes`, still asserted by `bench_supply_split`. |
+| **Verify** | ✅ **Gate C added and passing**: `0/43` layers overlapped at `1E` (drain `4.9 s`) vs **`42/43` at `2E`** (drain `0.006 s`) — the parking lot and the corridor, measured. Byte-exactness gates pass at the new default (`16`/`18`/`10`/`38`, 0 failures, token unchanged). |
 
 ### P2.2 — Completion-driven staging release
 
@@ -141,8 +142,9 @@ Implements the §0 spec. Each step is independently verifiable and independently
 | | |
 | :--- | :--- |
 | **Where** | `tests/test_v4_staging_depth.cpp` |
-| **Gate A** | ❌ fails today (`1.134×`). **Target:** flat across a wide depth range. **Reaching `< E` is a hypothesis** (R6's gradient), not a committed outcome — the blocker is paced reads, which need the park lifted. |
+| **Gate A** | ❌ fails today (`1.144×`). **Target:** flat across a wide depth range. **Reaching `< E` is a hypothesis** (R6's gradient), not a committed outcome — the blocker is paced reads, which need the park lifted. |
 | **Gate B** | ✅ passes today. **Must keep passing.** |
+| **Gate C** | ✅ **added with P2.1**, passes: the default `2E` shape shows `42/43` layer-bodies with a read and a copy in flight at once; `1E` shows `0/43`. |
 | **Command** | `./build/bin/test_v4_staging_depth` (default `64 128 192 256 384 512`) |
 
 ---
@@ -186,11 +188,11 @@ Phase 1  ✅ DONE — H2D overlapped (3.2–4.5 s/window); memory cost blocks sh
    │
    ▼
 Phase 2  MANDATORY — the corridor becomes a demand-driven pipeline
-   │   P2.1  scaffolding: 2 staging blocks in BOTH scenarios + readout   (§0.5 fixed)
+   │   P2.1  ✅ DONE  arena is 2E unconditionally + corridor-fill readout (Gate C)
    │   P2.2  release each staging slot on its copy event                 (R3)
    │   P2.3  copy into VRAM as each read lands, event-gated              (R1, R3)
    │   P2.4  lookahead derived from free blocks                          (R5)
-   │   P2.5  gates: A must pass over a wide range incl. < E; B must hold
+   │   P2.5  gates: A must pass over a wide range incl. < E; B/C must hold
    │   └─ ABORT if any step cannot hold byte-exactness → keep it opt-in, record negative
    ▼
 Phase 3  optional, independent (dispatch bookkeeping)
@@ -220,9 +222,9 @@ At each gate: **update the analysis doc**, then commit. Never start the next ste
 
 - **Phase 1:** ✅ `h2d_drain → ≈0`, `wall_s` down `3.2–4.5 s` at Warm 0 and Warm 30, byte-exact. **Caveat:** needs `banks = 2` (`+3.44 GiB` pinned) → **opt-in** until Phase 2.
 - **Phase 2:** the §0 spec holds — R1–R8 met, with:
-  - **R2:** the default arena is `2E` in both scenarios (scenario 2 has overlap).
+  - **R2:** ✅ the arena is `2E` in both scenarios (scenario 2 has overlap); the knob is gone.
   - **R5:** lookahead derived from free blocks, no constant.
-  - **Gate A** flat across a **wide** depth range; **`< E` is a hypothesis** (blocked by paced reads + the park), so treat `E` as the first real target and `< E` as the stretch goal.
+  - **Gate A** flat across a **wide** depth range; **`< E` is a hypothesis** (blocked by paced reads + the park), so treat `E` as the first real target and `< E` as the stretch goal. **Gate B and Gate C** must hold.
   - the Phase 1 win (`h2d_drain → ≈0`, `wall` down) survives; pinned cost fits the production Warm shape.
 - **Phase 3 (if done):** `disp_ms` down in both tables, no behaviour change.
 - **Throughout:** no regression in decode or the routed bank; measurements reproducible from `scripts/supply_split.sh` and `./build/bin/test_v4_staging_depth`; **one heavy process at a time**.

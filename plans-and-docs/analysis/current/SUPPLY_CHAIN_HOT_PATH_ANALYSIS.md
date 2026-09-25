@@ -213,7 +213,7 @@ Ordered by confidence-to-effort, not by size. Every "fix" here is unstarted and 
 | 5 | **Drop duplicate event** (§4.4b) | `record_h2d_event` | 22 k create/destroy/window | complete inline at the batch sync | M | med |
 | 6 | **Measure first** (§5.1) | `bench_supply_split` + supply counters | — | **done (§8)** | S | none |
 | 7 | **Rolling corridor** (§5.2 C2) | `materialize` + sweep | **the shipping form of §10's win** — same overlap from a bounded surplus instead of a whole extra bank | per-expert read → H2D during the previous body → release | L | med |
-| 8 | **`banks = 2`** (§5.2 C1) | `V4ModelHost` staging sizing | **coupled with the deferred drain it recovers the whole exposed H2D (§10); standalone it does not** (§8) | implemented; opt-in (`prefill_sweep_staging_banks`), default `1` — C2 removes the need | M | pinned-mem coupling (`+3.44 GiB`), SQ/CQ |
+| 8 | **`banks = 2`** (§5.2 C1) | `V4ModelHost` staging sizing | **coupled with the deferred drain it recovers the whole exposed H2D (§10); standalone it does not** (§8). **§12 measured the mechanism directly**: at `1E` the arena is one room (`0/43` layer-bodies overlapped, drain `4.9 s`); at `2E` it is two (`42/43`, drain `0.006 s`). | **now the unconditional default**; the config knob is removed (R6), depth moves only via `resize_staging_slots` | M | pinned-mem (`+3.44 GiB`) — P2.2/P2.3 must make it cheaper |
 | 9 | **id→index map** (§4.4d) | `find`/`ensure_registry_transfer` | ~200 k cmp/layer, but total dispatch CPU ≈0.15% (§8) | `unordered_map` index | S | low value |
 | 10 | **Single H2D copy** (§5.2 C5) | `materialize` | ~1–3 ms/layer | contiguous copy | M | low value |
 | 11 | **Large-BAR NVMe→VRAM** (§5.2 C4) | spike — **done (§9)** | **`NOT_SUPPORTED`, measured** — kernel refuses VRAM as an O_DIRECT target | closed, no workaround | — | settled |
@@ -424,7 +424,7 @@ Three changes, all in the sweep's supply path:
 
 Two findings fall out, one about this document and one about the budget:
 
-- **The default must stay `banks = 1`.** The overlap is proven but not yet affordable. `prefill_sweep_staging_banks` ships with default `1` (the engine's original memory shape) and the second bank is an explicit opt-in for the A/B.
+- **The default must stay `banks = 1`.** The overlap is proven but not yet affordable. **Superseded by §12:** the default is now `2E` because `1E` is a measurably worse algorithm (`0/43` overlapped), and the pinned cost is addressed by making the second block cheaper (P2.2/P2.3), not by keeping the parking lot.
 - **The host-reserve model is under-sized** (`HOST_RAM_RESERVED_BYTES = 10 GiB`). The budget check *passed* `35 + 6.75 = 41.75 ≤ 52` and the machine still swapped, so the unmodelled overhead is `> 10 GiB`. This belongs to the open [host-memory pressure investigation](HOST_MEMORY_PRESSURE_INVESTIGATION.md) — it is a data point for it, not a defect in this plan.
 
 **Consequence for the plan:** Phase 1's win is **conditional on Phase 2**. Per-expert slot recycling (C2) recovers the same overlap from a bounded surplus (a handful of slots) instead of a whole `E`-slot bank, which is what makes it fit both the memory budget and the host-memory investigation's constraint. Phase 2 is therefore **mandatory, not optional** — it is how Phase 1's result ships.
@@ -475,3 +475,41 @@ Phase 2 is restated by these gates rather than by a profile, and it now has pass
 - Neither gate mentions this hardware, so the same two commands decide the question on any machine.
 
 The instruments are cheap (one model load, three windows) and already committed, so every later step is measured against a property rather than a number.
+
+---
+
+## 12. Measured — the staging arena is one room or two (2026-09-25)
+
+*Status: **measured.** The "corridor" and the "parking lot" are now a number, not a description. Plan step P2.1.*
+
+### 12.1 What was added
+
+- **`PrefetchStagingArena::StateCounts`** — occupancy **by pipeline stage**: `free`, `reading` (a read landing in the slot), `copying` (a copy-into-VRAM draining the slot). `in_use_slots` said how many were busy; this says *what for*, which is the distinction the corridor claim rests on.
+- **`V4PrefillSweep::occupancy_samples()`** — one sample per layer, taken as each body begins (after the lookahead is issued), so it is the corridor's fill for that layer. Cleared per window.
+- **Gate C** in `test_v4_staging_depth` — a layer counts as *overlapped* when a read and a copy are in flight at the same instant. That is the pipeline working; a single block pinned at `E` with the other empty is the parking lot.
+- **`staging_slot_count` returns `2E` unconditionally** when the sweep is on, and the `prefill_sweep_staging_banks` knob is **removed** (a settable depth lets a resource select the algorithm — plan R6). The A/B now moves depth through `resize_staging_slots`.
+
+### 12.2 Results
+
+One swept window, `N = 256`, 43 layers × 256 experts, Warm 0, one process:
+
+| depth | slots | banks | wall_s | drain_s | overlapped layers |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 / 128 / 192 | — | — | — | — | refused (below the dispatch's floor) |
+| 256 | 256 | 1 | 34.959 | **4.856** | **0/43** |
+| 384 | 384 | 1 | 35.065 | **4.883** | **0/43** |
+| 512 | 512 | 2 | **30.641** | **0.006** | **42/43** |
+
+### 12.3 What it establishes
+
+1. **The two models are exactly as claimed, and now measured.** At `1E` the arena is **one room**: `0/43` layer-bodies ever had a read and a copy in flight together, and the drain is the full `4.9 s`. At `2E` it is **two rooms**: `42/43` bodies overlapped, and the drain collapses to `0.006 s`. The `+14%` wall-time gain is that overlap and nothing else.
+2. **`384` is not a third shape.** It grew the arena by `50%` and changed nothing (`0/43`, same drain) — because `banks = 384 / 256 = 1`, so it is still the one-room algorithm with `128` idle slots. This is the clearest single piece of evidence that the **depth is selecting the algorithm** rather than being a budget: below `2E`, slots are pure waste.
+3. **The floor is the read wave, confirmed behaviourally.** `64/128/192` cannot run at all: the dispatch binds a whole layer's set, so the arena must hold `E` before the window starts. Note that `256 → 384` gaining nothing is the *same fact* seen from the other side — the extra `128` slots buy no overlap because they cannot form a second block.
+4. **`vram_reserved_ahead` peaks near `E`** (`250` of `256`) in every configuration, which is the reserved-but-empty figure the pipeline model predicted: the lookahead layer's VRAM block is held while its bytes are still in staging.
+
+### 12.4 Consequence
+
+P2.1's part is done: the arena is `2E` by default in both scenarios, the knob is gone, and the pipeline's fill is observable. The remaining Phase 2 steps are unchanged and now have a measurement to move:
+
+- **P2.2** (release each staging slot on its own copy event) is what could bring the floor down from `E`, since the `256 → 384` result shows that **extra slots below `2E` are worthless** — the win comes from forming a second block, not from having spare slots.
+- **Gate A** still fails (`1.144×`). Its target is that the `1E → 2E` step disappears because the algorithm no longer depends on the size.

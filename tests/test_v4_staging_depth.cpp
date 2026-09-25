@@ -40,6 +40,7 @@
 #include <hip/hip_runtime.h>
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -91,6 +92,12 @@ struct Row {
     uint64_t layers_released{0};
     double io_wait_s{0.0};
     double drain_s{0.0};
+    // Corridor fill, from the sweep's per-layer samples: how many layers had a
+    // staging block reading **and** a staging block copying at the same instant —
+    // the signature of an overlapped pipeline rather than a parking lot.
+    uint32_t layers_sampled{0};
+    uint32_t layers_overlapped{0};
+    uint32_t peak_reserved_ahead{0};
 };
 
 } // namespace
@@ -184,29 +191,44 @@ int main(int argc, char** argv) {
         row.layers_released = host.prefill_sweep().layers_released() - released_before;
         row.io_wait_s = static_cast<double>(host.supply_io_wait_ns()) / 1e9;
         row.drain_s = static_cast<double>(host.supply_h2d_drain_ns()) / 1e9;
+
+        // Corridor fill: a sample is "overlapped" when a read is landing in one
+        // staging block while a copy drains another — the pipeline working. One block
+        // pinned at `E` with the other at zero is the parking lot.
+        for (const auto& sample : host.sweep_occupancy()) {
+            ++row.layers_sampled;
+            if (sample.staging_reading > 0 && sample.staging_copying > 0) {
+                ++row.layers_overlapped;
+            }
+            row.peak_reserved_ahead = std::max(row.peak_reserved_ahead,
+                                               sample.vram_reserved_ahead);
+        }
+
         row.ran = true;
         row.note = host.prefill_sweep_engaged() ? "swept" : "NOT swept";
         rows.push_back(row);
     }
 
-    std::printf("\n%s\n", std::string(104, '=').c_str());
+    std::printf("%s\n", std::string(104, '=').c_str());
     std::printf(
         "  DEPTH SWEEP — one swept window, N=%u, %u layers x %u experts, one process\n",
         kLength, host.num_layers(), per_layer);
     std::printf("%s\n", std::string(104, '=').c_str());
-    std::printf("%-7s %-6s %-6s %-9s %-9s %-8s %-9s %-9s %-8s %s\n",
-                "depth", "slots", "banks", "wall_s", "io_wait_s", "drain_s",
-                "layers", "experts", "token", "note");
+    std::printf("%-6s %-6s %-5s %-8s %-8s %-8s %-8s %-8s %-7s %s\n",
+                "depth", "slots", "banks", "wall_s", "io_wait", "drain_s",
+                "samples", "overlap", "token", "note");
     for (const Row& r : rows) {
         if (!r.ran) {
-            std::printf("%-7u %-6s %-6s %-9s %-10s %-8s %-9s %-9s %-8s %s\n",
-                        r.depth, "-", "-", "-", "-", "-", "-", "-", "-", r.note.c_str());
+            std::printf("%-6u %-6s %-5s %-8s %-9s %-8s %-8s %-8s %-7s %s\n",
+                        r.depth, "-", "-", "-", "-", "-", "-", "-", "-",
+                        r.note.c_str());
             continue;
         }
-        std::printf("%-7u %-6u %-6u %-9.3f %-10.3f %-8.3f %-9llu %-9llu %-8u %s\n",
+        std::printf("%-6u %-6u %-5u %-8.3f %-9.3f %-8.3f %-8u %-8s %-7u %s\n",
                     r.depth, r.staging_slots, r.banks, r.wall_s, r.io_wait_s, r.drain_s,
-                    static_cast<unsigned long long>(r.layer_loads),
-                    static_cast<unsigned long long>(r.experts_streamed),
+                    r.layers_sampled,
+                    (std::to_string(r.layers_overlapped) + "/" +
+                     std::to_string(r.layers_sampled)).c_str(),
                     r.token, r.note.c_str());
     }
     std::printf("\n");
@@ -267,6 +289,28 @@ int main(int argc, char** argv) {
                     std::to_string(ref.experts_streamed) + " experts");
         assert_that("B: layers released is identical at every depth", same_released,
                     std::to_string(ref.layers_released) + " layers");
+    }
+
+    // ---- Gate C — the corridor is filled, not just sized ---------------------
+    std::printf("\n%s\n", std::string(104, '=').c_str());
+    std::printf("  C. CORRIDOR FILL — a read landing while a copy drains, concurrently\n");
+    std::printf("%s\n", std::string(104, '=').c_str());
+    if (ran.empty()) {
+        assert_that("C: a swept window ran", false, "none ran");
+    } else {
+        for (const Row* r : ran) {
+            char detail[128];
+            std::snprintf(detail, sizeof(detail),
+                          "%u/%u layers overlapped, peak reserved-ahead %u experts",
+                          r->layers_overlapped, r->layers_sampled, r->peak_reserved_ahead);
+            // The **default** shape (2E) must overlap; a deliberately reduced depth
+            // may not, and that is the point of the gate rather than a failure.
+            const bool is_default = r->banks >= 2;
+            assert_that(
+                ("C: depth " + std::to_string(r->depth) +
+                 (is_default ? " (default 2E) overlaps" : " (reduced depth)")).c_str(),
+                !is_default || r->layers_overlapped > 0, detail);
+        }
     }
 
     // ---- Reported, not asserted: the floor the design imposes ----------------

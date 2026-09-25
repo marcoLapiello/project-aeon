@@ -462,6 +462,18 @@ public:
         return batch;
     }
 
+    // The staging arena's occupancy by pipeline stage, for a caller that wants to
+    // observe whether the corridor is filled. See `PrefetchStagingArena::StateCounts`.
+    PrefetchStagingArena::StateCounts staging_state_counts() const {
+        if (prefetch_staging_ == nullptr) return {};
+        return prefetch_staging_->state_counts();
+    }
+
+    uint32_t staging_in_use_slots() const {
+        if (prefetch_staging_ == nullptr) return 0;
+        return prefetch_staging_->in_use_slots();
+    }
+
     // Releases the staging slots a **streamed** batch borrowed, once its uploads
     // have landed. The executor does this in `on_routed_consumed`; the prefill sweep
     // has no such hook, so it calls this as soon as its batch is materialized — the

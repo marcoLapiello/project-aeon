@@ -190,21 +190,20 @@ struct AeonRuntimeConfig {
     uint32_t prefill_sweep_min_tokens{0};
 
     // The layer-sized staging **banks** the arena holds when `prefill_sweep` is on
-    // (Phase 1 of the supply-chain hot-path plan). Two banks are what the sweep's
-    // deferred drain needs: one layer's H2D copies stay in flight through its body
-    // while the lookahead reads the next layer into the other bank.
+    // are always **two** (`2E`); there is deliberately no knob. The count is not a
+    // tuning figure: at `1E` the arena is one room and the pipeline is serial across
+    // layers (`read(L) -> copy(L) -> drain -> read(L+1)`), at `2E` it is two rooms and
+    // `L`'s copy overlaps `L+1`'s read. A configurable depth would therefore let a
+    // *resource* select the *algorithm*, which is exactly what the supply-chain
+    // hot-path plan's R6 forbids. The depth is a budget a caller changes at runtime
+    // through `V4ModelHost::resize_staging_slots` (for the A/B and the sensitivity
+    // gate), never a behaviour switch.
     //
-    // The default is **1**, the pre-Phase-1 shape and the byte-for-byte memory shape
-    // the engine has always had, because the second bank costs `+3.44 GiB` of
-    // non-reclaimable **pinned** host memory (`E = 256`: 3.44 -> 6.75 GiB). Measured
-    // on the 62 GiB reference box, that cost is not affordable at the production Warm
-    // shape: Warm 35 GiB is itself pinned, so `35 + 6.75 = 41.75 GiB` pinned plus the
-    // ~13 GiB the 10 GiB host reserve does not cover pushes the machine into swap. The
-    // deferred drain's win was measured at Warm 0 (-4.5 s of a 63.6 s window at
-    // N = 512), so it is real — but it is only shippable once Phase 2's per-expert slot
-    // recycling gets the same overlap out of a bounded surplus instead of a whole
-    // extra bank. Until then this stays an explicit opt-in for the A/B.
-    uint32_t prefill_sweep_staging_banks{1};
+    // The cost is real and reported: `2E` is `6.75 GiB` of non-reclaimable pinned
+    // host memory at `E = 256` (`3.44 GiB` more than `1E`). At the production Warm
+    // shape that is tight — Warm is itself pinned — and the budget check does not
+    // model it (see the host-memory pressure investigation). Making `2E` cheaper is
+    // the remaining work of the plan's Phase 2, not a reason to keep the knob.
 
     // Hardware target device index
     int device_id{0};
@@ -213,17 +212,19 @@ struct AeonRuntimeConfig {
 
 // The staging arena's slot count, shared by the budget report and the arena's own
 // construction so the reported `transient_staging_bytes` is exactly what is
-// allocated. A chunk's deduplicated distinct set is at most the layer width, and the
-// sweep additionally holds `prefill_sweep_staging_banks` layer-sized banks for its
-// deferred drain. Decode's shape (`TOTAL_STAGING_SLOTS`) is the floor.
+// allocated. Two terms:
+//
+//   * decode/a-chunk's deduplicated distinct set, at most the layer width (`6C`
+//     capped by `E`), with `TOTAL_STAGING_SLOTS` as the floor; and
+//   * when the sweep is on, **two layer-blocks** — one is the read destination and
+//     one is the copy source (see `AeonRuntimeConfig::prefill_sweep`).
 inline uint32_t staging_slot_count(const AeonRuntimeConfig& cfg, uint32_t experts_per_layer) {
     const uint32_t chunk_ceiling = std::min<uint32_t>(
         6u * std::max<uint32_t>(1, cfg.prefill_chunk), experts_per_layer);
     const uint32_t base = std::max<uint32_t>(
         PrefetchStagingArena::TOTAL_STAGING_SLOTS, chunk_ceiling);
     if (!cfg.prefill_sweep) return base;
-    const uint32_t sweep_banks = std::max<uint32_t>(1, cfg.prefill_sweep_staging_banks);
-    return std::max<uint32_t>(base, sweep_banks * experts_per_layer);
+    return std::max<uint32_t>(base, 2u * experts_per_layer);
 }
 
 struct MemoryBudgetReport {

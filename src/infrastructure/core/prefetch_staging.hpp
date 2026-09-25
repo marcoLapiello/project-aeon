@@ -192,6 +192,32 @@ public:
         return in_use;
     }
 
+    // The arena's occupancy **by pipeline stage**, which is what says whether the
+    // corridor is actually filled rather than merely sized. `reading` is the slots a
+    // read is landing in (`IO_PENDING`/`IO_COMPLETE`); `copying` is the slots a
+    // copy-into-VRAM is draining (`GPU_TRANSFER_PENDING`). A healthy two-block
+    // staging corridor shows both non-zero at once during a layer body; a parking
+    // lot shows one of them pinned at `E` while the other is zero.
+    struct StateCounts {
+        uint32_t free{0};
+        uint32_t reading{0};
+        uint32_t copying{0};
+        uint32_t in_use() const noexcept { return reading + copying; }
+    };
+
+    StateCounts state_counts() const {
+        StateCounts counts;
+        for (uint32_t i = 0; i < slot_count_; ++i) {
+            switch (slot_states[i]) {
+            case SlotState::AVAILABLE: ++counts.free; break;
+            case SlotState::IO_PENDING:
+            case SlotState::IO_COMPLETE: ++counts.reading; break;
+            case SlotState::GPU_TRANSFER_PENDING: ++counts.copying; break;
+            }
+        }
+        return counts;
+    }
+
     void begin_io(uint32_t slot_idx) {
         transition(slot_idx, SlotState::AVAILABLE, SlotState::IO_PENDING);
     }

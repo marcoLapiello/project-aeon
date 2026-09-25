@@ -172,6 +172,9 @@ public:
         // the observable proof that the drain freed only what the pass needs, and
         // that the preserved residents are the ones decode resumes on.
         hot_after_drain_ = registry_->published_hot_slots();
+        // The corridor's fill is sampled per **window**, not accumulated across
+        // windows: a gate reads the readout for the pass it just ran.
+        occupancy_samples_.clear();
         active_ = true;
         dispatch_ahead(0);
     }
@@ -200,6 +203,11 @@ public:
             ensure_layer(layer);
         }
         dispatch_ahead(layer + 1);
+        // Sampled **after** the lookahead is issued, at the instant the body starts:
+        // this is the corridor's fill for this layer, which is the thing a gate reads
+        // (a `reading` block and a `copying` block both non-zero means the pipeline is
+        // overlapped; one pinned at `E` with the other at zero is a parking lot).
+        record_occupancy(layer);
     }
 
     // Retire layer `layer`. The room it frees is what the layer after `layer + 1`
@@ -251,6 +259,24 @@ public:
     }
 
     // ---- observability, for the gate ----------------------------------------
+
+    // One layer's corridor fill, sampled as its body begins.
+    struct BlockOccupancy {
+        uint32_t layer{0};
+        // Staging arena, by pipeline stage. `reading` is a read landing in a slot;
+        // `copying` is a copy-into-VRAM draining a slot. Both non-zero = overlapped.
+        uint32_t staging_free{0};
+        uint32_t staging_reading{0};
+        uint32_t staging_copying{0};
+        // Experts whose VRAM slots are **reserved for the lookahead layer** at this
+        // instant. These are outstanding: the block is held but its bytes have not
+        // all arrived, which is the "reserved-but-empty" figure.
+        uint32_t vram_reserved_ahead{0};
+    };
+
+    const std::vector<BlockOccupancy>& occupancy_samples() const noexcept {
+        return occupancy_samples_;
+    }
 
     uint64_t layer_loads() const noexcept { return layer_loads_; }
     uint64_t experts_streamed() const noexcept { return experts_streamed_; }
@@ -420,6 +446,21 @@ private:
         frontier_depth_ = std::max(frontier_depth_, resident_layers);
     }
 
+    // Sample the corridor's fill for one layer. Cheap (an arena scan) and bounded by
+    // the layer count, so it is on unconditionally for the swept path.
+    void record_occupancy(uint32_t layer) {
+        const auto counts = supply_->staging_state_counts();
+        BlockOccupancy sample;
+        sample.layer = layer;
+        sample.staging_free = counts.free;
+        sample.staging_reading = counts.reading;
+        sample.staging_copying = counts.copying;
+        sample.vram_reserved_ahead = pending_valid_
+            ? static_cast<uint32_t>(pending_state_.expert_count())
+            : 0u;
+        occupancy_samples_.push_back(sample);
+    }
+
     V4ExpertSupplyCoordinator* supply_{nullptr};
     ExpertRegistry* registry_{nullptr};
     bool active_{false};
@@ -449,6 +490,8 @@ private:
     uint32_t lookahead_depth_{0};
     uint32_t hot_after_drain_{0};
     uint32_t frontier_depth_{0};
+    // One corridor-fill sample per layer, for the gate.
+    std::vector<BlockOccupancy> occupancy_samples_;
 };
 
 } // namespace aeon::core

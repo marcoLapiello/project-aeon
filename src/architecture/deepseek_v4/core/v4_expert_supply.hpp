@@ -328,6 +328,14 @@ public:
         supply_.reap_registry_transfers();
     }
 
+    // The staging arena's occupancy by pipeline stage — the corridor's fill, as
+    // opposed to its size. Read at a layer boundary by the sweep's readout.
+    PrefetchStagingArena::StateCounts staging_state_counts() const {
+        return supply_.staging_state_counts();
+    }
+
+    uint32_t staging_in_use_slots() const noexcept { return supply_.staging_in_use_slots(); }
+
     void mark_gpu_readiness_wait_start(uint64_t operation_id) {
         supply_.mark_gpu_readiness_wait_start(operation_id);
     }

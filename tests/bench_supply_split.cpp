@@ -214,15 +214,25 @@ int main(int argc, char** argv) {
     runtime.prefill_chunk = kChunk;
     runtime.prefill_window = kWindow;
     runtime.warm_host_bytes = warm_gib * 1024ULL * 1024ULL * 1024ULL;
-    // Phase 1 A/B (supply-chain hot-path plan): the sweep's staging banks. `1` is the
-    // pre-Phase-1 shape (the blocking drain), `2` (the config default) the
-    // deferred-drain headroom. Env-overridable so the A/B needs no rebuild.
-    if (const char* banks_env = std::getenv("AEON_SWEEP_BANKS")) {
-        runtime.prefill_sweep_staging_banks = static_cast<uint32_t>(std::atoi(banks_env));
-    }
+    // The sweep's arena is `2E` (two layer-blocks) by default. The A/B arm resizes it
+    // to **one** layer-block at runtime — the pre-Phase-2 shape — through the depth
+    // API rather than a config flag, because the depth must not be a behaviour switch
+    // (plan R6).
+    const uint32_t sweep_banks_env = [] {
+        const char* env = std::getenv("AEON_SWEEP_BANKS");
+        return env != nullptr ? static_cast<uint32_t>(std::atoi(env)) : 0u;
+    }();
 
     V4ModelHost host;
     host.initialize(model_dir, runtime, /*verbose=*/false);
+    if (sweep_banks_env == 1) {
+        const uint32_t per_layer = host.registry().experts_per_layer;
+        if (!host.resize_staging_slots(per_layer)) {
+            throw std::runtime_error("bench_supply_split: could not resize staging to one bank");
+        }
+    } else if (sweep_banks_env != 0 && sweep_banks_env != 2) {
+        throw std::runtime_error("bench_supply_split: AEON_SWEEP_BANKS must be 1 or 2");
+    }
     V4Graph graph(host);
 
     // One tokenizer/encoder for the whole run, and the ids encoded once so every
