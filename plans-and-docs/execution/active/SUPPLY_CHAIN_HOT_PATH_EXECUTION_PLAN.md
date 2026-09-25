@@ -103,16 +103,18 @@ Implements the §0 spec. Each step is independently verifiable and independently
 | **Requirement** | R8 ✅ `transient_staging_bytes` == `slots × payload_bytes`, still asserted by `bench_supply_split`. |
 | **Verify** | ✅ **Gate C added and passing**: `0/43` layers overlapped at `1E` (drain `4.9 s`) vs **`42/43` at `2E`** (drain `0.006 s`) — the parking lot and the corridor, measured. Byte-exactness gates pass at the new default (`16`/`18`/`10`/`38`, 0 failures, token unchanged). |
 
-### P2.2 — Completion-driven staging release
+### P2.2 — Completion-driven staging release — ✅ **done**
 
 | | |
 | :--- | :--- |
+| **Status** | ✅ **shipped 2026-09-25.** The release is attached to the copy's own completion event. **Measured effect on throughput: none on its own** — see below. |
 | **Fixes** | Holding each staging slot for a whole body when its copy took ~0.1 s. |
-| **Where** | `tiered_expert_supply.hpp` — the reaper (`reap_registry_transfers`) and `release_streamed_staging`; `v4_prefill_sweep.hpp` |
-| **Change** | Release a slot the moment **its own** copy's event fires (the reaper already queries each `h2d_event`), not as a block at the boundary. Slots become a free-list. |
-| **Requirement** | R3. Release is triggered by the copy event, not the layer boundary. |
-| **Requirement** | In-flight accounting stays exact: no reuse while the read *or* the copy is outstanding (`SlotState`). |
-| **Verify** | `in_use_slots() == 0` at `prefill_end`; byte-exactness gates; the Phase 1 win survives. |
+| **Where** | `prefetch_staging.hpp` (`release_if_copying`), `tiered_expert_supply.hpp` (the reaper's success path + `staging_released_on_completion()`), `v4_prefill_sweep.hpp` (reap **before** reclaim in `after_layer`/`materialize_layer`) |
+| **Change** | The reaper releases each slot the moment **its own** `h2d_event` fires, via `release_if_copying` (idempotent, so decode's `on_routed_consumed` still releases safely). The sweep reaps **before** its block reclaim, so the completion path is primary and `release_streamed_staging` is the fallback. |
+| **Requirement** | R3 ✅ Release is triggered by the copy event, not the layer boundary. |
+| **Requirement** | In-flight accounting stays exact: no reuse while the read *or* the copy is outstanding (`SlotState`, unbypassed). |
+| **Verify** | ✅ `in_use_slots() == 0` at `prefill_end`; byte-exactness gates pass (`16`/`18`/`10`/`38`); **`staging_released_on_completion` = `10198` at `2E`, `0` at `1E`** — the release really does come from the completion path. |
+| **Honest result** | **No wall-time change** (`30.913` vs `30.641 s`, within noise; `drain_s` `0.000`). This is expected and not a failure: the host is parked per layer, so *when* within the boundary a slot frees cannot move throughput. P2.2's value is **structural** — the arena is now a completion-drained free-list, which is the prerequisite for P2.3 (copy on read-completion) and P2.4 (lookahead from free blocks). It does **not** by itself lower the `E` floor. |
 
 ### P2.3 — Copy into VRAM as soon as a read lands
 
@@ -189,8 +191,8 @@ Phase 1  ✅ DONE — H2D overlapped (3.2–4.5 s/window); memory cost blocks sh
    ▼
 Phase 2  MANDATORY — the corridor becomes a demand-driven pipeline
    │   P2.1  ✅ DONE  arena is 2E unconditionally + corridor-fill readout (Gate C)
-   │   P2.2  release each staging slot on its copy event                 (R3)
-   │   P2.3  copy into VRAM as each read lands, event-gated              (R1, R3)
+   │   P2.2  ✅ DONE  release each staging slot on its copy event (R3); no throughput change alone
+   │   P2.3  copy into VRAM as each read lands, event-gated              (R1, R3)  ← next
    │   P2.4  lookahead derived from free blocks                          (R5)
    │   P2.5  gates: A must pass over a wide range incl. < E; B/C must hold
    │   └─ ABORT if any step cannot hold byte-exactness → keep it opt-in, record negative

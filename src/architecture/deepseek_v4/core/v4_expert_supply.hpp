@@ -152,6 +152,10 @@ public:
     uint64_t h2d_drain_ns() const noexcept { return supply_.h2d_drain_ns(); }
     uint64_t h2d_drain_calls() const noexcept { return supply_.h2d_drain_calls(); }
     uint64_t dispatch_cpu_ns() const noexcept { return supply_.dispatch_cpu_ns(); }
+    // Staging slots freed by the completion path instead of a boundary block (P2.2).
+    uint64_t staging_released_on_completion() const noexcept {
+        return supply_.staging_released_on_completion();
+    }
     void reset_transfer_counters() noexcept { supply_.reset_transfer_counters(); }
 
     LayerPrefetchState dispatch_layer_prefetch(

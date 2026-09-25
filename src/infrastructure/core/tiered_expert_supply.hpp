@@ -189,6 +189,14 @@ public:
     // `O(catalog)` scans, and the transfer record-keeping. The region the analysis's
     // §4 estimated and that no other counter covers.
     uint64_t dispatch_cpu_ns() const noexcept { return dispatch_cpu_ns_; }
+    // Staging slots released by the **completion** path rather than as a boundary
+    // block: one per expert whose H2D copy's event fired and whose slot was therefore
+    // handed back immediately (plan P2.2 / R3). A numerator against
+    // `prefetch_staging_->slot_count()` it says how much of the arena drains
+    // incrementally instead of at a boundary.
+    uint64_t staging_released_on_completion() const noexcept {
+        return staging_released_on_completion_;
+    }
 
     // Zeroes every transfer counter above so a caller can slice one phase (prefill,
     // then decode) without re-instantiating the supply. Counters only — no state is
@@ -202,6 +210,7 @@ public:
         h2d_drain_ns_ = 0;
         h2d_drain_calls_ = 0;
         dispatch_cpu_ns_ = 0;
+        staging_released_on_completion_ = 0;
     }
 
     PayloadBatch dispatch(
@@ -911,6 +920,17 @@ public:
             }
 
             expert_registry_->complete_request(transfer.operation_id);
+            // Completion-driven release (plan P2.2 / R3): the copy's own event has
+            // fired, so its staging slot is spent — the data now lives in VRAM. Free
+            // it here rather than holding it to the layer boundary, so the arena
+            // drains incrementally instead of as a block. `release_if_copying` is
+            // safe on both paths: decode releases its own slots in
+            // `on_routed_consumed` (where the slot is already `AVAILABLE` by now) and
+            // simply reports `false`.
+            if (transfer.has_staging && prefetch_staging_ != nullptr &&
+                prefetch_staging_->release_if_copying(transfer.staging_idx)) {
+                ++staging_released_on_completion_;
+            }
             const auto ready_at = std::chrono::steady_clock::now();
             const auto h2d_ns = transfer.h2d_enqueued_at.time_since_epoch().count() == 0
                 ? uint64_t{0}
@@ -1022,6 +1042,7 @@ private:
     uint64_t h2d_drain_ns_{0};
     uint64_t h2d_drain_calls_{0};
     uint64_t dispatch_cpu_ns_{0};
+    uint64_t staging_released_on_completion_{0};
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion>* direct_io_completions_{nullptr};
     uint64_t* next_direct_io_id_{nullptr};
     hipStream_t compute_stream_{nullptr};

@@ -787,6 +787,10 @@ public:
     // CPU time in `dispatch`'s per-request loop (the registry reservation and the two
     // `O(catalog)` scans). Reported for both phases, since the loop is shared.
     uint64_t supply_dispatch_cpu_ns() const noexcept { return supply_.dispatch_cpu_ns(); }
+    // Staging slots freed by the completion path instead of a boundary block (P2.2).
+    uint64_t supply_staging_released_on_completion() const noexcept {
+        return supply_.staging_released_on_completion();
+    }
     void reset_supply_transfer_counters() noexcept { supply_.reset_transfer_counters(); }
     // Layers whose reads were in flight when a body started (1 = the double buffer
     // is engaged; 0 = the pool is too small for two layers and loads are serial).

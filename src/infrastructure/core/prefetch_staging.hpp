@@ -253,6 +253,20 @@ public:
         available_since_[slot_idx] = std::chrono::steady_clock::now();
     }
 
+    // Release a slot **iff** a copy is still draining through it, and report whether
+    // it did. This is the completion-driven form (plan R3): the reaper releases the
+    // slot when its copy's own event fires, and a caller that would also release it
+    // as a block (the sweep's boundary drain, the executor's `on_routed_consumed`)
+    // finds it already `AVAILABLE` and skips. `release_after_gpu_transfer` cannot be
+    // used for that because it throws on an unexpected state.
+    bool release_if_copying(uint32_t slot_idx) {
+        validate_slot(slot_idx);
+        if (slot_states[slot_idx] != SlotState::GPU_TRANSFER_PENDING) return false;
+        slot_states[slot_idx] = SlotState::AVAILABLE;
+        available_since_[slot_idx] = std::chrono::steady_clock::now();
+        return true;
+    }
+
     void release_after_failure(uint32_t slot_idx) {
         validate_slot(slot_idx);
         slot_states[slot_idx] = SlotState::AVAILABLE;

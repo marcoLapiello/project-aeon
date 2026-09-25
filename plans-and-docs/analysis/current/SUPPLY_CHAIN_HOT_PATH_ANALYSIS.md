@@ -1,6 +1,6 @@
 # Supply-Chain Hot-Path Analysis — is the feed a river or a bucket?
 
-*Status: open analysis — **largely measured and settled**. Written 2026-09-22; deepened 2026-09-23 in a second source pass; **measured 2026-09-24** (Step 1 §8, Step 2 §9, Phase 1 §10). A two-round audit of the expert supply's transfer path and its per-request bookkeeping, in answer to two questions: (1) is the NVMe→VRAM feed a continuous stream or an interrupted one; (2) which substeps on that road are expensive enough to be worth removing. Source read: `direct_io_reader.hpp`, `tiered_expert_supply.hpp`, `prefetch_staging.hpp`, `expert_registry.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp`, `v4_expert_executor.hpp`, `v4_model_host.hpp`, `memory_budget.hpp`, `bench_prefill_ab.cpp`. Instrumentation added: `TieredExpertSupply` transfer counters + `tests/bench_supply_split.cpp` + `scripts/supply_split.sh`; probe added: `tools/aeon_c4_probe.cpp`. **Headline: the transfer path is near its ceiling; the exposed swept-layer H2D `4.1–5.4 s/window` was then removed in Phase 1 (§10) by a deferred drain — `3.2–3.5 s/window` recovered, at both Warm 0 and Warm 30 — but only with a second staging bank that costs `+3.44 GiB` pinned, which does not fit the production Warm shape; the shipping form is C2's per-expert recycling (Phase 2). The largest measured supply cost — decode's NVMe wait (§8.5) — has a remedy that is out of scope here.***
+*Status: open analysis — **largely measured and settled**. Written 2026-09-22; deepened 2026-09-23 in a second source pass; **measured 2026-09-24** (Step 1 §8, Step 2 §9, Phase 1 §10) and **2026-09-25** (portability gates §11, arena shape §12, completion-driven release §13). A two-round audit of the expert supply's transfer path and its per-request bookkeeping, in answer to two questions: (1) is the NVMe→VRAM feed a continuous stream or an interrupted one; (2) which substeps on that road are expensive enough to be worth removing. Source read: `direct_io_reader.hpp`, `tiered_expert_supply.hpp`, `prefetch_staging.hpp`, `expert_registry.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp`, `v4_expert_executor.hpp`, `v4_model_host.hpp`, `memory_budget.hpp`, `bench_prefill_ab.cpp`. Instrumentation added: `TieredExpertSupply` transfer counters + `tests/bench_supply_split.cpp` + `scripts/supply_split.sh`; probe added: `tools/aeon_c4_probe.cpp`. **Headline: the transfer path is near its ceiling; the exposed swept-layer H2D `4.1–5.4 s/window` was then removed in Phase 1 (§10) by a deferred drain — `3.2–3.5 s/window` recovered, at both Warm 0 and Warm 30 — but only with a second staging bank that costs `+3.44 GiB` pinned, which does not fit the production Warm shape; the shipping form is C2's per-expert recycling (Phase 2). The largest measured supply cost — decode's NVMe wait (§8.5) — has a remedy that is out of scope here.***
 
 **Subject.** The mechanics of moving a routed expert from NVMe into VRAM — the read submission, the staging corridor, the H2D, and the registry bookkeeping around all three. This is the *how fast can the bytes arrive* question, not the *which bytes should arrive* strategy question, which the [prefill supply review](PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) and the [prefill supply strategy plan](PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) own.
 
@@ -513,3 +513,36 @@ P2.1's part is done: the arena is `2E` by default in both scenarios, the knob is
 
 - **P2.2** (release each staging slot on its own copy event) is what could bring the floor down from `E`, since the `256 → 384` result shows that **extra slots below `2E` are worthless** — the win comes from forming a second block, not from having spare slots.
 - **Gate A** still fails (`1.144×`). Its target is that the `1E → 2E` step disappears because the algorithm no longer depends on the size.
+
+---
+
+## 13. Measured — completion-driven staging release (2026-09-25)
+
+*Status: **measured.** The mechanism works; it moves no throughput on its own. Plan step P2.2.*
+
+### 13.1 What was added
+
+- **`PrefetchStagingArena::release_if_copying(slot)`** — frees a slot **iff** a copy is still draining through it, reporting whether it did. `release_after_gpu_transfer` throws on an unexpected state, which is why the idempotent form is needed: decode releases its slots in `on_routed_consumed` *and* the reaper now may, and both must be safe.
+- **The reaper releases on completion** — in `reap_registry_transfers`'s success path, the moment a transfer's own `h2d_event` fires, on top of the existing `complete_request`. Counted in `staging_released_on_completion()`.
+- **The sweep reaps before it reclaims** (`after_layer`, `materialize_layer`), so the completion path is primary and `release_streamed_staging` is the fallback for any slot whose event had not fired.
+
+### 13.2 Results
+
+Same gate, one swept window, `N = 256`, 43 layers:
+
+| depth | banks | wall_s | drain_s | overlapped | **released on completion** |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 1 | 34.896 | 4.708 | 0/43 | **0** |
+| 384 | 1 | 35.027 | 4.891 | 0/43 | **0** |
+| 512 | 2 | 30.913 | 0.000 | 42/43 | **10198** |
+
+### 13.3 What it establishes
+
+1. **The release really is completion-driven at the default shape.** `10198` of the `10718` streamed experts had their slot freed by their own copy's event, not by the boundary block. The remaining `520` are the preserved residents, which never enter the staging arena.
+2. **At `1E` it is `0` by construction** — that path still drains synchronously (`finish_streamed_batch` in `materialize_layer`, gated by `deferred_drain_`), so the slots are already `AVAILABLE` when the reaper looks. P2.2 is inert where Phase 1's deferred drain is off, which is consistent.
+3. **No throughput change: `30.913` vs `30.641 s`.** This is a *negative* result and it is expected. The host is parked at every layer boundary, so *when* inside a boundary a slot becomes free cannot move the critical path. P2.2's value is **structural**: the arena is now a completion-drained free-list, which is the shape P2.3 (copy on read-completion) and P2.4 (lookahead from free blocks) are written against.
+4. **It does not lower the `E` floor, and it was not expected to.** The floor is the read *wave*, not the release timing — reads are still dispatched as one set of `E` at the boundary. Lowering it needs paced submission, which needs a host that runs during the body.
+
+### 13.4 Consequence
+
+The remaining Phase-2 lever is **P2.3**: the copy currently happens at the boundary, so `L+1` sits in staging with an empty VRAM block for most of a body. Moving the copy to read-completion is the step with a throughput argument, and P2.2 is what makes it expressible (each expert's slot is now individually tracked and releaseable).

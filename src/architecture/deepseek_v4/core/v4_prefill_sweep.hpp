@@ -231,8 +231,12 @@ public:
                 " retired while layer " + std::to_string(resident_layer_) +
                 "'s staging bank is still resident");
         }
-        reclaim_resident_staging();
+        // **Reap first, reclaim second** (plan R3): the copies landed during the body,
+        // so the reaper releases their staging slots **by completion** and the block
+        // reclaim below then finds the bank already drained. The reclaim stays as the
+        // fallback for any slot whose event had not fired at this instant.
         supply_->reap_registry_transfers();
+        reclaim_resident_staging();
         registry_->release_layer(layer);
         ++layers_released_;
         update_frontier();
@@ -358,6 +362,9 @@ private:
     // through the body, so the drain is the blocking one, as before.
     void materialize_layer() {
         if (!pending_valid_) return;
+        // Reap before the defensive reclaim, for the same reason as `after_layer`: a
+        // slot whose copy has already landed is freed by its own completion event.
+        supply_->reap_registry_transfers();
         // Defensive: only the mismatch path can find a resident still held here (the
         // normal flow returns it in `after_layer`), but returning it beats leaking a
         // bank.
