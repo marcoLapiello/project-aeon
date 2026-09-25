@@ -60,7 +60,12 @@ enum class ExpertRequestKind : uint8_t {
     HOT_HIT = 0,
     WARM_PROMOTION = 1,
     COLD_MISS = 2,
-    PENDING = 3
+    PENDING = 3,
+    // A cold read reserved **without** a VRAM destination: the bytes land in the
+    // staging arena and wait there until `attach_vram_destination` gives them a slot.
+    // This is what lets the supply's read leg and copy leg be bounded separately
+    // (a read is limited by staging, a copy by VRAM) instead of both by VRAM.
+    COLD_STAGED = 4
 };
 
 struct ExpertCatalogEntry {
@@ -254,15 +259,25 @@ public:
         uint32_t layer_id,
         uint32_t expert_id,
         uint64_t current_step,
-        uint64_t demotion_queue_capacity
+        uint64_t demotion_queue_capacity,
+        bool stage_only = false
     ) {
-        return reserve_request(get_global_id(layer_id, expert_id), current_step, demotion_queue_capacity);
+        return reserve_request(
+            get_global_id(layer_id, expert_id), current_step, demotion_queue_capacity,
+            stage_only);
     }
 
+    // `stage_only` reserves a **cold** read with no VRAM destination (kind
+    // `COLD_STAGED`): the operation is in flight and the bytes will land in staging,
+    // but no slot is held. `attach_vram_destination` supplies one later, at the moment
+    // the copy can actually run. It is ignored for any source other than COLD_NVME — a
+    // Warm shadow or a demotion needs its destination decided at reservation, so those
+    // keep the immediate-reserve path.
     ExpertRequestReservation reserve_request(
         uint32_t gid,
         uint64_t current_step,
-        uint64_t demotion_queue_capacity
+        uint64_t demotion_queue_capacity,
+        bool stage_only = false
     ) {
         if (gid >= catalog.size()) {
             throw std::out_of_range("ExpertRegistry: global expert ID is out of range");
@@ -364,8 +379,15 @@ public:
 
         const uint64_t operation_id = next_operation_id++;
         const ExpertTier source_tier = entry.owner;
-        const auto destination = reserve_vram_destination(
-            gid, operation_id, demotion_queue_capacity);
+        // A cold read may be reserved **staged-only**: no VRAM slot is taken now, and
+        // `attach_vram_destination` supplies one when the copy can run. Every other
+        // source decides its destination here, because a Warm shadow or a demotion
+        // depends on the victim/ownership state at reservation time.
+        const bool defer_vram = stage_only && source_tier == ExpertTier::COLD_NVME;
+        std::optional<VramDestination> destination;
+        if (!defer_vram) {
+            destination = reserve_vram_destination(gid, operation_id, demotion_queue_capacity);
+        }
 
         int32_t source_host_slot = -1;
         if (source_tier == ExpertTier::WARM_HOST) {
@@ -384,23 +406,55 @@ public:
         entry.publication = ExpertPublication::UNPUBLISHED;
         entry.slot_state = ExpertSlotState::ACTIVE;
         entry.lease_count++;
-        entry.pending_slot_idx = static_cast<int32_t>(destination.vram_slot);
+        entry.pending_slot_idx = destination.has_value()
+            ? static_cast<int32_t>(destination->vram_slot)
+            : -1;
 
         ExpertRequestReservation request{
-            source_tier == ExpertTier::WARM_HOST
-                ? ExpertRequestKind::WARM_PROMOTION
-                : ExpertRequestKind::COLD_MISS,
+            defer_vram
+                ? ExpertRequestKind::COLD_STAGED
+                : (source_tier == ExpertTier::WARM_HOST
+                       ? ExpertRequestKind::WARM_PROMOTION
+                       : ExpertRequestKind::COLD_MISS),
             source_tier,
             gid,
             operation_id,
-            static_cast<int32_t>(destination.vram_slot),
+            destination.has_value() ? static_cast<int32_t>(destination->vram_slot) : -1,
             source_host_slot,
             true,
-            destination.demotion
+            destination.has_value() ? destination->demotion
+                                    : std::optional<ExpertDemotionReservation>{}
         };
 
         checked_validate();
         return request;
+    }
+
+    // Give a staged-only operation its VRAM destination, at the moment its copy can
+    // actually run (plan P2.5). Returns the slot. Idempotent: an operation that
+    // already has a destination returns it unchanged, so a caller may attach and then
+    // copy without tracking whether an earlier call already did. The destination is
+    // reserved exactly as `reserve_request` would have done at reservation time, so
+    // the free-slot/demotion rules are unchanged — only **when** they run is.
+    int32_t attach_vram_destination(uint64_t operation_id, uint64_t demotion_queue_capacity) {
+        auto* incoming = find_incoming_operation(operation_id);
+        if (incoming == nullptr) {
+            throw std::logic_error(
+                "ExpertRegistry: attach_vram_destination has no pending request");
+        }
+        if (incoming->pending_slot_idx >= 0) {
+            return incoming->pending_slot_idx;
+        }
+        const auto destination = reserve_vram_destination(
+            incoming->global_expert_id, operation_id, demotion_queue_capacity);
+        incoming->pending_slot_idx = static_cast<int32_t>(destination.vram_slot);
+        return incoming->pending_slot_idx;
+    }
+
+    // Whether an operation is reserved but still waiting for its VRAM destination.
+    bool operation_is_staged_only(uint64_t operation_id) {
+        auto* incoming = find_incoming_operation(operation_id);
+        return incoming != nullptr && incoming->pending_slot_idx < 0;
     }
 
     void complete_demotion(uint64_t operation_id) {

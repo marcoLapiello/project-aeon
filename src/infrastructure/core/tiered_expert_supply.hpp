@@ -63,6 +63,12 @@ public:
         bool is_prefetched{false};
         uint32_t staging_idx{0};
         bool io_pending{false};
+        // The reads have all landed in staging but the copy has not been enqueued.
+        // Two reasons: the blocking path has not run yet, or the operation is
+        // staged-only and no VRAM slot was free (plan P2.5). Either way the bytes are
+        // safe in staging and the copy is retried later, which is what makes the read
+        // leg and the copy leg independently bounded.
+        bool io_complete{false};
         uint64_t io_user_data{0};
         uint32_t io_request_count{0};
         // The tier that answered this request. Carried on the transfer so a
@@ -222,7 +228,8 @@ public:
     PayloadBatch dispatch(
         const std::vector<PayloadRequest>& requests,
         uint64_t current_step,
-        std::vector<uint32_t>& leased_experts
+        std::vector<uint32_t>& leased_experts,
+        bool stage_only = false
     ) {
         PayloadBatch batch;
         batch.transfers.resize(requests.size());
@@ -262,7 +269,7 @@ public:
             ExpertRequestReservation request;
             for (;;) {
                 request = expert_registry_->reserve_request(
-                    expert_id, current_step, demotion_queue_capacity_);
+                    expert_id, current_step, demotion_queue_capacity_, stage_only);
                 if (request.kind != ExpertRequestKind::PENDING) {
                     break;
                 }
@@ -591,7 +598,14 @@ public:
 
             const uint32_t staging_idx = state.staging_idx;
             io_wait_ns_ += elapsed_ns(io_wait_started);
-            enqueue_expert_copy(state, staging_idx);
+            // The blocking path is used where a VRAM slot is guaranteed (the sweep's
+            // `materialize_entry`, after the previous layer released its block), so a
+            // refusal here is a real defect rather than the staged-only deferral.
+            if (!enqueue_expert_copy(state, staging_idx)) {
+                throw std::runtime_error(
+                    "TieredExpertSupply: materialize found no VRAM slot for a staged-only "
+                    "expert — the lookahead over-committed its copy budget");
+            }
         }
     }
 
@@ -599,7 +613,20 @@ public:
     // mark the transfer done. Shared by the blocking `materialize` and the
     // non-blocking `materialize_available` so the two cannot diverge — the copy's
     // stream, its gate event, and the registry record are identical either way.
-    void enqueue_expert_copy(PayloadTransfer& state, uint32_t staging_idx) {
+    //
+    // Returns `false` **without enqueuing** when the operation is staged-only and no
+    // VRAM slot is free: the expert stays in staging and the caller retries later
+    // (plan P2.5 — this is the whole point of decoupling the read leg from the copy
+    // leg; reads are bounded by staging, copies by VRAM).
+    bool enqueue_expert_copy(PayloadTransfer& state, uint32_t staging_idx) {
+        if (state.vram_slot < 0) {
+            // Staged-only: take the destination now, when the copy can actually run.
+            if (expert_registry_->free_vram_slot_count() == 0) {
+                return false;
+            }
+            state.vram_slot = expert_registry_->attach_vram_destination(
+                state.operation_id, demotion_queue_capacity_);
+        }
         const auto h2d_enqueue_started = std::chrono::steady_clock::now();
         prefetch_staging_->complete_io(staging_idx);
         prefetch_staging_->begin_gpu_transfer(staging_idx);
@@ -619,6 +646,8 @@ public:
 
         state.is_prefetched = true;
         state.io_pending = false;
+        state.io_complete = false;
+        return true;
     }
 
     // The **non-blocking** materialize (plan P2.3 / R3): move every completion the CQ
@@ -640,52 +669,61 @@ public:
 
         size_t enqueued = 0;
         for (auto& state : batch.transfers) {
-            if (!state.io_pending) continue;
-
-            // Every chunk present? If not, this expert is still reading; leave it.
-            bool complete = true;
-            for (size_t chunk = 0; chunk < state.io_request_count; ++chunk) {
-                if (direct_io_completions_->find(state.io_user_data + chunk) ==
-                    direct_io_completions_->end()) {
-                    complete = false;
-                    break;
-                }
-            }
-            if (!complete) continue;
-
-            const auto io_wait_started = std::chrono::steady_clock::now();
-            for (size_t chunk = 0; chunk < state.io_request_count; ++chunk) {
-                const uint64_t request_id = state.io_user_data + chunk;
-                auto completion_it = direct_io_completions_->find(request_id);
-                const auto completed_at = std::chrono::steady_clock::now();
-                if (auto* transfer = find_registry_transfer(state.operation_id)) {
-                    if (transfer->io_submitted_at.time_since_epoch().count() != 0) {
-                        transfer->nvme_read_service_ns += static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                completed_at - transfer->io_submitted_at).count());
+            // Phase 1: move this expert's landed reads out of the CQ, once. A read
+            // that is already marked complete skips straight to the copy below.
+            if (state.io_pending) {
+                bool complete = true;
+                for (size_t chunk = 0; chunk < state.io_request_count; ++chunk) {
+                    if (direct_io_completions_->find(state.io_user_data + chunk) ==
+                        direct_io_completions_->end()) {
+                        complete = false;
+                        break;
                     }
                 }
-                const auto completion = completion_it->second;
-                direct_io_completions_->erase(completion_it);
-                if (completion.result < 0) {
-                    mark_registry_request_failed(state.operation_id, "nvme_read_failure");
-                    throw std::runtime_error(
-                        "TieredExpertSupply: direct expert read failed: " +
-                        std::string(strerror(-completion.result)));
+                if (!complete) continue;
+
+                const auto io_wait_started = std::chrono::steady_clock::now();
+                for (size_t chunk = 0; chunk < state.io_request_count; ++chunk) {
+                    const uint64_t request_id = state.io_user_data + chunk;
+                    auto completion_it = direct_io_completions_->find(request_id);
+                    const auto completed_at = std::chrono::steady_clock::now();
+                    if (auto* transfer = find_registry_transfer(state.operation_id)) {
+                        if (transfer->io_submitted_at.time_since_epoch().count() != 0) {
+                            transfer->nvme_read_service_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    completed_at - transfer->io_submitted_at).count());
+                        }
+                    }
+                    const auto completion = completion_it->second;
+                    direct_io_completions_->erase(completion_it);
+                    if (completion.result < 0) {
+                        mark_registry_request_failed(state.operation_id, "nvme_read_failure");
+                        throw std::runtime_error(
+                            "TieredExpertSupply: direct expert read failed: " +
+                            std::string(strerror(-completion.result)));
+                    }
+                    const size_t chunk_offset =
+                        chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
+                    const size_t expected_bytes = std::min(
+                        aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
+                        expert_payload_bytes_ - chunk_offset);
+                    if (completion.result != static_cast<int32_t>(expected_bytes)) {
+                        mark_registry_request_failed(state.operation_id, "nvme_short_read");
+                        throw std::runtime_error(
+                            "TieredExpertSupply: direct expert read returned a short payload");
+                    }
                 }
-                const size_t chunk_offset = chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
-                const size_t expected_bytes = std::min(
-                    aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
-                    expert_payload_bytes_ - chunk_offset);
-                if (completion.result != static_cast<int32_t>(expected_bytes)) {
-                    mark_registry_request_failed(state.operation_id, "nvme_short_read");
-                    throw std::runtime_error(
-                        "TieredExpertSupply: direct expert read returned a short payload");
-                }
+                io_wait_ns_ += elapsed_ns(io_wait_started);
+                state.io_pending = false;
+                state.io_complete = true;
             }
-            io_wait_ns_ += elapsed_ns(io_wait_started);
-            enqueue_expert_copy(state, state.staging_idx);
-            ++enqueued;
+
+            // Phase 2: the copy. A staged-only expert whose VRAM is not free yet is
+            // left `io_complete` and retried on a later call — the deferral that
+            // decouples the copy leg from the read leg (plan P2.5).
+            if (state.io_complete && enqueue_expert_copy(state, state.staging_idx)) {
+                ++enqueued;
+            }
         }
         copies_pumped_ += static_cast<uint64_t>(enqueued);
         return enqueued;

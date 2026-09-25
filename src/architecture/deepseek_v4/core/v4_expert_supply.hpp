@@ -286,7 +286,8 @@ public:
         uint32_t layer,
         const std::vector<uint32_t>& local_expert_ids,
         std::vector<uint32_t>& leased_experts,
-        uint32_t staging_base = 0
+        uint32_t staging_base = 0,
+        bool stage_only = false
     ) {
         if (expert_registry_ == nullptr) {
             throw std::logic_error("V4ExpertSupplyCoordinator: coordinator is not configured");
@@ -304,7 +305,7 @@ public:
             });
         }
         LayerPrefetchState state;
-        state.supply_batch = supply_.dispatch(requests, layer, leased_experts);
+        state.supply_batch = supply_.dispatch(requests, layer, leased_experts, stage_only);
         if (state.supply_batch.transfers.size() != local_expert_ids.size()) {
             throw std::logic_error(
                 "V4ExpertSupplyCoordinator: supply returned an incomplete layer stream");

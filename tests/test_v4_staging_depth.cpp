@@ -148,6 +148,9 @@ int main(int argc, char** argv) {
 
     V4ModelHost host;
     host.initialize(model_dir, runtime, /*verbose=*/false);
+    if (const char* cap = std::getenv("AEON_READ_AHEAD_MAX")) {
+        host.set_sweep_read_ahead_max(static_cast<uint32_t>(std::atoi(cap)));
+    }
     V4Graph graph(host);
 
     const uint32_t per_layer = host.registry().experts_per_layer;

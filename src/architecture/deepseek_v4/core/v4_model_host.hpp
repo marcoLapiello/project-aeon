@@ -805,6 +805,10 @@ public:
     uint32_t sweep_derived_ahead_capacity() const noexcept {
         return prefill_sweep_.derived_lookahead_capacity();
     }
+    // Test instrument: cap the sweep's read lookahead (0 = staging-bounded only).
+    void set_sweep_read_ahead_max(uint32_t max_depth) noexcept {
+        prefill_sweep_.set_read_ahead_max(max_depth);
+    }
 
     // The start of a new sequence. Every layer's ring sentinels, counters and
     // committed-entry positions go back to what a freshly allocated layer holds,
@@ -887,14 +891,20 @@ private:
             : std::max<uint32_t>(1u, staging_slots / experts_per_layer);
         staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
 
-        // The direct reader's submission queue must hold a whole layer's reads at
-        // once: `dispatch()` queues every cold request of a batch before it calls
-        // `submit_pending_reads()` a single time.
+        // The direct reader's ring must hold **every read that can be outstanding at
+        // once**, not one layer's worth. `dispatch()` queues a batch's cold requests
+        // before it submits once, and with the decoupled corridor (plan P2.5) more
+        // than one layer's reads can be in flight simultaneously — bounded by the
+        // staging arena, since a read needs a staging slot. Sizing this to a single
+        // layer while two are outstanding over-subscribes the completion queue (it is
+        // `2 x SQ`); the kernel then cannot post completions and `wait_for_completion`
+        // stalls, which measured as `io_wait 1.7 -> 12.8 s`. So the ring follows the
+        // staging depth.
         size_t batch_requests = direct_requests_per_expert(format) * dedup_ceiling;
         if (runtime_cfg.prefill_sweep) {
             batch_requests = std::max<size_t>(
                 batch_requests,
-                direct_requests_per_expert(format) * static_cast<size_t>(experts_per_layer));
+                direct_requests_per_expert(format) * static_cast<size_t>(staging_slots));
         }
         const uint32_t io_queue_depth = static_cast<uint32_t>(
             std::max<size_t>(64, batch_requests));

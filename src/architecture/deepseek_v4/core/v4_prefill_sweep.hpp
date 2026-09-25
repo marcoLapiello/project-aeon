@@ -328,18 +328,43 @@ public:
     // Resident layers at the moment of the deepest lookahead seen — the width of the
     // sliding window, measured rather than assumed.
     uint32_t frontier_depth() const noexcept { return frontier_depth_; }
-    // How many whole layer-sets the free blocks allow right now — the **derived**
-    // lookahead capacity (plan R5). Reported so a gate can show the depth is a
-    // function of the resources and not a constant.
-    uint32_t derived_lookahead_capacity() const noexcept {
+    // How many layer-sets the **staging** arena can hold in flight right now — the
+    // read leg's bound and the lookahead depth (plan R5/P2.5). Deliberately **not**
+    // derived from VRAM: a read needs only a staging slot, a copy needs a VRAM slot,
+    // so a VRAM-derived read queue would stop reads whenever VRAM filled even though
+    // staging was free. That coupling is what the old `min(free VRAM, free staging)`
+    // encoded; removing it is what lets reads run a layer ahead of copies.
+    uint32_t derived_lookahead_capacity() const noexcept { return read_lookahead_capacity(); }
+
+    // How many layers the staging arena can hold in flight — the read budget. The copy
+    // leg is bounded separately (in the supply, by free VRAM slots), so this is the
+    // only bound on reads.
+    uint32_t read_lookahead_capacity() const noexcept {
         if (registry_ == nullptr || supply_ == nullptr) return 0;
         const uint32_t per_layer = registry_->experts_per_layer;
         if (per_layer == 0) return 0;
-        const uint32_t vram_layers =
-            static_cast<uint32_t>(registry_->free_vram_slot_count()) / per_layer;
+        // **At most `banks - 1`** when there are two or more banks, because a read must
+        // land in a bank no other queued layer holds, and the resident layer's bank is
+        // not a candidate: its bytes are still the source of its copies. With the
+        // staging arena at `2E` that is exactly one layer, which is why a depth of 2
+        // measured as a regression — it let the layer two ahead land in the resident's
+        // bank (`reading 498`, `io_wait 1.7 -> 12.8 s`). A deeper lookahead is therefore
+        // a **larger arena** question, not a scheduling one: `3E` staging admits 2.
+        //
+        // The single-bank case keeps a depth of 1: there the drain is **blocking**
+        // (`deferred_drain_` is false), so the bank is returned before the next
+        // dispatch and reusing it is the legacy, correct behaviour. A bound of 0 would
+        // degenerate the sweep to fully serial loading.
+        const uint32_t bank_bound = staging_banks_ > 1 ? staging_banks_ - 1 : 1;
         const uint32_t staging_layers = supply_->staging_free_slots() / per_layer;
-        return std::min(vram_layers, staging_layers);
+        const uint32_t bound = std::min(staging_layers, bank_bound);
+        return read_ahead_max_ == 0 ? bound : std::min(bound, read_ahead_max_);
     }
+
+    // Cap the read lookahead (0 = only the staging arena bounds it). A **test
+    // instrument**: it lets a gate separate "how deep the reads run" from "what the
+    // pump costs", which are otherwise confounded.
+    void set_read_ahead_max(uint32_t max_depth) noexcept { read_ahead_max_ = max_depth; }
 
 private:
     // One dispatched-ahead layer: its reads are in flight (or landed), in layer order.
@@ -347,17 +372,6 @@ private:
         V4ExpertSupplyCoordinator::LayerPrefetchState state{};
         uint32_t layer{0};
     };
-
-    // How many whole layer-sets both resources can hold at this instant — the
-    // lookahead depth, **derived rather than hardcoded** (plan R5). It is the smaller
-    // of the free VRAM blocks and the free staging blocks, so it grows on a larger
-    // pool, shrinks to 0 when either is exhausted, and degrades to 1 (or the serial
-    // path) on a smaller one.
-    //
-    // VRAM and staging are both counted because they are both required: a layer's set
-    // must have VRAM slots to land in **and** staging slots to be read through, and
-    // the resident layer's bank is already subtracted from the staging free count.
-    // (Public counterpart: `derived_lookahead_capacity()`.)
 
     // Loads the missing experts of one layer and waits for them: the caller's next
     // step is to compute this layer.
@@ -393,7 +407,8 @@ private:
         }
         if (missing.empty()) return false;
 
-        out = supply_->dispatch_layer_stream(layer, missing, leases_, staging_base_for(layer));
+        out = supply_->dispatch_layer_stream(
+            layer, missing, leases_, staging_base_for(layer), /*stage_only=*/true);
         ++layer_loads_;
         experts_streamed_ += missing.size();
         io_ns_ += static_cast<uint64_t>(
@@ -497,7 +512,7 @@ private:
         if (registry_ == nullptr || supply_ == nullptr) return;
         if (from >= registry_->num_layers) return;
 
-        uint32_t budget = derived_lookahead_capacity();
+        uint32_t budget = read_lookahead_capacity();
         if (budget <= ahead_.size()) return;
         budget -= static_cast<uint32_t>(ahead_.size());
 
@@ -510,7 +525,6 @@ private:
                 ++layer;
                 continue;
             }
-            if (registry_->free_vram_slot_count() < per_layer) return;
             LookaheadEntry entry;
             entry.layer = layer;
             if (dispatch_layer_into(layer, entry.state)) {
@@ -567,6 +581,8 @@ private:
     // each boundary (plan R5), so it deepens on a larger pool and empties when either
     // VRAM or staging runs out — it is not a fixed depth.
     std::deque<LookaheadEntry> ahead_;
+    // Test instrument: upper bound on the read lookahead (0 = staging only).
+    uint32_t read_ahead_max_{0};
     // The layer whose reads are settled and whose uploads are ordered behind the
     // compute stream, but whose staging bank is still held: the deferred-drain state.
     // `after_layer` returns it, so the upload overlaps the body instead of fronting it.
