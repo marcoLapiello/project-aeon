@@ -91,8 +91,10 @@
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -189,17 +191,12 @@ public:
     // costs a wait of near zero rather than the full read.
     void before_layer(uint32_t layer) {
         if (!active_) return;
-        if (pending_valid_) {
-            if (pending_layer_ == layer) {
-                materialize_layer();
-            } else {
-                // A *later* layer is in flight (only reachable if the driver skipped
-                // ahead). Flush it so the free-slot accounting stays simple, then load
-                // this one the synchronous way.
-                materialize_layer();
-                ensure_layer(layer);
-            }
+        if (!ahead_.empty() && ahead_.front().layer == layer) {
+            materialize_front();
         } else {
+            // Nothing queued for this layer: either the resource-derived depth did not
+            // reach it, or it is already resident (a preserved resident is skipped by
+            // the lookahead rather than queued). `ensure_layer` is idempotent.
             ensure_layer(layer);
         }
         dispatch_ahead(layer + 1);
@@ -210,19 +207,23 @@ public:
         record_occupancy(layer);
     }
 
-    // The mid-body pump (plan P2.3): enqueue the lookahead layer's copies as its own
+    // The mid-body pump (plan P2.3): enqueue each queued layer's copies as its own
     // reads land, instead of in one block at the next boundary. Called from the
     // executor's per-token hook — the only host activity inside a body — so the
-    // lookahead's VRAM block fills during this layer's body rather than after it.
-    // Non-blocking: experts still being read are simply left for the next call.
+    // lookahead's VRAM blocks fill during this layer's body rather than after it.
+    // Non-blocking, and over **every** queued layer, so a deeper lookahead (P2.4) is
+    // pumped too.
     size_t pump() {
-        if (!active_ || !pending_valid_) return 0;
-        return supply_->pump_layer_prefetch(pending_state_);
+        if (!active_) return 0;
+        size_t pumped = 0;
+        for (auto& entry : ahead_) {
+            pumped += supply_->pump_layer_prefetch(entry.state);
+        }
+        return pumped;
     }
 
-    // Retire layer `layer`. The room it frees is what the layer after `layer + 1`
-    // was waiting for; if the pool was too small to hold two layers the next
-    // dispatch was skipped at `before_layer` and `ensure_layer` picks it up then.
+    // Retire layer `layer`. The room it frees is what the layers after it were waiting
+    // for; the lookahead is re-derived at the next `before_layer`.
     //
     // The staging bank is returned **here**, not at the layer's own `before_layer`.
     // The driver synchronizes the compute stream at this boundary (Step 0 D3), so the
@@ -231,6 +232,7 @@ public:
     // `reap_registry_transfers` is what promotes the layer's completed uploads out of
     // `PROMOTION_PENDING` before `release_layer` refuses a live transfer.
     void after_layer(uint32_t layer) {
+        if (!active_) return;
         // The resident bank belongs to the layer being retired: the driver calls
         // `before_layer(L)` then `after_layer(L)`, so a mismatch is a driver defect and
         // is refused rather than silently reclaiming the wrong bank.
@@ -254,16 +256,16 @@ public:
     // Leave the mode. Hot must be empty, which the per-layer release guarantees.
     void end() {
         if (!active_) return;
-        // Defensive: a pending dispatch would leave a transfer in flight, and
-        // `end_prefill_stream` refuses that. The driver never leaves one (it only ever
-        // dispatches `layer + 1`, and there is no layer 43), so this is a guard rather
-        // than a path — but completing it beats throwing out of a teardown.
-        if (pending_valid_) {
-            const uint32_t layer = pending_layer_;
-            materialize_layer();
+        // Settle and retire every queued layer. The driver has synchronized, so the
+        // reads and copies are done and this is quick; a leftover would leave a
+        // transfer in flight and `end_prefill_stream` refuses one.
+        while (!ahead_.empty()) {
+            LookaheadEntry entry = std::move(ahead_.front());
+            ahead_.pop_front();
+            materialize_entry(entry);
             reclaim_resident_staging();
             supply_->reap_registry_transfers();
-            registry_->release_layer(layer);
+            registry_->release_layer(entry.layer);
         }
         reclaim_resident_staging();
         active_ = false;
@@ -281,10 +283,13 @@ public:
         uint32_t staging_free{0};
         uint32_t staging_reading{0};
         uint32_t staging_copying{0};
-        // Experts whose VRAM slots are **reserved for the lookahead layer** at this
+        // Experts whose VRAM slots are **reserved for the lookahead layers** at this
         // instant. These are outstanding: the block is held but its bytes have not
         // all arrived, which is the "reserved-but-empty" figure.
         uint32_t vram_reserved_ahead{0};
+        // The lookahead length the free blocks allowed at this sample — derived, not
+        // fixed (R5). Zero means a resource was exhausted.
+        uint32_t derived_capacity{0};
     };
 
     const std::vector<BlockOccupancy>& occupancy_samples() const noexcept {
@@ -312,8 +317,37 @@ public:
     // Resident layers at the moment of the deepest lookahead seen — the width of the
     // sliding window, measured rather than assumed.
     uint32_t frontier_depth() const noexcept { return frontier_depth_; }
+    // How many whole layer-sets the free blocks allow right now — the **derived**
+    // lookahead capacity (plan R5). Reported so a gate can show the depth is a
+    // function of the resources and not a constant.
+    uint32_t derived_lookahead_capacity() const noexcept {
+        if (registry_ == nullptr || supply_ == nullptr) return 0;
+        const uint32_t per_layer = registry_->experts_per_layer;
+        if (per_layer == 0) return 0;
+        const uint32_t vram_layers =
+            static_cast<uint32_t>(registry_->free_vram_slot_count()) / per_layer;
+        const uint32_t staging_layers = supply_->staging_free_slots() / per_layer;
+        return std::min(vram_layers, staging_layers);
+    }
 
 private:
+    // One dispatched-ahead layer: its reads are in flight (or landed), in layer order.
+    struct LookaheadEntry {
+        V4ExpertSupplyCoordinator::LayerPrefetchState state{};
+        uint32_t layer{0};
+    };
+
+    // How many whole layer-sets both resources can hold at this instant — the
+    // lookahead depth, **derived rather than hardcoded** (plan R5). It is the smaller
+    // of the free VRAM blocks and the free staging blocks, so it grows on a larger
+    // pool, shrinks to 0 when either is exhausted, and degrades to 1 (or the serial
+    // path) on a smaller one.
+    //
+    // VRAM and staging are both counted because they are both required: a layer's set
+    // must have VRAM slots to land in **and** staging slots to be read through, and
+    // the resident layer's bank is already subtracted from the staging free count.
+    // (Public counterpart: `derived_lookahead_capacity()`.)
+
     // Loads the missing experts of one layer and waits for them: the caller's next
     // step is to compute this layer.
     void ensure_layer(uint32_t layer) {
@@ -327,13 +361,16 @@ private:
                 std::to_string(registry_->free_vram_slot_count()) +
                 " are free — the lookahead must not outrun the release order");
         }
-        dispatch_layer(layer);
-        materialize_layer();
+        LookaheadEntry entry;
+        entry.layer = layer;
+        if (!dispatch_layer_into(layer, entry.state)) return;
+        materialize_entry(entry);
     }
 
     // Issue one layer's reads and return without waiting. The bytes are in flight
-    // when this returns; nothing is resident yet.
-    void dispatch_layer(uint32_t layer) {
+    // when this returns; nothing is resident yet. Returns `false` when the layer has
+    // nothing missing (so the caller does not queue an empty entry).
+    bool dispatch_layer_into(uint32_t layer, V4ExpertSupplyCoordinator::LayerPrefetchState& out) {
         const auto started = std::chrono::steady_clock::now();
         supply_->reap_registry_transfers();
         std::vector<uint32_t> missing;
@@ -343,25 +380,29 @@ private:
                 missing.push_back(expert);
             }
         }
-        if (missing.empty()) {
-            pending_valid_ = false;
-            return;
-        }
+        if (missing.empty()) return false;
 
-        pending_state_ = supply_->dispatch_layer_stream(
-            layer, missing, leases_, staging_base_for(layer));
-        pending_layer_ = layer;
-        pending_valid_ = true;
+        out = supply_->dispatch_layer_stream(layer, missing, leases_, staging_base_for(layer));
         ++layer_loads_;
         experts_streamed_ += missing.size();
         io_ns_ += static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - started).count());
+        return true;
     }
 
-    // Wait for the dispatched layer's reads, leave its uploads in flight, and hold the
-    // batch resident. With the double buffer engaged the wait is short by construction:
-    // the reads were issued one layer's compute ago.
+    // Settle the queue's front: wait its reads, hold its bank (or drain it when there
+    // is only one bank), and make it the resident layer.
+    void materialize_front() {
+        if (ahead_.empty()) return;
+        LookaheadEntry entry = std::move(ahead_.front());
+        ahead_.pop_front();
+        materialize_entry(entry);
+    }
+
+    // Wait for `entry`'s reads, leave its uploads in flight, and hold the batch
+    // resident. With the double buffer engaged the wait is short by construction: the
+    // reads were issued one or more layers' compute ago.
     //
     // With a deferred drain the host does **not** order the compute stream here, so the
     // body may launch while the copies are still in flight and the slots are held until
@@ -369,22 +410,20 @@ private:
     // the copy in front of the attention and router it is meant to hide behind, which
     // recovers nothing at all. With one bank there is no room to hold the copies
     // through the body, so the drain is the blocking one, as before.
-    void materialize_layer() {
-        if (!pending_valid_) return;
+    void materialize_entry(LookaheadEntry& entry) {
         // Reap before the defensive reclaim, for the same reason as `after_layer`: a
         // slot whose copy has already landed is freed by its own completion event.
         supply_->reap_registry_transfers();
-        // Defensive: only the mismatch path can find a resident still held here (the
-        // normal flow returns it in `after_layer`), but returning it beats leaking a
-        // bank.
+        // Defensive: the normal flow returns the previous bank in `after_layer`, but
+        // returning it here beats leaking one.
         reclaim_resident_staging();
         const auto started = std::chrono::steady_clock::now();
-        supply_->materialize_layer_prefetch(pending_state_);
+        supply_->materialize_layer_prefetch(entry.state);
         if (!deferred_drain_) {
             // One bank: no room to hold the copies through the body, so the drain is
             // the blocking one and the slots are returned before the next dispatch —
             // the pre-Phase-1 shape.
-            supply_->finish_streamed_batch(pending_state_);
+            supply_->finish_streamed_batch(entry.state);
         }
         // With a deferred drain nothing more is done here: the copies stay in flight
         // and **nothing** is ordered on the compute stream. Ordering is the consumer's:
@@ -406,11 +445,10 @@ private:
         }
         leases_.clear();
         if (deferred_drain_) {
-            resident_state_ = std::move(pending_state_);
-            resident_layer_ = pending_layer_;
+            resident_state_ = std::move(entry.state);
+            resident_layer_ = entry.layer;
             resident_valid_ = true;
         }
-        pending_valid_ = false;
         update_frontier();
     }
 
@@ -437,19 +475,40 @@ private:
         return (layer % staging_banks_) * registry_->experts_per_layer;
     }
 
-    // Start the next layer's reads if the pool can hold them alongside the current
-    // one. When it cannot, this is a no-op and `ensure_layer` loads that layer
-    // synchronously at its own boundary — the strategy degrades to the serial form
-    // rather than failing.
-    void dispatch_ahead(uint32_t layer) {
-        if (pending_valid_) return;
-        if (layer >= registry_->num_layers) return;
-        const uint32_t per_layer = registry_->experts_per_layer;
-        const uint32_t resident = registry_->layer_resident_count(layer);
-        if (resident == per_layer) return;
-        if (registry_->free_vram_slot_count() < per_layer - resident) return;
-        dispatch_layer(layer);
-        lookahead_depth_ = pending_valid_ ? 1u : 0u;
+    // Queue the next layers' reads, as many as the **derived** capacity allows. The
+    // capacity is recomputed each call rather than held as a constant, so the queue
+    // length is a function of the free blocks at this boundary and nothing else.
+    //
+    // `from` is where the caller believes the lookahead should start; the queue may
+    // already hold layers beyond it, in which case dispatching resumes after the
+    // queue's tail so nothing is dispatched twice.
+    void dispatch_ahead(uint32_t from) {
+        if (registry_ == nullptr || supply_ == nullptr) return;
+        if (from >= registry_->num_layers) return;
+
+        uint32_t budget = derived_lookahead_capacity();
+        if (budget <= ahead_.size()) return;
+        budget -= static_cast<uint32_t>(ahead_.size());
+
+        uint32_t layer = ahead_.empty() ? from : std::max(from, ahead_.back().layer + 1);
+        while (budget > 0 && layer < registry_->num_layers) {
+            const uint32_t per_layer = registry_->experts_per_layer;
+            if (registry_->layer_resident_count(layer) == per_layer) {
+                // Already resident (a preserved resident): it costs nothing and must
+                // not consume the budget, but it is not a lookahead entry either.
+                ++layer;
+                continue;
+            }
+            if (registry_->free_vram_slot_count() < per_layer) return;
+            LookaheadEntry entry;
+            entry.layer = layer;
+            if (dispatch_layer_into(layer, entry.state)) {
+                ahead_.push_back(std::move(entry));
+                --budget;
+            }
+            ++layer;
+        }
+        lookahead_depth_ = static_cast<uint32_t>(ahead_.size());
     }
 
     void update_frontier() {
@@ -458,7 +517,8 @@ private:
         for (uint32_t layer = 0; layer < layers; ++layer) {
             if (registry_->layer_resident_count(layer) != 0) ++resident_layers;
         }
-        if (pending_valid_) ++resident_layers;
+        // The queued layers are resident by reservation even before their bytes land.
+        if (!ahead_.empty()) ++resident_layers;
         frontier_depth_ = std::max(frontier_depth_, resident_layers);
     }
 
@@ -471,20 +531,22 @@ private:
         sample.staging_free = counts.free;
         sample.staging_reading = counts.reading;
         sample.staging_copying = counts.copying;
-        sample.vram_reserved_ahead = pending_valid_
-            ? static_cast<uint32_t>(pending_state_.expert_count())
-            : 0u;
+        sample.vram_reserved_ahead = 0;
+        for (const auto& entry : ahead_) {
+            sample.vram_reserved_ahead += static_cast<uint32_t>(entry.state.expert_count());
+        }
+        sample.derived_capacity = derived_lookahead_capacity();
         occupancy_samples_.push_back(sample);
     }
 
     V4ExpertSupplyCoordinator* supply_{nullptr};
     ExpertRegistry* registry_{nullptr};
     bool active_{false};
-    // The one layer whose reads are in flight, if any. A single slot and not a queue:
-    // the driver visits layers strictly in order, so at most one layer is ever ahead.
-    V4ExpertSupplyCoordinator::LayerPrefetchState pending_state_{};
-    uint32_t pending_layer_{0};
-    bool pending_valid_{false};
+    // The lookahead queue: layers whose reads have been dispatched and whose bytes are
+    // on their way, in layer order. Its length is **derived from the free blocks** at
+    // each boundary (plan R5), so it deepens on a larger pool and empties when either
+    // VRAM or staging runs out — it is not a fixed depth.
+    std::deque<LookaheadEntry> ahead_;
     // The layer whose reads are settled and whose uploads are ordered behind the
     // compute stream, but whose staging bank is still held: the deferred-drain state.
     // `after_layer` returns it, so the upload overlaps the body instead of fronting it.

@@ -799,6 +799,12 @@ public:
     uint32_t sweep_lookahead_depth() const noexcept {
         return prefill_sweep_.lookahead_depth();
     }
+    // The lookahead length the **free blocks** allow at this instant (plan R5) — the
+    // smaller of the free VRAM blocks and the free staging blocks. Derived, not
+    // configured: it grows on a larger pool and shrinks to 0 when either runs out.
+    uint32_t sweep_derived_ahead_capacity() const noexcept {
+        return prefill_sweep_.derived_lookahead_capacity();
+    }
 
     // The start of a new sequence. Every layer's ring sentinels, counters and
     // committed-entry positions go back to what a freshly allocated layer holds,

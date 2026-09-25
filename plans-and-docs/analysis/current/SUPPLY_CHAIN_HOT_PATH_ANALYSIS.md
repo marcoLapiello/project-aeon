@@ -584,3 +584,53 @@ This is the first step that **weakens the depth-vs-algorithm coupling** rather t
 
 - The residual `5.5%` is the `2E`-only cross-layer overlap: at `2E`, `L`'s copy and `L+1`'s read are in flight together, which one block cannot do. P2.4 (lookahead from free blocks) is what could close it, by deriving the depth so the two-room shape is reached from the pool rather than chosen by the arena size.
 - `< E` is still not reached, and the blocker is unchanged: reads are still submitted as **one wave of `E`**. Pacing them needs the same per-token pump pointed at submission rather than completion — a natural extension now that the hook exists.
+
+---
+
+## 15. Measured — the derived lookahead, and Gate A passing (2026-09-25)
+
+*Status: **measured, and the portability gate now passes.** Plan step P2.4, with a finding that bears on the memory cost.*
+
+### 15.1 What was added
+
+- **The lookahead is a queue, and its length is computed.** `std::deque<LookaheadEntry> ahead_` replaces the single `pending_state_`; `derived_lookahead_capacity()` returns
+  `min(free VRAM blocks, free staging blocks)` — recomputed at every boundary. `dispatch_ahead` fills the queue up to that budget, `pump` drains **every** queued layer, and `before_layer` materializes the front.
+- **Both resources are counted, and both are required.** A layer's set needs VRAM slots to land in *and* staging slots to be read through, so a depth derived from VRAM alone would over-commit the arena. The resident layer's bank is already excluded from the staging free count, which is what keeps the two consistent.
+- **A resident layer is skipped without consuming budget** — the case where a preserved resident means the lookahead must jump over a layer rather than queue it.
+
+Also fixed here: `after_layer` had lost its `!active_` guard in the P2.3 edit — restored.
+
+### 15.2 Results
+
+Same gate, one swept window, `N = 256`, 43 layers:
+
+| depth | banks | wall_s (P2.3 → P2.4) | drain_s | derived depth | overlapped |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 1 | 32.204 → **31.869** | 1.613 → 1.266 | **1** | 0/43 |
+| 384 | 1 | 32.350 → **31.988** | 1.827 → 1.239 | **1** | 0/43 |
+| 512 | 2 | 30.654 → **31.112** | 0.000 → 0.000 | **1** | 41/43 |
+
+**Gate A: `1.131× → 1.028×` (and `1.032×` on a repeat run) — PASSES** the 5% tolerance. Before Phase 2 the spread was `1.144×`.
+
+### 15.3 What it establishes
+
+1. **The depth is now derived, and it evaluates to `1` here — correctly.** ~`285` preserved residents leave `512` of `797` slots, i.e. two layers, i.e. one ahead of the one computing. The number is no longer written down; it is what the resources allow, and it would grow on a larger pool.
+2. **Gate A's algorithm step is gone.** The `1E` and `2E` shapes now derive the *same* depth and run within `2.5%` of each other, where the pre-Phase-2 gap was `13%`. The size no longer selects a different algorithm — which is exactly R6's target, and it was reached by moving the work rather than by removing the need for a second room.
+
+### 15.4 Finding: the second staging bank no longer appears to buy throughput
+
+This is the important consequence, and it is **tentative**:
+
+| | `1E` | `2E` |
+| :--- | ---: | ---: |
+| wall (`N=256`) | `31.90 s` | `31.11 s` |
+| gap | — | **`2.5%`** |
+| corridor fill (read ∥ copy) | `0/43` | `41/43` |
+
+The bank still changes the **shape** (`2E` overlaps in separate slots, `1E` cannot) but no longer the **speed**, because P2.3's within-body pump gives `1E` the same effective overlap — each expert's copy runs as its own read lands, during the previous body. So the `+3.44 GiB` of pinned memory that P2.1 made unconditional may now be **removable**: reverting the default to `1E` would recover it and answer the [host-memory pressure investigation](HOST_MEMORY_PRESSURE_INVESTIGATION.md).
+
+**Not a conclusion yet.** It is one window length at Warm 0. Before acting it must be re-tested at larger `N` and with a Warm tier, because a longer body changes the read/copy balance and Warm changes where the bytes come from. Until then `2E` stays the default.
+
+### 15.5 Remaining Phase-2 item
+
+`< E` is still not reached: reads are submitted as **one wave of `E`**, so the arena cannot go below one layer's worth of slots. Pacing the submission (issue each read as a slot frees) is the remaining step, and it now has the per-token hook it needs — the same pump, pointed at submission rather than completion.

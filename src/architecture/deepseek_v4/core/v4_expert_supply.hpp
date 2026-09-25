@@ -351,6 +351,12 @@ public:
 
     uint32_t staging_in_use_slots() const noexcept { return supply_.staging_in_use_slots(); }
 
+    // Free staging slots — the resource the sweep's lookahead depth is derived from
+    // (plan R5), alongside the registry's free VRAM slots.
+    uint32_t staging_free_slots() const {
+        return supply_.staging_state_counts().free;
+    }
+
     void mark_gpu_readiness_wait_start(uint64_t operation_id) {
         supply_.mark_gpu_readiness_wait_start(operation_id);
     }

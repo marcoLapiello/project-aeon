@@ -131,26 +131,31 @@ Implements the §0 spec. Each step is independently verifiable and independently
 | **Result** | `1E`: `34.896 → 32.204 s` (`drain 4.708 → 1.613 s`); `384`: `35.027 → 32.350 s`; `2E`: `30.913 → 30.654 s` (already overlapped, so neutral). **Gate A spread `1.133× → 1.055×`.** |
 | **Why `1E` gained** | With the pump, `L+1`'s copies run **during `body(L)`** as its reads land, and P2.2's completion release frees the slots immediately — so even one staging block now pipelines read→copy within a body. The boundary drain shrinks to the residue (`1.6 s` of `4.7 s`). |
 
-### P2.4 — Derive the lookahead from free blocks
+### P2.4 — Derive the lookahead from free blocks — ✅ **done**
 
 | | |
 | :--- | :--- |
+| **Status** | ✅ **shipped 2026-09-25.** The single-slot lookahead is replaced by a queue whose depth is computed. **Gate A now PASSES** (`1.028×`, `1.032×` over two runs). |
 | **Fixes** | The hardcoded one-layer lookahead (`pending_valid_`/`resident_valid_`). |
-| **Where** | `v4_prefill_sweep.hpp` — `dispatch_ahead` / `before_layer` |
-| **Change** | Replace the single pending/resident pair with a queue sized by **how many blocks are free**, up to the VRAM frontier. Depth becomes dynamic. |
-| **Requirement** | R5. The depth is computed at runtime from free blocks; no constant. |
-| **Requirement** | R3. A layer enters the queue when a block frees, not on a fixed schedule. |
-| **Verify** | Scenario 1 reaches the §0.2 steady state (`L+1` in VRAM while `L` computes); byte-exactness gates; no SQ-full throw (ring check). |
+| **Where** | `v4_prefill_sweep.hpp` (`LookaheadEntry`, `std::deque ahead_`, `derived_lookahead_capacity()`, `dispatch_ahead`, `materialize_entry`/`materialize_front`, `pump`); `v4_expert_supply.hpp` (`staging_free_slots()`); `v4_model_host.hpp` (`sweep_derived_ahead_capacity()`) |
+| **Change** | The lookahead is a **queue**, and its length is `min(free VRAM blocks, free staging blocks)` recomputed at every boundary. `dispatch_ahead` fills it up to that budget; `pump` drains **every** queued layer; `before_layer` materializes the front. A layer that is already resident (a preserved resident) is skipped without consuming budget. |
+| **Requirement** | R5 ✅ Depth is a function of the free blocks at this instant; no constant. |
+| **Requirement** | R3 ✅ A layer enters the queue when a block frees, not on a schedule. |
+| **Verify** | ✅ Byte-exactness gates (`16`/`18`/`10`/`38`), token unchanged; **Gate A passes**; Gates B and C hold. |
+| **Result** | Spread `1.131× → 1.028×` (and `1.032×` on a repeat). `1E` `32.204 → 31.869 s`, `2E` `30.654 → 31.112 s`. Derived depth reports **`1`** in both — computed from the resources, which is what they allow here (~285 preserved residents leave 512 of 797 slots → 2 layers). |
 
-### P2.5 — The portability gates must pass *(acceptance)*
+> **Implication to test before anything is reverted.** With P2.2+P2.3+P2.4, `1E` and `2E` now run **within ~2.5% of each other** (`31.9` vs `31.1 s`), whereas before Phase 2 the gap was `13%`. The derived depth is `1` in both configurations, and the wall times have converged — so **the second staging bank no longer appears to buy throughput.** If that holds at larger `N` and with Warm, then P2.1's `2E` default can go back to `1E` and recover the `+3.44 GiB` of pinned memory, which is what the [host-memory pressure investigation](../../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) wants. **Not yet verified at those shapes — it is the next measurement, not a conclusion.** Note also that `2E` still shows the corridor fill (`41/43` overlapped) while `1E` shows `0/43`, so the bank still changes the *shape*; what it no longer changes is the *speed*.
+
+### P2.5 — The portability gates must pass *(acceptance)* — ✅ **A passes, B/C hold**
 
 | | |
 | :--- | :--- |
 | **Where** | `tests/test_v4_staging_depth.cpp` |
-| **Gate A** | ❌ fails today, but **much closer**: spread `1.055×` (was `1.144×` before P2.3). **Target:** flat across a wide depth range. **Reaching `< E` is a hypothesis** (R6's gradient), not a committed outcome — the blocker is paced reads. |
-| **Gate B** | ✅ passes today. **Must keep passing.** |
-| **Gate C** | ✅ **added with P2.1**, passes: the default `2E` shape shows `42/43` layer-bodies with a read and a copy in flight at once; `1E` shows `0/43`. |
-| **Command** | `./build/bin/test_v4_staging_depth` (default `64 128 192 256 384 512`) |
+| **Gate A** | ✅ **passes** (`1.028×`/`1.032×`). Was `1.144×` before Phase 2. **`< E` is still not reached** — reads are submitted as one wave of `E`, so the floor is unchanged; pacing them is the remaining item. |
+| **Gate B** | ✅ passes — identical work at every depth. |
+| **Gate C** | ✅ passes — `2E` overlaps (`41/43`), reduced depths do not. |
+| **Command** | `./build/bin/test_v4_staging_depth` (defaults `64 128 192 256 384 512`) |
+| **Follow-up** | Re-test the `1E`/`2E` gap at larger `N` and with Warm; if it stays ~0, revert P2.1's `2E` default to `1E` and recover `3.44 GiB`. |
 
 ---
 
@@ -196,8 +201,9 @@ Phase 2  MANDATORY — the corridor becomes a demand-driven pipeline
    │   P2.1  ✅ DONE  arena is 2E unconditionally + corridor-fill readout (Gate C)
    │   P2.2  ✅ DONE  release each staging slot on its copy event (R3); no throughput change alone
    │   P2.3  ✅ DONE  copy into VRAM as each read lands, pumped per token (R1/R3): −2.7 s at 1E
-   │   P2.4  lookahead derived from free blocks                          (R5)  ← next
-   │   P2.5  gates: A must pass over a wide range incl. < E; B/C must hold
+   │   P2.4  ✅ DONE  lookahead derived from free blocks (R5); Gate A now passes (1.03x)
+   │   P2.5  ✅ A passes, B/C hold; next: test the 1E/2E gap at larger N and with Warm
+   │          (if the gap stays ~0, revert 2E -> 1E and recover 3.44 GiB)
    │   └─ ABORT if any step cannot hold byte-exactness → keep it opt-in, record negative
    ▼
 Phase 3  optional, independent (dispatch bookkeeping)
@@ -228,8 +234,9 @@ At each gate: **update the analysis doc**, then commit. Never start the next ste
 - **Phase 1:** ✅ `h2d_drain → ≈0`, `wall_s` down `3.2–4.5 s` at Warm 0 and Warm 30, byte-exact. **Caveat:** needs `banks = 2` (`+3.44 GiB` pinned) → **opt-in** until Phase 2.
 - **Phase 2:** the §0 spec holds — R1–R8 met, with:
   - **R2:** ✅ the arena is `2E` in both scenarios (scenario 2 has overlap); the knob is gone.
-  - **R5:** lookahead derived from free blocks, no constant.
-  - **Gate A** flat across a **wide** depth range; **`< E` is a hypothesis** (blocked by paced reads + the park), so treat `E` as the first real target and `< E` as the stretch goal. **Gate B and Gate C** must hold.
+  - **R5:** ✅ lookahead derived from free blocks (a queue of `min(free VRAM, free staging)` layers).
+  - **Gate A** ✅ passes (`1.03×`); **Gate B** and **Gate C** hold. **`< E` remains open** (the read wave).
+  - ✅ the Phase 1 win survives (`drain → 0`, `wall` down); pinned cost still `2E` — **possibly reducible to `1E`**, see P2.4's implication.
   - the Phase 1 win (`h2d_drain → ≈0`, `wall` down) survives; pinned cost fits the production Warm shape.
 - **Phase 3 (if done):** `disp_ms` down in both tables, no behaviour change.
 - **Throughout:** no regression in decode or the routed bank; measurements reproducible from `scripts/supply_split.sh` and `./build/bin/test_v4_staging_depth`; **one heavy process at a time**.
