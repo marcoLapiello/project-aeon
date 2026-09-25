@@ -52,6 +52,7 @@ namespace {
 
 using aeon::core::V4Graph;
 using aeon::core::V4ModelHost;
+using aeon::core::V4PrefillSweep;
 using aeon::core::V4Sampler;
 using aeon::core::V4SamplerConfig;
 using Clock = std::chrono::steady_clock;
@@ -119,6 +120,8 @@ struct Row {
     uint32_t ahead_count{0};
     uint32_t hot_preserved{0};
     uint32_t sample_layer{0};
+    // The full per-layer sample set, kept for the optional corridor trace.
+    std::vector<V4PrefillSweep::BlockOccupancy> samples;
 };
 
 } // namespace
@@ -219,6 +222,7 @@ int main(int argc, char** argv) {
         // staging block while a copy drains another — the pipeline working. One block
         // pinned at `E` with the other at zero is the parking lot.
         const uint32_t mid_layer = host.num_layers() / 2;
+        row.samples = host.sweep_occupancy();
         for (const auto& sample : host.sweep_occupancy()) {
             ++row.layers_sampled;
             if (sample.staging_reading > 0 && sample.staging_copying > 0) {
@@ -348,6 +352,27 @@ int main(int argc, char** argv) {
                  (is_default ? " (default 2E) overlaps" : " (reduced depth)")).c_str(),
                 !is_default || r->layers_overlapped > 0, detail);
         }
+    }
+
+    // ---- Per-layer trace of the corridor, for the depth that matters --------
+    // The summary hides the question the user asks: are **both** staging halves in
+    // use, or only one? A per-half magnitude trace answers it directly.
+    if (const char* trace = std::getenv("AEON_TRACE_LAYERS")) {
+        const uint32_t want = static_cast<uint32_t>(std::atoi(trace));
+        std::printf("%s\n", std::string(104, '=').c_str());
+        std::printf("  PER-LAYER CORRIDOR TRACE (depth %u)\n", want);
+        std::printf("%s\n", std::string(104, '=').c_str());
+        std::printf("%-6s %-6s %-9s %-9s %-9s %-10s\n",
+                    "layer", "ahead", "reading", "copying", "stg_free", "vram_free");
+        for (const Row& r : rows) {
+            if (!r.ran || r.depth != want) continue;
+            for (const auto& s : r.samples) {
+                std::printf("%-6u %-6u %-9u %-9u %-9u %-10u\n",
+                            s.layer, s.ahead_count, s.staging_reading,
+                            s.staging_copying, s.staging_free, s.vram_free_slots);
+            }
+        }
+        std::printf("\n");
     }
 
     // ---- The derived depth, broken into its components -----------------------
