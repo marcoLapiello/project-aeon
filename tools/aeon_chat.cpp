@@ -72,6 +72,7 @@ struct Options {
     uint32_t prefill_window{4096};
     uint32_t prefill_chunk{64};
     uint32_t prefill_sweep_min_tokens{0};
+    uint32_t staging_blocks{2};
 };
 
 void print_usage(const char* executable) {
@@ -98,6 +99,10 @@ void print_usage(const char* executable) {
         << "  --demotion-queue <n>     Demotion-queue capacity (0 = derived from warm refill)\n"
         << "  --prefill-window <n>     Layer-major prefill window W in tokens (0 = the whole prompt)\n"
         << "  --prefill-chunk <n>      Body chunk C in tokens, 1..64 (default: 64)\n"
+        << "  --staging-blocks <n>     Swept-prefill staging arena in layer-blocks, 1.. (default: 2).\n"
+        << "                           A memory budget: each block is E x payload bytes of pinned\n"
+        << "                           host RAM (3.44 GiB at E=256), and the prefetch depth is\n"
+        << "                           derived from it. Does not change throughput.\n"
         << "  --prefill-sweep-min-tokens <n>\n"
         << "                           Prompt length at or above which the sweep supplies\n"
         << "                           experts; below it, the routed cache (0 = 3E/4)\n"
@@ -209,6 +214,9 @@ Options parse_options(int argc, char** argv) {
             options.prefill_sweep_min_tokens = static_cast<uint32_t>(parse_unsigned(
                 require_value(argc, argv, index, "--prefill-sweep-min-tokens"),
                 "--prefill-sweep-min-tokens"));
+        } else if (argument == "--staging-blocks") {
+            options.staging_blocks = static_cast<uint32_t>(parse_unsigned(
+                require_value(argc, argv, index, "--staging-blocks"), "--staging-blocks"));
         } else if (argument == "--profile-routing") {
             options.profile_routing = true;
         } else if (argument == "--validate-registry") {
@@ -341,6 +349,7 @@ int main(int argc, char** argv) {
         engine_options.runtime.prefill_window = options.prefill_window;
         engine_options.runtime.prefill_chunk = options.prefill_chunk;
         engine_options.runtime.prefill_sweep_min_tokens = options.prefill_sweep_min_tokens;
+        engine_options.runtime.prefill_sweep_staging_blocks = options.staging_blocks;
 
         aeon::core::V4Engine engine;
         engine.initialize(engine_options);

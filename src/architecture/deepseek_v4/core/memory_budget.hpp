@@ -189,21 +189,25 @@ struct AeonRuntimeConfig {
     // forbids.
     uint32_t prefill_sweep_min_tokens{0};
 
-    // The layer-sized staging **banks** the arena holds when `prefill_sweep` is on
-    // are always **two** (`2E`); there is deliberately no knob. The count is not a
-    // tuning figure: at `1E` the arena is one room and the pipeline is serial across
-    // layers (`read(L) -> copy(L) -> drain -> read(L+1)`), at `2E` it is two rooms and
-    // `L`'s copy overlaps `L+1`'s read. A configurable depth would therefore let a
-    // *resource* select the *algorithm*, which is exactly what the supply-chain
-    // hot-path plan's R6 forbids. The depth is a budget a caller changes at runtime
-    // through `V4ModelHost::resize_staging_slots` (for the A/B and the sensitivity
-    // gate), never a behaviour switch.
+    // The layer-sized staging **banks** the sweep's arena holds when `prefill_sweep`
+    // is on, in units of one layer's payloads (`E`). **A memory budget, not a tuning
+    // figure**: the prefetch depth is *derived* from the arena (`blanks - 1` blocks of
+    // free staging, bounded to one read wave at a time), so the count decides how much
+    // pinned host memory the corridor spends and nothing else. Measured across `2E…
+    // 6E`: `29.83–30.39 s`, Gate A spread `1.009x`, `42/43` layer-bodies overlapped at
+    // every size (SUPPLY_CHAIN_HOT_PATH_ANALYSIS §17.4).
     //
-    // The cost is real and reported: `2E` is `6.75 GiB` of non-reclaimable pinned
-    // host memory at `E = 256` (`3.44 GiB` more than `1E`). At the production Warm
-    // shape that is tight — Warm is itself pinned — and the budget check does not
-    // model it (see the host-memory pressure investigation). Making `2E` cheaper is
-    // the remaining work of the plan's Phase 2, not a reason to keep the knob.
+    // This is why the knob is legitimate where an earlier revision removed it: the
+    // objection then was that depth selected the *algorithm* (Gate A failed at
+    // `1.38x`, `1E` ran a serial read/copy pipeline). It does not any more, so the
+    // arena can be sized from the host's remaining RAM, which is exactly what a
+    // portability knob should express.
+    //
+    // `1` is the minimum and is supported (a single bank, the blocking drain); below
+    // one layer the swept dispatch cannot bind a whole layer's set, so smaller values
+    // are refused at load. Each block is `E x payload_bytes` of **non-reclaimable
+    // pinned** host memory — `3.44 GiB` per block at `E = 256`.
+    uint32_t prefill_sweep_staging_blocks{2};
 
     // Hardware target device index
     int device_id{0};
@@ -216,15 +220,17 @@ struct AeonRuntimeConfig {
 //
 //   * decode/a-chunk's deduplicated distinct set, at most the layer width (`6C`
 //     capped by `E`), with `TOTAL_STAGING_SLOTS` as the floor; and
-//   * when the sweep is on, **two layer-blocks** — one is the read destination and
-//     one is the copy source (see `AeonRuntimeConfig::prefill_sweep`).
+//   * when the sweep is on, `prefill_sweep_staging_blocks` layer-blocks — at least
+//     one to bind a whole layer's set, and by default two so one bank is the read
+//     destination and one the copy source (see `AeonRuntimeConfig::prefill_sweep`).
 inline uint32_t staging_slot_count(const AeonRuntimeConfig& cfg, uint32_t experts_per_layer) {
     const uint32_t chunk_ceiling = std::min<uint32_t>(
         6u * std::max<uint32_t>(1, cfg.prefill_chunk), experts_per_layer);
     const uint32_t base = std::max<uint32_t>(
         PrefetchStagingArena::TOTAL_STAGING_SLOTS, chunk_ceiling);
     if (!cfg.prefill_sweep) return base;
-    return std::max<uint32_t>(base, 2u * experts_per_layer);
+    const uint32_t blocks = std::max<uint32_t>(1, cfg.prefill_sweep_staging_blocks);
+    return std::max<uint32_t>(base, blocks * experts_per_layer);
 }
 
 struct MemoryBudgetReport {
