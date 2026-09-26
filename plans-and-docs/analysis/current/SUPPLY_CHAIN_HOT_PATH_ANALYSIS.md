@@ -825,3 +825,57 @@ The window is also slightly **faster** than the depth-1 configuration it replace
 2. **Do not increase the arena for speed.** `2E … 6E` are the same within `1%`. The drive is the limiter, so `2E` stays the default and each extra bank (`+3.4 GiB`) buys staging capacity only.
 3. **Depth is a budget, at last.** `read_lookahead_capacity` is `min(staging blocks, banks - 1)` — the cartridge box, and nothing else. This is the property R2/R5/R6 asked for and that §15.5 and §16.4 could not yet claim.
 4. **The 4-block pipeline remains a residency question**, not a corridor one: it needs three VRAM blocks live (computing, resident, copy-destination) and this pool fits two. That remains the [routing profile and placement study](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)'s subject.
+
+---
+
+## 18. The Warm shape was never actually measured, and it does not run (2026-09-26)
+
+*Status: **a measurement error of mine, corrected — and a real, newly exposed defect behind it.***
+
+### 18.1 `AEON_WARM_GIB` is not read by the engine
+
+Every gate run reported in §15–§17 was prefixed with `AEON_WARM_GIB=…`. **Nothing in `src/` reads that variable.** It is a *shell* variable that `scripts/prefill_ab.sh` and `scripts/supply_split.sh` translate into a **positional binary argument**; a test binary that is merely prefixed with it ignores it. `test_v4_staging_depth` hardcoded `runtime.warm_host_bytes = 0` besides.
+
+So the claim *"same verdict in the production Warm shape (`AEON_WARM_GIB=30`)"* in §17.4 was false — both runs were Warm 0, and the small difference was noise. **Plan guardrail #7 ("both Warm configurations") was never satisfied by this gate.** The gate now reads the variable itself and reports the figure it used (`warm=N GiB` in its header line), so the shape a row was measured in is no longer invisible.
+
+### 18.2 The memory question: the arena is correct
+
+The reported question was whether `4E`/`5E` plus Warm 30 should show ~`50 GiB` resident where only ~`20 GiB` was seen. Measured peak RSS, same binary and model, Warm 0:
+
+| slots | pinned staging | peak RSS |
+| ---: | ---: | ---: |
+| `512` | 6.75 GiB | 26.54 GiB |
+| `1024` | 13.50 GiB | 33.30 GiB |
+
+`Δ = 6.76 GiB`, matching `512 x 14,155,776 B = 6.75 GiB` to the byte. **The arena is allocated, pinned and counted exactly as specified** — nothing was broken there. The `~20 GiB` observed was `~19.8 GiB` of baseline (dense container, the touched pages of the 145 GB expert mmap, the HIP runtime) with **no Warm at all**, for the reason in §18.1.
+
+With Warm genuinely allocated, the same run reports peak RSS **56.55 GiB** against `26.54` at Warm 0 — `Δ ≈ 30 GiB`, exactly the Warm pool. The expectation was right; the measurement was missing.
+
+### 18.3 A real defect this exposed: the swept prefill does not run with Warm
+
+With Warm actually on (`AEON_WARM_GIB=30`), the swept window **aborts**:
+
+```
+ExpertRegistry: prefill stream has no free VRAM slot for a load
+  (the layer lookahead must not exceed capacity)
+```
+
+**Mechanism.** The staged-only decoupling is keyed on the **cold** path:
+
+```cpp
+const bool defer_vram = stage_only && source_tier == ExpertTier::COLD_NVME;
+```
+
+A `WARM_HOST` expert has no such deferral. Under a swept prefill Warm is frozen, so a Warm-resident expert takes the **shadow** branch, which calls `reserve_vram_destination` **at reservation time**. With Warm 30 a large share of each layer's set is Warm-resident, so dispatching a lookahead layer **takes its `E` VRAM slots immediately** rather than at copy time.
+
+The depth bound therefore cannot protect VRAM: it is derived from **staging** free blocks (`min(staging blocks, banks - 1)`), which is right for a *read* budget, but a Warm promotion commits VRAM at *reservation*. Steady state on this pool is `285` preserved + `256` computing + `256` lookahead `= 797`, exactly full; the layer after that dispatch finds `free_vram_slots == 0` and `PrefillAlloc::FreeListOnly` refuses — correctly, because the sweep genuinely over-committed.
+
+Cold loads never hit this because their reservation is deferred, so a queued layer holds **no** VRAM until its copy runs.
+
+**Why it was never seen:** Warm was never allocated (§18.1), so this path was never exercised by any gate. It is pre-existing, not a regression from §17.
+
+### 18.4 Open
+
+- **The fix is a design decision, not a patch:** the `stage_only` deferral should extend to the **shadow** path, so a Warm promotion under a swept prefill also lands in staging first and takes its VRAM destination at copy time. That keeps one admission rule for both sources and makes the staging-derived depth bound correct for both.
+- **Until then, guardrail #7 cannot be met** by `test_v4_staging_depth`, and the swept prefill should not be claimed to work in the production Warm shape.
+- **A memory guard has been added** to the gate: the arena change is refused when the projection (from the host's own `transient_staging_bytes` per slot) would leave less than an `8 GiB` reserve against `MemAvailable`. Warm 30 plus a deep arena otherwise enters swap, where the run does not fail — it stops progressing.

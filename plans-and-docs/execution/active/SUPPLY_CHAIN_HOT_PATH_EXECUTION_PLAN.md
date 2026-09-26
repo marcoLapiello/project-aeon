@@ -161,6 +161,15 @@ Implements the §0 spec. Each step is independently verifiable and independently
 
 ### P2.6 — Decouple the read leg from VRAM; serialize the read waves — ✅ **done**
 
+> **Caveat (2026-09-26, analysis §18):** every gate run in P2.1–P2.6 was prefixed with
+> `AEON_WARM_GIB=…`, which **the engine does not read** — so guardrail #7 (both Warm
+> configurations) was never satisfied and every row is Warm 0. With Warm genuinely on,
+> the swept window **aborts**: the `stage_only` deferral is keyed on `COLD_NVME`, so a
+> Warm promotion (a shadow under a swept prefill) still reserves VRAM at *reservation*
+> and the staging-derived depth bound over-commits. **Open work — see §18.4.** The gate
+> now reads the variable itself, prints the shape it used, and refuses an arena that
+> would force the box into swap.
+
 | | |
 | :--- | :--- |
 | **Status** | ✅ **shipped 2026-09-26.** Measured: the coupling is gone, the real defect behind `3E` is identified and fixed, and depth is a pure budget (analysis §16–§17). |

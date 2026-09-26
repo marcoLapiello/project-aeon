@@ -80,6 +80,24 @@ double since(const Clock::time_point& start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
 }
 
+// `MemAvailable` in bytes, or 0 when `/proc/meminfo` cannot be read. The depth
+// sweep pins a large arena on **top of** the Warm pool, and Warm 30 plus a deep
+// arena can push this box into swap — where a run does not fail, it stops
+// progressing, which is the worst possible failure mode for a gate. So the arena
+// change is refused when the projection says it would not fit, rather than being
+// attempted and hanging.
+uint64_t mem_available_bytes() {
+    std::FILE* file = std::fopen("/proc/meminfo", "r");
+    if (file == nullptr) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+    }
+    std::fclose(file);
+    return static_cast<uint64_t>(kb) * 1024ULL;
+}
+
 struct Row {
     uint32_t depth{0};
     bool ran{false};
@@ -144,7 +162,18 @@ int main(int argc, char** argv) {
     runtime.prefill_sweep = true;
     runtime.prefill_chunk = kChunk;
     runtime.prefill_window = kWindow;
-    runtime.warm_host_bytes = 0;  // the fault is in the pipeline, not the tiering
+    // Warm is a **local** read of the environment, because nothing in `src/` reads
+    // `AEON_WARM_GIB`: it is a shell variable the scripts translate into a binary
+    // *argument*. Prefixing this binary with it was therefore a silent no-op, and this
+    // line used to hardcode 0 besides — so a documented `AEON_WARM_GIB=30` run was
+    // really a Warm-0 run. Both shapes are required here (plan guardrail #7): Warm 0
+    // exercises the corridor on its own, Warm 30 is the production shape where Warm
+    // residency removes part of the cold stream.
+    const char* warm_env = std::getenv("AEON_WARM_GIB");
+    const uint64_t warm_gib = warm_env != nullptr
+        ? std::strtoull(warm_env, nullptr, 10)
+        : 0ULL;
+    runtime.warm_host_bytes = warm_gib * 1024ULL * 1024ULL * 1024ULL;
 
     V4ModelHost host;
     host.initialize(model_dir, runtime, /*verbose=*/false);
@@ -159,6 +188,16 @@ int main(int argc, char** argv) {
     // not need this; that it does is the depth-dependence gate B is meant to expose.
     const uint32_t required = std::min<uint32_t>(6u * kChunk, per_layer);
 
+    // The pinned bytes one staging slot costs, from the host's own accounting, so the
+    // projection below cannot drift from what the arena really allocates.
+    const uint32_t base_slots = host.staging_slot_count();
+    const uint64_t slot_bytes = base_slots == 0
+        ? 0
+        : host.budget().transient_staging_bytes / base_slots;
+    // Keep a reserve: reaching exactly MemAvailable still leaves the box thrashing on
+    // a 8 GiB swap, so the guard wants real headroom rather than a zero margin.
+    constexpr uint64_t kReserveBytes = 8ULL * 1024 * 1024 * 1024;
+
     std::vector<uint32_t> ids(kLength);
     for (uint32_t i = 0; i < kLength; ++i) {
         ids[i] = (i * 7u + 1u) % 1000u;
@@ -169,17 +208,39 @@ int main(int argc, char** argv) {
 
     std::printf(
         "[staging-depth] layers=%u E=%u window=%u chunk=%u floor=%u slots "
-        "(initial: %u slots, %u banks)\n",
+        "(initial: %u slots, %u banks), warm=%llu GiB\n",
         host.num_layers(), per_layer, kLength, kChunk, required,
-        host.staging_slot_count(), host.sweep_staging_banks());
+        host.staging_slot_count(), host.sweep_staging_banks(),
+        static_cast<unsigned long long>(warm_gib));
 
     std::vector<Row> rows;
+    uint32_t current_slots = base_slots;
     for (const uint32_t depth : depths) {
         Row row;
         row.depth = depth;
 
         if (depth < required) {
             row.note = "below the swept dispatch's floor";
+            rows.push_back(row);
+            continue;
+        }
+        // Memory guard (derived, not a hardware constant): the arena is pinned on top
+        // of the Warm pool and the loaded model, so a depth that does not fit must be
+        // refused, not attempted. Attempting it enters swap, where the run does not
+        // fail — it stops progressing.
+        const uint64_t delta_bytes = depth > current_slots
+            ? static_cast<uint64_t>(depth - current_slots) * slot_bytes
+            : 0;
+        const uint64_t available = mem_available_bytes();
+        if (delta_bytes + kReserveBytes > available) {
+            char note[160];
+            std::snprintf(note, sizeof(note),
+                          "refused: needs +%.1f GiB, only %.1f GiB available "
+                          "(reserve %.1f GiB)",
+                          static_cast<double>(delta_bytes) / (1024.0 * 1024.0 * 1024.0),
+                          static_cast<double>(available) / (1024.0 * 1024.0 * 1024.0),
+                          static_cast<double>(kReserveBytes) / (1024.0 * 1024.0 * 1024.0));
+            row.note = note;
             rows.push_back(row);
             continue;
         }
@@ -195,6 +256,7 @@ int main(int argc, char** argv) {
             rows.push_back(row);
             continue;
         }
+        current_slots = row.staging_slots;
 
         // A fresh session and a fresh phase: the KV/compressor/indexer state is
         // zeroed so every depth runs the identical window, and the counters start at
