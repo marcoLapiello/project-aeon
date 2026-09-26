@@ -647,3 +647,89 @@ Before Phase 2 the same comparison was `13%`. The bank still changes the **shape
 ### 15.6 Remaining Phase-2 item
 
 `< E` is still not reached: reads are submitted as **one wave of `E`**, so the arena cannot go below one layer's worth of slots. Pacing the submission (issue each read as a slot frees) is the remaining step, and it now has the per-token hook it needs. Note that on this pool it would buy **nothing today** — the constraint is VRAM residency (§15.4), not staging — so it is a portability item (R6), not a throughput one.
+
+---
+
+## 16. Measured — reads decoupled from VRAM, and the depth question answered (2026-09-26)
+
+*Status: **measured.** The coupling is removed, a latent defect it exposed is fixed, and the `3E`/depth-2 corridor the plan hoped for is now **measured and refuted on this pool** — with the depth bound corrected so that a larger arena is a pure budget again.*
+
+### 16.1 The coupling, removed at its root
+
+`reserve_request` used to fuse the VRAM slot into the read: a cold request took `reserve_vram_destination` *and* entered `IO_PENDING` at the same instant, so **a read could not be issued without a free VRAM slot**. The lookahead depth was therefore `min(free VRAM, free staging)` and VRAM decided the read queue.
+
+| | before | after |
+| :--- | :--- | :--- |
+| reservation | `reserve_vram_destination` + `IO_PENDING` | new `COLD_STAGED` kind: **no** VRAM slot (`pending_slot_idx = -1`) |
+| destination | decided at reservation | `attach_vram_destination()` decides it when the copy can run |
+| read depth | `min(free VRAM, free staging)` | staging (per bank), separately from the copy leg |
+| copy enqueue | unconditional | `enqueue_expert_copy` attaches late and **returns `false` when VRAM is full**, leaving the expert staged (`io_complete`) to retry |
+
+Byte-exact throughout (`16`/`18`/`10`/`38` checks, 0 failures, token `86`).
+
+### 16.2 The defect the decoupling exposed
+
+The blocking `materialize` only processed transfers with `io_pending == true`. A transfer whose reads had landed via the per-token pump but whose **copy was deferred** for lack of a VRAM slot (the new `io_complete` state) was therefore skipped entirely — never submitted. The layer body then joined layer `L`'s transfers and found one without a submitted copy:
+
+```
+TieredExpertSupply: duplicate request joined before its transfer was submitted
+  (expert=1003, gid=1003, operation=23440)
+```
+
+That is a real bug, not a bookkeeping quirk: it is the *only* failure mode that makes deep lookahead unusable, and it was hit at `3E`. The fix makes the blocking path a **join of the two legs** — it enqueues the copy for every expert already `io_complete`, then settles the read waits. `3E` and `4E` then ran clean.
+
+### 16.3 `3E` at depth 2 — measured, and it is a regression
+
+One swept window, `N = 256`, 43 layers × 256 experts, `AEON_WARM_GIB=0`, before the depth bound was corrected:
+
+| arena | banks | derived depth | wall_s | `io_wait` | overlapped |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| `512` (`2E`) | 2 | 1 | **30.341** | **1.601** | 42/43 |
+| `768` (`3E`) | 3 | 2 | **41.929** | **12.928** | 21/43 |
+| `1024` (`4E`) | 4 | 3 | 30.977 | 1.647 | 21/43 |
+
+The per-layer trace at `768` shows the mechanism directly — the corridor alternates between two states:
+
+```
+layer  ahead  reading   copying   stg_free  vram_free
+ 0      1      250       250       268       262
+ 1      2      500         0       268       262
+ 2      1      214       167       387       226
+ 3      2      500         0       268       262
+```
+
+At one boundary **two** layers read (`500`) and **nothing copies**; at the next, one layer reads while the resident copies (`214/167`). The second queued layer's reads are issued but its copy can never run — VRAM is `262 sl` free, exactly the one block the *first* queued layer needs. So the extra layer is not a prefetch; it is a read wave whose bytes cannot move, and it competes with the layer that *can* copy for the same drive. Hence `io_wait 1.6 → 12.9 s` and `+11.6 s` of window.
+
+**Why:** the pipeline shape `L` computing │ `L+1` in VRAM │ `L+2` copying needs **three** layers of VRAM state (a destination for `L+2`'s copy). This pool holds **2** (§15.3: 797 slots − ~`490` preserved ≈ `2E`). `2E` staging admits a *read* depth of 2 because its banks allow it, but the pool cannot host the copies that depth implies.
+
+### 16.4 The bound corrected: depth is a budget, not a schedule (R6)
+
+`read_lookahead_capacity()` gained a third term — the free VRAM **blocks**:
+
+```
+min( staging_layers , banks - 1 , free_vram_slots / E )
+```
+
+This is **not** a re-coupling. The decoupling is retained: a read is still issued and lands in staging with **no VRAM destination attached**, and the copy attaches and runs later. What the third term prevents is queueing a *layer* the pool cannot host, which builds a read wave that cannot drain. It is derived from the runtime free blocks, not written down, so a pool with a third block deepens by itself — exactly the portability property R2/R5/R6 ask for.
+
+Re-measured on the same gate, `AEON_WARM_GIB=0`:
+
+| arena | banks | derived (max) | derived (mid) | `stg_lyrs` mid | `vram_lyrs` mid | wall_s | `io_wait` | overlapped |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `512` (`2E`) | 2 | 1 | 0 | 0 | 1 | 30.381–30.641 | 1.65–1.76 | 42/43 |
+| `768` (`3E`) | 3 | 1 | 1 | 1 | 1 | 31.076 | 2.12 | 41/43 |
+| `1024` (`4E`) | 4 | 1 | 1 | **2** | **1** | 30.933 | 2.12 | 41/43 |
+
+- **Gate A: `1.014–1.027×` — PASSES** (it was `1.382×` FAIL in §16.3's state).
+- Gate B passes (identical token, layers, experts, releases at every depth).
+- Gate C passes (`2E` overlaps in `42/43` layer-bodies; the deeper arenas in `41/43`).
+- The derived table now names the binding resource explicitly: `stg_lyrs` grows `0 → 1 → 2` while `vram_lyrs` is pinned at `1`. **Staging beyond the design's need is pure budget.**
+
+Same conclusion in the production Warm shape (`AEON_WARM_GIB=30`): `30.226` / `30.921` / `31.028 s`, spread `1.027×`, Gate A PASSES.
+
+### 16.5 What this decides for production
+
+1. **`3E` (and `4E`) buys nothing.** `+3.44 GiB` / `+6.88 GiB` of pinned memory for a window that is the same within noise (`30.4` vs `31.0 s`). The corridor is **VRAM-residency-bound**, and §15.4's hand-off stands: the remaining headroom is the *which-bytes* question, not the corridor's size.
+2. **`2E` remains the default and `1E` remains a supported lower rung.** The depth no longer selects an algorithm (Gate A), so the arena size can be chosen purely on the memory budget — which is what R6 demanded and what §15.5 could not yet claim.
+3. **The decoupling is still the right architecture and is now shippable**, because it is what makes point 2 true. Without it the read depth was a VRAM function and every depth change moved throughput (`1.38×`).
+4. **The 4-block target is a residency question.** It needs **three VRAM blocks** live (computing, resident, copy-destination) — four with the read-ahead layer's staging. On a pool that fits two, no corridor work reaches it.

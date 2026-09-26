@@ -328,28 +328,35 @@ public:
     // Resident layers at the moment of the deepest lookahead seen — the width of the
     // sliding window, measured rather than assumed.
     uint32_t frontier_depth() const noexcept { return frontier_depth_; }
-    // How many layer-sets the **staging** arena can hold in flight right now — the
-    // read leg's bound and the lookahead depth (plan R5/P2.5). Deliberately **not**
-    // derived from VRAM: a read needs only a staging slot, a copy needs a VRAM slot,
-    // so a VRAM-derived read queue would stop reads whenever VRAM filled even though
-    // staging was free. That coupling is what the old `min(free VRAM, free staging)`
-    // encoded; removing it is what lets reads run a layer ahead of copies.
+    // The lookahead length the free blocks allow at this instant (plan R5/P2.6): the
+    // biggest number of layers whose reads may be in flight. Derived from the runtime
+    // free blocks, never a constant — see `read_lookahead_capacity`.
     uint32_t derived_lookahead_capacity() const noexcept { return read_lookahead_capacity(); }
 
-    // How many layers the staging arena can hold in flight — the read budget. The copy
-    // leg is bounded separately (in the supply, by free VRAM slots), so this is the
-    // only bound on reads.
+    // How many layers may have their reads in flight at once. Three bounds, each a
+    // distinct resource and each derived from its own free block count at this
+    // instant:
+    //
+    //   * **staging** — a layer's reads need `E` free slots in a bank no other queued
+    //     layer holds, so the read leg is bounded by the corridor and not by VRAM;
+    //     this is the decoupling (a read may be issued for a layer whose copy has not
+    //     run and whose VRAM destination is not attached yet);
+    //   * **banks - 1** — a read must land in a bank the *resident* layer is not still
+    //     copying out of;
+    //   * **free VRAM blocks** — a queued layer's copy still needs a whole block to
+    //     land in eventually, so queueing a layer the pool cannot host builds a read
+    //     wave whose bytes cannot move (measured: `io_wait 1.6 -> 12.9 s`).
+    //
+    // The third bound is not a re-coupling: it does not stop a read because a *copy*
+    // is pending. It stops the queue from exceeding the blocks the pool can host, and
+    // it deepens by itself on a pool with a third block.
     uint32_t read_lookahead_capacity() const noexcept {
         if (registry_ == nullptr || supply_ == nullptr) return 0;
         const uint32_t per_layer = registry_->experts_per_layer;
         if (per_layer == 0) return 0;
         // **At most `banks - 1`** when there are two or more banks, because a read must
         // land in a bank no other queued layer holds, and the resident layer's bank is
-        // not a candidate: its bytes are still the source of its copies. With the
-        // staging arena at `2E` that is exactly one layer, which is why a depth of 2
-        // measured as a regression — it let the layer two ahead land in the resident's
-        // bank (`reading 498`, `io_wait 1.7 -> 12.8 s`). A deeper lookahead is therefore
-        // a **larger arena** question, not a scheduling one: `3E` staging admits 2.
+        // not a candidate: its bytes are still the source of its copies.
         //
         // The single-bank case keeps a depth of 1: there the drain is **blocking**
         // (`deferred_drain_` is false), so the bank is returned before the next
@@ -357,7 +364,19 @@ public:
         // degenerate the sweep to fully serial loading.
         const uint32_t bank_bound = staging_banks_ > 1 ? staging_banks_ - 1 : 1;
         const uint32_t staging_layers = supply_->staging_free_slots() / per_layer;
-        const uint32_t bound = std::min(staging_layers, bank_bound);
+        // And the queued layer's **copy** still needs a whole VRAM block to land in.
+        // Reads are allowed to run ahead of their copy — that decoupling is the point
+        // — but a layer queued with no block to land in builds a read wave whose bytes
+        // cannot move, and it does so by competing for the drive with the layer that
+        // *can* copy. Measured: forcing two queued layers on a pool that holds two
+        // blocks made `io_wait` `1.6 -> 12.9 s` and the window `30.3 -> 41.9 s`, with
+        // the trace alternating `reading 500, copying 0` against `reading 200,
+        // copying 160`. So the depth is bounded by the blocks the pool can actually
+        // host for the lookahead — a figure derived from free VRAM at this instant, not
+        // a constant, which is why a pool with a third block deepens by itself.
+        const uint32_t vram_layers =
+            static_cast<uint32_t>(registry_->free_vram_slot_count()) / per_layer;
+        const uint32_t bound = std::min({staging_layers, bank_bound, vram_layers});
         return read_ahead_max_ == 0 ? bound : std::min(bound, read_ahead_max_);
     }
 

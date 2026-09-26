@@ -65,7 +65,7 @@ public:
         bool io_pending{false};
         // The reads have all landed in staging but the copy has not been enqueued.
         // Two reasons: the blocking path has not run yet, or the operation is
-        // staged-only and no VRAM slot was free (plan P2.5). Either way the bytes are
+        // staged-only and no VRAM slot was free (plan P2.6). Either way the bytes are
         // safe in staging and the copy is retried later, which is what makes the read
         // leg and the copy leg independently bounded.
         bool io_complete{false};
@@ -523,6 +523,26 @@ public:
     }
 
     void materialize(PayloadBatch& batch) {
+        // Enqueue the copy for every expert whose reads have **already** landed but
+        // whose copy was deferred by the non-blocking pump (plan P2.6): a staged-only
+        // expert that found no free VRAM slot at the moment its read completed. This
+        // pass is what makes the blocking materialize a *join* of the two legs rather
+        // than a read-only loop: without it an expert sits `io_complete` and
+        // unsubmitted, and the layer body's MoE dispatch — which joins a transfer only
+        // after its copy was submitted — surfaces it as
+        // "duplicate request joined before its transfer was submitted".
+        for (auto& state : batch.transfers) {
+            if (state.io_complete && !enqueue_expert_copy(state, state.staging_idx)) {
+                // The blocking path is used where a VRAM slot is guaranteed (the
+                // sweep's `materialize_entry`, after the previous layer released its
+                // block), so a refusal here is a real defect rather than the
+                // staged-only deferral.
+                throw std::runtime_error(
+                    "TieredExpertSupply: materialize found no VRAM slot for a staged-only "
+                    "expert — the lookahead over-committed its copy budget");
+            }
+        }
+
         for (auto& state : batch.transfers) {
             if (!state.io_pending) {
                 continue;
@@ -616,7 +636,7 @@ public:
     //
     // Returns `false` **without enqueuing** when the operation is staged-only and no
     // VRAM slot is free: the expert stays in staging and the caller retries later
-    // (plan P2.5 — this is the whole point of decoupling the read leg from the copy
+    // (plan P2.6 — this is the whole point of decoupling the read leg from the copy
     // leg; reads are bounded by staging, copies by VRAM).
     bool enqueue_expert_copy(PayloadTransfer& state, uint32_t staging_idx) {
         if (state.vram_slot < 0) {
@@ -720,7 +740,7 @@ public:
 
             // Phase 2: the copy. A staged-only expert whose VRAM is not free yet is
             // left `io_complete` and retried on a later call — the deferral that
-            // decouples the copy leg from the read leg (plan P2.5).
+            // decouples the copy leg from the read leg (plan P2.6).
             if (state.io_complete && enqueue_expert_copy(state, state.staging_idx)) {
                 ++enqueued;
             }

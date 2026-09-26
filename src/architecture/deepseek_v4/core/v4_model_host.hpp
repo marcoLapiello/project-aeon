@@ -893,7 +893,7 @@ private:
 
         // The direct reader's ring must hold **every read that can be outstanding at
         // once**, not one layer's worth. `dispatch()` queues a batch's cold requests
-        // before it submits once, and with the decoupled corridor (plan P2.5) more
+        // before it submits once, and with the decoupled corridor (plan P2.6) more
         // than one layer's reads can be in flight simultaneously — bounded by the
         // staging arena, since a read needs a staging slot. Sizing this to a single
         // layer while two are outstanding over-subscribes the completion queue (it is

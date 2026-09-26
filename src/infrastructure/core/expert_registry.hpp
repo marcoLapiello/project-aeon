@@ -431,7 +431,7 @@ public:
     }
 
     // Give a staged-only operation its VRAM destination, at the moment its copy can
-    // actually run (plan P2.5). Returns the slot. Idempotent: an operation that
+    // actually run (plan P2.6). Returns the slot. Idempotent: an operation that
     // already has a destination returns it unchanged, so a caller may attach and then
     // copy without tracking whether an earlier call already did. The destination is
     // reserved exactly as `reserve_request` would have done at reservation time, so
