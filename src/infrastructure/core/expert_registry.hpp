@@ -149,6 +149,14 @@ public:
     uint32_t total_experts{11008};
     uint32_t vram_capacity{0};
     uint32_t host_capacity{0};
+    // How many host slots the current partition exposes to Warm. The arrays above are
+    // sized to `host_capacity`, which is the **maximum** (the region minus the base
+    // staging), because the Warm/staging boundary moves: a swept prefill hands the
+    // corridor more of the shared region and takes it back when the window ends.
+    // Keeping the arrays at their maximum is what makes a boundary move a free-list
+    // edit rather than a reallocation or a catalog re-map. Equals `host_capacity`
+    // until the first move.
+    uint32_t host_capacity_usable{0};
 
     std::vector<ExpertCatalogEntry> catalog;
     std::vector<int32_t> vram_slots;
@@ -224,6 +232,7 @@ public:
 
         host_slots.assign(host_capacity, -1);
         host_slot_reservations.assign(host_capacity, 0);
+        host_capacity_usable = host_capacity;
         free_host_slots.clear();
         for (uint32_t slot = host_capacity; slot-- > 0;) {
             free_host_slots.push_back(slot);
@@ -934,6 +943,97 @@ public:
     // Free VRAM slots. The lookahead stops when a whole layer no longer fits.
     size_t free_vram_slot_count() const noexcept { return free_vram_slots.size(); }
 
+    // ---- the Warm/staging partition ------------------------------------------
+    //
+    // Warm and the transport corridor are one pinned region cut by a movable
+    // boundary (`ExpertHostRegion`): Warm takes the head, the arena the tail, and
+    // `set_host_capacity` is the cut. The two consumers want opposite shapes — decode
+    // wants `12` staging slots and every other byte as Warm residency, a swept prefill
+    // wants `blocks x E` staging and gives the rest back — so the boundary is moved at
+    // the phase boundaries rather than fixed at load.
+    //
+    // Neither move relocates storage: the region is allocated once, so a boundary
+    // move edits the free list and the arena's base pointer.
+
+    // How many region slots the Warm tier may use right now.
+    uint32_t usable_host_capacity() const noexcept { return host_capacity_usable; }
+
+    // Move the boundary **upward**: return slots to the Warm free list. Callers do
+    // this when a prefill window ends. Slots that were never surrendered are already
+    // in the list, so only the newly recovered range is added.
+    void grow_host_capacity(uint32_t usable) {
+        if (usable <= host_capacity_usable) return;
+        if (usable > host_capacity) {
+            throw std::out_of_range(
+                "ExpertRegistry: host capacity exceeds the allocated region");
+        }
+        for (uint32_t slot = host_capacity_usable; slot < usable; ++slot) {
+            if (host_slots[slot] >= 0 || host_slot_reservations[slot] != 0) {
+                throw std::logic_error(
+                    "ExpertRegistry: cannot grow Warm capacity over a slot still in use");
+            }
+            free_host_slots.push_back(slot);
+        }
+        host_capacity_usable = usable;
+        checked_validate();
+    }
+
+    // Move the boundary **downward**: `[usable, host_capacity_usable)` is surrendered.
+    // The caller must have drained it first — `release_host_tail` is the drain — so an
+    // occupied slot here is a caller defect, refused rather than silently orphaned.
+    // The surrendered range leaves the free list, so nothing can be admitted into it.
+    void shrink_host_capacity(uint32_t usable) {
+        if (usable >= host_capacity_usable) return;
+        for (uint32_t slot = usable; slot < host_capacity_usable; ++slot) {
+            if (host_slots[slot] >= 0 || host_slot_reservations[slot] != 0) {
+                throw std::logic_error(
+                    "ExpertRegistry: cannot shrink Warm capacity under a slot still in use");
+            }
+        }
+        host_capacity_usable = usable;
+        rebuild_free_host_slots();
+        checked_validate();
+    }
+
+    // Demote every Warm resident in `[keep, host_capacity_usable)` to Cold and free its
+    // slot: ownership is dropped and the slot returned to service as staging. **No data
+    // moves** — the payload is still in the container, so the expert is re-read on
+    // demand. This is the drain half of a boundary move, and it is what lets decode
+    // reclaim the corridor's share of the region.
+    //
+    // Requires a boundary state (no live lease, no in-flight transfer), which the
+    // caller reaches exactly as `begin_prefill_stream` does. Returns how many experts
+    // were demoted, so a caller can report the cost of the trade it just made.
+    uint32_t release_host_tail(uint32_t keep) {
+        if (keep > host_capacity_usable) {
+            throw std::out_of_range("ExpertRegistry: host tail keep-point is out of range");
+        }
+        uint32_t released = 0;
+        for (uint32_t slot = keep; slot < host_capacity_usable; ++slot) {
+            const int32_t gid = host_slots[slot];
+            if (gid < 0) continue;
+            auto& entry = catalog[static_cast<size_t>(gid)];
+            if (entry.owner != ExpertTier::WARM_HOST) {
+                throw std::logic_error("ExpertRegistry: host tail slot is not Warm-owned");
+            }
+            if (entry.lease_count != 0 || entry.operation != ExpertOperation::NONE) {
+                throw std::logic_error(
+                    "ExpertRegistry: cannot surrender a Warm slot with a live lease or "
+                    "transfer — the caller must reach a boundary first");
+            }
+            if (entry.in_lru) {
+                remove_from_lru(entry, warm_host_lru, static_cast<uint32_t>(gid));
+            }
+            host_slots[slot] = -1;
+            entry.owner = ExpertTier::COLD_NVME;
+            entry.slot_idx = -1;
+            entry.slot_state = ExpertSlotState::UNALLOCATED;
+            ++released;
+        }
+        checked_validate();
+        return released;
+    }
+
     // The Hot residents the last prefill drained at entry, in drain order
     // (worst-LRU first). The caller reloads them through the normal cold path after
     // `end_prefill_stream()`, so decode resumes on the pre-prefill set. Empty when
@@ -1060,7 +1160,8 @@ public:
                     throw std::logic_error("ExpertRegistry: Hot entry does not map to its VRAM slot");
                 }
             } else if (entry.owner == ExpertTier::WARM_HOST) {
-                if (entry.slot_idx < 0 || static_cast<size_t>(entry.slot_idx) >= host_capacity ||
+                if (entry.slot_idx < 0 ||
+                    static_cast<size_t>(entry.slot_idx) >= host_capacity_usable ||
                     host_slots[static_cast<size_t>(entry.slot_idx)] !=
                         static_cast<int32_t>(entry.global_expert_id)) {
                     throw std::logic_error("ExpertRegistry: Warm entry does not map to its host slot");
@@ -1527,6 +1628,18 @@ private:
         free_host_slots.push_back(slot);
     }
 
+    // Rebuild the free list to exactly the usable prefix, preserving every slot's
+    // occupancy. Used after a boundary move, where the set of admissible slots
+    // changes wholesale and an incremental edit would be easy to get wrong.
+    void rebuild_free_host_slots() {
+        free_host_slots.clear();
+        for (uint32_t slot = host_capacity_usable; slot-- > 0;) {
+            if (host_slots[slot] < 0 && host_slot_reservations[slot] == 0) {
+                free_host_slots.push_back(slot);
+            }
+        }
+    }
+
     void validate_lru(const std::list<uint32_t>& lru, ExpertTier tier) const {
         std::vector<uint8_t> seen(catalog.size(), 0);
         for (uint32_t gid : lru) {
@@ -1561,7 +1674,7 @@ private:
                     vram_slots[slot] = static_cast<int32_t>(gid);
                     push_lru_front(entry, hot_vram_lru);
                     ++vram_assigned;
-                } else if (preload_warm_host && host_assigned < host_capacity) {
+                } else if (preload_warm_host && host_assigned < host_capacity_usable) {
                     const uint32_t slot = free_host_slots.back();
                     free_host_slots.pop_back();
                     entry.owner = ExpertTier::WARM_HOST;

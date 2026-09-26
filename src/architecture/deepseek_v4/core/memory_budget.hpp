@@ -77,8 +77,18 @@ struct AeonRuntimeConfig {
     // User-configurable: target context sequence length (tokens)
     uint32_t context_size{4096};
 
-    // Maximum host budget for persistent Warm payloads plus runtime transport.
-    // Zero disables persistent Warm ownership and D2H refill.
+    // The **total** pinned host RAM for expert payloads: Warm residency *plus* the
+    // transport corridor, which share one region cut by a boundary that moves per
+    // phase (`ExpertHostRegion`). Zero disables Warm ownership and the corridor
+    // becomes the only tenant. Because this is the total, it is also the guard: the
+    // host RAM a run holds is exactly this figure, not this figure plus a staging
+    // allocation the user had to remember to add.
+    //
+    // The partition inside it: decode and a chunked prefill use
+    // `max(12, min(6C, E))` slots for the corridor and everything else for Warm; a
+    // **swept** prefill grows the corridor to `prefill_sweep_staging_blocks x E` and
+    // hands the difference back when the window ends. So the resident Warm set is
+    // larger during decode — where its cache value is — than during a sweep.
     size_t warm_host_bytes{0};
 
     // Allocate the configured Warm capacity without requiring a synchronous
@@ -223,14 +233,34 @@ struct AeonRuntimeConfig {
 //   * when the sweep is on, `prefill_sweep_staging_blocks` layer-blocks — at least
 //     one to bind a whole layer's set, and by default two so one bank is the read
 //     destination and one the copy source (see `AeonRuntimeConfig::prefill_sweep`).
-inline uint32_t staging_slot_count(const AeonRuntimeConfig& cfg, uint32_t experts_per_layer) {
+//
+// The corridor has **two** meaningful sizes now that it shares a region with Warm
+// (`ExpertHostRegion`): the **base** it needs whenever it is not running a swept
+// window (decode and the routed prefill), and the **prefill** size a swept window
+// grows it to, taking the difference out of Warm. `staging_slot_counts` returns both,
+// so the budget report, the host, and the boundary moves all read one helper.
+struct StagingSlotCounts {
+    uint32_t base{0};
+    uint32_t prefill{0};
+};
+
+inline StagingSlotCounts staging_slot_counts(
+    const AeonRuntimeConfig& cfg,
+    uint32_t experts_per_layer
+) {
     const uint32_t chunk_ceiling = std::min<uint32_t>(
         6u * std::max<uint32_t>(1, cfg.prefill_chunk), experts_per_layer);
     const uint32_t base = std::max<uint32_t>(
         PrefetchStagingArena::TOTAL_STAGING_SLOTS, chunk_ceiling);
-    if (!cfg.prefill_sweep) return base;
+    if (!cfg.prefill_sweep) return StagingSlotCounts{base, base};
     const uint32_t blocks = std::max<uint32_t>(1, cfg.prefill_sweep_staging_blocks);
-    return std::max<uint32_t>(base, blocks * experts_per_layer);
+    return StagingSlotCounts{base, std::max<uint32_t>(base, blocks * experts_per_layer)};
+}
+
+// The prefill size alone, kept for the callers that only need the arena's upper bound
+// (the artifact's own arena construction).
+inline uint32_t staging_slot_count(const AeonRuntimeConfig& cfg, uint32_t experts_per_layer) {
+    return staging_slot_counts(cfg, experts_per_layer).prefill;
 }
 
 struct MemoryBudgetReport {
@@ -278,10 +308,20 @@ struct MemoryBudgetReport {
     size_t hot_vram_bytes{0};
     uint32_t warm_host_slots{0};
     size_t warm_host_bytes{0};
+    // The same figures at the **other end** of the partition: what Warm holds while a
+    // swept prefill has grown the corridor to its configured size.
+    uint32_t warm_host_slots_min{0};
+    // The shared pinned region: Warm slots followed by the corridor's slots, cut by a
+    // boundary that moves at the phase transitions.
+    uint32_t host_region_slots{0};
+    size_t host_region_bytes{0};
     size_t expert_payload_bytes{0};
     size_t configured_host_budget_bytes{0};
     size_t persistent_warm_host_budget_bytes{0};
     size_t transient_staging_bytes{0};
+    // The staging the corridor needs whenever it is **not** running a swept window
+    // (decode, and a chunked prefill): the budget's `base` term.
+    size_t staging_base_bytes{0};
     uint32_t cold_nvme_slots{0};
 
     // Diagnostics / recommendations
@@ -331,11 +371,17 @@ struct MemoryBudgetReport {
             << "    - Tier 1: Hot VRAM     : " << hot_vram_slots << " slots ("
             << (double)hot_vram_bytes / (1024 * 1024 * 1024) << " GB)\n"
             << "    - Tier 2: Warm Host DDR: " << warm_host_slots << " slots ("
-            << (double)warm_host_bytes / (1024 * 1024 * 1024) << " GB)\n"
+            << (double)warm_host_bytes / (1024 * 1024 * 1024) << " GB)"
+            << "  [min " << warm_host_slots_min << " while a swept prefill runs]\n"
             << "    - Expert Payload Size : " << expert_payload_bytes << " bytes\n"
+            << "    - Host Region (Warm + staging, one pinned allocation): "
+            << (double)host_region_bytes / (1024 * 1024 * 1024) << " GB in "
+            << host_region_slots << " slots\n"
             << "    - Configured Host Budget : " << (double)configured_host_budget_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Persistent Warm Budget : " << (double)persistent_warm_host_budget_bytes / (1024 * 1024 * 1024) << " GB\n"
-            << "    - Transient Staging    : " << (double)transient_staging_bytes / (1024 * 1024 * 1024) << " GB\n"
+            << "    - Transient Staging    : " << (double)transient_staging_bytes / (1024 * 1024 * 1024) << " GB"
+            << "  (base " << (double)staging_base_bytes / (1024 * 1024) << " MiB; the swept"
+            << " prefill borrows the difference from Warm)\n"
             << "    - Tier 3: Cold NVMe SSD: " << cold_nvme_slots << " slots\n"
             << "================================================================================\n";
         return oss.str();
@@ -573,66 +619,79 @@ public:
         report.hot_vram_bytes = static_cast<size_t>(report.hot_vram_slots) *
                                 expert_format.payload_bytes;
 
-        // 8. Calculate persistent Warm capacity.
+        // 8. Calculate the host region: **one** pinned budget that Warm and the
+        // transport corridor share.
         //
-        // Warm and the transport staging arena are **two independent budgets**, not
-        // one pool with a deduction (Step 0 D5): staging is a transit corridor whose
-        // size follows the chunk `C`, and Warm is expert residency. So the requested
-        // `warm_host_bytes` is the Warm budget *in full* — it is not reduced by the
-        // staging figure. What is checked is the **total**: Warm plus staging plus the
-        // fixed reserve must fit the host, or the plan would swap.
+        // `warm_host_bytes` is the **total** host RAM for expert payloads, and the
+        // partition inside it moves at runtime. Warm and staging were two separate
+        // allocations, so the RAM a run held was `warm + staging` — a number the user
+        // could only reach by adding two settings, and one they could overshoot
+        // without noticing. They are also physically the same thing (expert payloads
+        // of the artifact's width, 4 KiB-aligned, same layout); the difference is
+        // policy, not storage. One number that *is* the total is what makes the
+        // setting a guard rather than a hint.
         //
-        // Staging follows the chunk, and the figure matches what the host actually
-        // allocates: `max(12, min(6C, experts_per_layer))` slots, plus the sweep's
-        // layer-sized banks. The literal `12` that used to stand here was decode's
-        // shape and understated a `C = 256` arena (256 slots, 3456 MiB) by ~21x, and
-        // the sweep's over-allocation would understate it again. Both the report and
-        // the arena call `staging_slot_count`, so the two cannot drift.
+        // The base staging is what decode and a chunked prefill need — the
+        // deduplicated distinct set, `max(12, min(6C, E))` — and the swept prefill may
+        // grow it to `blocks x E`, taking the difference out of Warm for the duration
+        // of the window and giving it back when the window ends.
         const uint32_t experts_per_layer =
             static_cast<uint32_t>(expert_format.experts_per_layer);
-        const uint32_t staging_slots = staging_slot_count(runtime_cfg, experts_per_layer);
+        const auto staging = aeon::core::staging_slot_counts(runtime_cfg, experts_per_layer);
         report.transient_staging_bytes =
-            static_cast<size_t>(staging_slots) * expert_format.payload_bytes;
-        report.configured_host_budget_bytes = runtime_cfg.warm_host_bytes == 0
-            ? report.transient_staging_bytes
-            : std::min(runtime_cfg.warm_host_bytes, report.max_allowed_host_ram_bytes);
-        const size_t persistent_host_budget = runtime_cfg.warm_host_bytes == 0
-            ? 0
-            : report.configured_host_budget_bytes;
-        report.persistent_warm_host_budget_bytes = persistent_host_budget;
+            static_cast<size_t>(staging.prefill) * expert_format.payload_bytes;
+        report.staging_base_bytes =
+            static_cast<size_t>(staging.base) * expert_format.payload_bytes;
 
-        // The total, which is where the two budgets meet. `max_allowed_host_ram_bytes`
-        // is already the reserve-subtracted ceiling.
-        const size_t host_total = persistent_host_budget + report.transient_staging_bytes;
-        if (host_total > report.max_allowed_host_ram_bytes) {
+        report.configured_host_budget_bytes = runtime_cfg.warm_host_bytes;
+        const size_t host_region_bytes = runtime_cfg.warm_host_bytes;
+        // The ceiling is already reserve-subtracted, so this is the whole check.
+        if (host_region_bytes > report.max_allowed_host_ram_bytes) {
             report.is_feasible = false;
             report.rejection_reason =
-                "Host plan exceeds the RAM ceiling: Warm " +
-                std::to_string(persistent_host_budget / (1024ULL * 1024 * 1024)) +
-                " GiB + staging " +
-                std::to_string(report.transient_staging_bytes / (1024 * 1024)) +
-                " MiB > " +
+                "Host budget " +
+                std::to_string(host_region_bytes / (1024ULL * 1024 * 1024)) +
+                " GiB exceeds the " +
                 std::to_string(report.max_allowed_host_ram_bytes / (1024ULL * 1024 * 1024)) +
                 " GiB allowed";
             return report;
         }
-        if (runtime_cfg.warm_host_bytes > 0 &&
-            persistent_host_budget < expert_format.payload_bytes) {
+        if (host_region_bytes != 0 && host_region_bytes < report.transient_staging_bytes) {
             report.is_feasible = false;
-            report.rejection_reason = "Warm host budget cannot hold one complete expert";
+            report.rejection_reason =
+                "Host budget " +
+                std::to_string(host_region_bytes / (1024 * 1024)) +
+                " MiB cannot hold the " +
+                std::to_string(report.transient_staging_bytes / (1024 * 1024)) +
+                " MiB the configured staging blocks reserve — raise it or lower "
+                "prefill_sweep_staging_blocks";
             return report;
         }
+
+        const uint32_t region_slots = static_cast<uint32_t>(
+            host_region_bytes / expert_format.payload_bytes);
+        report.host_region_slots = region_slots;
+        report.host_region_bytes =
+            static_cast<size_t>(region_slots) * expert_format.payload_bytes;
+        // Warm occupies what the corridor is not using. At the base staging that is
+        // its maximum (decode and the routed prefill); at the configured blocks it is
+        // its minimum (a swept window).
+        const uint32_t warm_slots_max = region_slots > staging.base
+            ? region_slots - staging.base
+            : 0;
+        report.warm_host_slots_min = region_slots > staging.prefill
+            ? region_slots - staging.prefill
+            : 0;
 
         const uint32_t total_experts = static_cast<uint32_t>(expert_format.total_experts());
         uint32_t remaining_after_vram = (total_experts > report.hot_vram_slots)
             ? (total_experts - report.hot_vram_slots)
             : 0;
 
-        uint32_t host_slots_budgeted = static_cast<uint32_t>(
-            persistent_host_budget / expert_format.payload_bytes);
-        report.warm_host_slots = std::min(remaining_after_vram, host_slots_budgeted);
+        report.warm_host_slots = std::min(remaining_after_vram, warm_slots_max);
         report.warm_host_bytes = static_cast<size_t>(report.warm_host_slots) *
                                  expert_format.payload_bytes;
+        report.persistent_warm_host_budget_bytes = report.warm_host_bytes;
 
         // 9. Cold NVMe pool gets the rest
         report.cold_nvme_slots = total_experts - (report.hot_vram_slots + report.warm_host_slots);

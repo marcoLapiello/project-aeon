@@ -69,6 +69,7 @@
 #include "infrastructure/core/aeon_loader.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
+#include "infrastructure/core/expert_host_region.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
 #include "architecture/deepseek_v4/core/v4_prefill_sweep.hpp"
 #include "infrastructure/core/supply_telemetry.hpp"
@@ -483,6 +484,11 @@ public:
         if (staging_->in_use_slots() != 0) return false;
         if (outstanding_expert_leases() != 0) return false;
         if (slots < PrefetchStagingArena::TOTAL_STAGING_SLOTS) return false;
+        // A shared region has a **fixed** total: its corridor can only be resized by
+        // moving the boundary, which is what the phase transitions do. Letting a
+        // caller resize the arena alone would silently over-commit the region, so the
+        // two directions are different operations and this one refuses.
+        if (host_region_active_) return false;
 
         staging_->resize(slots);
         const uint32_t per_layer = static_cast<uint32_t>(config_.n_routed_experts);
@@ -496,6 +502,83 @@ public:
             static_cast<size_t>(slots) * staging_->payload_bytes();
         return true;
     }
+
+    // ---- the Warm/staging partition -----------------------------------------
+    //
+    // Warm and the corridor are one pinned region cut by a boundary
+    // (`ExpertHostRegion`). Both phases move it, and the two moves are exact
+    // inverses because the region's total is fixed:
+    //
+    //   * decode, and a **chunked** prefill, need only the corridor's base
+    //     (`max(12, min(6C, E))` — the deduplicated set a batch can bind, with the
+    //     decode double-buffer as the floor). Everything else is Warm residency,
+    //     which is where decode's NVMe hits are decided;
+    //   * a **swept** prefill grows the corridor to `blocks x E` for the length of the
+    //     window and hands the difference back at `prefill_end`.
+    //
+    // Moving it is a pointer and a free-list edit: the storage is allocated once, so
+    // no page is committed or pinned by the move. The only real cost is that a slot
+    // surrendered by Warm must be **drained**, and a Warm expert that is dropped is
+    // re-read from NVMe on demand — which is why the move happens only when a swept
+    // window actually needs the room, and why the corridor's base rather than its
+    // maximum is what decode gets.
+    //
+    // `warm_slots` is the whole description of the split: the Warm head is
+    // `[0, warm_slots)` and the corridor is `[warm_slots, region_slots)`. Every step
+    // is idempotent, so a caller may apply the same partition repeatedly.
+    void apply_host_partition(uint32_t warm_slots, uint32_t staging_slots) {
+        if (!host_region_active_ || staging_ == nullptr) return;
+        // **Idempotent by construction.** `prefill_begin` is not the only caller that
+        // enters a window — the driver enters one itself when it begins a window, so
+        // the same partition is requested twice for the same window. Re-applying it
+        // would re-base the arena and destroy its per-slot events while the sweep's
+        // own lookahead is using them, so an already-current partition is a no-op.
+        if (warm_slots == current_warm_slots_ &&
+            staging_slots == staging_->slot_count()) {
+            return;
+        }
+        // A boundary move re-bases the arena and re-creates its per-slot events, so
+        // nothing may still reference one. This is the same precondition
+        // `resize_staging_slots` enforces, and it is what a phase boundary leaves.
+        if (staging_->in_use_slots() != 0 || outstanding_expert_leases() != 0) {
+            throw std::logic_error(
+                "V4ModelHost: cannot move the host partition with a transfer or lease live "
+                "(staging_in_use=" + std::to_string(staging_->in_use_slots()) +
+                " of " + std::to_string(staging_->slot_count()) +
+                ", leases=" + std::to_string(outstanding_expert_leases()) + ")");
+        }
+        if (warm_slots + staging_slots != host_region_.slot_count()) {
+            throw std::logic_error(
+                "V4ModelHost: the host partition does not cover the region exactly");
+        }
+
+        // Shrink: demote the Warm tail **before** the capacity moves under it, so the
+        // free-list edit finds every surrendered slot empty.
+        if (warm_slots < registry_.usable_host_capacity()) {
+            registry_.release_host_tail(warm_slots);
+            registry_.shrink_host_capacity(warm_slots);
+        }
+        host_pool_.bind(host_region_.base(), warm_slots, host_region_.format(),
+                        host_region_.is_pinned());
+        if (warm_slots > registry_.usable_host_capacity()) {
+            registry_.grow_host_capacity(warm_slots);
+        }
+        staging_->bind(host_region_.slot_ptr(warm_slots), staging_slots,
+                       host_region_.format());
+
+        const uint32_t per_layer = static_cast<uint32_t>(config_.n_routed_experts);
+        sweep_staging_banks_ = per_layer == 0
+            ? 1u
+            : std::max<uint32_t>(1u, staging_slots / per_layer);
+        prefill_sweep_.configure(&supply_, &registry_, sweep_staging_banks_);
+        budget_.transient_staging_bytes =
+            static_cast<size_t>(staging_slots) * staging_->payload_bytes();
+        current_warm_slots_ = warm_slots;
+    }
+
+    // The partition right now: Warm slots resident, and the corridor's slots.
+    uint32_t warm_host_slots_current() const noexcept { return current_warm_slots_; }
+    bool staging_shares_warm_region() const noexcept { return host_region_active_; }
 
     // Layer-sized staging banks the sweep's arena holds, derived from the arena's
     // actual depth (`slots / experts_per_layer`). The default is `2` (R2); the
@@ -686,6 +769,17 @@ public:
         drain_expert_streams();
         supply_.reap_registry_transfers();
         executor_->release_leases();
+        // The window's shape decides the partition: a **swept** window grows the
+        // corridor to its configured size and takes it out of Warm (restored in
+        // `prefill_end`); a routed window needs only the corridor's base and leaves
+        // Warm at its maximum, which is where decode's hits come from. Placed here,
+        // while nothing is in flight, because a move re-bases the arena and re-creates
+        // its per-slot events.
+        if (host_region_active_ && staging_prefill_slots_ > staging_base_slots_) {
+            apply_host_partition(
+                sweep_active_ ? warm_slots_prefill_ : warm_slots_base_,
+                sweep_active_ ? staging_prefill_slots_ : staging_base_slots_);
+        }
         if (sweep_active_) {
             prefill_sweep_.begin();
         } else {
@@ -734,6 +828,15 @@ public:
             drain_expert_streams();
             supply_.reap_registry_transfers();
             registry_.end_prefill_stream();
+        }
+        // Hand the corridor's prefill borrow back to Warm. The window is over and
+        // everything is drained, so the surrendered slots return to the Warm free list
+        // and decode resumes with the larger residency — which is the whole reason the
+        // boundary moved rather than the arena simply being sized for the worst case.
+        // A restored expert is re-read on demand, so this costs nothing until one is
+        // actually wanted.
+        if (host_region_active_ && warm_slots_base_ > current_warm_slots_) {
+            apply_host_partition(warm_slots_base_, staging_base_slots_);
         }
         // Reload whatever the drain freed, through the normal cold path, so decode
         // resumes on the set the pool held before the pass (the plan's restore
@@ -878,18 +981,47 @@ private:
             PrefetchStagingArena::EXPERTS_PER_HORIZON *
                 std::max<uint32_t>(1, runtime_cfg.prefill_chunk),
             experts_per_layer);
-        const uint32_t staging_slots =
-            aeon::core::staging_slot_count(runtime_cfg, experts_per_layer);
+        const auto staging = aeon::core::staging_slot_counts(runtime_cfg, experts_per_layer);
+        const uint32_t staging_slots = staging.prefill;
+
+        // The host region: **one** pinned allocation shared by the Warm tier and the
+        // corridor, cut by a boundary the phases move (`apply_host_partition`). Its
+        // total is the configured host budget, so the RAM a run holds is the number
+        // the user set — Warm and staging are no longer two settings to add and
+        // overshoot.
+        //
+        // With no host budget there is no region and the corridor allocates its own
+        // memory, which is the decode-only and gate shape.
+        const uint32_t region_slots = budget_.host_region_slots;
+        host_region_active_ = region_slots > 0;
+        staging_base_slots_ = staging.base;
+        staging_prefill_slots_ = staging.prefill;
+        if (host_region_active_) {
+            if (region_slots < staging.base) {
+                throw std::runtime_error(
+                    "V4ModelHost: the host region (" + std::to_string(region_slots) +
+                    " slots) cannot hold the corridor's base (" +
+                    std::to_string(staging.base) + " slots)");
+            }
+            host_region_.allocate(region_slots, format);
+            warm_slots_base_ = region_slots - staging.base;
+            warm_slots_prefill_ = region_slots - staging.prefill;
+            current_warm_slots_ = warm_slots_base_;
+            // Start at the base partition: decode and a chunked prefill are the
+            // opening state, and a swept window moves the boundary in `prefill_begin`.
+            staging_ = std::make_unique<PrefetchStagingArena>(
+                host_region_.slot_ptr(warm_slots_base_), staging.base, format);
+        } else {
+            staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
+        }
         // The sweep's bank count is **derived from the arena it actually has**, not
         // from a configured constant: `staging_slots / experts_per_layer` whole
         // layer-sized banks. A depth change moves the arena and this derivation
         // together, so there is no second place for the two to disagree (see
-        // `resize_staging_slots`). The constant that used to live here encoded "one
-        // layer reading, one layer copying" and was a tuning figure, not a fact.
+        // `apply_host_partition`).
         sweep_staging_banks_ = experts_per_layer == 0
             ? 1u
-            : std::max<uint32_t>(1u, staging_slots / experts_per_layer);
-        staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
+            : std::max<uint32_t>(1u, staging_->slot_count() / experts_per_layer);
 
         // The direct reader's ring must hold **every read that can be outstanding at
         // once**, not one layer's worth. `dispatch()` queues a batch's cold requests
@@ -929,7 +1061,15 @@ private:
         // the item-21 gate's subject, so nothing here re-checks it.
         preload_hot_experts(format);
         if (warm_slots > 0) {
-            host_pool_.allocate(warm_slots, format);
+            // The Warm pool is a **view** over the region's head when one is shared,
+            // and an allocation of its own otherwise. Either way it is `warm_slots`
+            // wide, which is the capacity the registry was initialised with.
+            if (host_region_active_) {
+                host_pool_.bind(host_region_.base(), warm_slots, host_region_.format(),
+                                host_region_.is_pinned());
+            } else {
+                host_pool_.allocate(warm_slots, format);
+            }
             if (runtime_cfg.preload_warm_host) {
                 preload_warm_experts(format);
             }
@@ -1241,6 +1381,18 @@ private:
     HostExpertPool host_pool_;
     ExpertRegistry registry_;
     std::unique_ptr<PrefetchStagingArena> staging_;
+    // The pinned region the Warm pool and the corridor share, when a host budget is
+    // configured. Empty otherwise, and the corridor allocates its own memory.
+    ExpertHostRegion host_region_;
+    bool host_region_active_{false};
+    // The two partitions the phases move between: the corridor's base
+    // (`max(12, min(6C, E))`) with Warm at its maximum, and the swept prefill's
+    // `blocks x E` with Warm at its minimum. Both sum to the region exactly.
+    uint32_t staging_base_slots_{0};
+    uint32_t staging_prefill_slots_{0};
+    uint32_t warm_slots_base_{0};
+    uint32_t warm_slots_prefill_{0};
+    uint32_t current_warm_slots_{0};
     SupplyTelemetry telemetry_;
     RoutingReuseProfiler reuse_profiler_;
     std::unique_ptr<aeon::io::DirectIOReader> io_reader_;

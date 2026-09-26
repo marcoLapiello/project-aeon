@@ -105,6 +105,13 @@ public:
     }
 
     void free() {
+        // A **view** (see `bind`) points at another owner's memory: dropping the view
+        // must not free it, only forget it.
+        if (!owns_memory_) {
+            segments_.clear();
+            num_slots = 0;
+            return;
+        }
         for (auto& segment : segments_) {
             if (!segment.base) continue;
             if (segment.uses_hip_host_malloc) {
@@ -118,6 +125,39 @@ public:
         }
         segments_.clear();
         num_slots = 0;
+    }
+
+    // Bind this pool as a **view** over `slots` payloads at `base`, which another
+    // owner allocated (the shared `ExpertHostRegion`). The pool then owns no memory:
+    // `free()` only forgets the view. `pinned` says whether the backing memory is
+    // page-locked, because the supply chooses a direct upload only for a pinned slot.
+    //
+    // A view is one segment, not many: the backing region is already a single
+    // allocation, so the per-64-slot segmentation the owning path uses (it exists to
+    // degrade to unpinned memory in pieces) has nothing to do here.
+    // A view is laid out in `SEGMENT_SLOTS`-sized segments, exactly like an owned
+    // pool: `get_expert_slot_ptr`/`is_slot_pinned` resolve a slot by
+    // `slot / SEGMENT_SLOTS`, so a single large segment would mis-index every slot
+    // past the first. The segments share the backing region's memory; only their
+    // `base` pointers differ.
+    void bind(uint8_t* base, uint32_t slots, const ExpertFormatDescriptor& format, bool pinned) {
+        free();
+        format.validate_payload();
+        format_ = format;
+        owns_memory_ = false;
+        if (slots == 0) return;
+        num_slots = slots;
+        const uint32_t segment_count = (slots + SEGMENT_SLOTS - 1) / SEGMENT_SLOTS;
+        segments_.reserve(segment_count);
+        for (uint32_t index = 0; index < segment_count; ++index) {
+            Segment segment;
+            segment.slot_count = std::min(SEGMENT_SLOTS, slots - index * SEGMENT_SLOTS);
+            segment.base = base + static_cast<size_t>(index) * SEGMENT_SLOTS *
+                                      format_.payload_bytes;
+            segment.uses_hip_host_malloc = pinned;
+            segment.uses_hip_host_register = false;
+            segments_.push_back(segment);
+        }
     }
 
     const ExpertFormatDescriptor& format() const noexcept {
@@ -188,14 +228,19 @@ private:
 
     std::vector<Segment> segments_;
     ExpertFormatDescriptor format_{make_current_swizzled_expert_format()};
+    // False when this pool is a view over another owner's memory (`bind`); `free()`
+    // then only forgets the view.
+    bool owns_memory_{true};
 
     void move_from(HostExpertPool&& other) {
         num_slots = other.num_slots;
         segments_ = std::move(other.segments_);
         format_ = other.format_;
+        owns_memory_ = other.owns_memory_;
 
         other.num_slots = 0;
         other.segments_.clear();
+        other.owns_memory_ = true;
         other.format_ = make_current_swizzled_expert_format();
     }
 };

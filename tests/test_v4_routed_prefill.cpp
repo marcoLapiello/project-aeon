@@ -50,7 +50,11 @@ constexpr uint32_t kContext = 256;
 // — which is what exercises the cross-chunk residency the bank exists to give.
 constexpr uint32_t kWindow = 48;
 constexpr uint32_t kChunk = 16;
-constexpr size_t kWarmBytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
+// The host budget is the **total** pinned region: Warm *and* the transport corridor
+// share it (`ExpertHostRegion`), so a figure that only covers the Warm residency the
+// routed bank wants is now rejected at load. `8 GiB` covers the corridor at this
+// chunk's shape and leaves the routed bank the residency it is here to exercise.
+constexpr size_t kWarmBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr double kPayloadBytes = 14'155'776.0;
 
 uint32_t g_checks = 0;

@@ -67,6 +67,14 @@ public:
         allocate();
     }
 
+    // Construct as a **view** over another owner's memory (`bind` below), with no
+    // allocation of its own. The owner is the shared `ExpertHostRegion`, which is what
+    // lets the corridor and the Warm tier be one pinned allocation cut by a movable
+    // boundary.
+    PrefetchStagingArena(uint8_t* base, uint32_t slots, const ExpertFormatDescriptor& format) {
+        bind(base, slots, format);
+    }
+
     // The number of staging slots this arena owns. A batch dispatcher must not
     // assign more distinct staging indices than this.
     uint32_t slot_count() const noexcept { return slot_count_; }
@@ -97,6 +105,7 @@ public:
         format_.validate_payload();
         size_t total_bytes = static_cast<size_t>(slot_count_) * format_.payload_bytes;
         uses_hip_host_malloc_ = false;
+        owns_memory_ = true;
 
         // Allocate pinned host memory
         hipError_t err = hipHostMalloc(reinterpret_cast<void**>(&h_pinned_base), total_bytes, hipHostMallocPortable);
@@ -116,16 +125,34 @@ public:
             uses_hip_host_malloc_ = true;
         }
 
-        // Create non-blocking HIP events for transfer synchronization
-        events = new hipEvent_t[slot_count_]();
-        slot_states.assign(slot_count_, SlotState::AVAILABLE);
-        available_since_.assign(slot_count_, std::chrono::steady_clock::now());
-        for (uint32_t i = 0; i < slot_count_; ++i) {
-            CHECK_HIP(hipEventCreateWithFlags(&events[i], hipEventDisableTiming));
-        }
-
+        create_slot_events();
         is_allocated_ = true;
     }
+
+    // Bind the arena as a **view** over `slots` payloads at `base`, which another
+    // owner allocated (the shared `ExpertHostRegion`): the arena then owns no memory
+    // and `free()` only forgets the view. The per-slot events and states are still
+    // this object's, because they describe transfer progress rather than storage.
+    //
+    // This is what makes the corridor a *partition* of one region instead of a second
+    // allocation: moving the Warm/staging boundary moves this base pointer and the
+    // slot count, nothing is reallocated, and no page is re-pinned.
+    void bind(uint8_t* base, uint32_t slots, const ExpertFormatDescriptor& format) {
+        if (slots == 0) {
+            throw std::invalid_argument("PrefetchStagingArena: cannot bind zero slots");
+        }
+        format.validate_payload();
+        destroy_slot_events();
+        format_ = format;
+        h_pinned_base = base;
+        slot_count_ = slots;
+        owns_memory_ = false;
+        uses_hip_host_malloc_ = false;
+        uses_hip_host_register_ = false;
+        create_slot_events();
+        is_allocated_ = true;
+    }
+
 
     // Re-size the arena in place. Only the **depth** changes: the payload width, the
     // sector size, and the format are the artifact's, not a policy. The depth is a
@@ -147,15 +174,8 @@ public:
 
     void free() {
         if (is_allocated_) {
-            for (uint32_t i = 0; i < slot_count_; ++i) {
-                if (events[i]) {
-                    (void)hipEventDestroy(events[i]);
-                    events[i] = nullptr;
-                }
-            }
-            delete[] events;
-            events = nullptr;
-            if (h_pinned_base) {
+            destroy_slot_events();
+            if (h_pinned_base && owns_memory_) {
                 if (uses_hip_host_malloc_) {
                     (void)hipHostFree(h_pinned_base);
                 } else {
@@ -164,10 +184,11 @@ public:
                     }
                     std::free(h_pinned_base);
                 }
-                h_pinned_base = nullptr;
             }
+            h_pinned_base = nullptr;
             uses_hip_host_malloc_ = false;
             uses_hip_host_register_ = false;
+            owns_memory_ = true;
             slot_states.assign(slot_count_, SlotState::AVAILABLE);
             available_since_.assign(slot_count_, std::chrono::steady_clock::now());
             is_allocated_ = false;
@@ -332,8 +353,34 @@ private:
     uint32_t slot_count_{TOTAL_STAGING_SLOTS};
     bool uses_hip_host_malloc_{false};
     bool uses_hip_host_register_{false};
+    // False when the arena is a view over another owner's memory (`bind`); `free()`
+    // then destroys the events but frees no storage.
+    bool owns_memory_{true};
     ExpertFormatDescriptor format_{make_current_swizzled_expert_format()};
     std::vector<std::chrono::steady_clock::time_point> available_since_{};
+
+    // The per-slot events and states, shared by `allocate` and `bind` so the two
+    // cannot set up a slot differently.
+    void create_slot_events() {
+        events = new hipEvent_t[slot_count_]();
+        slot_states.assign(slot_count_, SlotState::AVAILABLE);
+        available_since_.assign(slot_count_, std::chrono::steady_clock::now());
+        for (uint32_t i = 0; i < slot_count_; ++i) {
+            CHECK_HIP(hipEventCreateWithFlags(&events[i], hipEventDisableTiming));
+        }
+    }
+
+    void destroy_slot_events() {
+        if (events == nullptr) return;
+        for (uint32_t i = 0; i < slot_count_; ++i) {
+            if (events[i]) {
+                (void)hipEventDestroy(events[i]);
+                events[i] = nullptr;
+            }
+        }
+        delete[] events;
+        events = nullptr;
+    }
 
     void validate_slot(uint32_t slot_idx) const {
         if (slot_idx >= slot_count_) {
