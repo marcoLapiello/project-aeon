@@ -159,19 +159,19 @@ Implements the §0 spec. Each step is independently verifiable and independently
 | **Command** | `./build/bin/test_v4_staging_depth` (defaults `64 128 192 256 384 512`) |
 | **Follow-up** | Re-test the `1E`/`2E` gap at larger `N` and with Warm; if it stays ~0, revert P2.1's `2E` default to `1E` and recover `3.44 GiB`. |
 
-### P2.6 — Decouple the read leg from VRAM, and bound the depth by what the pool can host — ✅ **done**
+### P2.6 — Decouple the read leg from VRAM; serialize the read waves — ✅ **done**
 
 | | |
 | :--- | :--- |
-| **Status** | ✅ **shipped 2026-09-26.** Measured: the coupling is gone, a latent defect it exposed is fixed, and `3E`/depth-2 is **refuted** on this pool (analysis §16). |
-| **Fixes** | `reserve_request` fused the VRAM slot into the read, so a read could not be issued without one and the read depth was a VRAM function (`min(free VRAM, free staging)`). That is what made the arena **size** select the algorithm (R6). |
-| **Where** | `expert_registry.hpp` (`ExpertRequestKind::COLD_STAGED`, `stage_only`, `attach_vram_destination`, `operation_is_staged_only`); `tiered_expert_supply.hpp` (`io_complete`, `enqueue_expert_copy` returns `bool` + late attach, two-phase `materialize_available`, `materialize` joins the two legs); `v4_expert_supply.hpp` / `v4_prefill_sweep.hpp` (`stage_only` plumbing, three-term `read_lookahead_capacity`); `v4_model_host.hpp` (ring sized to the arena, not one layer) |
-| **Change** | A cold read reserves **no** VRAM destination (`COLD_STAGED`, `pending_slot_idx = -1`); `attach_vram_destination` supplies one when the copy can actually run. `enqueue_expert_copy` returns `false` when VRAM is full, leaving the expert staged (`io_complete`) to retry. The blocking `materialize` now **enqueues the copy for every already-`io_complete` expert** before settling reads — without this, a pump-deferred copy stayed unsubmitted and the layer body hit `duplicate request joined before its transfer was submitted`. |
-| **Requirement** | R3 ✅ every stage advance is a completion event; the read leg and the copy leg are bounded independently. |
-| **Requirement** | R5/R6 ✅ the depth is `min(staging blocks, banks − 1, free VRAM blocks)`, all runtime-derived. The third term does **not** re-couple: a read is still issued with no destination attached; it only stops the queue from exceeding the blocks the pool can host. |
+| **Status** | ✅ **shipped 2026-09-26.** Measured: the coupling is gone, the real defect behind `3E` is identified and fixed, and depth is a pure budget (analysis §16–§17). |
+| **Fixes** | (a) `reserve_request` fused the VRAM slot into the read, so a read could not be issued without one; (b) **R3's first link was missing**, so the drive was handed whole-layer read waves without regard to what it was already carrying. |
+| **Where** | `expert_registry.hpp` (`COLD_STAGED`, `stage_only`, `attach_vram_destination`, `operation_is_staged_only`); `tiered_expert_supply.hpp` (`io_complete`, `enqueue_expert_copy` returns `bool` + late attach, two-phase `materialize_available`, `materialize` joins the two legs); `v4_expert_supply.hpp` (`pump_layer_prefetch` always re-syncs); `v4_prefill_sweep.hpp` (`reads_in_flight`, `advance_reads`, two-term `read_lookahead_capacity`); `v4_model_host.hpp` (ring sized to the arena) |
+| **Change** | (a) A cold read reserves **no** VRAM destination; `attach_vram_destination` supplies one when the copy can run, and `enqueue_expert_copy` returns `false` when VRAM is full, leaving the expert staged to retry. `materialize` now **enqueues the copy for every already-`io_complete` expert** before settling reads — without it a pump-deferred copy stayed unsubmitted and the body hit `duplicate request joined before its transfer was submitted`. (b) **One read wave in flight at a time**, the next issued by `advance_reads()` from the per-token hook the instant the previous lands. |
+| **Requirement** | R3 ✅ every stage advance is a completion event; the read leg is bounded by staging, the copy leg by VRAM. |
+| **Requirement** | R5/R6 ✅ `min(staging blocks, banks − 1)` — the runtime free staging, and nothing else. **No VRAM term** (an earlier attempt added one and it *was* the re-coupling; see analysis §16.4 → §17). |
 | **Verify** | ✅ Byte-exactness (`16`/`18`/`10`/`38`, 0 failures, token `86`); `in_use_slots() == 0`; `invariants_hold()`. |
-| **Result** | **Gate A `1.382×` FAIL → `1.014–1.027×` PASS**, at `Warm 0` and `Warm 30`. Depth is now a pure budget: `2E` `30.4 s`, `3E` `31.0 s`, `4E` `30.9 s` — and the derived table shows `stg_lyrs` `0 → 1 → 2` while `vram_lyrs` stays `1`. |
-| **Decision — do not increase the arena** | `3E`/`4E` cost `+3.44`/`+6.88 GiB` pinned for no measurable window gain. The corridor is **VRAM-residency**-bound: depth 2 needs three VRAM blocks live and this pool fits two (analysis §16.3). Keep `2E`; the remaining headroom is the *which-bytes* question (routing/placement study), not the corridor's size. |
+| **Result** | `2E…6E` all `29.83–30.39 s`, **Gate A `1.009×` PASS** (was `1.382×` FAIL), **Gate C `42/43` at every depth** (was `0/43` at `1E`, `21/43` at `3E`+). `io_wait` `1.2–1.8 s`. The `3E` pathology (`41.9 s`) is gone because its cause was two waves in front of the drive, not depth. |
+| **Decision** | Keep `2E`: the arena size does not move throughput, so it is chosen on memory alone. A larger one is a budget, not a lever. |
 
 ---
 
@@ -219,8 +219,9 @@ Phase 2  MANDATORY — the corridor becomes a demand-driven pipeline
    │   P2.3  ✅ DONE  copy into VRAM as each read lands, pumped per token (R1/R3): −2.7 s at 1E
    │   P2.4  ✅ DONE  lookahead derived from free blocks (R5); Gate A now passes (1.03x)
    │   P2.5  ✅ A passes, B/C hold; 1E/2E gap ~3% — 2E kept as the default
-   │   P2.6  ✅ DONE  read leg decoupled from VRAM; depth = min(staging, banks-1, vram
-   │          blocks) — Gate A passes at every depth, 3E/4E buy nothing (analysis §16)
+   │   P2.6  ✅ DONE  read leg decoupled from VRAM; one read wave in flight, next issued
+   │          on completion via the per-token hook; depth = min(staging, banks-1) —
+   │          Gate A 1.009x PASS at every depth (analysis §17)
    │   └─ ABORT if any step cannot hold byte-exactness → keep it opt-in, record negative
    ▼
 Phase 3  optional, independent (dispatch bookkeeping)
@@ -241,7 +242,8 @@ At each gate: **update the analysis doc**, then commit. Never start the next ste
 | **Single H2D copy (C5)** | Submission is not the cost; bandwidth is already at the PCIe ceiling. |
 | **`O(catalog)` scans as a *throughput* item** | Measured `≈1%` — hence Phase 3 (hygiene). |
 | **Decode NVMe wait (`36–63%`/token)** | **Out of scope** — its remedy is *which bytes are resident*. Hand-off to the [routing profile and placement study](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md). |
-| **A larger staging arena as a *speed* lever** | Measured `3E`/`4E` = `2E` within noise (`30.4` vs `31.0` s) for `+3.44`/`+6.88 GiB` pinned (analysis §16). The corridor is VRAM-residency-bound; depth is a budget only (R6). |
+| **A larger staging arena as a *speed* lever** | Measured `2E…6E` all `29.83–30.39 s` (analysis §17.4); the drive is the limiter, so depth is a budget only (R6). |
+| **Bounding the read queue by free VRAM** | Tried in §16.4 and **refuted in §17**: it *is* the very coupling the decoupling removes (the cartridge box must not be sized by the rifle's magazine wells). The real `3E` defect was two read waves in front of the drive. |
 | **`validate_invariants` per request** | Already off by default; boundary audits kept (analysis §4.6). |
 | **`LayerPrefetchState::sync_state`** | µs scale; a clarity smell, not a cost (analysis §4.5). |
 

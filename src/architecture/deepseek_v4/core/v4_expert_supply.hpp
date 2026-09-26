@@ -336,7 +336,12 @@ public:
     // filled during the previous layer's body instead of at the next boundary.
     size_t pump_layer_prefetch(LayerPrefetchState& state) {
         const size_t enqueued = supply_.materialize_available(state.supply_batch);
-        if (enqueued > 0) sync_state(state);
+        // Always re-sync, not only when a copy was enqueued: `materialize_available`
+        // also clears each transfer's `io_pending` as its reads land, and the sweep's
+        // "is a read wave still in flight?" gate reads that flag. Leaving it stale when
+        // a wave lands with no VRAM slot free would wedge the gate and stop the
+        // corridor.
+        sync_state(state);
         return enqueued;
     }
 

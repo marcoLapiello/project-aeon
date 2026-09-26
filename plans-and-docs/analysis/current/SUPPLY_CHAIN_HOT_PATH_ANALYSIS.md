@@ -702,7 +702,16 @@ At one boundary **two** layers read (`500`) and **nothing copies**; at the next,
 
 **Why:** the pipeline shape `L` computing │ `L+1` in VRAM │ `L+2` copying needs **three** layers of VRAM state (a destination for `L+2`'s copy). This pool holds **2** (§15.3: 797 slots − ~`490` preserved ≈ `2E`). `2E` staging admits a *read* depth of 2 because its banks allow it, but the pool cannot host the copies that depth implies.
 
-### 16.4 The bound corrected: depth is a budget, not a schedule (R6)
+### 16.4 ~~The bound corrected~~ — **refuted; see §17**
+
+A third term — the free VRAM **blocks** — was added to `read_lookahead_capacity()` and
+the tables below were recorded as its justification. **That reading was wrong.** A VRAM
+term in the read bound *is* the coupling the decoupling exists to remove: it makes the
+size of the cartridge box a function of how many magazines the rifle has loaded. It
+passed Gate A only because it **forbade the depth at which the real defect appears**.
+§17 identifies the actual mechanism — two read waves in front of the drive at once —
+removes the term again, and fixes the defect properly. The numbers below are kept only
+as the record of a wrong conclusion.
 
 `read_lookahead_capacity()` gained a third term — the free VRAM **blocks**:
 
@@ -727,9 +736,92 @@ Re-measured on the same gate, `AEON_WARM_GIB=0`:
 
 Same conclusion in the production Warm shape (`AEON_WARM_GIB=30`): `30.226` / `30.921` / `31.028 s`, spread `1.027×`, Gate A PASSES.
 
-### 16.5 What this decides for production
+### 16.5 ~~What this decides for production~~ — superseded by §17.5
 
 1. **`3E` (and `4E`) buys nothing.** `+3.44 GiB` / `+6.88 GiB` of pinned memory for a window that is the same within noise (`30.4` vs `31.0 s`). The corridor is **VRAM-residency-bound**, and §15.4's hand-off stands: the remaining headroom is the *which-bytes* question, not the corridor's size.
 2. **`2E` remains the default and `1E` remains a supported lower rung.** The depth no longer selects an algorithm (Gate A), so the arena size can be chosen purely on the memory budget — which is what R6 demanded and what §15.5 could not yet claim.
 3. **The decoupling is still the right architecture and is now shippable**, because it is what makes point 2 true. Without it the read depth was a VRAM function and every depth change moved throughput (`1.38×`).
 4. **The 4-block target is a residency question.** It needs **three VRAM blocks** live (computing, resident, copy-destination) — four with the read-ahead layer's staging. On a pool that fits two, no corridor work reaches it.
+
+---
+
+## 17. Corrected — the real defect was two read waves in front of the drive (2026-09-26)
+
+*Status: **measured.** The VRAM term is removed, the actual defect is identified and fixed, and depth is a pure budget at last. Supersedes §16.4 and §16.5.*
+
+### 17.1 The `3E` pathology does not track depth, or banks, or the ring
+
+`3E` at depth 2 measured `41.9 s` / `io_wait 12.9 s`. Depth was blamed first. Holding **depth = 2 fixed** and varying the arena, and varying depth at a fixed arena, both refute it:
+
+| arena | banks | read depth | wall_s | `io_wait` | verdict |
+| ---: | ---: | ---: | ---: | ---: | :--- |
+| `512` (`2E`) | 2 | 1 | 30.48 | 1.68 | fine |
+| `768` (`3E`) | 3 | 2 | **41.69** | **12.69** | **pathological** |
+| `1024` (`4E`) | 4 | 2 | 30.29 | 1.12 | fine |
+| `1024` (`4E`) | 4 | 3 | 30.84 | 1.52 | fine |
+| `1280` (`5E`) | 5 | 2 | 30.18 | 1.13 | fine |
+| `1536` (`6E`) | 6 | 5 | 32.74 | 2.68 | fine |
+
+`4E` at depth **3** is fine; `3E` at depth **2** is not. So it is not depth, and not bank parity either (`5E` is odd and fine). It is not the io_uring ring: doubling the ring to `2 × 4 × staging_slots` SQEs left `3E` unchanged at `42.2 s`.
+
+The trace at `3E` shows the signature directly:
+
+```
+layer  ahead  reading  copying  stg_free
+ 1      2      498       0        270     <- two layers reading, nothing copying
+ 2      1      204      157       407     <- one layer reading while the other copies
+```
+
+`reading = 498` is **two whole layers of reads outstanding at once**, reproducibly (−3 runs at `41.9 ± 0.2 s`, `io_wait 13.0 ± 0.1 s`).
+
+### 17.2 The mechanism
+
+The drive interleaves whatever is outstanding and we do not get to choose its order. When two layers' waves are queued together, the front layer's requests are **not** served first — they are diluted across a window twice as long — and the layer the sweep is about to materialize waits for them. That is the extra `io_wait`, and the window grows by exactly that amount (`+11.3 s` of window against `+11.4 s` of `io_wait`).
+
+`3E` is where it first bites: the read depth can reach `banks - 1` while the resident layer still holds a bank, so `3E` is the smallest arena that can place two waves in flight. `2E` cannot reach depth 2 at all (`banks - 1 = 1`), and the larger arenas had free slots at the instant the budget was computed, so the extra depth was rarely taken.
+
+### 17.3 The fix — one read wave in flight, advanced by completion
+
+`dispatch_ahead` now refuses to put a second wave in front of the drive:
+
+```cpp
+if (reads_in_flight()) return;      // one wave at a time, always
+...
+if (reads_in_flight()) break;       // ... including within a single queue fill
+```
+
+and the next wave is issued by **`advance_reads()`, called from the per-token pump** — the instant the previous wave has landed, not a moment later. The drive therefore stays continuously busy (a wave is submitted as soon as the previous one's slots free) without ever holding two competing waves. This is the plan's R3 first link (*slot-free → issue a read*) realised, and it is a statement about the drive's ordering, not a bandwidth or latency figure (R8).
+
+Two supporting changes:
+
+- **`pump_layer_prefetch` always re-syncs** its `LayerPrefetchState`. It previously re-synced only when a copy was enqueued, which leaves `io_pending` stale when a wave lands with no free VRAM well — and the new gate reads that flag, so it would have wedged the corridor.
+- **The VRAM term is removed** from `read_lookahead_capacity()`; the bound is `min(staging blocks, banks - 1)`, the cartridge box and nothing else.
+
+### 17.4 Result — depth is finally a pure budget
+
+`AEON_WARM_GIB=0`, one swept window, `N = 256`, 43 layers, `AEON_READ_AHEAD_MAX` unset:
+
+| arena | banks | derived (max) | derived (mid) | `stg_lyrs` mid | `vram_lyrs` mid | wall_s | `io_wait` | overlapped |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `512` (`2E`) | 2 | 1 | 0 | 0 | 1 | 30.294 | 1.585 | **42/43** |
+| `768` (`3E`) | 3 | 2 | 1 | 1 | 1 | 30.018 | 1.157 | **42/43** |
+| `1024` (`4E`) | 4 | 3 | 2 | 2 | 1 | 30.051 | 1.198 | **42/43** |
+| `1280` (`5E`) | 5 | 4 | 3 | 3 | 1 | 30.083 | 1.174 | **42/43** |
+| `1536` (`6E`) | 6 | 5 | 4 | 4 | 1 | 30.142 | 1.241 | **42/43** |
+
+- **Gate A: spread `1.009×` — PASSES**, and unlike §16.4 it passes because the depth genuinely does not select behaviour, not because the depth was forbidden. It was `1.382×` FAIL before the gate.
+- **Gate B passes** — identical token, layers, experts and releases at every depth.
+- **Gate C passes `42/43` at every depth** (it was `0/43` at `1E` and `21/43` at `3E`+ before).
+- The derived table names the binding resource: `stg_lyrs` climbs `0 → 4` while `vram_lyrs` stays pinned at `1`. **Staging beyond the drive's need is pure budget.**
+- Same verdict in the production Warm shape (`AEON_WARM_GIB=30`): `30.435` / `29.892` / `30.142 s`, spread `1.018×`, Gate A PASSES.
+
+Byte-exactness is unaffected: `16`/`18`/`10`/`38` checks, 0 failures, token `86`.
+
+The window is also slightly **faster** than the depth-1 configuration it replaces (`29.83–30.39 s` against `30.19–30.41 s`), with `io_wait` down to `1.2–1.8 s`.
+
+### 17.5 What this decides
+
+1. **Do not bound reads by VRAM.** §16.4's third term was a re-coupling and is gone. A copy that finds no free VRAM well waits in staging; it does not stop the reads behind it.
+2. **Do not increase the arena for speed.** `2E … 6E` are the same within `1%`. The drive is the limiter, so `2E` stays the default and each extra bank (`+3.4 GiB`) buys staging capacity only.
+3. **Depth is a budget, at last.** `read_lookahead_capacity` is `min(staging blocks, banks - 1)` — the cartridge box, and nothing else. This is the property R2/R5/R6 asked for and that §15.5 and §16.4 could not yet claim.
+4. **The 4-block pipeline remains a residency question**, not a corridor one: it needs three VRAM blocks live (computing, resident, copy-destination) and this pool fits two. That remains the [routing profile and placement study](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)'s subject.

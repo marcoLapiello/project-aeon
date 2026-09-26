@@ -191,6 +191,7 @@ public:
     // costs a wait of near zero rather than the full read.
     void before_layer(uint32_t layer) {
         if (!active_) return;
+        active_layer_ = layer;
         if (!ahead_.empty() && ahead_.front().layer == layer) {
             materialize_front();
         } else {
@@ -219,6 +220,10 @@ public:
         for (auto& entry : ahead_) {
             pumped += supply_->pump_layer_prefetch(entry.state);
         }
+        // A read wave has landed somewhere in what we just drained: issue the next one
+        // now, so the drive never idles between layers (plan R3's first link, bounded
+        // to one wave at a time by `dispatch_ahead`).
+        advance_reads();
         return pumped;
     }
 
@@ -333,23 +338,19 @@ public:
     // free blocks, never a constant — see `read_lookahead_capacity`.
     uint32_t derived_lookahead_capacity() const noexcept { return read_lookahead_capacity(); }
 
-    // How many layers may have their reads in flight at once. Three bounds, each a
-    // distinct resource and each derived from its own free block count at this
-    // instant:
+    // How many layers may have their reads in flight at once. Two bounds, both from
+    // the **cartridge box** — the staging arena — and from nothing else:
     //
-    //   * **staging** — a layer's reads need `E` free slots in a bank no other queued
-    //     layer holds, so the read leg is bounded by the corridor and not by VRAM;
-    //     this is the decoupling (a read may be issued for a layer whose copy has not
-    //     run and whose VRAM destination is not attached yet);
+    //   * **staging** — a layer's reads need `E` free slots, so the read leg is
+    //     bounded by the corridor and not by VRAM;
     //   * **banks - 1** — a read must land in a bank the *resident* layer is not still
-    //     copying out of;
-    //   * **free VRAM blocks** — a queued layer's copy still needs a whole block to
-    //     land in eventually, so queueing a layer the pool cannot host builds a read
-    //     wave whose bytes cannot move (measured: `io_wait 1.6 -> 12.9 s`).
+    //     copying out of.
     //
-    // The third bound is not a re-coupling: it does not stop a read because a *copy*
-    // is pending. It stops the queue from exceeding the blocks the pool can host, and
-    // it deepens by itself on a pool with a third block.
+    // VRAM is deliberately absent: the staging arena and the VRAM pool are two
+    // independent resources, and how many loaded magazines the rifle holds must not
+    // decide how many are prepared in the box. A copy that finds no free VRAM well
+    // waits in staging; it does not stop the reads after it. A host that wants a
+    // deeper corridor pins more staging and the depth follows (plan R2/R5/R6).
     uint32_t read_lookahead_capacity() const noexcept {
         if (registry_ == nullptr || supply_ == nullptr) return 0;
         const uint32_t per_layer = registry_->experts_per_layer;
@@ -363,20 +364,16 @@ public:
         // dispatch and reusing it is the legacy, correct behaviour. A bound of 0 would
         // degenerate the sweep to fully serial loading.
         const uint32_t bank_bound = staging_banks_ > 1 ? staging_banks_ - 1 : 1;
+        // **Nothing else.** In particular the depth is deliberately **not** bounded by
+        // free VRAM: the staging arena and the VRAM pool are two independent resources
+        // — a cartridge box and a rifle's magazine wells — and the number of magazines
+        // in the box must not be a function of how many the rifle has loaded. A read
+        // needs a staging slot and nothing more; its copy takes a VRAM slot later, at
+        // copy time, and a copy that finds no free well simply waits in staging without
+        // stopping the reads that follow it. Bounding the read queue by VRAM is exactly
+        // the coupling this decoupling exists to remove.
         const uint32_t staging_layers = supply_->staging_free_slots() / per_layer;
-        // And the queued layer's **copy** still needs a whole VRAM block to land in.
-        // Reads are allowed to run ahead of their copy — that decoupling is the point
-        // — but a layer queued with no block to land in builds a read wave whose bytes
-        // cannot move, and it does so by competing for the drive with the layer that
-        // *can* copy. Measured: forcing two queued layers on a pool that holds two
-        // blocks made `io_wait` `1.6 -> 12.9 s` and the window `30.3 -> 41.9 s`, with
-        // the trace alternating `reading 500, copying 0` against `reading 200,
-        // copying 160`. So the depth is bounded by the blocks the pool can actually
-        // host for the lookahead — a figure derived from free VRAM at this instant, not
-        // a constant, which is why a pool with a third block deepens by itself.
-        const uint32_t vram_layers =
-            static_cast<uint32_t>(registry_->free_vram_slot_count()) / per_layer;
-        const uint32_t bound = std::min({staging_layers, bank_bound, vram_layers});
+        const uint32_t bound = std::min(staging_layers, bank_bound);
         return read_ahead_max_ == 0 ? bound : std::min(bound, read_ahead_max_);
     }
 
@@ -530,6 +527,21 @@ private:
     void dispatch_ahead(uint32_t from) {
         if (registry_ == nullptr || supply_ == nullptr) return;
         if (from >= registry_->num_layers) return;
+        // **One read wave in flight at a time.** A second layer's reads must not
+        // overlap the first: the drive interleaves whatever is outstanding, so a
+        // second wave dilutes the first and delays the layer that is actually needed
+        // next. Measured on this drive: two layers outstanding cost `io_wait 1.6 ->
+        // 12.9 s` and `+11.5 s` of window at every arena size that admitted them
+        // (`3E` at depth 2), while one wave at a time holds `io_wait ~1.7 s`. This is a
+        // structural rule, not a hardware constant: the drive's order is not ours to
+        // choose, so we do not put two competing waves in front of it.
+        //
+        // The next wave is issued by `advance_reads` from the per-token hook, the
+        // instant the previous one has landed — so the drive stays continuously busy
+        // (no gap at the layer boundary) without ever holding two waves. Staging depth
+        // is unchanged by this: it still decides how many layers may be **staged**
+        // (read and waiting for a copy), which is the cartridge box's size.
+        if (reads_in_flight()) return;
 
         uint32_t budget = read_lookahead_capacity();
         if (budget <= ahead_.size()) return;
@@ -549,10 +561,36 @@ private:
             if (dispatch_layer_into(layer, entry.state)) {
                 ahead_.push_back(std::move(entry));
                 --budget;
+                // The gate re-checked per planned layer, so **one call never puts two
+                // waves in front of the drive**. Later layers are planned by
+                // `advance_reads` as this wave lands.
+                if (reads_in_flight()) break;
             }
             ++layer;
         }
         lookahead_depth_ = static_cast<uint32_t>(ahead_.size());
+    }
+
+    // Issue the next read wave as soon as the previous one has landed. Called from the
+    // per-token hook, which is the only host activity inside a body, so the corridor
+    // keeps advancing while the layer computes instead of waiting for the next
+    // boundary. A no-op while a wave is still in flight, or when the queue is full.
+    void advance_reads() {
+        if (!active_) return;
+        const uint32_t from = ahead_.empty() ? active_layer_ + 1 : ahead_.back().layer + 1;
+        dispatch_ahead(from);
+    }
+
+    // Whether any queued layer still has reads in the drive. `io_pending` is cleared
+    // by the supply as each expert's read lands (the pump's `materialize_available`),
+    // so this is fresh within one token of the layer body.
+    bool reads_in_flight() const noexcept {
+        for (const auto& entry : ahead_) {
+            for (const uint8_t pending : entry.state.io_pending) {
+                if (pending != 0) return true;
+            }
+        }
+        return false;
     }
 
     void update_frontier() {
@@ -614,6 +652,11 @@ private:
     // `staging_banks_ > 1`: whether the drain is deferred to `after_layer`. Derived so
     // the two uses of the bank count cannot disagree.
     bool deferred_drain_{false};
+    // The layer whose body is running. `advance_reads` needs it to know which layer
+    // follows when the queue is momentarily empty (its front entry was just
+    // materialized), so the next wave is planned from the right point and an already
+    // released layer is never re-planned.
+    uint32_t active_layer_{0};
     std::vector<uint32_t> leases_;
     uint64_t layer_loads_{0};
     uint64_t experts_streamed_{0};
