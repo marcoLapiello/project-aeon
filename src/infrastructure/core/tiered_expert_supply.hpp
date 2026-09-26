@@ -71,6 +71,14 @@ public:
         bool io_complete{false};
         uint64_t io_user_data{0};
         uint32_t io_request_count{0};
+        // A deferred Warm hand-off (plan P2.7): its bytes are already in host memory,
+        // so its staging slot is `IO_COMPLETE` from the outset and the copy runs later,
+        // when `attach_vram_destination` supplies a VRAM slot. `staging_ready` tells
+        // the copy path not to run the read-completion transition, and
+        // `warm_host_slot` (when pinned) is the upload source, so no payload is copied
+        // through the arena.
+        bool staging_ready{false};
+        int32_t warm_host_slot{-1};
         // The tier that answered this request. Carried on the transfer so a
         // caller can classify a whole layer's outcome (all-Hot / Warm / any-Cold)
         // without reconstructing it from the telemetry records.
@@ -366,6 +374,34 @@ public:
                     state.io_user_data = request_id;
                     state.io_request_count = static_cast<uint32_t>(request_count);
                     submitted_direct_io = true;
+                } else if (source_is_warm && request.vram_slot < 0) {
+                    // Staged-only Warm promotion (plan P2.7). The destination was
+                    // deferred by the registry, so nothing is uploaded here: the
+                    // payload waits in host memory (or in the arena, when the Warm slot
+                    // is not pinned) and `enqueue_expert_copy` takes the VRAM slot and
+                    // runs the copy when one is free. This is what keeps a Warm-heavy
+                    // swept prefill from committing a whole layer's VRAM at
+                    // reservation, which the staging-derived depth bound cannot see.
+                    const bool pinned = host_pool_ != nullptr && source_slot >= 0 &&
+                        host_pool_->is_slot_pinned(static_cast<uint32_t>(source_slot));
+                    bind_staging(request.operation_id, payload_request.staging_idx);
+                    if (pinned) {
+                        // Borrow the slot for its completion event only.
+                        prefetch_staging_->mark_ready(payload_request.staging_idx);
+                        state.warm_host_slot = source_slot;
+                    } else {
+                        // A non-pinned Warm slot must be copied now: there is no later
+                        // host read that could serve the upload.
+                        auto* transfer = find_registry_transfer(request.operation_id);
+                        transfer->staging_idx = payload_request.staging_idx;
+                        transfer->has_staging = true;
+                        prefetch_staging_->stage_payload(
+                            payload_request.staging_idx,
+                            host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(source_slot)));
+                    }
+                    state.staging_idx = payload_request.staging_idx;
+                    state.staging_ready = true;
+                    state.io_complete = true;
                 } else if (source_is_warm && host_pool_ && source_slot >= 0 &&
                            host_pool_->is_slot_pinned(static_cast<uint32_t>(source_slot))) {
                     bind_staging(request.operation_id, payload_request.staging_idx);
@@ -640,7 +676,8 @@ public:
     // leg; reads are bounded by staging, copies by VRAM).
     bool enqueue_expert_copy(PayloadTransfer& state, uint32_t staging_idx) {
         if (state.vram_slot < 0) {
-            // Staged-only: take the destination now, when the copy can actually run.
+            // No destination yet: take it now, when the copy can actually run. Covers
+            // both a staged-only cold read and a deferred Warm hand-off (P2.7).
             if (expert_registry_->free_vram_slot_count() == 0) {
                 return false;
             }
@@ -648,12 +685,21 @@ public:
                 state.operation_id, demotion_queue_capacity_);
         }
         const auto h2d_enqueue_started = std::chrono::steady_clock::now();
-        prefetch_staging_->complete_io(staging_idx);
+        // A Warm hand-off marked its slot `IO_COMPLETE` at dispatch, so the read leg is
+        // already accounted for; only a cold read still needs its completion recorded.
+        if (!state.staging_ready) {
+            prefetch_staging_->complete_io(staging_idx);
+        }
         prefetch_staging_->begin_gpu_transfer(staging_idx);
         wait_for_demotion_dependency(state.operation_id, sdma_cold_stream_);
+        // The upload source: the pinned Warm slot when there is one (no arena copy
+        // was made), else the staging slot the read landed in.
+        const uint8_t* source_ptr = state.warm_host_slot >= 0
+            ? host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(state.warm_host_slot))
+            : prefetch_staging_->get_slot_ptr(staging_idx);
         payload_pool_->upload_from_host_expert(
             static_cast<uint32_t>(state.vram_slot),
-            prefetch_staging_->get_slot_ptr(staging_idx),
+            source_ptr,
             sdma_cold_stream_
         );
         check_hip(
@@ -661,12 +707,16 @@ public:
             "hipEventRecord(cold H2D)");
         record_h2d_event(
             state.operation_id, sdma_cold_stream_, staging_idx, true,
-            static_cast<int32_t>(staging_idx), state.vram_slot);
+            state.warm_host_slot >= 0 ? state.warm_host_slot
+                                      : static_cast<int32_t>(staging_idx),
+            state.vram_slot);
         h2d_enqueue_ns_ += elapsed_ns(h2d_enqueue_started);
 
         state.is_prefetched = true;
         state.io_pending = false;
         state.io_complete = false;
+        state.staging_ready = false;
+        state.warm_host_slot = -1;
         return true;
     }
 

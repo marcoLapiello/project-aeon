@@ -161,14 +161,11 @@ Implements the §0 spec. Each step is independently verifiable and independently
 
 ### P2.6 — Decouple the read leg from VRAM; serialize the read waves — ✅ **done**
 
-> **Caveat (2026-09-26, analysis §18):** every gate run in P2.1–P2.6 was prefixed with
-> `AEON_WARM_GIB=…`, which **the engine does not read** — so guardrail #7 (both Warm
-> configurations) was never satisfied and every row is Warm 0. With Warm genuinely on,
-> the swept window **aborts**: the `stage_only` deferral is keyed on `COLD_NVME`, so a
-> Warm promotion (a shadow under a swept prefill) still reserves VRAM at *reservation*
-> and the staging-derived depth bound over-commits. **Open work — see §18.4.** The gate
-> now reads the variable itself, prints the shape it used, and refuses an arena that
-> would force the box into swap.
+> **Caveat resolved by P2.7 (analysis §18).** Every gate row in P2.1–P2.6 was prefixed
+> with `AEON_WARM_GIB=…`, which **the engine does not read** — so all of them were Warm
+> 0, and with Warm genuinely on the swept window aborted. P2.7 fixes that and the gate
+> now reads the variable itself, prints the shape and the `MemAvailable` it ran under,
+> and refuses an arena that would force the box into swap.
 
 | | |
 | :--- | :--- |
@@ -181,6 +178,20 @@ Implements the §0 spec. Each step is independently verifiable and independently
 | **Verify** | ✅ Byte-exactness (`16`/`18`/`10`/`38`, 0 failures, token `86`); `in_use_slots() == 0`; `invariants_hold()`. |
 | **Result** | `2E…6E` all `29.83–30.39 s`, **Gate A `1.009×` PASS** (was `1.382×` FAIL), **Gate C `42/43` at every depth** (was `0/43` at `1E`, `21/43` at `3E`+). `io_wait` `1.2–1.8 s`. The `3E` pathology (`41.9 s`) is gone because its cause was two waves in front of the drive, not depth. |
 | **Decision** | Keep `2E`: the arena size does not move throughput, so it is chosen on memory alone. A larger one is a budget, not a lever. |
+
+### P2.7 — Extend the staged-only deferral to the Warm shadow — ✅ **done**
+
+| | |
+| :--- | :--- |
+| **Status** | ✅ **shipped 2026-09-26.** The swept prefill now runs in the production Warm shape, which it previously refused (analysis §18). |
+| **Fixes** | The `stage_only` deferral was keyed on `COLD_NVME`, so a **Warm shadow** reserved its VRAM destination at *reservation* time. Under a swept prefill that commits a whole layer's slots immediately, invisible to a depth bound derived from **staging** — so the pool over-committed and the next load found none free: `prefill stream has no free VRAM slot for a load`. |
+| **Where** | `expert_registry.hpp` (the `warm_frozen_ && WARM_HOST` branch honours `stage_only`; destination deferred, `pending_slot_idx = -1`); `prefetch_staging.hpp` (`mark_ready`); `tiered_expert_supply.hpp` (deferred Warm branch, `staging_ready`/`warm_host_slot`, `enqueue_expert_copy` attaches late and picks the source); `tests/test_v4_prefill_sweep.cpp` (realistic Warm); `tests/test_v4_staging_depth.cpp` (guard + Warm) |
+| **Change** | One admission rule for both sources: **a read, or a Warm hand-off, takes a staging slot immediately and a VRAM slot only when its copy can run.** A deferred Warm hand-off borrows its staging slot **without a payload copy** (`mark_ready`) and uploads from the pinned host slot — staging a payload it already holds would add a memcpy per Warm expert (~`4 s` of a `30 s` window). A non-pinned Warm slot still stages through the arena. |
+| **Requirement** | R3/R5/R6 ✅ the depth bound is not informed by VRAM, and nothing commits VRAM at reservation. |
+| **Requirement** | Guardrail #7 ✅ **now actually met**: `test_v4_prefill_sweep` runs with `16 GiB` Warm (`1213` Warm experts, against `75` at the old `1 GiB`), so the shadow path is exercised rather than nominally present. |
+| **Verify** | ✅ `16 GiB` Warm sweep: **bit-exact** (`0 differing of 258560`), Warm unchanged (`0 of 1213`), no shadow survives. All four byte-exactness gates `16`/`18`/`10`/`38`, 0 failures. `Warm 0` matrix unchanged (`31.07 / 30.25 / 30.13 s`, Gate A `1.031×`). |
+| **Result** | `Warm 30`, default arena: **abort → `29.093 s`, `io_wait 0.436 s`**, Gate C passes. Faster than `Warm 0` (`30.6 s`) and with `~4×` less `io_wait`, because a share of each layer is answered by a Warm hand-off instead of a cold read. `overlap 22/43` against `42/43` is expected: a deferred hand-off has no read leg for the sample to see. |
+| **Gate safety** | A derived memory guard refuses an arena change that would leave less than a `16 GiB` reserve against `MemAvailable`; a one-depth run reports Gates A/B as skipped rather than failed, because an infeasible comparison is not a violated invariant. |
 
 ---
 
@@ -231,6 +242,9 @@ Phase 2  MANDATORY — the corridor becomes a demand-driven pipeline
    │   P2.6  ✅ DONE  read leg decoupled from VRAM; one read wave in flight, next issued
    │          on completion via the per-token hook; depth = min(staging, banks-1) —
    │          Gate A 1.009x PASS at every depth (analysis §17)
+   │   P2.7  ✅ DONE  the deferral now covers the Warm shadow too, so the swept prefill
+   │          runs in the production Warm shape (abort -> 29.09 s, io_wait 0.44 s);
+   │          the sweep gate runs with a realistic 16 GiB Warm and stays bit-exact
    │   └─ ABORT if any step cannot hold byte-exactness → keep it opt-in, record negative
    ▼
 Phase 3  optional, independent (dispatch bookkeeping)

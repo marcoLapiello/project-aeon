@@ -267,12 +267,15 @@ public:
             stage_only);
     }
 
-    // `stage_only` reserves a **cold** read with no VRAM destination (kind
-    // `COLD_STAGED`): the operation is in flight and the bytes will land in staging,
-    // but no slot is held. `attach_vram_destination` supplies one later, at the moment
-    // the copy can actually run. It is ignored for any source other than COLD_NVME — a
-    // Warm shadow or a demotion needs its destination decided at reservation, so those
-    // keep the immediate-reserve path.
+    // `stage_only` reserves the operation with no VRAM destination at reservation:
+    // the bytes land in the staging arena and wait there until
+    // `attach_vram_destination` gives them a slot, at the moment the copy can run.
+    // This is what lets the supply's read leg and copy leg be bounded separately (a
+    // read is limited by staging, a copy by VRAM) instead of both by VRAM.
+    //
+    // It applies to a **cold read** and to a **Warm shadow** alike. It is ignored for
+    // any other source: a demotion needs its destination decided at reservation, and
+    // a non-frozen Warm promotion has no staging leg at all.
     ExpertRequestReservation reserve_request(
         uint32_t gid,
         uint64_t current_step,
@@ -346,8 +349,19 @@ public:
             }
 
             const uint64_t shadow_operation = next_operation_id++;
-            const VramDestination destination = reserve_vram_destination(
-                gid, shadow_operation, demotion_queue_capacity);
+            // A shadow promotion may **also** be reserved staged-only. Under a swept
+            // prefill the lookahead depth is derived from the **staging** arena, so a
+            // Warm expert that took its VRAM destination here would commit a whole
+            // layer's slots at *reservation* time — invisible to the depth bound, so
+            // the pool over-commits and the next load finds no free slot. Deferring the
+            // destination to copy time keeps **one** admission rule for both sources:
+            // a read (or a Warm hand-off) takes a staging slot immediately and a VRAM
+            // slot only when its copy can run. `attach_vram_destination` supplies it.
+            std::optional<VramDestination> destination;
+            if (!stage_only) {
+                destination = reserve_vram_destination(
+                    gid, shadow_operation, demotion_queue_capacity);
+            }
             const int32_t source_host_slot = entry.slot_idx;
 
             ++hits_warm;
@@ -362,7 +376,9 @@ public:
             entry.publication = ExpertPublication::UNPUBLISHED;
             entry.slot_state = ExpertSlotState::ACTIVE;
             entry.lease_count++;
-            entry.pending_slot_idx = static_cast<int32_t>(destination.vram_slot);
+            entry.pending_slot_idx = destination.has_value()
+                ? static_cast<int32_t>(destination->vram_slot)
+                : -1;
             entry.warm_shadow = true;
             checked_validate();
             return ExpertRequestReservation{
@@ -370,7 +386,7 @@ public:
                 ExpertTier::WARM_HOST,
                 gid,
                 shadow_operation,
-                static_cast<int32_t>(destination.vram_slot),
+                destination.has_value() ? static_cast<int32_t>(destination->vram_slot) : -1,
                 source_host_slot,
                 true,
                 std::nullopt

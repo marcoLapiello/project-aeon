@@ -54,7 +54,14 @@ constexpr uint32_t kContext = 256;
 // exactly chunk-major and therefore certified nothing about the layer-major order.
 constexpr uint32_t kWindow = 96;
 constexpr uint32_t kChunk = 16;
-constexpr size_t kWarmBytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
+// A **realistic** Warm pool, not a token one. At `1 GiB` only ~`1.6` experts per layer
+// are Warm-resident, so the frozen-prefill shadow path — the one a Warm-heavy sweep
+// exercises — was effectively untested and a real defect hid behind it (analysis §18.3:
+// a Warm promotion reserved its VRAM at reservation rather than at copy time, and the
+// pool over-committed). `16 GiB` puts ~`10%` of every layer on that path while staying
+// well inside this box's memory, and the gate's own Warm-preservation checks below are
+// computed from the pool rather than written down, so they follow it.
+constexpr size_t kWarmBytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
 
 uint32_t g_checks = 0;
 uint32_t g_failures = 0;

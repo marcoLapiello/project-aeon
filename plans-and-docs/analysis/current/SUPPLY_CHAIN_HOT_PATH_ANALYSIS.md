@@ -874,8 +874,64 @@ Cold loads never hit this because their reservation is deferred, so a queued lay
 
 **Why it was never seen:** Warm was never allocated (§18.1), so this path was never exercised by any gate. It is pre-existing, not a regression from §17.
 
-### 18.4 Open
+### 18.4 Fixed — the deferral now covers the shadow path (plan P2.7)
 
-- **The fix is a design decision, not a patch:** the `stage_only` deferral should extend to the **shadow** path, so a Warm promotion under a swept prefill also lands in staging first and takes its VRAM destination at copy time. That keeps one admission rule for both sources and makes the staging-derived depth bound correct for both.
-- **Until then, guardrail #7 cannot be met** by `test_v4_staging_depth`, and the swept prefill should not be claimed to work in the production Warm shape.
-- **A memory guard has been added** to the gate: the arena change is refused when the projection (from the host's own `transient_staging_bytes` per slot) would leave less than an `8 GiB` reserve against `MemAvailable`. Warm 30 plus a deep arena otherwise enters swap, where the run does not fail — it stops progressing.
+The `stage_only` deferral was extended from the cold read to the **Warm shadow**, so
+one admission rule covers both:
+
+| | before | after |
+| :--- | :--- | :--- |
+| cold read, `stage_only` | VRAM deferred | VRAM deferred |
+| Warm shadow, `stage_only` | **VRAM taken at reservation** | **VRAM deferred** |
+| destination | — | `attach_vram_destination` at copy time, for both |
+
+A deferred Warm hand-off takes its staging slot **without a payload copy**
+(`PrefetchStagingArena::mark_ready`: `AVAILABLE -> IO_COMPLETE`): the bytes are already
+in pinned host memory, so the copy runs later straight out of the host slot. That is
+deliberate — staging a `14 MB` payload it already holds would add a memcpy per Warm
+expert, which on a Warm-heavy sweep is roughly `4 s` of a `30 s` window. The arena slot
+is borrowed only for the completion event the ordering already uses.
+
+A Warm slot that is **not** pinned is staged through the arena as before; with no
+deferred host read, that is the only way to preserve the bytes.
+
+### 18.5 Result — the swept prefill runs in the production Warm shape
+
+`test_v4_staging_depth`, `AEON_WARM_GIB=30`, default arena (`2E`), one swept window:
+
+| | |
+| :--- | :--- |
+| before | **aborted** — `prefill stream has no free VRAM slot for a load` |
+| after | `29.093 s`, `io_wait 0.436 s`, `42 layers` sampled, Gate C passes |
+
+It is also **faster than Warm 0** (`30.6 s`), and for a mechanical reason: with Warm 30
+a share of every layer is answered by a Warm hand-off instead of a cold read, so there
+is less to read and `io_wait` falls by `~4x` (`1.7 -> 0.44 s`). `overlap` is lower
+(`22/43` against `42/43`) because a deferred hand-off has no *read* leg for the
+"reading and copying at once" sample to see — expected, not a regression.
+
+**`test_v4_prefill_sweep` now uses a realistic Warm pool** (`16 GiB`, `1213` Warm
+experts against `75` at the old `1 GiB`), so the shadow path is genuinely exercised
+rather than nominally present. It passes **bit-exact** (`0 differing of 258560`), with
+Warm unchanged across the sweep (`0 of 1213`) and no shadow surviving the window.
+
+All four byte-exactness gates pass: `16`/`18`/`10`/`38` checks, 0 failures, and the
+`Warm 0` depth matrix is unchanged (`31.07 / 30.25 / 30.13 s`, Gate A `1.031x`, `42/43`
+overlap).
+
+### 18.6 The gate can no longer enter the pressure zone
+
+Two changes, both to the gate rather than the engine:
+
+- **A derived memory guard.** An arena change is refused when the projection — the
+  per-slot bytes from the host's own `transient_staging_bytes` — would leave less than a
+  **`16 GiB`** reserve against `MemAvailable`. The reserve is large because `Warm 30` is
+  `30 GiB` pinned and the model adds ~`20 GiB`: on a 62 GiB box the production shape plus
+  *any* arena above the default is already marginal, and a small reserve let a resize
+  through into swap, where a run does not fail — it stops progressing.
+- **A one-depth run is no longer a Gate A/B failure.** When the guard refuses the other
+  depths, "fewer than two depths" is the correct outcome, not a violated invariant; the
+  gates report it as such and the row that ran still holds its measurement.
+
+`MemAvailable` is printed in the gate header, so the headroom a row was measured under
+is visible rather than assumed.

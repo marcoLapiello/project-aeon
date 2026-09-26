@@ -222,6 +222,15 @@ public:
         transition(slot_idx, SlotState::AVAILABLE, SlotState::IO_PENDING);
     }
 
+    // Claim a slot and mark its bytes **ready to copy**, without staging a payload
+    // into it. The deferred Warm hand-off needs this: the payload is already pinned
+    // host memory, so a copy through the arena would add a whole-payload memcpy for
+    // nothing — the slot is held only for its completion event, and the copy runs
+    // later out of the host slot (see `enqueue_expert_copy`).
+    void mark_ready(uint32_t slot_idx) {
+        transition(slot_idx, SlotState::AVAILABLE, SlotState::IO_COMPLETE);
+    }
+
     void complete_io(uint32_t slot_idx) {
         transition(slot_idx, SlotState::IO_PENDING, SlotState::IO_COMPLETE);
     }
