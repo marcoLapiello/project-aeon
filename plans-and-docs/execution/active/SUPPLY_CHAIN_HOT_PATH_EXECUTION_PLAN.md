@@ -179,6 +179,22 @@ Implements the §0 spec. Each step is independently verifiable and independently
 | **Result** | `2E…6E` all `29.83–30.39 s`, **Gate A `1.009×` PASS** (was `1.382×` FAIL), **Gate C `42/43` at every depth** (was `0/43` at `1E`, `21/43` at `3E`+). `io_wait` `1.2–1.8 s`. The `3E` pathology (`41.9 s`) is gone because its cause was two waves in front of the drive, not depth. |
 | **Decision** | Keep `2E`: the arena size does not move throughput, so it is chosen on memory alone. A larger one is a budget, not a lever. |
 
+### P2.8 — One pinned region: the Warm/staging boundary moves per phase — ✅ **done**
+
+| | |
+| :--- | :--- |
+| **Status** | ✅ **shipped 2026-09-26.** `warm_host_bytes` is now the **total** pinned budget and the split inside it moves (analysis §19). |
+| **Fixes** | Warm and the corridor were two allocations, so the host RAM a run held was `warm + staging` — two settings to add, and one a user could overshoot. |
+| **Where** | `expert_host_region.hpp` (new: the one allocation); `host_expert_pool.hpp` / `prefetch_staging.hpp` (`bind`, non-owning views); `expert_registry.hpp` (`host_capacity_usable`, `grow/shrink_host_capacity`, `release_host_tail`); `memory_budget.hpp` (`staging_slot_counts`, the folded budget); `v4_model_host.hpp` (`apply_host_partition` at the two boundaries) |
+| **Change** | One region, `[ Warm \| staging ]`, cut by a boundary that moves: decode and a chunked prefill keep the corridor at `max(12, min(6C, E))` and give Warm everything else; a swept prefill grows it to `blocks x E` and hands the difference back at `prefill_end`. Moving it is a pointer move plus a free-list edit. A surrendered Warm slot is demoted to Cold (no data moves) and re-read on demand. Registry arrays are sized to the maximum Warm capacity, so a move never reallocates the catalog. |
+| **Requirement** | R2/R5/R6 ✅ the corridor's size is still purely a budget, and now the *total* is the user's number. |
+| **Requirement** | Guardrail #2/#3 ✅ a move requires no transfer in flight and no live lease, both refused rather than assumed; `validate_invariants` holds at every policy. |
+| **Verify** | ✅ Byte-exact at every policy: `16`/`18`/`10`/`38`/`7`/`11` checks, 0 failures. `test_v4_prefill_sweep` shows `415` Warm experts demoted and restored for the corridor, logits bit-exact. |
+| **Measured** | `Warm 25 GiB`, `3` blocks: decode `21.62 GiB` Warm (`1640` slots) with a `3456 MiB` corridor; swept prefill `15.38 GiB` Warm with `10.12 GiB` corridor. The borrow costs `+2%` NVMe across two passes (`313.9 -> 345.2 GiB`) — the corridor's rent, which `--staging-blocks 1` declines. |
+| **Note** | `warm_host_bytes` must now cover the corridor; a budget below the configured staging blocks is rejected at load with the figure it needed. |
+
+---
+
 ### P2.7 — Extend the staged-only deferral to the Warm shadow — ✅ **done**
 
 | | |

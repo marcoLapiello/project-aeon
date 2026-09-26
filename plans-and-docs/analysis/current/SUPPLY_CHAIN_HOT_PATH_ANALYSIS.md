@@ -935,3 +935,97 @@ Two changes, both to the gate rather than the engine:
 
 `MemAvailable` is printed in the gate header, so the headroom a row was measured under
 is visible rather than assumed.
+
+---
+
+## 19. One pinned region for Warm and the corridor, cut by a movable boundary (2026-09-26)
+
+*Status: **shipped.** Warm and the transport corridor are one allocation; the split
+moves per phase.*
+
+### 19.1 The two budgets were never two things
+
+Warm residency and the staging arena were separate pinned allocations, so the host RAM
+a run held was `warm + staging` — a figure reachable only by adding two settings, and
+one a user could overshoot without noticing. They are also, physically, the same thing:
+expert payloads of the artifact's width, 4 KiB-aligned, same layout. The difference is
+**policy** — a Warm slot is a durable residence owned by the registry, a staging slot a
+transient one owned by a transfer — which is why they can share storage and still keep
+one admission rule each.
+
+`warm_host_bytes` is now the **total**, so it is also the guard: the RAM a run holds is
+exactly what the user set. Each consumer takes a **view** (`ExpertHostRegion` plus a
+non-owning `bind()` on both pools), so moving the boundary is a pointer move and a
+free-list edit — no page is allocated, freed or re-pinned, and the two sizes cancel
+exactly, which two allocations resized against each other could never do (a pool frees
+in `64`-slot segments).
+
+### 19.2 Why the boundary moves
+
+The two consumers want opposite shapes, and this is the point of the feature:
+
+| phase | corridor | Warm | why |
+| :--- | ---: | ---: | :--- |
+| decode, chunked prefill | `max(12, min(6C, E))` | everything else | Warm residency is where decode's NVMe hits are decided |
+| swept prefill | `blocks x E` | the remainder | only the lookahead wants a deep corridor |
+
+Measured on a 62 GiB box with `Warm 25 GiB` and `3` staging blocks and the 1231-token
+prompt:
+
+| | Warm | corridor |
+| :--- | ---: | ---: |
+| before (two allocations) | `25.00 GiB` + `10.12 GiB` separate = **35.12 GiB held** | |
+| decode | `21.62 GiB` (`1640` slots) | `3456 MiB` base |
+| swept prefill | `15.38 GiB` (`1128` slots) | `10.12 GiB` |
+
+So the figure the user sets is what the process holds, and the corridor's share is
+available to Warm whenever a sweep is not running. A user who wants the old decode
+residency sets `25 + 3.44 = 28.4 GiB`; one who wants the old total sets `35`.
+
+**The borrow is not free, and it is measured:** the swept prefill demotes `512` Warm
+experts to Cold for the length of the window, and they are re-read on demand —
+`nvme_gib 313.9 -> 345.2` across two passes, about `+2%`. That is the corridor's rent,
+and `--staging-blocks 1` declines to pay it by keeping the corridor at its base.
+
+### 19.3 How it is kept safe
+
+- **Registry arrays are sized to the maximum** Warm capacity, so a boundary move never
+  reallocates or re-maps the catalog. Only `host_capacity_usable` and the free list
+  change, and `validate_invariants` enforces that no Warm owner sits beyond the
+  boundary.
+- **The move is idempotent.** `prefill_begin` is entered both by the caller and by the
+  driver, so the same partition is requested twice per window; re-applying it would
+  re-base the arena under the sweep's live lookahead.
+- **The drain is explicit.** `release_host_tail` drops ownership of the surrendered
+  Warm slots and frees them; no data moves, because the payload is still in the
+  container.
+- **Both preconditions are refused, not assumed:** a transfer in flight or a live lease
+  blocks a move, exactly as `resize_staging_slots` already required. The move happens at
+  the two boundaries, which already drain both.
+
+### 19.4 Verification
+
+Byte-exactness is unaffected at every policy:
+
+| gate | result |
+| :--- | :--- |
+| `test_v4_prefill_sweep` | `16/0` — region active, `415` Warm experts demoted for the corridor and restored, logits bit-exact |
+| `test_v4_routed_prefill` | `18/0` — the routed bank needs only the base, so the boundary does not move |
+| `test_v4_prefill_window` | `10/0` |
+| `test_v4_engine` | `38/0` |
+| `test_v4_staging_depth` | `7/0` — no host budget, so the standalone arena path is unchanged |
+| `test_v4_warm_frozen_prefill` | `11/0` |
+
+**Semantic change to note:** `warm_host_bytes` must now cover the corridor, so a budget
+below the configured staging blocks is **rejected at load** with the figure it needed.
+`test_v4_routed_prefill`'s `1 GiB` became `8 GiB` for that reason, and
+`test_v4_prefill_sweep` already ran at a realistic pool.
+
+### 19.5 Also fixed en route
+
+Two latent defects the new code exposed, both in code this change touches:
+
+- `hipHostUnregister` was called with two arguments; it takes one.
+- The pool's non-owning view was a single large segment, but `get_expert_slot_ptr`
+  resolves a slot by `slot / SEGMENT_SLOTS`, so every slot past the first mis-indexed.
+  The view is now laid out in `SEGMENT_SLOTS` segments like an owned pool.
