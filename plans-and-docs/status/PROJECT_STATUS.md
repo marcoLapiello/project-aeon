@@ -10,9 +10,9 @@ Numbers do not live here. Measured results belong to the [Performance & Accuracy
 
 ## 1. Where the project is
 
-Project Aeon is **rewriting its DeepSeek-V4 inference graph**. The storage, streaming, artifact-format and kernel layers are kept; the graph that composes them is rebuilt from a verified specification — [DSV4 Inference Pipeline Plan](../execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md), the authority for graph semantics, whose every `[V]` claim cites readable reference code and whose every remaining unknown names the gate that settles it.
+Project Aeon runs **DeepSeek-V4-Flash-0731 end-to-end on consumer AMD RDNA3** (`gfx1100`): text in, text out, with the `145.12 GiB` routed-expert store streamed from NVMe through the Warm host tier into VRAM and the `12.71 GiB` dense backbone resident. The acceptance criterion — one command, a conversation in, text out — is met.
 
-**Why.** An audit of the runtime against the selected checkpoint found structural errors in the graph — not tuning gaps: a missing Hyper-Connections comb scale, a missing compressor APE term, and HCA layers running indexer selection they do not have. The tests of the time did not catch them because several compared a kernel against an oracle derived from the same helper (the anti-circularity rule). Measurements taken against that graph describe a different computation and are invalid; the ledger records the deletion. The pre-rewrite graph and its gate were deleted on 2026-09-18, ~5,600 lines.
+It got there by **rebuilding the inference graph** against a verified specification rather than repairing the original. An audit of the runtime against the selected checkpoint found structural errors — a missing Hyper-Connections comb scale, a missing compressor APE term, and HCA layers running indexer selection they do not have — and several tests of the time could not have caught them, because they compared a kernel against an oracle derived from the same helper. **Measurements taken before 2026-09-18 describe that other computation and are invalid**; the ledger records the deletion of the pre-rewrite graph, ~5,600 lines.
 
 | Field | Value |
 | :--- | :--- |
@@ -46,12 +46,8 @@ Oldest to newest. As the list grows, the two oldest rows fuse into one, so the t
 
 | Milestone | State | Detail |
 | :--- | :--- | :--- |
-| Phase 0–2: foundations, primitives, three-tier storage stack (oldest rows, fused) | complete | [Phase 0](../execution/completed/PHASE_0_EXECUTION_PLAN.md), [Phase 1](../execution/completed/PHASE_1_EXECUTION_PLAN.md), [Phase 2](../execution/completed/PHASE_2_EXECUTION_PLAN.md), [Warm-tier repair](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) |
-| Native text path: tokenizer, prompt formatter, EOS-aware generation, CLI | complete | [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](../execution/completed/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) |
-| Specification and oracle harness: Tier 0 research, Step 0 prompt encoding, Tier 1 primitives, Step 3 `hc_head` | verified | [DSV4 Inference Pipeline Plan](../execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md) §Tier 0–1, §Step 0, §Step 3 |
-| Tier 2 — the layer body, the three attention classes, the serial loop (items 16–18) | closed | pipeline plan §Tier 2 |
-| Tier 3 — chunked prefill and the long-context lifecycle (items 19–20), real-scale state | done | pipeline plan §Tier 3 |
-| Tier 4 — streaming and tiering, state restore (items 21–22) | certified | pipeline plan §Tier 4; [session analysis](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) |
+| Foundations (oldest rows, fused): build and hardware baseline, the three-tier storage stack, and the native text path | complete | [Phase 0](../execution/completed/PHASE_0_EXECUTION_PLAN.md), [Phase 1](../execution/completed/PHASE_1_EXECUTION_PLAN.md), [Phase 2](../execution/completed/PHASE_2_EXECUTION_PLAN.md), [Warm-tier repair](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md), [native text path](../execution/completed/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) |
+| DeepSeek-V4 specification and oracle harness: Step 0 prompt encoding and the implementation order Tiers 0–4, through the layer body, the three attention classes, chunked prefill, the long-context lifecycle, streaming and tiering, and state restore | verified | [DSV4 Inference Pipeline Plan](../execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md) — one plan; its every `[V]` claim cites readable reference code |
 | Graph rewrite: composition P0–P4, the 43-layer text-in/text-out path | acceptance criterion met | [DSV4 Graph Composition Plan](../execution/completed/DSV4_GRAPH_COMPOSITION_PLAN.md) §7; ledger M28 |
 | Prefill supply strategy: prompt-length gate, bounded Hot drain, routed bank, Hot-set restore | complete | [PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md](../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md); ledger M44/M44b |
 | Supply-chain hot path: the corridor as a demand-driven pipeline | complete | [SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md](../execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md); ledger M42–M46; evidence §8–§19 of [the analysis](../analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md) |
@@ -60,12 +56,11 @@ Oldest to newest. As the list grows, the two oldest rows fuse into one, so the t
 
 | Work in progress | State | Detail |
 | :--- | :--- | :--- |
-| Expert streaming and chunked prefill | in progress | [EXPERT_STREAMING_EXECUTION_PLAN.md](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) — §6 open work: the `W`/`C` window sweep, the prefill body's `~120 ms/prompt-token`, the sub-`E` waved ring, the cold→warm fill path, the placement policy, and prefix reuse. Its prefill supply half is complete: [Prefill Supply Strategy](../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md); its corridor half is complete: [Supply-Chain Hot Path](../execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md) |
-| Session state and swap | open | [SESSION_STATE_AND_SWAP_ANALYSIS.md](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) |
-| Host-memory pressure | open investigation | [HOST_MEMORY_PRESSURE_INVESTIGATION.md](../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) |
-| Routing profile and placement study | open | [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) |
-| Kernel compute path | open | [KERNEL_COMPUTE_PATH_ANALYSIS.md](../analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md) — the compute half of "batched prefill" is unbuilt |
-| Backend generalization: factory and second backend | open gates | [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) |
+| Prefill body cost (`~120 ms/prompt-token`) | open — **next investigation** | Linear in the prompt and measured through `aeon_chat`; neither supply nor the registry audit, both of which are accounted for. Must be split into body vs supply before it anchors a target. [KERNEL_COMPUTE_PATH_ANALYSIS.md](../analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md) — the compute half of "batched prefill" is unbuilt |
+| Expert streaming — residual | open | [EXPERT_STREAMING_EXECUTION_PLAN.md](../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) billed deliverables are complete (telemetry, the tier-invariance and starved-pool gates, the demotion-queue A/B, the layer-major sweep), and its supply and corridor halves are in **Past**. What remains is §6: the `W`/`C` window sweep — every run to date is one pass (`W ≥ N`), so the `⌈N/W⌉` regime is unmeasured — and the cold→warm fill path. A **sub-`E` staging ring** is unreached but low value: the depth question is closed (the arena is a budget, not a lever) and it would buy nothing while VRAM residency is the limiter |
+| Session state and swap — prefix reuse | open, not started | Every turn re-prefills from token 0. A product requirement rather than an optimization. [SESSION_STATE_AND_SWAP_ANALYSIS.md](../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) |
+| Host-memory pressure | open investigation | Why a `45 GiB` Warm tier does not finish loading on a `62.62 GiB` host: cause unidentified, the dense-page hypothesis excluded, and the deciding measurement (`--warm-gib 45 --no-warm-preload`, freshly booted) not yet completed. The honest ceiling is `≈40 GiB` Warm. [HOST_MEMORY_PRESSURE_INVESTIGATION.md](../analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) |
+| Routing profile and placement study | Phase 1 complete, Phase 2 scoped | Reuse-distance and Belady-OPT measured (ledger M35/M36); Phase 2 decides whether frequency-informed placement can help. The aggregation library exists; the driver needs adjusting to the rebuilt runtime. [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) |
 
 ### Future
 
@@ -73,6 +68,7 @@ Directions explicitly defined as future — researched or discussed, not yet adm
 
 | Direction | Why it waits | Detail |
 | :--- | :--- | :--- |
+| Backend generalization: the factory and a second backend | its remaining stages are **contingent on a second backend existing**, and the plan's own non-goal forbids the shared abstraction before two concrete backends demonstrate it | [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) — the descriptor, manifest, backend selection, dense binding and source boundaries are already implemented |
 | Prefix matcher (block table, cache key, radix search, eviction) | needs an assembled graph and a fork workload | composition plan §9; session analysis |
 | MTP / DSpark draft head (`num_nextn_predict_layers=1`) | speculative decoding, not the base forward pass | composition plan §9; pipeline plan §Tier 0.2e |
 | Multi-GPU pipeline parallelism (Phase 3) | out of scope for this revision | composition plan §9; [vision](../reference/strategy/PROJECT_AEON_VISION.md) |
@@ -83,18 +79,20 @@ Directions explicitly defined as future — researched or discussed, not yet adm
 
 ---
 
-## 4. Open gates, settled empirically rather than by reading
+## 4. Measurement gates, settled empirically rather than by reading
 
-Pointers only. Each gate is specified, with its procedure and its result, in the document that owns it.
+Not everything can be decided by reading code, and these are the questions that cannot. Each is specified, with its procedure and its result, in the document that owns it.
 
-1. **KV fp8/E4M3 vs bf16 storage delta** — open. (pipeline plan Gates 9/10)
-2. **MoE routed-expert accumulation order** — partially settled.
-3. ~~Indexer Hadamard rotation~~ — **settled: do not apply it** (pipeline plan Gate 11).
-4. ~~Local-window prefix-reuse boundary~~ — **settled at item 20**: the compressed store never evicts inside the declared context, so only the local ring is window-bounded and must be **replayed**, not restored.
+| Gate | State |
+| :--- | :--- |
+| KV fp8/E4M3 versus bf16 storage delta | open (pipeline plan Gates 9/10) |
+| MoE routed-expert accumulation order | partially settled |
+| Indexer Hadamard rotation | **settled: do not apply it** (pipeline plan Gate 11) |
+| Local-window prefix-reuse boundary | **settled at item 20**: the compressed store never evicts inside the declared context, so only the local ring is window-bounded and must be **replayed**, not restored |
 
-**Graph correctness is closed.** Tiers 0–4 and composition P0–P4 are done, and the acceptance criterion is met — one command, conversation in, text out, on the artifact's real weights through Hot/Warm/Cold.
+**Correctness is settled; the gates above are measurements.** Tiers 0–4 and composition P0–P4 are certified and the acceptance criterion is met, so nothing on the correctness axis is undecided — what remains open in this project is measurement, performance, and product scope.
 
-**Kept infrastructure** — cold-tier characterization, physical `.aeon` placement, host-memory pressure, the model-backed `>= 6.0 GB/s` target, kernel occupancy tuning, the routing placement study, the explicit backend factory, and Phase 3 multi-GPU.
+Also open, tracked where they belong: cold-tier characterization, physical `.aeon` placement, the model-backed `>= 6.0 GB/s` target, and kernel occupancy tuning.
 
 ---
 
