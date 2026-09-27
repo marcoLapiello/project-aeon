@@ -44,10 +44,10 @@ The two files with the highest churn. This is where the "grown during the last i
 - [x] `memory_budget.hpp` becomes the umbrella. **Gate:** `test_v4_engine`, `test_v4_staging_depth`, and the budget cross-check in `test_v4_layer_body_lifecycle` pass unchanged. *(`test_v4_staging_depth` failed once on a timing gate under load and passed on rerun; the split is a byte-identical move, so this was environmental.)*
 
 ### A2. `v4_model_host.hpp` → owner + controllers (fan-in 13)
-The header itself says it is the G1 composition root; the target is to shrink it to genuine ownership and accessors. Extract in this order, one controller per commit:
-- [ ] `v4_prefill_controller.hpp` — `prefill_begin` / `prefill_before_layer` / `prefill_after_layer` / `prefill_end`, `restore_prefill_warm`, and the sweep accessors (`prefill_sweep`, `sweep_occupancy`, `sweep_load_ns`, `sweep_io_ns`, `prefill_sweep_engaged*`).
+The header itself says it is the G1 composition root; the target is to shrink it to genuine ownership and accessors. Extract one controller per commit. Drawn in dependency order — the self-contained workspace first, the coupled lifecycle last — so each step lands and is gated on its own:
+- [x] `v4_prefill_workspace.hpp` — `V4PrefillWorkspace` owns the residual carry, the worst-case batch scratch, and the window/chunk it was sized for. It takes the layer vector and model config as arguments, so it needs no host reference. *Done 2026-09-27: gates `test_v4_engine`, `test_v4_graph_body`, `test_v4_prefill_sweep` pass unchanged.*
 - [ ] `v4_host_partition.hpp` — `apply_host_partition`, `resize_staging_slots`, and the slot arithmetic (`staging_in_use_slots`, `staging_slot_count`, `batch_staging_capacity`, `sweep_staging_banks`).
-- [ ] `v4_prefill_workspace.hpp` — `allocate_prefill_workspace`, `ensure_prefill_carry`, `prefill_carry*`, `prefill_window_tokens` / `prefill_chunk_tokens` / `prefill_carry_bytes`.
+- [ ] `v4_prefill_controller.hpp` — `prefill_begin` / `prefill_before_layer` / `prefill_after_layer` / `prefill_end`, `restore_prefill_warm`, and the sweep accessors (`prefill_sweep`, `sweep_occupancy`, `sweep_load_ns`, `sweep_io_ns`, `prefill_sweep_engaged*`).
 - [ ] Leave the host with: streams, layers/scratch/resources accessors, registry/pool/telemetry accessors, `initialize`, `free`.
 - [ ] `v4_model_host.hpp` stays the umbrella. **Gate:** `test_v4_graph_body`, `test_v4_graph_head`, `test_v4_engine`, `test_v4_staging_depth` pass unchanged; `aeon_chat` token stream identical to the pre-split run.
 
@@ -130,7 +130,7 @@ Explicitly **not** scheduled. Listed so the inventory is complete and so a futur
 | Tier | Item | State |
 | :--- | :--- | :--- |
 | A1 | `memory_budget.hpp` → 3 units | ✅ |
-| A2 | `v4_model_host.hpp` → owner + 3 controllers | ☐ |
+| A2 | `v4_model_host.hpp` → owner + 3 controllers | ◐ workspace done |
 | B1 | `v4_layer_body.hpp` → types + phases | ☐ |
 | B2 | `tiered_expert_supply.hpp` → types + seams | ☐ |
 | C1 | `expert_registry.hpp` → registry + partition + residency + validation | ☐ |

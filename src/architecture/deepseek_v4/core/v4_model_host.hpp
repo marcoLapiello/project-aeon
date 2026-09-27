@@ -60,6 +60,7 @@
 #include "architecture/deepseek_v4/core/v4_layer.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
+#include "architecture/deepseek_v4/core/v4_prefill_workspace.hpp"
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_model_resources.hpp"
 #include "architecture/deepseek_v4/core/v4_model_spec.hpp"
@@ -243,10 +244,7 @@ public:
         layers_.clear();
         resources_.free();
         scratch_.free();
-        batch_scratch_.free();
-        if (d_prefill_carry_half_) { (void)hipFree(d_prefill_carry_half_); d_prefill_carry_half_ = nullptr; }
-        if (d_prefill_carry_) { (void)hipFree(d_prefill_carry_); d_prefill_carry_ = nullptr; }
-        prefill_carry_tokens_ = 0;
+        prefill_workspace_.free();
         streams_.destroy();
         loader_.close_all();
         layer_specs_.clear();
@@ -284,15 +282,13 @@ public:
     // (`allocate_prefill_workspace`), that one buffer already covers every layer and
     // this is a no-op — which is what makes the layer-major pass allocation-free.
     void ensure_batch_scratch(uint32_t layer_id, uint32_t count) {
-        if (prefill_workspace_ready_ && count <= batch_scratch_.token_count()) return;
-        if (batch_scratch_count_ == count && batch_scratch_layer_ == layer_id) return;
-        batch_scratch_.allocate(layer(layer_id), count);
-        batch_scratch_layer_ = layer_id;
-        batch_scratch_count_ = count;
+        prefill_workspace_.ensure_batch_scratch(layer(layer_id), layer_id, count);
     }
 
-    V4LayerBodyBatchScratch& batch_scratch() noexcept { return batch_scratch_; }
-    const V4LayerBodyBatchScratch& batch_scratch() const noexcept { return batch_scratch_; }
+    V4LayerBodyBatchScratch& batch_scratch() noexcept { return prefill_workspace_.batch_scratch(); }
+    const V4LayerBodyBatchScratch& batch_scratch() const noexcept {
+        return prefill_workspace_.batch_scratch();
+    }
 
     // ---- Step 6 item 7: the prefill workspace, derived from the knobs ---------
     //
@@ -311,58 +307,22 @@ public:
     // allowance here, so a configuration that would overrun fails with a named
     // message instead of quietly shrinking the expert pool.
     void allocate_prefill_workspace(uint32_t window_tokens, uint32_t chunk_tokens) {
-        if (window_tokens == 0 || chunk_tokens == 0) {
-            throw std::invalid_argument(
-                "V4ModelHost: the prefill window and chunk must be positive");
-        }
-        if (chunk_tokens > V4LayerBodyBatchScratch::kMaxTokens) {
-            throw std::invalid_argument(
-                "V4ModelHost: prefill chunk " + std::to_string(chunk_tokens) +
-                " exceeds the body's row cap of " +
-                std::to_string(V4LayerBodyBatchScratch::kMaxTokens));
-        }
-
-        ensure_prefill_carry(window_tokens);
-
-        // Worst case across the layers: the composed row-set, the indexer's
-        // candidate scores and its top-k are each the maximum any layer needs.
-        uint32_t max_compressed_capacity = 0;
-        uint32_t max_index_topk = 0;
-        uint32_t max_local_capacity = 0;
-        for (const auto& layer : layers_) {
-            const auto& layout = layer.state_layout();
-            max_compressed_capacity = std::max(max_compressed_capacity, layout.compressed_capacity);
-            max_index_topk = std::max(max_index_topk, layout.index_topk);
-            max_local_capacity = std::max(max_local_capacity, layout.local_capacity);
-        }
-        batch_scratch_.allocate_capacity(max_compressed_capacity, max_index_topk,
-                                         max_local_capacity, chunk_tokens);
-        const size_t allowance = batch_scratch_allowance_bytes(chunk_tokens);
-        if (batch_scratch_.bytes() > allowance) {
-            throw std::runtime_error(
-                "V4ModelHost: the prefill batch scratch is " +
-                std::to_string(batch_scratch_.bytes() / (1024 * 1024)) +
-                " MiB but the budget allows " +
-                std::to_string(allowance / (1024 * 1024)) +
-                " MiB for chunk " + std::to_string(chunk_tokens) +
-                " — raise BATCH_SCRATCH_BYTES_PER_ROW or lower prefill_chunk");
-        }
-
-        prefill_window_tokens_ = window_tokens;
-        prefill_chunk_tokens_ = chunk_tokens;
-        prefill_workspace_ready_ = true;
+        prefill_workspace_.allocate(window_tokens, chunk_tokens, layers_, config_);
     }
 
     // What was allocated, for the report and the gates.
-    uint32_t prefill_window_tokens() const noexcept { return prefill_window_tokens_; }
-    uint32_t prefill_chunk_tokens() const noexcept { return prefill_chunk_tokens_; }
-    size_t prefill_carry_bytes() const noexcept {
-        const size_t hc_dim = static_cast<size_t>(config_.hc_mult) *
-                              static_cast<size_t>(config_.hidden_size);
-        return static_cast<size_t>(prefill_carry_tokens_) * hc_dim *
-               (sizeof(uint16_t) + sizeof(float));
+    uint32_t prefill_window_tokens() const noexcept {
+        return prefill_workspace_.prefill_window_tokens();
     }
-    size_t prefill_batch_scratch_bytes() const noexcept { return batch_scratch_.bytes(); }
+    uint32_t prefill_chunk_tokens() const noexcept {
+        return prefill_workspace_.prefill_chunk_tokens();
+    }
+    size_t prefill_carry_bytes() const noexcept {
+        return prefill_workspace_.prefill_carry_bytes(config_);
+    }
+    size_t prefill_batch_scratch_bytes() const noexcept {
+        return prefill_workspace_.prefill_batch_scratch_bytes();
+    }
     // The decode workspace's real size (`V4ActivationScratch` + the routed-expert
     // scratch), for the report and the load-time check against the budget's allowance.
     size_t decode_scratch_bytes() const noexcept {
@@ -380,27 +340,14 @@ public:
     // fp32, held in VRAM for the whole layer-major pass. Grows only, so a window
     // of a given size is allocated once and reused by every later pass that fits.
     void ensure_prefill_carry(uint32_t tokens) {
-        if (tokens == 0) {
-            throw std::invalid_argument("V4ModelHost: a prefill carry cannot be zero tokens");
-        }
-        if (tokens <= prefill_carry_tokens_) return;
-
-        if (d_prefill_carry_half_) { (void)hipFree(d_prefill_carry_half_); d_prefill_carry_half_ = nullptr; }
-        if (d_prefill_carry_) { (void)hipFree(d_prefill_carry_); d_prefill_carry_ = nullptr; }
-        prefill_carry_tokens_ = 0;
-
-        const uint32_t hc_dim = static_cast<uint32_t>(config_.hc_mult) *
-                                static_cast<uint32_t>(config_.hidden_size);
-        CHECK_HIP(hipMalloc(&d_prefill_carry_half_,
-                            static_cast<size_t>(tokens) * hc_dim * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_prefill_carry_,
-                            static_cast<size_t>(tokens) * hc_dim * sizeof(float)));
-        prefill_carry_tokens_ = tokens;
+        prefill_workspace_.ensure_prefill_carry(tokens, config_);
     }
 
-    half* prefill_carry_half() noexcept { return d_prefill_carry_half_; }
-    float* prefill_carry() noexcept { return d_prefill_carry_; }
-    uint32_t prefill_carry_tokens() const noexcept { return prefill_carry_tokens_; }
+    half* prefill_carry_half() noexcept { return prefill_workspace_.prefill_carry_half(); }
+    float* prefill_carry() noexcept { return prefill_workspace_.prefill_carry(); }
+    uint32_t prefill_carry_tokens() const noexcept {
+        return prefill_workspace_.prefill_carry_tokens();
+    }
 
     const V4DeviceStreams& streams() const noexcept { return streams_; }
 
@@ -1433,19 +1380,10 @@ private:
     V4ActivationScratch scratch_;
     std::vector<V4Layer> layers_;
 
-    // The layer-major prefill working set (Step 6). The workspace is re-allocated
-    // when the layer changes; the carry grows and is kept.
-    V4LayerBodyBatchScratch batch_scratch_;
-    uint32_t batch_scratch_layer_{UINT32_MAX};
-    uint32_t batch_scratch_count_{0};
-    half* d_prefill_carry_half_{nullptr};
-    float* d_prefill_carry_{nullptr};
-    uint32_t prefill_carry_tokens_{0};
-    // Step 6 item 7: the configured knobs and whether the workspace was allocated at
-    // load for them.
-    uint32_t prefill_window_tokens_{0};
-    uint32_t prefill_chunk_tokens_{0};
-    bool prefill_workspace_ready_{false};
+    // The layer-major prefill working set (Step 6): the residual carry and the
+    // worst-case batch scratch, allocated once at load. Owned by the workspace
+    // (see `v4_prefill_workspace.hpp`).
+    V4PrefillWorkspace prefill_workspace_;
 
     UnifiedVRAMExpertPool vram_pool_;
     HostExpertPool host_pool_;
