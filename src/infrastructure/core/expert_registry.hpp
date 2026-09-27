@@ -498,12 +498,6 @@ public:
         return incoming->pending_slot_idx;
     }
 
-    // Whether an operation is reserved but still waiting for its VRAM destination.
-    bool operation_is_staged_only(uint64_t operation_id) {
-        auto* incoming = find_incoming_operation(operation_id);
-        return incoming != nullptr && incoming->pending_slot_idx < 0;
-    }
-
     void complete_demotion(uint64_t operation_id) {
         auto* victim = find_operation_victim(operation_id);
         if (victim == nullptr || victim->gpu_transfer != ExpertGpuTransfer::D2H_PENDING) {

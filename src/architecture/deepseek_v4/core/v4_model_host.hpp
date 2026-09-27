@@ -582,9 +582,6 @@ public:
         current_warm_slots_ = warm_slots;
     }
 
-    // The partition right now: Warm slots resident, and the corridor's slots.
-    uint32_t warm_host_slots_current() const noexcept { return current_warm_slots_; }
-    bool staging_shares_warm_region() const noexcept { return host_region_active_; }
     // The corridor capacity a **chunked** window will have, which is what a caller's
     // chunk has to fit — not the live arena, which is cut to decode's smaller shape
     // between windows.
@@ -711,11 +708,6 @@ public:
     void record_supply_decode_token() {
         telemetry_.record_decode_token();
     }
-
-    // Dense-container page-cache residency dropped after the uploads, in bytes (0
-    // when the runtime was configured not to release). Reported rather than
-    // inferred: `madvise` is a hint, so the only figure worth printing is this one.
-    size_t released_dense_bytes() const noexcept { return last_released_dense_bytes_; }
 
     // Host read access, for building an oracle: `embed.weight` is reached through
     // `resources().host_embed_table` (a pointer into the container), while

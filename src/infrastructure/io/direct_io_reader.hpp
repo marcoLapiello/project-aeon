@@ -260,18 +260,6 @@ public:
         return completions;
     }
 
-    // Read synchronously via O_DIRECT io_uring submission and completion.
-    size_t read_direct(int fd, void* aligned_buf, size_t bytes, uint64_t file_offset) {
-        submit_read(fd, aligned_buf, bytes, file_offset, 0xAE01);
-        submit_pending_reads();
-        DirectIOCompletion completion = wait_for_completion();
-        if (completion.result < 0) {
-            throw std::runtime_error("DirectIOReader: read error: " +
-                                     std::string(strerror(-completion.result)));
-        }
-        return static_cast<size_t>(completion.result);
-    }
-
 private:
     static void validate_request(
         int fd,

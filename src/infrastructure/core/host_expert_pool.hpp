@@ -214,10 +214,6 @@ public:
         return num_slots - pinned_slot_count();
     }
 
-    size_t allocated_bytes() const {
-        return static_cast<size_t>(num_slots) * format_.payload_bytes;
-    }
-
 private:
     struct Segment {
         uint8_t* base{nullptr};
