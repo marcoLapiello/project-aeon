@@ -276,7 +276,7 @@ public:
             const uint32_t expert_id = payload_request.global_expert_id;
             ExpertRequestReservation request;
             for (;;) {
-                request = expert_registry_->reserve_request(
+                request = expert_registry_->reserve_request_by_gid(
                     expert_id, current_step, demotion_queue_capacity_, stage_only);
                 if (request.kind != ExpertRequestKind::PENDING) {
                     break;

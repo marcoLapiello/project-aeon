@@ -282,11 +282,19 @@ struct TieringGate {
     // The teardown order the removed pipeline established: leases are released,
     // transfers reaped, and only then are the consumed staging slots returned to
     // the arena.
+    //
+    // The release is `release_if_copying` rather than `release_after_gpu_transfer`
+    // because the reap above is now **completion-driven** (plan P2.2): the reaper
+    // frees each slot the moment its own copy event fires, so by the time this block
+    // runs the slot may already be back in the arena. The idempotent form tolerates
+    // exactly that — which is why it exists — whereas the strict form throws on it.
+    // This mirrors `release_streamed_staging`, which skips a slot that is no longer
+    // `GPU_TRANSFER_PENDING` for the same reason.
     void finish_round(const std::vector<uint32_t>& staging_taken) {
         for (uint32_t gid : leased) registry.release_lease(gid);
         leased.clear();
         supply.reap_registry_transfers();
-        for (uint32_t slot : staging_taken) staging.release_after_gpu_transfer(slot);
+        for (uint32_t slot : staging_taken) (void)staging.release_if_copying(slot);
     }
 
     static std::vector<uint32_t> staging_slots_of(

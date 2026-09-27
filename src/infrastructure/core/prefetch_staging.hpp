@@ -388,10 +388,24 @@ private:
         }
     }
 
+    static const char* state_name(SlotState state) {
+        switch (state) {
+        case SlotState::AVAILABLE: return "AVAILABLE";
+        case SlotState::IO_PENDING: return "IO_PENDING";
+        case SlotState::IO_COMPLETE: return "IO_COMPLETE";
+        case SlotState::GPU_TRANSFER_PENDING: return "GPU_TRANSFER_PENDING";
+        }
+        return "?";
+    }
+
     void transition(uint32_t slot_idx, SlotState expected, SlotState next) {
         validate_slot(slot_idx);
         if (slot_states[slot_idx] != expected) {
-            throw std::runtime_error("PrefetchStagingArena: invalid slot state transition");
+            throw std::runtime_error(
+                std::string("PrefetchStagingArena: invalid slot state transition for slot ") +
+                std::to_string(slot_idx) + ": expected " + state_name(expected) +
+                " -> " + state_name(next) + ", but the slot is " +
+                state_name(slot_states[slot_idx]));
         }
         slot_states[slot_idx] = next;
     }

@@ -157,6 +157,9 @@ public:
     // edit rather than a reallocation or a catalog re-map. Equals `host_capacity`
     // until the first move.
     uint32_t host_capacity_usable{0};
+    // Warm residents surrendered to the corridor by a boundary move, for re-admission
+    // at `prefill_end` (see `host_restore_set`).
+    std::vector<uint32_t> host_restore_set_;
 
     std::vector<ExpertCatalogEntry> catalog;
     std::vector<int32_t> vram_slots;
@@ -233,6 +236,7 @@ public:
         host_slots.assign(host_capacity, -1);
         host_slot_reservations.assign(host_capacity, 0);
         host_capacity_usable = host_capacity;
+        host_restore_set_.clear();
         free_host_slots.clear();
         for (uint32_t slot = host_capacity; slot-- > 0;) {
             free_host_slots.push_back(slot);
@@ -271,11 +275,29 @@ public:
         uint64_t demotion_queue_capacity,
         bool stage_only = false
     ) {
-        return reserve_request(
+        return reserve_request_by_gid(
             get_global_id(layer_id, expert_id), current_step, demotion_queue_capacity,
             stage_only);
     }
 
+    // The same request addressed by **global** expert id, at an arity the pair form
+    // cannot be called with — three arguments, while the pair form needs four. The
+    // distinct arity is the point: the two were overloads of one name and **both** take
+    // four integers, so once `stage_only` gave the pair form a default a four-argument
+    // call became ambiguous (and a target that happened not to be rebuilt carried the
+    // breakage unnoticed). Keeping this form at three arguments removes the overlap
+    // without renaming anything a caller already uses.
+    ExpertRequestReservation reserve_request(
+        uint32_t gid,
+        uint64_t current_step,
+        uint64_t demotion_queue_capacity
+    ) {
+        return reserve_request_by_gid(gid, current_step, demotion_queue_capacity, false);
+    }
+
+    // The gid form with the deferral, named so it cannot take part in overload
+    // resolution against the pair form.
+    //
     // `stage_only` reserves the operation with no VRAM destination at reservation:
     // the bytes land in the staging arena and wait there until
     // `attach_vram_destination` gives them a slot, at the moment the copy can run.
@@ -285,7 +307,7 @@ public:
     // It applies to a **cold read** and to a **Warm shadow** alike. It is ignored for
     // any other source: a demotion needs its destination decided at reservation, and
     // a non-frozen Warm promotion has no staging leg at all.
-    ExpertRequestReservation reserve_request(
+    ExpertRequestReservation reserve_request_by_gid(
         uint32_t gid,
         uint64_t current_step,
         uint64_t demotion_queue_capacity,
@@ -958,6 +980,53 @@ public:
     // How many region slots the Warm tier may use right now.
     uint32_t usable_host_capacity() const noexcept { return host_capacity_usable; }
 
+    // The Warm residents a boundary move surrendered to the corridor, in the order
+    // they were released. The caller re-admits them at `prefill_end` so a window
+    // leaves the Warm tier **as it found it** — which is the frozen-prefill guarantee
+    // (Step 6 D-b), and the reason a move is a borrow rather than a loss. Cleared by
+    // `clear_host_restore_set` once they have been restored.
+    const std::vector<uint32_t>& host_restore_set() const noexcept { return host_restore_set_; }
+
+    void clear_host_restore_set() noexcept { host_restore_set_.clear(); }
+
+    // Take a free region slot for a Warm re-admission, or -1 when none is free.
+    int32_t take_free_host_slot() {
+        if (free_host_slots.empty()) return -1;
+        const int32_t slot = static_cast<int32_t>(free_host_slots.back());
+        free_host_slots.pop_back();
+        return slot;
+    }
+
+    // Give `gid` Warm ownership of `slot`. The caller has already filled the slot's
+    // payload, so this is the bookkeeping half of a re-admission: owner, slot map, and
+    // LRU. Rejects an expert that is not Cold — an entry that still holds a residency
+    // would end up with two, which is the one thing the tier model forbids.
+    void admit_warm(uint32_t gid, uint32_t slot) {
+        if (gid >= catalog.size()) {
+            throw std::out_of_range("ExpertRegistry: re-admitted expert is out of range");
+        }
+        if (slot >= host_capacity_usable) {
+            throw std::out_of_range("ExpertRegistry: re-admission slot is outside Warm");
+        }
+        auto& entry = catalog[gid];
+        if (entry.owner != ExpertTier::COLD_NVME || entry.slot_idx != -1) {
+            throw std::logic_error(
+                "ExpertRegistry: re-admitting expert " + std::to_string(gid) +
+                " that still holds a residency (owner=" +
+                std::to_string(static_cast<int>(entry.owner)) +
+                ", slot=" + std::to_string(entry.slot_idx) + ")");
+        }
+        if (host_slots[slot] >= 0 || host_slot_reservations[slot] != 0) {
+            throw std::logic_error("ExpertRegistry: re-admission slot is already in use");
+        }
+        entry.owner = ExpertTier::WARM_HOST;
+        entry.slot_idx = static_cast<int32_t>(slot);
+        entry.slot_state = ExpertSlotState::ACTIVE;
+        host_slots[slot] = static_cast<int32_t>(gid);
+        push_lru_front(entry, warm_host_lru);
+        checked_validate();
+    }
+
     // Move the boundary **upward**: return slots to the Warm free list. Callers do
     // this when a prefill window ends. Slots that were never surrendered are already
     // in the list, so only the newly recovered range is added.
@@ -1028,6 +1097,9 @@ public:
             entry.owner = ExpertTier::COLD_NVME;
             entry.slot_idx = -1;
             entry.slot_state = ExpertSlotState::UNALLOCATED;
+            // Remembered so the caller can put them back: the corridor's borrow must
+            // not cost Warm its cache, only the re-read.
+            host_restore_set_.push_back(static_cast<uint32_t>(gid));
             ++released;
         }
         checked_validate();

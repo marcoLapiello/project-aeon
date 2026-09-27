@@ -84,11 +84,12 @@ struct AeonRuntimeConfig {
     // host RAM a run holds is exactly this figure, not this figure plus a staging
     // allocation the user had to remember to add.
     //
-    // The partition inside it: decode and a chunked prefill use
-    // `max(12, min(6C, E))` slots for the corridor and everything else for Warm; a
-    // **swept** prefill grows the corridor to `prefill_sweep_staging_blocks x E` and
-    // hands the difference back when the window ends. So the resident Warm set is
-    // larger during decode — where its cache value is — than during a sweep.
+    // The partition inside it: **decode** gives the corridor `2 x 6` slots (the
+    // double buffer) and keeps everything else for Warm; a **routed** prefill needs
+    // the layer's deduplicated distinct set, `min(6C, E)`; a **swept** prefill grows
+    // the corridor to `prefill_sweep_staging_blocks x E` and hands the difference back
+    // when the window ends. So Warm residency is largest during decode — where its
+    // cache value is — and smallest during a sweep.
     size_t warm_host_bytes{0};
 
     // Allocate the configured Warm capacity without requiring a synchronous
@@ -225,42 +226,66 @@ struct AeonRuntimeConfig {
 };
 
 // The staging arena's slot count, shared by the budget report and the arena's own
-// construction so the reported `transient_staging_bytes` is exactly what is
-// allocated. Two terms:
+// construction so the reported figures are exactly what is allocated.
 //
-//   * decode/a-chunk's deduplicated distinct set, at most the layer width (`6C`
-//     capped by `E`), with `TOTAL_STAGING_SLOTS` as the floor; and
-//   * when the sweep is on, `prefill_sweep_staging_blocks` layer-blocks — at least
-//     one to bind a whole layer's set, and by default two so one bank is the read
-//     destination and one the copy source (see `AeonRuntimeConfig::prefill_sweep`).
+// There are **three** distinct corridor requirements, because there are three
+// dispatch paths and each binds a different number of staging indices at once:
 //
-// The corridor has **two** meaningful sizes now that it shares a region with Warm
-// (`ExpertHostRegion`): the **base** it needs whenever it is not running a swept
-// window (decode and the routed prefill), and the **prefill** size a swept window
-// grows it to, taking the difference out of Warm. `staging_slot_counts` returns both,
-// so the budget report, the host, and the boundary moves all read one helper.
+//   * **decode** — `dispatch_layer_prefetch` stages one token's six routed experts
+//     into `(layer % 2) * 6 + 0..5`, so it needs `TOTAL_STAGING_SLOTS` (`2 x 6`, the
+//     double buffer) and nothing more. This is the certified decode shape.
+//   * **routed batched prefill** — `dispatch_layer_prefetch_batch` stages the layer's
+//     deduplicated distinct set into `0 .. D-1` with `D <= min(6C, E)`, so it needs
+//     `min(6C, E)` slots — one layer's worth at any useful chunk. **Not 12**: the two
+//     are different requirements and only coincide at `C = 2`.
+//   * **swept batched prefill** — `dispatch_layer_stream` stages a whole layer into
+//     `(layer % banks) * E` and keeps `banks` of them live, so it needs
+//     `blocks x E` slots; and it needs **at least one whole layer** regardless of the
+//     block count, because a swept dispatch binds the layer's entire missing set.
+//
+// The corridor is sized to its largest requirement, and the Warm/staging boundary is
+// cut to the requirement of the phase actually running (`ExpertHostRegion`), so the
+// two smaller phases hand the difference back to Warm residency — which is where
+// decode's NVMe hits are decided, and where a mistyped `min(6C, E)` was costing a
+// full layer's worth of residency for no reason.
 struct StagingSlotCounts {
-    uint32_t base{0};
+    // Decode: one token's six experts, double-buffered.
+    uint32_t decode{0};
+    // A chunked (routed) prefill: the layer's deduplicated distinct set.
+    uint32_t batch{0};
+    // A swept prefill: `blocks` whole layers.
     uint32_t prefill{0};
+    // The largest of the three — the corridor's allocation, and its size when no host
+    // region is shared.
+    uint32_t peak{0};
 };
 
 inline StagingSlotCounts staging_slot_counts(
     const AeonRuntimeConfig& cfg,
     uint32_t experts_per_layer
 ) {
+    StagingSlotCounts counts;
+    counts.decode = PrefetchStagingArena::TOTAL_STAGING_SLOTS;
     const uint32_t chunk_ceiling = std::min<uint32_t>(
         6u * std::max<uint32_t>(1, cfg.prefill_chunk), experts_per_layer);
-    const uint32_t base = std::max<uint32_t>(
-        PrefetchStagingArena::TOTAL_STAGING_SLOTS, chunk_ceiling);
-    if (!cfg.prefill_sweep) return StagingSlotCounts{base, base};
-    const uint32_t blocks = std::max<uint32_t>(1, cfg.prefill_sweep_staging_blocks);
-    return StagingSlotCounts{base, std::max<uint32_t>(base, blocks * experts_per_layer)};
+    counts.batch = std::max<uint32_t>(counts.decode, chunk_ceiling);
+    // A swept dispatch binds a whole layer, so the prefill size is at least one layer
+    // even at `blocks = 0`; at least two by default, one to read into and one to copy
+    // out of.
+    const uint32_t blocks = cfg.prefill_sweep
+        ? std::max<uint32_t>(1, cfg.prefill_sweep_staging_blocks)
+        : 1;
+    counts.prefill = cfg.prefill_sweep
+        ? std::max<uint32_t>(counts.batch, blocks * experts_per_layer)
+        : counts.batch;
+    counts.peak = std::max({counts.decode, counts.batch, counts.prefill});
+    return counts;
 }
 
-// The prefill size alone, kept for the callers that only need the arena's upper bound
-// (the artifact's own arena construction).
+// The corridor's allocation size — its largest requirement, shared by the budget
+// report and the artifact's own arena construction.
 inline uint32_t staging_slot_count(const AeonRuntimeConfig& cfg, uint32_t experts_per_layer) {
-    return staging_slot_counts(cfg, experts_per_layer).prefill;
+    return staging_slot_counts(cfg, experts_per_layer).peak;
 }
 
 struct MemoryBudgetReport {
@@ -308,8 +333,10 @@ struct MemoryBudgetReport {
     size_t hot_vram_bytes{0};
     uint32_t warm_host_slots{0};
     size_t warm_host_bytes{0};
-    // The same figures at the **other end** of the partition: what Warm holds while a
-    // swept prefill has grown the corridor to its configured size.
+    // The same figure at the other two partitions: what Warm holds while a routed
+    // prefill (one layer's distinct set) or a swept prefill (`blocks` layers) has
+    // taken its share of the corridor.
+    uint32_t warm_host_slots_routed{0};
     uint32_t warm_host_slots_min{0};
     // The shared pinned region: Warm slots followed by the corridor's slots, cut by a
     // boundary that moves at the phase transitions.
@@ -319,9 +346,12 @@ struct MemoryBudgetReport {
     size_t configured_host_budget_bytes{0};
     size_t persistent_warm_host_budget_bytes{0};
     size_t transient_staging_bytes{0};
-    // The staging the corridor needs whenever it is **not** running a swept window
-    // (decode, and a chunked prefill): the budget's `base` term.
-    size_t staging_base_bytes{0};
+    // The corridor's **decode** requirement (`2 x 6`, double-buffered) and its
+    // **chunked-prefill** requirement (the layer's deduplicated distinct set). The
+    // allocation is the largest requirement (`transient_staging_bytes`); these two are
+    // what each phase actually binds, and so what each phase hands back to Warm.
+    size_t staging_decode_bytes{0};
+    size_t staging_batch_bytes{0};
     uint32_t cold_nvme_slots{0};
 
     // Diagnostics / recommendations
@@ -372,7 +402,8 @@ struct MemoryBudgetReport {
             << (double)hot_vram_bytes / (1024 * 1024 * 1024) << " GB)\n"
             << "    - Tier 2: Warm Host DDR: " << warm_host_slots << " slots ("
             << (double)warm_host_bytes / (1024 * 1024 * 1024) << " GB)"
-            << "  [min " << warm_host_slots_min << " while a swept prefill runs]\n"
+            << "  [decode; " << warm_host_slots_routed << " at a routed prefill, "
+            << warm_host_slots_min << " at a swept one]\n"
             << "    - Expert Payload Size : " << expert_payload_bytes << " bytes\n"
             << "    - Host Region (Warm + staging, one pinned allocation): "
             << (double)host_region_bytes / (1024 * 1024 * 1024) << " GB in "
@@ -380,8 +411,9 @@ struct MemoryBudgetReport {
             << "    - Configured Host Budget : " << (double)configured_host_budget_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Persistent Warm Budget : " << (double)persistent_warm_host_budget_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Transient Staging    : " << (double)transient_staging_bytes / (1024 * 1024 * 1024) << " GB"
-            << "  (base " << (double)staging_base_bytes / (1024 * 1024) << " MiB; the swept"
-            << " prefill borrows the difference from Warm)\n"
+            << "  (peak; decode " << (double)staging_decode_bytes / (1024 * 1024)
+            << " MiB, routed prefill " << (double)staging_batch_bytes / (1024 * 1024)
+            << " MiB — the boundary hands the difference to Warm)\n"
             << "    - Tier 3: Cold NVMe SSD: " << cold_nvme_slots << " slots\n"
             << "================================================================================\n";
         return oss.str();
@@ -631,17 +663,19 @@ public:
         // policy, not storage. One number that *is* the total is what makes the
         // setting a guard rather than a hint.
         //
-        // The base staging is what decode and a chunked prefill need — the
-        // deduplicated distinct set, `max(12, min(6C, E))` — and the swept prefill may
-        // grow it to `blocks x E`, taking the difference out of Warm for the duration
-        // of the window and giving it back when the window ends.
+        // The corridor's three requirements, and the phase-precise partitions they
+        // imply. Each phase cuts the boundary so Warm keeps everything the corridor is
+        // not using **for that phase**: the differences are real residency, and decode
+        // is the phase that wants the most of it.
         const uint32_t experts_per_layer =
             static_cast<uint32_t>(expert_format.experts_per_layer);
         const auto staging = aeon::core::staging_slot_counts(runtime_cfg, experts_per_layer);
         report.transient_staging_bytes =
-            static_cast<size_t>(staging.prefill) * expert_format.payload_bytes;
-        report.staging_base_bytes =
-            static_cast<size_t>(staging.base) * expert_format.payload_bytes;
+            static_cast<size_t>(staging.peak) * expert_format.payload_bytes;
+        report.staging_decode_bytes =
+            static_cast<size_t>(staging.decode) * expert_format.payload_bytes;
+        report.staging_batch_bytes =
+            static_cast<size_t>(staging.batch) * expert_format.payload_bytes;
 
         report.configured_host_budget_bytes = runtime_cfg.warm_host_bytes;
         const size_t host_region_bytes = runtime_cfg.warm_host_bytes;
@@ -663,8 +697,8 @@ public:
                 std::to_string(host_region_bytes / (1024 * 1024)) +
                 " MiB cannot hold the " +
                 std::to_string(report.transient_staging_bytes / (1024 * 1024)) +
-                " MiB the configured staging blocks reserve — raise it or lower "
-                "prefill_sweep_staging_blocks";
+                " MiB the corridor needs at its largest (a swept prefill) — raise it or "
+                "lower prefill_sweep_staging_blocks";
             return report;
         }
 
@@ -673,15 +707,15 @@ public:
         report.host_region_slots = region_slots;
         report.host_region_bytes =
             static_cast<size_t>(region_slots) * expert_format.payload_bytes;
-        // Warm occupies what the corridor is not using. At the base staging that is
-        // its maximum (decode and the routed prefill); at the configured blocks it is
-        // its minimum (a swept window).
-        const uint32_t warm_slots_max = region_slots > staging.base
-            ? region_slots - staging.base
-            : 0;
-        report.warm_host_slots_min = region_slots > staging.prefill
-            ? region_slots - staging.prefill
-            : 0;
+        // Warm keeps what each phase's corridor does not use. Decode gives the corridor
+        // the least, so it is where Warm is largest — which is the point: decode is
+        // where the residency pays.
+        const auto warm_for = [region_slots](uint32_t staging_slots) {
+            return region_slots > staging_slots ? region_slots - staging_slots : 0u;
+        };
+        const uint32_t warm_slots_max = warm_for(staging.decode);
+        report.warm_host_slots_routed = warm_for(staging.batch);
+        report.warm_host_slots_min = warm_for(staging.prefill);
 
         const uint32_t total_experts = static_cast<uint32_t>(expert_format.total_experts());
         uint32_t remaining_after_vram = (total_experts > report.hot_vram_slots)

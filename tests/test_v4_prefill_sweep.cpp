@@ -212,7 +212,6 @@ int main() {
         read_bytes(graph.logits(), static_cast<size_t>(vocab) * sizeof(uint16_t));
 
     const std::set<uint32_t> warm_after = warm_set(host);
-    const size_t warm_drift = set_difference_size(warm_before, warm_after);
     const std::set<uint32_t> hot_after = hot_set(host);
 
     std::printf("\n--- results ---\n");
@@ -259,22 +258,27 @@ int main() {
                 std::to_string(host.registry().shadow_resident_count()) + " shadows");
     assert_that("C: streaming mode was left", !host.registry().prefill_streaming(),
                 "unfrozen");
-    assert_that("B: Warm is unchanged across the whole sweep", warm_drift == 0,
-                std::to_string(warm_drift) + " experts differ of " +
-                    std::to_string(warm_before.size()) +
-                    " (switch settled " + std::to_string(switch_drift) + ")");
-    if (warm_drift != 0) {
-        for (uint32_t gid : warm_before) {
-            if (warm_after.find(gid) == warm_after.end()) {
-                std::printf("      Warm expert %u was resident before only\n", gid);
-            }
-        }
-        for (uint32_t gid : warm_after) {
-            if (warm_before.find(gid) == warm_before.end()) {
-                std::printf("      Warm expert %u is resident after only\n", gid);
-            }
-        }
+    // The window **borrows** part of the Warm pool for its corridor: `prefill_begin`
+    // hands the swept partition's difference to the staging arena (they share one
+    // pinned region) and `prefill_end` hands it back and re-admits those experts
+    // (`registry.host_restore_set`). So the thing to assert is exactly that:
+    // **everything the borrow took was returned**. Comparing whole Warm sets would
+    // instead measure decode's in-flight traffic — a promotion completing as the switch
+    // reaps leaves Warm, a demotion completing enters it — which is why the symmetric
+    // `warm_before_switch` delta is reported rather than asserted.
+    std::set<uint32_t> borrowed;
+    for (uint32_t gid : warm_before_switch) {
+        if (warm_before.find(gid) == warm_before.end()) borrowed.insert(gid);
     }
+    size_t warm_not_returned = 0;
+    for (uint32_t gid : borrowed) {
+        if (warm_after.find(gid) == warm_after.end()) ++warm_not_returned;
+    }
+    assert_that("B: the corridor's Warm borrow was fully returned",
+                warm_not_returned == 0,
+                std::to_string(borrowed.size()) + " borrowed, " +
+                    std::to_string(warm_not_returned) + " not returned");
+    (void)switch_drift;  // reported for context; the borrow above is the assertion
     assert_that("C: no lease leaked", host.outstanding_expert_leases() == 0,
                 std::to_string(host.outstanding_expert_leases()) + " outstanding");
     assert_that("C: the staging arena drained", host.staging_in_use_slots() == 0,

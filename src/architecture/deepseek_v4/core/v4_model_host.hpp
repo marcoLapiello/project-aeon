@@ -506,22 +506,28 @@ public:
     // ---- the Warm/staging partition -----------------------------------------
     //
     // Warm and the corridor are one pinned region cut by a boundary
-    // (`ExpertHostRegion`). Both phases move it, and the two moves are exact
-    // inverses because the region's total is fixed:
+    // (`ExpertHostRegion`). The boundary is cut to **the requirement of the phase
+    // actually running**, because there are three dispatch paths and each binds a
+    // different number of staging slots at once:
     //
-    //   * decode, and a **chunked** prefill, need only the corridor's base
-    //     (`max(12, min(6C, E))` — the deduplicated set a batch can bind, with the
-    //     decode double-buffer as the floor). Everything else is Warm residency,
-    //     which is where decode's NVMe hits are decided;
-    //   * a **swept** prefill grows the corridor to `blocks x E` for the length of the
-    //     window and hands the difference back at `prefill_end`.
+    //   * **decode** (`dispatch_layer_prefetch`) stages one token's six experts into
+    //     `(layer % 2) * 6`, so it needs `2 x 6` and nothing more;
+    //   * a **routed** prefill (`dispatch_layer_prefetch_batch`) stages the layer's
+    //     deduplicated distinct set, `min(6C, E)` — one layer at any useful chunk;
+    //   * a **swept** prefill (`dispatch_layer_stream`) stages whole layers, `E` each,
+    //     and keeps `banks` live, so it needs `blocks x E`.
     //
-    // Moving it is a pointer and a free-list edit: the storage is allocated once, so
-    // no page is committed or pinned by the move. The only real cost is that a slot
-    // surrendered by Warm must be **drained**, and a Warm expert that is dropped is
-    // re-read from NVMe on demand — which is why the move happens only when a swept
-    // window actually needs the room, and why the corridor's base rather than its
-    // maximum is what decode gets.
+    // A single "prefill" size for all three would hand decode a whole layer's worth of
+    // slots it never binds, and every one of those is a Warm residency given away in
+    // the phase whose NVMe hits they decide. So the phases are cut separately: decode
+    // cuts the corridor smallest and Warm largest, a routed window takes the middle,
+    // and a swept window takes the most and hands it back at `prefill_end`.
+    //
+    // Moving the boundary is a pointer and a free-list edit: the storage is allocated
+    // once, so no page is committed or pinned by the move. The real cost is that a
+    // slot surrendered by Warm must be drained, and a Warm expert that is dropped is
+    // re-read from NVMe on demand — which is why decode gets the most residency and
+    // the swept window takes the least.
     //
     // `warm_slots` is the whole description of the split: the Warm head is
     // `[0, warm_slots)` and the corridor is `[warm_slots, region_slots)`. Every step
@@ -579,6 +585,10 @@ public:
     // The partition right now: Warm slots resident, and the corridor's slots.
     uint32_t warm_host_slots_current() const noexcept { return current_warm_slots_; }
     bool staging_shares_warm_region() const noexcept { return host_region_active_; }
+    // The corridor capacity a **chunked** window will have, which is what a caller's
+    // chunk has to fit — not the live arena, which is cut to decode's smaller shape
+    // between windows.
+    uint32_t batch_staging_capacity() const noexcept { return staging_batch_slots_; }
 
     // Layer-sized staging banks the sweep's arena holds, derived from the arena's
     // actual depth (`slots / experts_per_layer`). The default is `2` (R2); the
@@ -765,21 +775,26 @@ public:
     void prefill_begin(uint32_t window_tokens) {
         prefill_active_ = prefill_sweep_enabled();
         sweep_active_ = prefill_active_ && window_tokens >= sweep_min_tokens_;
-        if (!prefill_active_) return;
-        drain_expert_streams();
-        supply_.reap_registry_transfers();
-        executor_->release_leases();
-        // The window's shape decides the partition: a **swept** window grows the
-        // corridor to its configured size and takes it out of Warm (restored in
-        // `prefill_end`); a routed window needs only the corridor's base and leaves
-        // Warm at its maximum, which is where decode's hits come from. Placed here,
-        // while nothing is in flight, because a move re-bases the arena and re-creates
-        // its per-slot events.
-        if (host_region_active_ && staging_prefill_slots_ > staging_base_slots_) {
-            apply_host_partition(
-                sweep_active_ ? warm_slots_prefill_ : warm_slots_base_,
-                sweep_active_ ? staging_prefill_slots_ : staging_base_slots_);
+        // A window opens at a compute-stream boundary, so the corridor is quiescent and
+        // the partition can be moved. This runs for **every** window, including one
+        // that runs the per-token path with `prefill_sweep` off: a chunk still binds
+        // its deduplicated set (`min(6C, E)`), so the corridor needs the batch size
+        // whether or not the sweep is driving. Moving it only for a swept window leaves
+        // the arena at decode's `2 x 6` while a chunk indexes past it.
+        if (prefill_active_ || host_region_active_) {
+            drain_expert_streams();
+            supply_.reap_registry_transfers();
+            if (executor_ != nullptr) executor_->release_leases();
         }
+        // The window's shape decides the partition: a **swept** window takes `blocks`
+        // whole layers of corridor and gives Warm the least; any other window takes the
+        // layer's deduplicated set, `min(6C, E)`, and gives Warm the rest.
+        if (host_region_active_) {
+            apply_host_partition(
+                sweep_active_ ? warm_slots_prefill_ : warm_slots_routed_,
+                sweep_active_ ? staging_prefill_slots_ : staging_batch_slots_);
+        }
+        if (!prefill_active_) return;
         if (sweep_active_) {
             prefill_sweep_.begin();
         } else {
@@ -818,33 +833,84 @@ public:
     }
 
     void prefill_end() {
-        if (!prefill_active_) return;
-        supply_.reap_registry_transfers();
-        if (sweep_active_) {
-            prefill_sweep_.end();
-        } else {
-            // Settle the routed path's in-flight uploads before the mode change: the
-            // end refuses a pending transfer.
+        // Reach a quiescent boundary first: both the partition move and the mode change
+        // below require no transfer in flight and no lease held.
+        if (host_region_active_ || prefill_active_) {
             drain_expert_streams();
             supply_.reap_registry_transfers();
-            registry_.end_prefill_stream();
+            if (executor_ != nullptr) executor_->release_leases();
         }
-        // Hand the corridor's prefill borrow back to Warm. The window is over and
-        // everything is drained, so the surrendered slots return to the Warm free list
-        // and decode resumes with the larger residency — which is the whole reason the
-        // boundary moved rather than the arena simply being sized for the worst case.
-        // A restored expert is re-read on demand, so this costs nothing until one is
-        // actually wanted.
-        if (host_region_active_ && warm_slots_base_ > current_warm_slots_) {
-            apply_host_partition(warm_slots_base_, staging_base_slots_);
+        if (prefill_active_) {
+            if (sweep_active_) {
+                prefill_sweep_.end();
+            } else {
+                registry_.end_prefill_stream();
+            }
         }
-        // Reload whatever the drain freed, through the normal cold path, so decode
-        // resumes on the set the pool held before the pass (the plan's restore
-        // requirement). Shared by both strategies.
+        // Return the corridor to the **decode** partition: the window is over, so the
+        // surrendered slots rejoin the Warm free list and decode resumes with the
+        // largest residency — the whole reason the boundary moves rather than the
+        // corridor being sized for the worst case. This runs for **every** window,
+        // including one that ran the per-token path with the sweep off, since that
+        // window moved the boundary too.
+        if (host_region_active_) {
+            apply_host_partition(warm_slots_decode_, staging_decode_slots_);
+            // Put the Warm residents the move surrendered **back**. Without this the
+            // borrow would cost Warm its cache, and the frozen-prefill guarantee
+            // (Step 6 D-b) — Warm identical before and after — would not hold across
+            // the move.
+            restore_prefill_warm(loader_.expert_format());
+        }
+        // Then the Hot residents the prefill drain freed, so decode resumes on the set
+        // the pool held before the pass (the plan's restore requirement). A no-op when
+        // no drain ran.
         restore_prefill_residents(loader_.expert_format());
         // `prefill_active_`/`sweep_active_` deliberately stay set: they record the
         // strategy the window chose, for the gates that read the choice afterwards.
         // `prefill_begin` re-decides both for the next window.
+    }
+
+    // Re-admit the Warm residents a boundary move surrendered. `release_host_tail`
+    // recorded them; each is read back into a free Warm slot through the same blocking
+    // `O_DIRECT` path the startup preload uses, so the tier ends the window as it began
+    // it. The cost is the re-read and nothing else — the corridor's rent, which a
+    // smaller `--staging-blocks` declines to pay.
+    void restore_prefill_warm(const ExpertFormatDescriptor& format) {
+        const std::vector<uint32_t> restore = registry_.host_restore_set();
+        if (restore.empty()) return;
+        const uint32_t per_layer = registry_.experts_per_layer;
+        const size_t batch = std::max<size_t>(
+            1, io_reader_->submission_capacity() / direct_requests_per_expert(format));
+        // Advance a single cursor rather than stepping `start` by a whole batch: a batch
+        // that runs out of room must **stop**, not skip the experts it could not place.
+        // (Stepping the outer loop by `batch` after an inner break silently dropped the
+        // remainder of that batch, which is a restoration gap, not a capacity limit.)
+        size_t cursor = 0;
+        while (cursor < restore.size()) {
+            std::vector<std::pair<uint32_t, uint32_t>> expert_ids;
+            std::vector<uint8_t*> destinations;
+            while (cursor < restore.size() && expert_ids.size() < batch) {
+                const uint32_t gid = restore[cursor++];
+                const int32_t slot = registry_.take_free_host_slot();
+                if (slot < 0) {
+                    // The tier is full. Concurrent decode residency took the room the
+                    // borrowed expert would need — the pool is a fixed size, so an
+                    // admission during the window displaces a restoration. The
+                    // remainder stay Cold and are re-read on demand, which is the same
+                    // cost as the borrow itself.
+                    cursor = restore.size();
+                    break;
+                }
+                registry_.admit_warm(gid, static_cast<uint32_t>(slot));
+                expert_ids.emplace_back(gid / per_layer, gid % per_layer);
+                destinations.push_back(
+                    host_pool_.get_expert_slot_ptr(static_cast<uint32_t>(slot)));
+            }
+            if (!expert_ids.empty()) {
+                read_experts_direct_blocking(expert_ids, destinations);
+            }
+        }
+        registry_.clear_host_restore_set();
     }
 
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
@@ -982,7 +1048,7 @@ private:
                 std::max<uint32_t>(1, runtime_cfg.prefill_chunk),
             experts_per_layer);
         const auto staging = aeon::core::staging_slot_counts(runtime_cfg, experts_per_layer);
-        const uint32_t staging_slots = staging.prefill;
+        const uint32_t staging_slots = staging.peak;
 
         // The host region: **one** pinned allocation shared by the Warm tier and the
         // corridor, cut by a boundary the phases move (`apply_host_partition`). Its
@@ -991,26 +1057,38 @@ private:
         // overshoot.
         //
         // With no host budget there is no region and the corridor allocates its own
-        // memory, which is the decode-only and gate shape.
+        // memory at its peak, which is the decode-only and gate shape.
         const uint32_t region_slots = budget_.host_region_slots;
         host_region_active_ = region_slots > 0;
-        staging_base_slots_ = staging.base;
+        staging_decode_slots_ = staging.decode;
+        staging_batch_slots_ = staging.batch;
         staging_prefill_slots_ = staging.prefill;
         if (host_region_active_) {
-            if (region_slots < staging.base) {
+            if (region_slots < staging.peak) {
                 throw std::runtime_error(
                     "V4ModelHost: the host region (" + std::to_string(region_slots) +
-                    " slots) cannot hold the corridor's base (" +
-                    std::to_string(staging.base) + " slots)");
+                    " slots) cannot hold the corridor's largest requirement (" +
+                    std::to_string(staging.peak) + " slots, a swept prefill)");
             }
             host_region_.allocate(region_slots, format);
-            warm_slots_base_ = region_slots - staging.base;
+            // The corridor's **resting** size, and therefore the partition every phase
+            // cuts back to. With the sweep enabled a window is a cleanly delimited
+            // phase, so the resting cut is decode's `2 x 6` and the boundary moves out
+            // for a window. With the sweep **off** the engine runs the per-token path,
+            // where decode and a chunked window interleave with no phase boundary to
+            // cut at and a chunk still binds `min(6C, E)` — so every partition is the
+            // same and nothing ever moves. (Sweep-off is a legacy path, kept working
+            // rather than optimised.)
+            const bool phase_cuts = runtime_cfg.prefill_sweep;
+            staging_decode_slots_ = phase_cuts ? staging.decode : staging.batch;
+            staging_batch_slots_ = staging.batch;
+            staging_prefill_slots_ = staging.prefill;
+            warm_slots_decode_ = region_slots - staging_decode_slots_;
+            warm_slots_routed_ = region_slots - staging.batch;
             warm_slots_prefill_ = region_slots - staging.prefill;
-            current_warm_slots_ = warm_slots_base_;
-            // Start at the base partition: decode and a chunked prefill are the
-            // opening state, and a swept window moves the boundary in `prefill_begin`.
+            current_warm_slots_ = warm_slots_decode_;
             staging_ = std::make_unique<PrefetchStagingArena>(
-                host_region_.slot_ptr(warm_slots_base_), staging.base, format);
+                host_region_.slot_ptr(warm_slots_decode_), staging_decode_slots_, format);
         } else {
             staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
         }
@@ -1247,7 +1325,7 @@ private:
             operation_ids.reserve(end - start);
             for (size_t i = start; i < end; ++i) {
                 const uint32_t gid = restore[i];
-                const auto request = registry_.reserve_request(
+                const auto request = registry_.reserve_request_by_gid(
                     gid, 0, demotion_queue_capacity_);
                 if (request.kind != ExpertRequestKind::COLD_MISS || request.vram_slot < 0) {
                     throw std::runtime_error(
@@ -1388,9 +1466,11 @@ private:
     // The two partitions the phases move between: the corridor's base
     // (`max(12, min(6C, E))`) with Warm at its maximum, and the swept prefill's
     // `blocks x E` with Warm at its minimum. Both sum to the region exactly.
-    uint32_t staging_base_slots_{0};
+    uint32_t staging_decode_slots_{0};
+    uint32_t staging_batch_slots_{0};
     uint32_t staging_prefill_slots_{0};
-    uint32_t warm_slots_base_{0};
+    uint32_t warm_slots_decode_{0};
+    uint32_t warm_slots_routed_{0};
     uint32_t warm_slots_prefill_{0};
     uint32_t current_warm_slots_{0};
     SupplyTelemetry telemetry_;
