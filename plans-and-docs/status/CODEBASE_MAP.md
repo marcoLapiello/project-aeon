@@ -33,7 +33,7 @@ The production-facing implementation is:
 - `src/platform/rdna3/device.hpp` - RDNA3/HIP device selection and GPU utilities.
 - `src/architecture/deepseek_v4/core/v4_engine.hpp` - the text binding: tokenizer + prompt encoder + generation loop + graph.
 - `src/architecture/deepseek_v4/core/v4_graph.hpp` - the ordered forward pass (embed, 43 layers, head, LM head).
-- `src/architecture/deepseek_v4/core/v4_model_host.hpp` - what is resident: the whole assembly.
+- `src/architecture/deepseek_v4/core/v4_model_host.hpp` - what is resident: the whole assembly. It now delegates the layer-major prefill working set to `v4_prefill_workspace.hpp` (`V4PrefillWorkspace`) and the Warm/staging boundary to `v4_host_partition.hpp` (`V4HostPartition`), keeping its own API unchanged.
 - `src/architecture/deepseek_v4/core/v4_sampler.hpp` - the logit-processor seam and the sampler.
 - `src/architecture/deepseek_v4/core/v4_layer_body.hpp` - the single layer body (decode and chunk share it).
 - `src/architecture/deepseek_v4/core/v4_model_resources.hpp` - RoPE caches and model-level resident weights.
