@@ -62,6 +62,7 @@
 #include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
 #include "architecture/deepseek_v4/core/v4_prefill_workspace.hpp"
 #include "architecture/deepseek_v4/core/v4_host_partition.hpp"
+#include "architecture/deepseek_v4/core/v4_prefill_controller.hpp"
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_model_resources.hpp"
 #include "architecture/deepseek_v4/core/v4_model_spec.hpp"
@@ -584,144 +585,38 @@ public:
         return result;
     }
 
-    // ---- Step 6 item 6: the prefill sweep ------------------------------------
+    // ---- Step 6 item 6: the prefill sweep / routed bank ----------------------
     //
-    // `forward_window` drives these. The whole switch is local to a window: the
-    // sweep frees only what the pass needs on entry, streams the layers in order, and
-    // leaves the residents that were present at entry (plus the restored drain set)
-    // on exit, so a window is self-contained and decode can resume the moment it ends
-    // on the set it had before.
-    //
-    // Enabled only when `AeonRuntimeConfig::prefill_sweep` is set **and** the Hot pool
-    // can hold a whole layer (the sweep has no victim to evict). This is the
-    // configuration-level feasibility; whether a given window *uses* the sweep also
-    // depends on the prompt-length gate, which `prefill_sweep_engaged_for` applies.
-    // Otherwise the window drives the per-token dispatch, which is what the engine's
-    // `forward_token` path uses.
-    bool prefill_sweep_enabled() const noexcept {
-        return prefill_sweep_requested_ && prefill_sweep_.is_feasible();
-    }
+    // `forward_window` drives the window lifecycle below; the strategy, the
+    // prompt-length gate and the sweep itself live in `V4PrefillController`
+    // (`v4_prefill_controller.hpp`). These are the host's entry points to it.
+    bool prefill_sweep_enabled() const noexcept { return prefill_controller_.enabled(); }
 
     // The prompt-length gate, resolved at load (`E / 4` unless configured). Reported
     // so a gate can name the switch point.
-    uint32_t prefill_sweep_min_tokens() const noexcept { return sweep_min_tokens_; }
+    uint32_t prefill_sweep_min_tokens() const noexcept { return prefill_controller_.min_tokens(); }
 
     // Whether a window of `window_tokens` runs the sweep: enabled and feasible, and
     // at least the gate long. This is the **only** condition on the switch.
     bool prefill_sweep_engaged_for(uint32_t window_tokens) const noexcept {
-        return prefill_sweep_enabled() && window_tokens >= sweep_min_tokens_;
+        return prefill_controller_.engaged_for(window_tokens);
     }
 
     // The strategy the last window began with, chosen from its length: the sweep at
     // or above the gate, the route-aware cached supply below it. Recorded rather than
     // inferred so a gate can read it.
-    bool prefill_sweep_engaged() const noexcept { return sweep_active_; }
+    bool prefill_sweep_engaged() const noexcept { return prefill_controller_.engaged(); }
 
     // `window_tokens` is the window length `W`, which the driver is the only one to
     // know at this point — the gate is read here and nowhere else. Both strategies
     // are prefill supplies; `prefill_sweep` enables them, the length picks which.
-    void prefill_begin(uint32_t window_tokens) {
-        prefill_active_ = prefill_sweep_enabled();
-        sweep_active_ = prefill_active_ && window_tokens >= sweep_min_tokens_;
-        // A window opens at a compute-stream boundary, so the corridor is quiescent and
-        // the partition can be moved. This runs for **every** window, including one
-        // that runs the per-token path with `prefill_sweep` off: a chunk still binds
-        // its deduplicated set (`min(6C, E)`), so the corridor needs the batch size
-        // whether or not the sweep is driving. Moving it only for a swept window leaves
-        // the arena at decode's `2 x 6` while a chunk indexes past it.
-        if (prefill_active_ || host_partition_.active()) {
-            drain_expert_streams();
-            supply_.reap_registry_transfers();
-            if (executor_ != nullptr) executor_->release_leases();
-        }
-        // The window's shape decides the partition: a **swept** window takes `blocks`
-        // whole layers of corridor and gives Warm the least; any other window takes the
-        // layer's deduplicated set, `min(6C, E)`, and gives Warm the rest.
-        if (host_partition_.active()) {
-            host_partition_.apply(
-                sweep_active_ ? host_partition_.warm_prefill_slots()
-                              : host_partition_.warm_routed_slots(),
-                sweep_active_ ? host_partition_.staging_prefill_slots()
-                              : host_partition_.staging_batch_slots(),
-                experts_per_layer(), outstanding_expert_leases());
-        }
-        if (!prefill_active_) return;
-        if (sweep_active_) {
-            prefill_sweep_.begin();
-        } else {
-            // The routed bank (Step 4): drain one layer's worth of the worst-LRU
-            // residents, keep the rest resident, and admit route-aware. The layer's
-            // union grows into the freed `E` slots and is leased until the layer
-            // retires, so it persists across the layer's chunks without a whole-layer
-            // pre-load.
-            registry_.begin_prefill_stream(
-                registry_.experts_per_layer,
-                ExpertRegistry::PrefillAlloc::BoundedEvict);
-        }
-    }
+    void prefill_begin(uint32_t window_tokens) { prefill_controller_.begin(window_tokens); }
 
-    void prefill_before_layer(uint32_t layer) {
-        if (!prefill_active_) return;
-        if (sweep_active_) prefill_sweep_.before_layer(layer);
-        // The routed path needs no pre-load: the body's router drives admission, and
-        // the union is held resident by its leases until the layer retires.
-    }
+    void prefill_before_layer(uint32_t layer) { prefill_controller_.before_layer(layer); }
 
-    void prefill_after_layer(uint32_t layer) {
-        if (!prefill_active_) return;
-        if (sweep_active_) {
-            prefill_sweep_.after_layer(layer);
-            return;
-        }
-        // The layer is dead the moment it retires, so its prefill-admitted set is
-        // released while the residents present at entry are spared (Step 1). Unlike
-        // the sweep — which loads a layer in one batch and settles it before the body
-        // — the routed path's **last chunk** may have left an upload in flight, and
-        // the release refuses a pending transfer, so settle and reap it first.
-        drain_expert_streams();
-        supply_.reap_registry_transfers();
-        registry_.release_layer(layer);
-    }
+    void prefill_after_layer(uint32_t layer) { prefill_controller_.after_layer(layer); }
 
-    void prefill_end() {
-        // Reach a quiescent boundary first: both the partition move and the mode change
-        // below require no transfer in flight and no lease held.
-        if (host_partition_.active() || prefill_active_) {
-            drain_expert_streams();
-            supply_.reap_registry_transfers();
-            if (executor_ != nullptr) executor_->release_leases();
-        }
-        if (prefill_active_) {
-            if (sweep_active_) {
-                prefill_sweep_.end();
-            } else {
-                registry_.end_prefill_stream();
-            }
-        }
-        // Return the corridor to the **decode** partition: the window is over, so the
-        // surrendered slots rejoin the Warm free list and decode resumes with the
-        // largest residency — the whole reason the boundary moves rather than the
-        // corridor being sized for the worst case. This runs for **every** window,
-        // including one that ran the per-token path with the sweep off, since that
-        // window moved the boundary too.
-        if (host_partition_.active()) {
-            host_partition_.apply(host_partition_.warm_decode_slots(),
-                                  host_partition_.staging_decode_slots(),
-                                  experts_per_layer(), outstanding_expert_leases());
-            // Put the Warm residents the move surrendered **back**. Without this the
-            // borrow would cost Warm its cache, and the frozen-prefill guarantee
-            // (Step 6 D-b) — Warm identical before and after — would not hold across
-            // the move.
-            restore_prefill_warm(loader_.expert_format());
-        }
-        // Then the Hot residents the prefill drain freed, so decode resumes on the set
-        // the pool held before the pass (the plan's restore requirement). A no-op when
-        // no drain ran.
-        restore_prefill_residents(loader_.expert_format());
-        // `prefill_active_`/`sweep_active_` deliberately stay set: they record the
-        // strategy the window chose, for the gates that read the choice afterwards.
-        // `prefill_begin` re-decides both for the next window.
-    }
+    void prefill_end() { prefill_controller_.end(); }
 
     // Re-admit the Warm residents a boundary move surrendered. `release_host_tail`
     // recorded them; each is read back into a free Warm slot through the same blocking
@@ -768,7 +663,7 @@ public:
 
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
     // streamed, and the deepest frontier the lookahead reached.
-    const V4PrefillSweep& prefill_sweep() const noexcept { return prefill_sweep_; }
+    const V4PrefillSweep& prefill_sweep() const noexcept { return prefill_controller_.sweep(); }
 
     // The corridor's **fill** per layer — staging slots reading, staging slots
     // copying, and the lookahead layer's reserved-but-not-yet-arrived VRAM experts.
@@ -776,17 +671,17 @@ public:
     // shows `reading` and `copying` both non-zero while a body runs; one pinned at `E`
     // with the other at zero is the parking lot. Empty unless a sweep ran.
     const std::vector<V4PrefillSweep::BlockOccupancy>& sweep_occupancy() const noexcept {
-        return prefill_sweep_.occupancy_samples();
+        return prefill_controller_.occupancy();
     }
 
     // Nanoseconds the sweep spent inside its layer loads (`dispatch` + `materialize`
     // + release), against the wall clock of the window. The split is what says
     // whether a swept prefill is transfer-bound or compute-bound, and how much a
     // load/compute overlap could recover.
-    uint64_t sweep_load_ns() const noexcept { return prefill_sweep_.load_ns(); }
+    uint64_t sweep_load_ns() const noexcept { return prefill_controller_.load_ns(); }
     // The dispatch half of the same accounting: time spent *submitting* reads, which
     // is what the double buffer pays to keep the drive busy across the compute.
-    uint64_t sweep_io_ns() const noexcept { return prefill_sweep_.io_ns(); }
+    uint64_t sweep_io_ns() const noexcept { return prefill_controller_.io_ns(); }
     // Inside `io_uring_enter` alone, and the SQE count it submitted. When this is
     // large the cost is the drive's queue, not the CPU.
     uint64_t direct_io_submit_ns() const noexcept { return supply_.direct_io_submit_ns(); }
@@ -819,17 +714,17 @@ public:
     // Layers whose reads were in flight when a body started (1 = the double buffer
     // is engaged; 0 = the pool is too small for two layers and loads are serial).
     uint32_t sweep_lookahead_depth() const noexcept {
-        return prefill_sweep_.lookahead_depth();
+        return prefill_controller_.lookahead_depth();
     }
     // The lookahead length the **free blocks** allow at this instant (plan R5) — the
     // smaller of the free VRAM blocks and the free staging blocks. Derived, not
     // configured: it grows on a larger pool and shrinks to 0 when either runs out.
     uint32_t sweep_derived_ahead_capacity() const noexcept {
-        return prefill_sweep_.derived_lookahead_capacity();
+        return prefill_controller_.derived_ahead_capacity();
     }
     // Test instrument: cap the sweep's read lookahead (0 = staging-bounded only).
     void set_sweep_read_ahead_max(uint32_t max_depth) noexcept {
-        prefill_sweep_.set_read_ahead_max(max_depth);
+        prefill_controller_.set_read_ahead_max(max_depth);
     }
 
     // The start of a new sequence. Every layer's ring sentinels, counters and
@@ -944,7 +839,7 @@ private:
         // second place for the two to disagree (see `apply_host_partition`).
         host_partition_.bind(V4HostPartition::Services{
             &registry_, &host_pool_, staging_.get(), &host_region_,
-            &prefill_sweep_, &supply_, &budget_});
+            &prefill_controller_.sweep(), &supply_, &budget_});
         host_partition_.refresh_sweep_banks(experts_per_layer);
 
         // The direct reader's ring must hold **every read that can be outstanding at
@@ -1049,27 +944,31 @@ private:
             telemetry_, runtime_cfg.profile_routing_reuse ? &reuse_profiler_ : nullptr,
             config_.swiglu_limit);
 
-        // 15 — the prefill sweep (Step 6 item 6). Borrows the same two components the
-        // executor does; it runs only between `prefill_begin` and `prefill_end`.
-        prefill_sweep_requested_ = runtime_cfg.prefill_sweep;
-        // The prompt-length gate (Step 3), resolved once from the layer width, and
+        // 15 — the prefill controller (Step 6 item 6): the sweep and the strategy
+        // switch. It borrows the same two components the executor does, and its
+        // sweep's bank count was bound by the partition where the arena was built;
+        // this resolves the switch and the prompt-length gate. The two host-side
+        // restore steps are injected, since both use the host's blocking-read path.
+        //
+        // The prompt-length gate (Step 3) is resolved once from the layer width, and
         // **placed at the measured crossover** rather than derived from theory: the
         // A/B (`scripts/prefill_ab.sh`, ledger M44) puts the routed bank ahead of the
         // sweep up to about `0.7 E` tokens and the sweep ahead from `0.75 E`, so the
         // default is `3 E / 4`. It is a visible, overridable setting, and the round
         // fraction keeps it expressed in the model's own terms.
-        sweep_min_tokens_ = runtime_cfg.prefill_sweep_min_tokens > 0
+        const uint32_t sweep_min_tokens = runtime_cfg.prefill_sweep_min_tokens > 0
             ? runtime_cfg.prefill_sweep_min_tokens
             : std::max<uint32_t>(
                   1, (static_cast<uint32_t>(config_.n_routed_experts) * 3u) / 4u);
-        // The sweep's bank count must match the arena's (`host_partition_.sweep_staging_banks()`,
-        // derived where the arena is built), or a layer's reads would collide with the bank
-        // still in flight.
-        prefill_sweep_.configure(&supply_, &registry_, host_partition_.sweep_staging_banks());
+        prefill_controller_.bind(V4PrefillController::Services{
+            &streams_, &supply_, executor_.get(), &registry_, &host_partition_,
+            [this] { restore_prefill_warm(loader_.expert_format()); },
+            [this] { restore_prefill_residents(loader_.expert_format()); }});
+        prefill_controller_.configure(runtime_cfg.prefill_sweep, sweep_min_tokens);
         // P2.3: let the per-token hook pump the swept lookahead's copies. The executor
         // does not know about the sweep, so it gets a callback; the sweep ignores the
         // call when it is not driving a window.
-        executor_->set_supply_pump([this] { (void)prefill_sweep_.pump(); });
+        executor_->set_supply_pump([this] { prefill_controller_.pump(); });
 
         // 16 — the prefill workspace (Step 6 item 7), derived from the configured
         // window and chunk and allocated **once, here**, so no window can fail
@@ -1318,19 +1217,11 @@ private:
     V4ExpertSupplyCoordinator supply_;
     V4RoutedExpertScratch expert_scratch_;
     std::unique_ptr<V4TieredExpertExecutor> executor_;
-    V4PrefillSweep prefill_sweep_;
-    bool prefill_sweep_requested_{false};
-    // Whether the layer-major prefill supply is active at all this window (either
-    // strategy). The length picks the strategy; this says one was chosen.
-    bool prefill_active_{false};
-    // The prompt-length gate, resolved at load from `prefill_sweep_min_tokens`
-    // (`E / 4` unless configured). Below it a window runs the route-aware cached
-    // supply. See `prefill_sweep_min_tokens()`.
-    uint32_t sweep_min_tokens_{0};
-    // Set by `prefill_begin` for the window it opens, so the per-layer hooks and
-    // `prefill_end` act on the strategy that was chosen for *this* window rather
-    // than re-deciding it (and so a gate can read the choice).
-    bool sweep_active_{false};
+    // The layer-major prefill lifecycle and the sweep: the strategy switch, the
+    // prompt-length gate, and the window begin/end that move the partition. It
+    // reaches its collaborators as bound services (see `v4_prefill_controller.hpp`);
+    // the host still owns the arena, region and sweep storage lifetime.
+    V4PrefillController prefill_controller_;
 };
 
 } // namespace aeon::core

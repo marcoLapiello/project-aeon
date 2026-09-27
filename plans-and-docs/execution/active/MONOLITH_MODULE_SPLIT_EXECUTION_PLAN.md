@@ -47,9 +47,9 @@ The two files with the highest churn. This is where the "grown during the last i
 The header itself says it is the G1 composition root; the target is to shrink it to genuine ownership and accessors. Extract one controller per commit. Drawn in dependency order — the self-contained workspace first, the coupled lifecycle last — so each step lands and is gated on its own:
 - [x] `v4_prefill_workspace.hpp` — `V4PrefillWorkspace` owns the residual carry, the worst-case batch scratch, and the window/chunk it was sized for. It takes the layer vector and model config as arguments, so it needs no host reference. *Done 2026-09-27: gates `test_v4_engine`, `test_v4_graph_body`, `test_v4_prefill_sweep` pass unchanged.*
 - [x] `v4_host_partition.hpp` — `V4HostPartition` owns the phase slot arithmetic and the boundary move (`apply`) and the arena re-depth (`resize`); it edits its collaborators as bound services rather than a host back-reference. *Done 2026-09-27: gates `test_v4_staging_depth`, `test_v4_prefill_sweep`, `test_v4_graph_body`, `test_v4_engine` pass unchanged.*
-- [ ] `v4_prefill_controller.hpp` — `prefill_begin` / `prefill_before_layer` / `prefill_after_layer` / `prefill_end`, `restore_prefill_warm`, and the sweep accessors (`prefill_sweep`, `sweep_occupancy`, `sweep_load_ns`, `sweep_io_ns`, `prefill_sweep_engaged*`).
-- [ ] Leave the host with: streams, layers/scratch/resources accessors, registry/pool/telemetry accessors, `initialize`, `free`.
-- [ ] `v4_model_host.hpp` stays the umbrella. **Gate:** `test_v4_graph_body`, `test_v4_graph_head`, `test_v4_engine`, `test_v4_staging_depth` pass unchanged; `aeon_chat` token stream identical to the pre-split run.
+- [x] `v4_prefill_controller.hpp` — `V4PrefillController` owns the window lifecycle (`begin` / `before_layer` / `after_layer` / `end`), the strategy switch and flags, and the sweep accessors. It reaches its collaborators as bound services and takes the two host-side restore steps as injected callbacks (they use the host's blocking-read path). The sweep member moved into it. *Done 2026-09-27: `test_v4_prefill_sweep`, `test_v4_graph_head`, `test_v4_graph_body`, `test_v4_engine` pass unchanged, `test_v4_staging_depth` passes on rerun (its known flaky timing gate).*
+- [x] Leave the host with: streams, layers/scratch/resources accessors, registry/pool/telemetry accessors, `initialize`, `free`.
+- [x] `v4_model_host.hpp` stays the umbrella. **Gate:** `test_v4_graph_body`, `test_v4_graph_head`, `test_v4_engine`, `test_v4_staging_depth` pass unchanged; `aeon_chat` token stream identical to the pre-split run.
 
 ---
 
@@ -130,7 +130,7 @@ Explicitly **not** scheduled. Listed so the inventory is complete and so a futur
 | Tier | Item | State |
 | :--- | :--- | :--- |
 | A1 | `memory_budget.hpp` → 3 units | ✅ |
-| A2 | `v4_model_host.hpp` → owner + 3 controllers | ◐ workspace, partition done |
+| A2 | `v4_model_host.hpp` → owner + 3 controllers | ✅ |
 | B1 | `v4_layer_body.hpp` → types + phases | ☐ |
 | B2 | `tiered_expert_supply.hpp` → types + seams | ☐ |
 | C1 | `expert_registry.hpp` → registry + partition + residency + validation | ☐ |
