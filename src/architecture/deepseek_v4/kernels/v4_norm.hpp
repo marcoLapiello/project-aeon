@@ -3,11 +3,9 @@
 // -----------------------------------------------------------------------------
 // DeepSeek-V4 kept primitive: Wave32 RMSNorm.
 //
-// This kernel is part of the layer the rewrite *keeps* — only the graph that
-// composes it is rebuilt. It was extracted from the pre-rewrite attention header
-// so that a single primitive can be compiled, gated, and certified on its own,
-// without dragging the legacy graph into the target. The legacy header now
-// includes this one, so there is exactly one definition.
+// It lives in its own header so the primitive can be compiled, gated, and
+// certified on its own, without pulling in the composition that calls it;
+// `v4_attention.hpp` includes this one, so there is exactly one definition.
 //
 // Shape contract: one warp (32 lanes) per token row; lane `l` handles elements
 // `l, l+32, l+64, …` and the sum-of-squares is reduced across the wave with

@@ -3,9 +3,8 @@
 // -----------------------------------------------------------------------------
 // DeepSeek-V4 kept primitive: RoPE (Step 2.3).
 //
-// Extracted from the pre-rewrite attention header for the same reason RMSNorm
-// was: a primitive must be gated on its own, outside the legacy graph, and there
-// must be exactly one definition. `v4_attention.hpp` includes this header.
+// Gated on its own, like RMSNorm, and with exactly one definition:
+// `v4_attention.hpp` includes this header.
 //
 // The four properties this file must get right — each is a recorded trap:
 //

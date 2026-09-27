@@ -1,11 +1,8 @@
 // -----------------------------------------------------------------------------
-// aeon_chat — text in, text out, driven by the rewritten graph.
+// aeon_chat — text in, text out.
 //
-// This was a **legacy** target until P4: it drove `V4Pipeline`, the pre-rewrite
-// graph (since deleted). The composition plan lists re-binding it as agreement
-// **G5** and part of phase **P4**, and the reason
-// is the acceptance criterion — "one command takes a conversation and returns
-// text" — which cannot be met by a binary that is not in the default build.
+// The acceptance criterion — "one command takes a conversation and returns
+// text" — is met by this binary, so it belongs in the default build.
 //
 // The CLI is now thin on purpose. It does four things the engine should not: parse
 // arguments, assemble messages, choose what to print, and exit. Everything else —

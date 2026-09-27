@@ -5,9 +5,9 @@
 //
 // The dense backbone's projections are all `y = W @ x` with fp16 weights and a
 // single token: `wq_a`, `wq_b`, `wkv`, the compressor gates, the indexer
-// projections, the router gate, the shared expert, and the LM head. Extracted
-// from the pre-rewrite attention header so the dense path can be composed and
-// gated outside the legacy graph, as with `v4_norm.hpp` and `v4_rope.hpp`.
+// projections, the router gate, the shared expert, and the LM head. It lives in
+// its own header so the dense path can be composed and gated on its own, as with
+// `v4_norm.hpp` and `v4_rope.hpp`.
 //
 // Two forms:
 //   `v4_gemv_fp16_kernel`      — one half per lane per step. Used for the MLA

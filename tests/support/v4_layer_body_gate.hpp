@@ -301,11 +301,9 @@ public:
         }
 
         // Deterministic: one expert at a time, in slot order, so the sum is
-        // `Σ_k w_k · W2_k · swiglu(W1_k·x)` with a fixed reduction order. This is
-        // the same shape as the pipeline's own `deterministic_expert_accumulation_`
-        // path (per-expert GEMV plus `v4_pipeline_accumulate_expert_kernel`), and
-        // like that path its accumulator is fp16 — which is the point: it is a
-        // *reproducible* order, not a more accurate one.
+        // `Σ_k w_k · W2_k · swiglu(W1_k·x)` with a fixed reduction order. The
+        // accumulator is fp16, which is the point: it is a *reproducible* order,
+        // not a more accurate one.
         half* expert_hidden = scratch->d_swizzled_expert_hidden;
         half* expert_down = scratch->d_expert_down;   // [M_PAD * hidden]
         float* expert_down_f32 = scratch->d_swizzled_moe_accum_f32;

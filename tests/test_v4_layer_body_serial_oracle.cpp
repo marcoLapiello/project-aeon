@@ -54,8 +54,8 @@
 // accumulation** (`executor.deterministic = true`), the same choice item 19 made,
 // and reports the nondeterminism as a measurement — `near_tie`,
 // `selection_mismatch_steps`, `worst_selection_gap`, `drift` — instead of
-// inferring it from an intermittently red line. The pipeline's own
-// `deterministic_expert_accumulation_` removes the amplification at its source.
+// inferring it from an intermittently red line. The deterministic accumulation
+// removes the amplification at its source.
 // Item 18's *finding* is unchanged and is why the seam and the counters exist.
 //
 // 136 tokens is not a round number: HCA (ratio 128) commits its first compressed

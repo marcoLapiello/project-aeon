@@ -9,9 +9,9 @@
 #include <cstdint>
 #include <cassert>
 
-// The Wave32 RMSNorm, RoPE, and GEMV kernels moved to focused modules so each
-// primitive can be gated on its own, outside the legacy graph. This header
-// keeps including them for its existing callers; there is no second definition.
+// The Wave32 RMSNorm, RoPE, and GEMV kernels live in focused modules so each
+// primitive can be gated on its own. This header includes them for its callers;
+// there is no second definition.
 #include "architecture/deepseek_v4/kernels/v4_norm.hpp"
 #include "architecture/deepseek_v4/kernels/v4_rope.hpp"
 #include "architecture/deepseek_v4/kernels/v4_gemv.hpp"
