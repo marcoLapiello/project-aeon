@@ -1,6 +1,6 @@
 # Expert Dispatch Shape — the `C = 1` case of a general batch
 
-*Status: open note for [Expert Streaming Execution Plan](../../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) **Step 0**. No code. Written 2026-09-21.*
+*Status: **historical** (archived 2026-09-27). A completed design note: it writes down the batched expert-seam shape parameterized by `C`, which **Step 0** of the [Expert Streaming Execution Plan](../../execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) is marked done for and which the code now implements (`dispatch_layer_prefetch_batch`; the corridor's three requirements are derived from `C` and `blocks`). No code, and nothing here is pending. Written 2026-09-21.*
 
 ## 1. What this note fixes
 

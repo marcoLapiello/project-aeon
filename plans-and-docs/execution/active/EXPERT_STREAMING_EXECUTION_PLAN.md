@@ -1,6 +1,6 @@
 # Expert Streaming Execution Plan
 
-*Status: active. Opened 2026-09-19. Supersedes [Expert Streaming and Chunked Prefill Analysis](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md) as the working document.*
+*Status: active. Opened 2026-09-19. Supersedes [Expert Streaming and Chunked Prefill Analysis](../../analysis/historical/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md) as the working document.*
 
 > The prefill supply half of this plan — the prompt-length gate, the bounded drain with Hot-set restore, and the routed bank below the gate — is **complete** in [Prefill Supply Strategy](../completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) (ledger M44/M44b). What remains open here is §6.
 
@@ -70,7 +70,7 @@ Each step states its requirement, its gate, and its files. A step is done when i
 
 ### Step 0 — The dispatch-shape note — **done**
 
-**Requirement.** Write down how the expert seam becomes *batched*: how `on_routing_ready` / `accumulate_routed` take a **set** of tokens rather than one, how leases are scoped, and how the staging arena is sized. One page: [EXPERT_DISPATCH_SHAPE_NOTE.md](../../analysis/current/EXPERT_DISPATCH_SHAPE_NOTE.md).
+**Requirement.** Write down how the expert seam becomes *batched*: how `on_routing_ready` / `accumulate_routed` take a **set** of tokens rather than one, how leases are scoped, and how the staging arena is sized. One page: [EXPERT_DISPATCH_SHAPE_NOTE.md](../../analysis/historical/EXPERT_DISPATCH_SHAPE_NOTE.md).
 
 **Why first.** `TOTAL_STAGING_SLOTS = 2 × 6 = 12`, one dispatch in flight, and per-token leases are decode-shaped facts today. Writing the batched shape down first means the certifiable constants are written as the `C = 1` case of a parameterized form, not as facts that must be unwound at Step 6.
 

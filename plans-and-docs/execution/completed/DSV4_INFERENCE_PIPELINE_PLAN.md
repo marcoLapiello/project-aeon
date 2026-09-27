@@ -1708,7 +1708,7 @@ differently rather than a routing bug. The cause is precision, not semantics: th
 > rebuilt graph. **Item 23's three seams are therefore closed**: the routed-expert executor, the
 > 43-layer driver, and the text binding. What remains of Part V is not item 23 but Tier 4's remaining
 > items — 21's concurrency remainder and 22b/R4, now owned by the
-> [Expert Streaming and Chunked Prefill Analysis](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md)
+> [Expert Streaming and Chunked Prefill Analysis](../../analysis/historical/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md)
 > and the [Session State and Swap Analysis](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md)
 > respectively — and the throughput work, which the plan keeps a separate gate. `2.7 tok/s` is not a
 > throughput claim: it is an unbatched single-token decode with the warm tier unallocated, and the

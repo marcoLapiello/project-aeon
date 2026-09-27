@@ -1,6 +1,6 @@
 # Supply-Chain Hot-Path — Execution Plan (completed)
 
-*Created 2026-09-24; restated as a spec 2026-09-25; **completed 2026-09-27**. Owner: [SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md](../../analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md) — this plan is the action list, the analysis doc owns the evidence. Scope: how fast the bytes arrive, not which bytes.*
+*Created 2026-09-24; restated as a spec 2026-09-25; **completed 2026-09-27**. Owner: [SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md](../../analysis/historical/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md) — this plan is the action list, the analysis doc owns the evidence. Scope: how fast the bytes arrive, not which bytes.*
 
 **Phase 1 and Phase 2 are done**, with the §0 spec holding (R1–R8) and every step measured on silicon. Only **Phase 3 (dispatch bookkeeping)** is open, deferred as low value (§3). Ledger: M42–M46. Analysis: §8–§19.
 

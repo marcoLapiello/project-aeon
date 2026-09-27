@@ -50,7 +50,7 @@ Oldest to newest. As the list grows, the two oldest rows fuse into one, so the t
 | DeepSeek-V4 specification and oracle harness: Step 0 prompt encoding and the implementation order Tiers 0–4, through the layer body, the three attention classes, chunked prefill, the long-context lifecycle, streaming and tiering, and state restore | verified | [DSV4 Inference Pipeline Plan](../execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md) — one plan; its every `[V]` claim cites readable reference code |
 | Graph rewrite: composition P0–P4, the 43-layer text-in/text-out path | acceptance criterion met | [DSV4 Graph Composition Plan](../execution/completed/DSV4_GRAPH_COMPOSITION_PLAN.md) §7; ledger M28 |
 | Prefill supply strategy: prompt-length gate, bounded Hot drain, routed bank, Hot-set restore | complete | [PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md](../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md); ledger M44/M44b |
-| Supply-chain hot path: the corridor as a demand-driven pipeline | complete | [SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md](../execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md); ledger M42–M46; evidence §8–§19 of [the analysis](../analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md) |
+| Supply-chain hot path: the corridor as a demand-driven pipeline | complete | [SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md](../execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md); ledger M42–M46; evidence §8–§19 of [the analysis](../analysis/historical/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md) |
 
 ### Present
 
@@ -71,7 +71,7 @@ Directions explicitly defined as future — researched or discussed, not yet adm
 | Backend generalization: the factory and a second backend | its remaining stages are **contingent on a second backend existing**, and the plan's own non-goal forbids the shared abstraction before two concrete backends demonstrate it | [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) — the descriptor, manifest, backend selection, dense binding and source boundaries are already implemented |
 | Prefix matcher (block table, cache key, radix search, eviction) | needs an assembled graph and a fork workload | composition plan §9; session analysis |
 | MTP / DSpark draft head (`num_nextn_predict_layers=1`) | speculative decoding, not the base forward pass | composition plan §9; pipeline plan §Tier 0.2e |
-| Multi-GPU pipeline parallelism (Phase 3) | out of scope for this revision | composition plan §9; [vision](../reference/strategy/PROJECT_AEON_VISION.md) |
+| Multi-GPU pipeline parallelism (Phase 3) | out of scope for this revision | composition plan §9; [vision](../reference/strategy/PROJECT_AEON_VISION.md). The one worked analysis is §7 of the [archived prefill/multi-GPU review](../analysis/historical/PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) — start there if this is picked up |
 | Tool use beyond prompt encoding | frontend work; needs the logit-processor seam plus a tool workload | composition plan §9 |
 | KV fp8/E4M3 versus bf16 store | a delta that must be measured, not assumed | pipeline plan Gates 9/10 |
 | Expert-placement policy (routing-aware hotlists) | scheduling optimization, not a correctness requirement | expert streaming analysis |

@@ -415,7 +415,7 @@ or before P4 is a prerequisite of the first coherent run:**
 
 The remaining gaps were extracted on 2026-09-18: the tiering and prefill work (the observer, the
 telemetry wiring, the batched embedding, the on-device indexer top-k, the chunk driver) into
-[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md),
+[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/historical/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md),
 and the session state work into
 [SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md).
 Neither is listed here.
@@ -451,7 +451,7 @@ later moved out with the rest of the tiering scope, leaving five here:
 instrument. The session-aggregate lift (G10) and the new session work (registry, cold store, R4) went
 with [SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md);
 the prefill work items went with
-[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md).
+[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/historical/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md).
 None of it is a research question.
 
 Of the four lifts listed, **G1, G2, G3 and G5 are spent** (P1–P4), and G9 was built by P2. Every gap
@@ -680,7 +680,7 @@ not a gate.
 
 The remaining work was **extracted on 2026-09-18**: tiering under miss pressure, chunked prefill and
 the diagnostics wiring they need — with the two rules those work items bind — into
-[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md);
+[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/historical/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md);
 and the session state work (aggregate, registry, residency, cold store, R4) into
 [SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md).
 Those documents own it; nothing about it is decided or restated here.
@@ -734,7 +734,7 @@ unbatched single-token decode with the warm tier unallocated.
 | The prefix **matcher** (block table, cache key, radix search, eviction) | its parameters are measurements of an assembled graph; session swap needs no key | session swap is green and a fork workload exists (see [SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md)) |
 | Tool use beyond the prompt encoding it already has | schema formatting, parser, turn orchestration are frontend work | the logit-processor seam (P3) plus a tool workload |
 | The fp8/E4M3 KV store vs bf16 | a storage decision whose delta must be measured, not assumed | the KV-precision gates (plan Gates 9/10) |
-| Expert-placement policy (routing-aware hotlists) | a scheduling optimization, not a correctness requirement | the tiering gate is green (see [EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md)) |
+| Expert-placement policy (routing-aware hotlists) | a scheduling optimization, not a correctness requirement | the tiering gate is green (see [EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/historical/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md)) |
 | Throughput targets | speed and correctness are two different gates | the chunked-prefill work (same document) |
 
 **Known remainders carried in, not re-decided here:** the KV-precision gates (the inference plan's
@@ -769,5 +769,5 @@ P3's first ordering assertion passed on both the correct and the wrong ordering 
 fourteen gaps, seven were lifts of code that already ran in the pre-rewrite graph (§6.1) and all
 seven are spent, so **every gap this plan opened is closed**. The work that remained when it closed —
 tiering under pressure and chunked prefill, then session state — was extracted on 2026-09-18 into
-[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/current/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md)
+[EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md](../../analysis/historical/EXPERT_STREAMING_AND_CHUNKED_PREFILL_ANALYSIS.md)
 and [SESSION_STATE_AND_SWAP_ANALYSIS.md](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md).
