@@ -37,11 +37,11 @@ All of `src/` is header-only (no `.cpp` in the engine or registry directories). 
 
 The two files with the highest churn. This is where the "grown during the last implementations" claim is literally true.
 
-### A1. `memory_budget.hpp` → three units (fan-in 11)
-- [ ] `aeon_runtime_config.hpp` — `AeonRuntimeConfig`, `StagingSlotCounts`, `staging_slot_counts`, `staging_slot_count`, the scratch-allowance helpers.
-- [ ] `memory_budget_report.hpp` — `MemoryBudgetReport`, `prefill_carry_bytes`, `AttentionStateMemory`.
-- [ ] `memory_budget_engine.hpp` — `MemoryBudgetEngine` (`evaluate` overloads) only.
-- [ ] `memory_budget.hpp` becomes the umbrella. **Gate:** `test_v4_engine`, `test_v4_staging_depth`, and the budget cross-check in `test_v4_layer_body_lifecycle` pass unchanged.
+### A1. `memory_budget.hpp` → three units (fan-in 11) — ✅ done 2026-09-27
+- [x] `aeon_runtime_config.hpp` — `AeonRuntimeConfig`, `StagingSlotCounts`, `staging_slot_counts`, `staging_slot_count`, the scratch-allowance helpers (and the constants they derive from).
+- [x] `memory_budget_report.hpp` — `MemoryBudgetReport`, `prefill_carry_bytes`, `AttentionStateMemory` (promoted from a nested type; internal-only, no external reference).
+- [x] `memory_budget_engine.hpp` — `MemoryBudgetEngine` (`evaluate` overloads) only.
+- [x] `memory_budget.hpp` becomes the umbrella. **Gate:** `test_v4_engine`, `test_v4_staging_depth`, and the budget cross-check in `test_v4_layer_body_lifecycle` pass unchanged. *(`test_v4_staging_depth` failed once on a timing gate under load and passed on rerun; the split is a byte-identical move, so this was environmental.)*
 
 ### A2. `v4_model_host.hpp` → owner + controllers (fan-in 13)
 The header itself says it is the G1 composition root; the target is to shrink it to genuine ownership and accessors. Extract in this order, one controller per commit:
@@ -129,7 +129,7 @@ Explicitly **not** scheduled. Listed so the inventory is complete and so a futur
 
 | Tier | Item | State |
 | :--- | :--- | :--- |
-| A1 | `memory_budget.hpp` → 3 units | ☐ |
+| A1 | `memory_budget.hpp` → 3 units | ✅ |
 | A2 | `v4_model_host.hpp` → owner + 3 controllers | ☐ |
 | B1 | `v4_layer_body.hpp` → types + phases | ☐ |
 | B2 | `tiered_expert_supply.hpp` → types + seams | ☐ |

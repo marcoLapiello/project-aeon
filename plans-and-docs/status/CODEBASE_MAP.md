@@ -40,7 +40,7 @@ The production-facing implementation is:
 - `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` - six-expert V4 request adapter and Aeon payload-source mapping.
 - `src/infrastructure/core/tiered_expert_supply.hpp` - architecture-neutral tiered payload movement and transfer lifecycle.
 - `src/infrastructure/core/aeon_loader.hpp` - native `.aeon` dense and expert container access.
-- `src/architecture/deepseek_v4/core/memory_budget.hpp` - V4 VRAM/host feasibility calculations and startup checks.
+- `src/architecture/deepseek_v4/core/memory_budget.hpp` - umbrella over the V4 memory budget: `aeon_runtime_config.hpp` (the knobs, safety margins, scratch allowances, staging slot counts), `memory_budget_report.hpp` (`MemoryBudgetReport` and its derived terms), and `memory_budget_engine.hpp` (the device/host query and feasibility evaluation).
 - `src/backend/swizzled_w4a16/core/vram_expert_pool.hpp` - current backend's Tier 1 hot expert pool.
 - `src/infrastructure/core/host_expert_pool.hpp` - shared Tier 2 warm expert pool.
 - `src/infrastructure/core/expert_registry.hpp` - shared expert residency and usage tracking.
