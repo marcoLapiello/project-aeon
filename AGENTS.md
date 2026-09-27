@@ -40,12 +40,13 @@ Oldest to newest. Each new milestone fuses the two older rows into one, so the t
 | Specification and oracle harness: Tier 0 research, Step 0 prompt encoding, Tier 1 primitives, Step 3 `hc_head` | verified | [DSV4 Inference Pipeline Plan](plans-and-docs/execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md) §Tier 0–1, §Step 0, §Step 3 |
 | Graph rewrite: Tiers 2–4 and composition P0–P4, the 43-layer text-in/text-out path | acceptance criterion met | [DSV4 Graph Composition Plan](plans-and-docs/execution/completed/DSV4_GRAPH_COMPOSITION_PLAN.md) §7; pipeline plan §Tier 2–4; ledger M28 |
 | Prefill supply strategy: prompt-length gate, bounded Hot drain, routed bank, Hot-set restore | complete | [PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md](plans-and-docs/execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md); ledger M44/M44b |
+| Supply-chain hot path: the corridor as a demand-driven pipeline | complete | [SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md](plans-and-docs/execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md); ledger M42–M46; evidence §8–§19 of [the analysis](plans-and-docs/analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md) |
 
 ### Present
 
 | Work in progress | State | Detail |
 | :--- | :--- | :--- |
-| Expert streaming and chunked prefill | in progress | [EXPERT_STREAMING_EXECUTION_PLAN.md](plans-and-docs/execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) — §6 open work: the `W`/`C` window sweep, the prefill body's `~120 ms/prompt-token`, the staging arena's `banks × depth`, the cold→warm fill path, the placement policy, and prefix reuse. Its prefill supply half is complete: [Prefill Supply Strategy](plans-and-docs/execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md), ledger M44/M44b |
+| Expert streaming and chunked prefill | in progress | [EXPERT_STREAMING_EXECUTION_PLAN.md](plans-and-docs/execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) — §6 open work: the `W`/`C` window sweep, the prefill body's `~120 ms/prompt-token`, the cold→warm fill path, the placement policy, and prefix reuse. Its prefill supply half is complete: [Prefill Supply Strategy](plans-and-docs/execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md), ledger M44/M44b; its corridor half is complete: [Supply-Chain Hot Path](plans-and-docs/execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md), ledger M42–M46 |
 | Session state and swap | open | [SESSION_STATE_AND_SWAP_ANALYSIS.md](plans-and-docs/analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) |
 | Host-memory pressure | open investigation | [HOST_MEMORY_PRESSURE_INVESTIGATION.md](plans-and-docs/analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) |
 | Routing profile and placement study | open | [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) |

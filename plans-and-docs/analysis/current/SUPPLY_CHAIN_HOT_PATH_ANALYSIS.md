@@ -2,7 +2,7 @@
 
 *Status: open analysis — **largely measured and settled**. Written 2026-09-22; deepened 2026-09-23 in a second source pass; **measured 2026-09-24** (Step 1 §8, Step 2 §9, Phase 1 §10) and **2026-09-25** (portability gates §11, arena shape §12, completion-driven release §13). A two-round audit of the expert supply's transfer path and its per-request bookkeeping, in answer to two questions: (1) is the NVMe→VRAM feed a continuous stream or an interrupted one; (2) which substeps on that road are expensive enough to be worth removing. Source read: `direct_io_reader.hpp`, `tiered_expert_supply.hpp`, `prefetch_staging.hpp`, `expert_registry.hpp`, `v4_expert_supply.hpp`, `v4_prefill_sweep.hpp`, `v4_expert_executor.hpp`, `v4_model_host.hpp`, `memory_budget.hpp`, `bench_prefill_ab.cpp`. Instrumentation added: `TieredExpertSupply` transfer counters + `tests/bench_supply_split.cpp` + `scripts/supply_split.sh`; probe added: `tools/aeon_c4_probe.cpp`. **Headline: the transfer path is near its ceiling; the exposed swept-layer H2D `4.1–5.4 s/window` was then removed in Phase 1 (§10) by a deferred drain — `3.2–3.5 s/window` recovered, at both Warm 0 and Warm 30 — but only with a second staging bank that costs `+3.44 GiB` pinned, which does not fit the production Warm shape; the shipping form is C2's per-expert recycling (Phase 2). The largest measured supply cost — decode's NVMe wait (§8.5) — has a remedy that is out of scope here.***
 
-**Subject.** The mechanics of moving a routed expert from NVMe into VRAM — the read submission, the staging corridor, the H2D, and the registry bookkeeping around all three. This is the *how fast can the bytes arrive* question, not the *which bytes should arrive* strategy question, which the [prefill supply review](PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) and the [prefill supply strategy plan](PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) own.
+**Subject.** The mechanics of moving a routed expert from NVMe into VRAM — the read submission, the staging corridor, the H2D, and the registry bookkeeping around all three. This is the *how fast can the bytes arrive* question, not the *which bytes should arrive* strategy question, which the [prefill supply review](PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) and the [prefill supply strategy plan](../../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md) own.
 
 **Scope.** The paths as written, with the cost of each substep reasoned from the code. **Nothing below is measured.** Every estimate is flagged as such, and §5 names the counters that would confirm or refute it — and reports that one of the two splits it asks for needs no new instrumentation at all, because both counters already exist.
 
@@ -289,7 +289,7 @@ The biggest measured supply cost is **not in the prefill** — it is **decode's 
 - Decode reads `440–1 700 MiB/token` from NVMe (6 experts × 43 layers × 13.5 MiB = `3.48 GiB` if all cold, so `12–49%` of the draws miss). Warm serves a comparable volume (`~1 045 MiB/token`), so Warm roughly halves the cold traffic.
 - Decode's `h2d_enqueue` (`0.5–1.6 ms`) and `submit` (`0.16–0.46 ms`) are negligible; `h2d_drain` is `0`.
 
-This is a **characterization of the transfer path**, and it is in scope: decode uses the same channels, so its split is the honest measure of what those channels cost in the other phase. What is **not** in scope is the remedy its size suggests. Making decode read fewer bytes is the *which bytes should arrive* question — explicitly excluded by this document's §Subject, and owned by the [routing profile and placement study](../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md). So the finding is recorded and **handed off**, not acted on: within this document's scope the remaining lever is C2/C3 (§8.6), and decode's residual is bounded by how fast the path can serve whatever demand exists — which the numbers above say is already the drive, hidden behind nothing left to remove on the copy side.
+This is a **characterization of the transfer path**, and it is in scope: decode uses the same channels, so its split is the honest measure of what those channels cost in the other phase. What is **not** in scope is the remedy its size suggests. Making decode read fewer bytes is the *which bytes should arrive* question — explicitly excluded by this document's §Subject, and owned by the [routing profile and placement study](../../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md). So the finding is recorded and **handed off**, not acted on: within this document's scope the remaining lever is C2/C3 (§8.6), and decode's residual is bounded by how fast the path can serve whatever demand exists — which the numbers above say is already the drive, hidden behind nothing left to remove on the copy side.
 
 ### 8.6 Revised disposition of the structural items
 
@@ -381,7 +381,7 @@ Two further facts fall out of the probe and are worth keeping:
 
 ## 10. Measured — Phase 1, the deferred drain (2026-09-24)
 
-*Status: **measured.** The first fix of the execution plan was built and A/B'd. The overlap is real; the memory cost is the blocker. Plan: [SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md](../../execution/active/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md).*
+*Status: **measured.** The first fix of the execution plan was built and A/B'd. The overlap is real; the memory cost is the blocker. Plan: [SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md](../../execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md).*
 
 ### 10.1 What was built
 
@@ -630,7 +630,7 @@ Same gate, one swept window, `N = 256`, 43 layers:
 
 The target shape — `L` computing │ `L+1` resident │ `L+2` copying │ `L+3` reading — needs **four** layers of VRAM state live at once. This pool holds ~two (797 slots, minus `466–539` preserved, is ~`2E`). So the limit is **residency, not the corridor**: no amount of staging, pumping, or depth derivation can put four layers in a pool that fits two.
 
-That places the remaining lookahead headroom in the **which-bytes** question — how much decode residency the prefill may spend — which is the [routing profile and placement study](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)'s subject, and was already the documented hand-off. Within this analysis's scope the corridor is now shaped correctly and its cost is measurable.
+That places the remaining lookahead headroom in the **which-bytes** question — how much decode residency the prefill may spend — which is the [routing profile and placement study](../../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)'s subject, and was already the documented hand-off. Within this analysis's scope the corridor is now shaped correctly and its cost is measurable.
 
 ### 15.5 Finding: the second staging bank buys ~`3%`, not the `13%` it used to
 
@@ -824,7 +824,7 @@ The window is also slightly **faster** than the depth-1 configuration it replace
 1. **Do not bound reads by VRAM.** §16.4's third term was a re-coupling and is gone. A copy that finds no free VRAM well waits in staging; it does not stop the reads behind it.
 2. **Do not increase the arena for speed.** `2E … 6E` are the same within `1%`. The drive is the limiter, so `2E` stays the default and each extra bank (`+3.4 GiB`) buys staging capacity only.
 3. **Depth is a budget, at last.** `read_lookahead_capacity` is `min(staging blocks, banks - 1)` — the cartridge box, and nothing else. This is the property R2/R5/R6 asked for and that §15.5 and §16.4 could not yet claim.
-4. **The 4-block pipeline remains a residency question**, not a corridor one: it needs three VRAM blocks live (computing, resident, copy-destination) and this pool fits two. That remains the [routing profile and placement study](ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)'s subject.
+4. **The 4-block pipeline remains a residency question**, not a corridor one: it needs three VRAM blocks live (computing, resident, copy-destination) and this pool fits two. That remains the [routing profile and placement study](../../execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md)'s subject.
 
 ---
 
