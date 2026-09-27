@@ -960,32 +960,68 @@ free-list edit — no page is allocated, freed or re-pinned, and the two sizes c
 exactly, which two allocations resized against each other could never do (a pool frees
 in `64`-slot segments).
 
-### 19.2 Why the boundary moves
+### 19.2 Why the boundary moves — and there are **three** sizes, not two
 
-The two consumers want opposite shapes, and this is the point of the feature:
+There are three dispatch paths, and each binds a different number of staging indices
+at once. That is the fact the first version of this section missed: it treated the
+corridor as having one non-swept size, `max(12, min(6C, E))`, which is the **routed
+window's** requirement applied to decode as well.
+
+| phase | dispatch | staging indices | requirement |
+| :--- | :--- | :--- | ---: |
+| decode | `dispatch_layer_prefetch` | `(layer % 2) * 6 + 0..5` | `2 x 6` = `12` |
+| routed batch | `dispatch_layer_prefetch_batch` | `0 .. D-1`, `D <= min(6C, E)` | `min(6C, E)` = `256` |
+| swept | `dispatch_layer_stream` | `(layer % banks) * E + index` | `blocks x E` |
+
+At `C = 256` and `E = 256` the middle figure is `256`, so decode was holding `244`
+slots it can never bind — `3.44 GiB` of Warm residency given away in the phase whose
+NVMe hits those slots decide. The fix is to cut the boundary to the requirement of the
+phase actually running:
 
 | phase | corridor | Warm | why |
 | :--- | ---: | ---: | :--- |
-| decode, chunked prefill | `max(12, min(6C, E))` | everything else | Warm residency is where decode's NVMe hits are decided |
+| decode | `12` | everything else | Warm residency is where decode's NVMe hits are decided |
+| routed window | `min(6C, E)` | the rest | the layer's deduplicated set is the most a chunk binds |
 | swept prefill | `blocks x E` | the remainder | only the lookahead wants a deep corridor |
 
-Measured on a 62 GiB box with `Warm 25 GiB` and `3` staging blocks and the 1231-token
+Measured on a 62 GiB box with `Warm 25 GiB`, `3` staging blocks and the 1231-token
 prompt:
 
 | | Warm | corridor |
 | :--- | ---: | ---: |
-| before (two allocations) | `25.00 GiB` + `10.12 GiB` separate = **35.12 GiB held** | |
-| decode | `21.62 GiB` (`1640` slots) | `3456 MiB` base |
+| before (two allocations) | `25.00 GiB` + `10.12 GiB` separate = **`35.12 GiB held`** | |
+| decode | `24.84 GiB` (`1884` slots) | `162 MiB` |
+| routed window | `21.62 GiB` (`1640` slots) | `3456 MiB` |
 | swept prefill | `15.38 GiB` (`1128` slots) | `10.12 GiB` |
 
-So the figure the user sets is what the process holds, and the corridor's share is
-available to Warm whenever a sweep is not running. A user who wants the old decode
-residency sets `25 + 3.44 = 28.4 GiB`; one who wants the old total sets `35`.
+So the figure the user sets is what the process holds, and the corridor keeps only what
+the running phase binds. Against the single-size version, decode gained `244` Warm
+slots (`+3.44 GiB` of residency) for free.
 
-**The borrow is not free, and it is measured:** the swept prefill demotes `512` Warm
-experts to Cold for the length of the window, and they are re-read on demand —
-`nvme_gib 313.9 -> 345.2` across two passes, about `+2%`. That is the corridor's rent,
-and `--staging-blocks 1` declines to pay it by keeping the corridor at its base.
+**The borrow is not free, and it is now measured at the larger Warm set:** the swept
+prefill demotes `756` Warm experts to Cold for the length of the window and they are
+re-read as `prefill_end` re-admits them (`host_restore_set`). **TTFT `158.6 -> 162.1 s`
+(`+2.2%`)** — the corridor's rent, paid in prefill time to buy decode residency. A user
+who does not want it sets `--staging-blocks 1` and keeps the corridor at its base.
+
+### 19.2b The borrow is a loan, not a loss
+
+A boundary move demotes the Warm residents in the surrendered range, records them, and
+`prefill_end` restores the capacity **and re-admits them** through the normal blocking
+read. Without the re-admission the window would end with a smaller Warm tier than it
+began with — which is exactly what `test_v4_warm_frozen_prefill` caught (84 of 291
+experts lost), and what the frozen-prefill guarantee (Step 6 D-b) forbids.
+
+Two limits on how exact the return can be, both honest:
+
+- **The pool is a fixed size.** An admission the window did not make — a decode
+  demotion completing during it — consumes room a borrowed expert would need, so the
+  return is exact **up to** what concurrent traffic displaced. The gates assert that
+  form rather than a strict equality, because a strict one would be measuring decode's
+  in-flight traffic, not the corridor.
+- **A batch that runs out of room must stop, not skip.** The first implementation
+  stepped its outer loop by a whole batch after an inner `break`, silently dropping the
+  experts it had not placed.
 
 ### 19.3 How it is kept safe
 
@@ -995,13 +1031,22 @@ and `--staging-blocks 1` declines to pay it by keeping the corridor at its base.
   boundary.
 - **The move is idempotent.** `prefill_begin` is entered both by the caller and by the
   driver, so the same partition is requested twice per window; re-applying it would
-  re-base the arena under the sweep's live lookahead.
+  re-base the arena under the sweep's live lookahead. `apply_host_partition` is
+  therefore a no-op when the requested partition is the current one, and it sets the
+  derived `sweep_staging_banks_` from the slots it just assigned rather than a cached
+  copy.
 - **The drain is explicit.** `release_host_tail` drops ownership of the surrendered
-  Warm slots and frees them; no data moves, because the payload is still in the
-  container.
+  Warm slots, frees them and records them in `host_restore_set`; no data moves, because
+  the payload is still in the container. `prefill_end` shrinks the corridor back, grows
+  Warm, and calls `restore_prefill_warm`, which re-admits the recorded set.
 - **Both preconditions are refused, not assumed:** a transfer in flight or a live lease
   blocks a move, exactly as `resize_staging_slots` already required. The move happens at
   the two boundaries, which already drain both.
+- **Sweep-off is legacy, and is treated as such.** The boundary only moves when
+  `runtime_cfg.prefill_sweep` is set: with sweep off, `staging_decode_slots_` is
+  initialized to the routed requirement, so the partition never changes and the moving
+  path is not exercised at all. The feature is not being kept working "at all costs" on
+  a path that is not a production configuration.
 
 ### 19.4 Verification
 
@@ -1009,12 +1054,15 @@ Byte-exactness is unaffected at every policy:
 
 | gate | result |
 | :--- | :--- |
-| `test_v4_prefill_sweep` | `16/0` — region active, `415` Warm experts demoted for the corridor and restored, logits bit-exact |
-| `test_v4_routed_prefill` | `18/0` — the routed bank needs only the base, so the boundary does not move |
+| `test_v4_prefill_sweep` | `16/0` — the swept window borrows a block of Warm for the corridor and **every** borrowed expert is returned (`not returned == 0`); logits bit-exact |
+| `test_v4_routed_prefill` | `18/0` — the routed window borrows less than a block and returns it up to what concurrent decode traffic displaced |
 | `test_v4_prefill_window` | `10/0` |
 | `test_v4_engine` | `38/0` |
 | `test_v4_staging_depth` | `7/0` — no host budget, so the standalone arena path is unchanged |
-| `test_v4_warm_frozen_prefill` | `11/0` |
+| `test_v4_warm_frozen_prefill` | `11/0` — the legacy per-token path, where every partition is the same size and nothing moves |
+| `test_v4_expert_tiering` | `29/0` |
+| `test_v4_expert_executor` | `12/0` |
+| `test_expert_registry_warm_state` / `test_dynamic_expert_pool` | pass (they had stopped **compiling**; see §19.5) |
 
 **Semantic change to note:** `warm_host_bytes` must now cover the corridor, so a budget
 below the configured staging blocks is **rejected at load** with the figure it needed.
@@ -1023,9 +1071,30 @@ below the configured staging blocks is **rejected at load** with the figure it n
 
 ### 19.5 Also fixed en route
 
-Two latent defects the new code exposed, both in code this change touches:
+Four latent defects, all in code this change touches, and three of them **pre-existing**
+— found only because the coupling work touched their call sites:
 
 - `hipHostUnregister` was called with two arguments; it takes one.
 - The pool's non-owning view was a single large segment, but `get_expert_slot_ptr`
   resolves a slot by `slot / SEGMENT_SLOTS`, so every slot past the first mis-indexed.
   The view is now laid out in `SEGMENT_SLOTS` segments like an owned pool.
+- **`reserve_request`'s two overloads both took four integers**, so once `stage_only`
+  gave the pair form a default a four-argument call was **ambiguous — it selected
+  neither** and failed to compile. `test_expert_registry_warm_state` and
+  `test_dynamic_expert_pool` stopped building at that commit and were never rebuilt,
+  because the gate list being run did not include them: a compile failure no gate saw.
+  The gid form now has a three-argument arity that cannot collide, and
+  `reserve_request_by_gid` carries the deferral.
+- **`test_v4_expert_tiering`'s teardown** released staging slots unguarded while its own
+  reap had already freed them through the completion path (P2.2) — the exact case
+  `release_if_copying` exists for. A stale test, not a stale engine.
+
+The `PrefetchStagingArena` transition error also now names the slot, the state it is in,
+and the transition attempted. The bare `"invalid slot state transition"` cost several
+rounds of bisection; a failure message that does not identify its subject is a tax on
+every future reader.
+
+**Process note.** Three of the four were invisible to every gate that was being run.
+Building **all** targets and running the *related* suite — not the four gates a change
+was expected to touch — is what surfaced them, and is worth doing before calling a
+change done.
