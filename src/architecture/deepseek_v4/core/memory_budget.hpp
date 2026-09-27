@@ -109,10 +109,6 @@ struct AeonRuntimeConfig {
     // Diagnostic A/B control. The production default keeps asynchronous refill enabled.
     bool enable_warm_refill{true};
 
-    // Correctness-mode control for deterministic routed-expert accumulation.
-    // The production default retains the fused atomic accumulation path.
-    bool deterministic_expert_accumulation{false};
-
     // Supply telemetry sink. Empty path disables recording entirely (the default);
     // a non-empty path opens a JSONL stream that `TieredExpertSupply` writes its
     // request, timing, occupancy, and demotion records into. `run_id` is stamped on
@@ -219,10 +215,6 @@ struct AeonRuntimeConfig {
     // are refused at load. Each block is `E x payload_bytes` of **non-reclaimable
     // pinned** host memory — `3.44 GiB` per block at `E = 256`.
     uint32_t prefill_sweep_staging_blocks{2};
-
-    // Hardware target device index
-    int device_id{0};
-
 };
 
 // The staging arena's slot count, shared by the budget report and the arena's own
