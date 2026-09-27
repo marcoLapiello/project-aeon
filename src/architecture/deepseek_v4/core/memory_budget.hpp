@@ -59,7 +59,7 @@ inline size_t batch_scratch_allowance_bytes(uint32_t chunk_tokens) {
     return static_cast<size_t>(chunk_tokens) * BATCH_SCRATCH_BYTES_PER_ROW;
 }
 
-// VRAM allowance for the **decode** path's fixed workspace: `V4PipelineScratchBuffers`
+// VRAM allowance for the **decode** path's fixed workspace: `V4ActivationScratch`
 // (the per-op temporaries, sized by the kernel shapes) plus `V4RoutedExpertScratch`
 // (six experts' accumulators). Neither is a function of a knob — both are fixed by the
 // model — so this is an allowance in the same sense as the batch scratch: the host
@@ -568,7 +568,7 @@ public:
         report.vram_batch_scratch_bytes = runtime_cfg.prefill_sweep
             ? batch_scratch_allowance_bytes(std::max<uint32_t>(1, runtime_cfg.prefill_chunk))
             : 0;
-        // The decode workspace is **not** a knob: `V4PipelineScratchBuffers` and
+        // The decode workspace is **not** a knob: `V4ActivationScratch` and
         // `V4RoutedExpertScratch` are fixed by the model's kernel shapes, and both
         // report their real allocation size. The old `100 MiB` literal that stood for
         // this was wrong in both directions — it over-counted by ~an order of

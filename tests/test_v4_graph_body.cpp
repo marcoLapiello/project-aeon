@@ -31,7 +31,7 @@
 // The selection is therefore *not* left unchecked. Its rule — softplus, add bias,
 // flat top-6, ties to the lower index, the hash table on layers 0–2 — is asserted
 // separately against the **device's own router logits** (read out of
-// `PipelineScratchBuffers::d_router_logits` after the layer), which is trap 37's
+// `V4ActivationScratch::d_router_logits` after the layer), which is trap 37's
 // rule: a discrete quantity produced by a rule is checked against the rule applied
 // to the device's own inputs, never elementwise against the reference's.
 //

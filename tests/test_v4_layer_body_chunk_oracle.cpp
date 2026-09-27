@@ -99,7 +99,7 @@
 
 namespace {
 
-using aeon::core::PipelineScratchBuffers;
+using aeon::core::V4ActivationScratch;
 using aeon::core::V4LayerBodyBatchScratch;
 using aeon::core::V4LayerBodyOutput;
 using aeon::core::V4LayerBodyRow;
@@ -232,7 +232,7 @@ std::vector<TokenRecord> run_layer_schedule(
     const std::vector<uint32_t>& schedule,
     bool use_decode_body,
     half* d_residuals,
-    PipelineScratchBuffers& scratch,
+    V4ActivationScratch& scratch,
     GateExpertExecutor& executor,
     aeon::core::V4LayerBodyObserver& observer,
     uint32_t limit = kTokens) {
@@ -413,7 +413,7 @@ int main() {
         payloads[k] = aeon::testgate::make_synthetic_payload(k + 1);
     }
 
-    PipelineScratchBuffers scratch;
+    V4ActivationScratch scratch;
     scratch.allocate();
     GateExpertExecutor executor;
     executor.scratch = &scratch;

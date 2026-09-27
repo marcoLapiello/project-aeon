@@ -211,7 +211,7 @@ size_t compare_snapshot(const std::string& label, const V4LayerStateSnapshot& wa
 // are comparable across runs regardless of what the layer wrote back.
 std::vector<TokenRecord> run_tokens(
     StackLayer& layer,
-    aeon::core::PipelineScratchBuffers& scratch,
+    aeon::core::V4ActivationScratch& scratch,
     const V4LayerBodyTables& tables,
     const half* d_seeds,
     uint32_t start,
@@ -350,7 +350,7 @@ int main() {
         payloads[k] = aeon::testgate::make_synthetic_payload(k + 1);
     }
 
-    aeon::core::PipelineScratchBuffers scratch;
+    aeon::core::V4ActivationScratch scratch;
     scratch.allocate();
     GateExpertExecutor executor;
     executor.scratch = &scratch;

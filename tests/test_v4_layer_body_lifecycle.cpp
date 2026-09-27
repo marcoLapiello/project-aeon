@@ -492,7 +492,7 @@ int main() {
         s.device.init_with_loader(spec, loader, kMaxSeq);
     }
 
-    aeon::core::PipelineScratchBuffers scratch;
+    aeon::core::V4ActivationScratch scratch;
     scratch.allocate();
 
     const size_t table_len = static_cast<size_t>(kTokens) * 32;

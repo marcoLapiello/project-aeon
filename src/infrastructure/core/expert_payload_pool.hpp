@@ -9,15 +9,7 @@
 #include <string>
 #include <utility>
 
-#ifndef CHECK_HIP
-#define CHECK_HIP(cmd) do { \
-    hipError_t err = cmd; \
-    if (err != hipSuccess) { \
-        throw std::runtime_error(std::string("HIP Error: ") + hipGetErrorString(err) + \
-            " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
-    } \
-} while(0)
-#endif
+#include "infrastructure/hip_check.hpp"
 
 namespace aeon::core {
 

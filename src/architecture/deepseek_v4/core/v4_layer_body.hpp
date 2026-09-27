@@ -17,13 +17,16 @@
 //      only testable if the test can drive the same code the runtime drives. So
 //      the body takes its model-level inputs, its observers and its routed-expert
 //      supply as *parameters*, and knows nothing about artifact tiers, telemetry
-//      or the pipeline object.
+//      or the model host.
 //
 // Two seams keep the numerics independent of the runtime around them:
 //
-//   * `V4LayerBodyObserver` — the attention trace. The gate passes the null
-//     observer; the pipeline passes one that fills a trace record. Keeping the
-//     field list here means there is exactly one description of a trace.
+//   * `V4LayerBodyObserver` — the attention trace. The runtime passes the **null**
+//     observer (`V4Graph` holds one, and nothing installs another), so the trace is
+//     **gate-only instrumentation**: `test_v4_layer_body_lifecycle` is the one
+//     observer that captures a record, and it does so to compare a chunked body
+//     against a serial one. Keeping the field list here means there is exactly one
+//     description of a trace.
 //
 //   * `V4RoutedExpertExecutor` — the routed-expert supply system (index lookup,
 //     Hot/Warm/Cold promotion, prefetch, leases, staging). All of it lives behind
@@ -33,7 +36,7 @@
 
 #include "architecture/deepseek_v4/core/v4_attention_trace.hpp"
 #include "architecture/deepseek_v4/core/v4_layer.hpp"
-#include "architecture/deepseek_v4/core/v4_pipeline_scratch.hpp"
+#include "architecture/deepseek_v4/core/v4_activation_scratch.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "architecture/deepseek_v4/kernels/moe_router.hpp"
 #include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
@@ -229,7 +232,7 @@ inline uint32_t committed_entries_for(const V4Layer& layer, uint32_t pos, int32_
 // The per-token buffer view. **One body serves both a decode step and a chunk of
 // tokens**, and this is the seam that makes that literal rather than aspirational:
 //
-//   * decode fills it from row 0 of `PipelineScratchBuffers`, which already has
+//   * decode fills it from row 0 of `V4ActivationScratch`, which already has
 //     the right shape — every workspace array in it is a single 16-row tile,
 //     because the expert kernels read `ffn_norm_act`/`moe_accum` in 16-row WMMA
 //     tiles and the pipeline replicates row 0 to fill them;
@@ -313,10 +316,10 @@ struct V4LayerBodyRow {
     int32_t composed_rows{0};
 };
 
-// The single-token row over `PipelineScratchBuffers` plus the layer's own indexer
+// The single-token row over `V4ActivationScratch` plus the layer's own indexer
 // state buffers. Every pointer is exactly what the pre-refactor body used, so the
 // decode path is byte-for-byte the same computation.
-inline V4LayerBodyRow decode_layer_body_row(PipelineScratchBuffers& scratch,
+inline V4LayerBodyRow decode_layer_body_row(V4ActivationScratch& scratch,
                                             V4Layer& layer) {
     V4LayerBodyRow row;
     row.d_res_in = scratch.d_res_in;
@@ -1157,7 +1160,7 @@ inline V4LayerBodyOutput run_layer_body_attention_tail(
 // decode steps.
 inline V4LayerBodyOutput run_layer_body_decoding(
     V4Layer& layer,
-    PipelineScratchBuffers& scratch,
+    V4ActivationScratch& scratch,
     const V4LayerBodyTables& tables,
     uint32_t token_id,
     uint32_t pos,

@@ -7,20 +7,12 @@
 #include <stdexcept>
 #include <string>
 
-#ifndef CHECK_HIP
-#define CHECK_HIP(cmd) do { \
-    hipError_t err = cmd; \
-    if (err != hipSuccess) { \
-        throw std::runtime_error(std::string("HIP Error: ") + hipGetErrorString(err) + \
-            " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
-    } \
-} while(0)
-#endif
+#include "infrastructure/hip_check.hpp"
 
 namespace aeon::core {
 
-// Scratch Device Buffers Reusable Across All Layers
-struct PipelineScratchBuffers {
+// Scratch device buffers, reused across all layers: one padded row's worth.
+struct V4ActivationScratch {
     // Residuals [4, 4096] in float and half
     float* d_res_in{nullptr};
     float* d_res_mid{nullptr};
@@ -94,21 +86,21 @@ struct PipelineScratchBuffers {
     int32_t* d_argmax_partial_idx{nullptr};  // [505]
     int32_t* d_argmax_result{nullptr}; // [1] GPU argmax output token id
 
-    PipelineScratchBuffers() = default;
+    V4ActivationScratch() = default;
 
-    ~PipelineScratchBuffers() {
+    ~V4ActivationScratch() {
         free();
     }
 
     // Move-only semantics to prevent accidental double-free
-    PipelineScratchBuffers(const PipelineScratchBuffers&) = delete;
-    PipelineScratchBuffers& operator=(const PipelineScratchBuffers&) = delete;
+    V4ActivationScratch(const V4ActivationScratch&) = delete;
+    V4ActivationScratch& operator=(const V4ActivationScratch&) = delete;
 
-    PipelineScratchBuffers(PipelineScratchBuffers&& other) noexcept {
+    V4ActivationScratch(V4ActivationScratch&& other) noexcept {
         move_from(std::move(other));
     }
 
-    PipelineScratchBuffers& operator=(PipelineScratchBuffers&& other) noexcept {
+    V4ActivationScratch& operator=(V4ActivationScratch&& other) noexcept {
         if (this != &other) {
             free();
             move_from(std::move(other));
@@ -280,7 +272,7 @@ private:
 
     size_t bytes_allocated_{0};
 
-    void move_from(PipelineScratchBuffers&& o) noexcept {
+    void move_from(V4ActivationScratch&& o) noexcept {
         d_res_in = o.d_res_in; o.d_res_in = nullptr;
         d_res_mid = o.d_res_mid; o.d_res_mid = nullptr;
         d_res_out = o.d_res_out; o.d_res_out = nullptr;

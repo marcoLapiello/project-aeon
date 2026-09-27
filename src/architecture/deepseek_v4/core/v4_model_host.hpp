@@ -41,7 +41,7 @@
 // What is *not* re-implemented here. Every object below already exists and is
 // used as it stands: `AeonModelLoader`, `DeepSeekV4Config`, `V4ModelSpec`,
 // `V4ModelContract`, `MemoryBudgetEngine`, `V4ModelResources`, `V4Layer`,
-// `PipelineScratchBuffers`, `V4DeviceStreams`, `V4LayerBodyTables`. This is that
+// `V4ActivationScratch`, `V4DeviceStreams`, `V4LayerBodyTables`. This is that
 // assembly lifted into the rewrite rather than a second design of it.
 //
 // Verification note (plan Part V, second rule). A host is not an op, so there is
@@ -63,7 +63,7 @@
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_model_resources.hpp"
 #include "architecture/deepseek_v4/core/v4_model_spec.hpp"
-#include "architecture/deepseek_v4/core/v4_pipeline_scratch.hpp"
+#include "architecture/deepseek_v4/core/v4_activation_scratch.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "infrastructure/backend_registry/expert_backend.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
@@ -267,8 +267,8 @@ public:
     V4ModelResources& resources() noexcept { return resources_; }
     const V4ModelResources& resources() const noexcept { return resources_; }
 
-    PipelineScratchBuffers& scratch() noexcept { return scratch_; }
-    const PipelineScratchBuffers& scratch() const noexcept { return scratch_; }
+    V4ActivationScratch& scratch() noexcept { return scratch_; }
+    const V4ActivationScratch& scratch() const noexcept { return scratch_; }
 
     // --- the layer-major prefill working set (Step 6) ------------------------
     //
@@ -363,7 +363,7 @@ public:
                (sizeof(uint16_t) + sizeof(float));
     }
     size_t prefill_batch_scratch_bytes() const noexcept { return batch_scratch_.bytes(); }
-    // The decode workspace's real size (`V4PipelineScratchBuffers` + the routed-expert
+    // The decode workspace's real size (`V4ActivationScratch` + the routed-expert
     // scratch), for the report and the load-time check against the budget's allowance.
     size_t decode_scratch_bytes() const noexcept {
         return scratch_.bytes() + expert_scratch_.bytes();
@@ -1430,7 +1430,7 @@ private:
 
     V4DeviceStreams streams_;
     V4ModelResources resources_;
-    PipelineScratchBuffers scratch_;
+    V4ActivationScratch scratch_;
     std::vector<V4Layer> layers_;
 
     // The layer-major prefill working set (Step 6). The workspace is re-allocated

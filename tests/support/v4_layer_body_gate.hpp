@@ -232,7 +232,7 @@ public:
     // Genuinely per-call scratch (the routed accumulate is serialized per token
     // in both the decode path and the chunk path, so one set of buffers serves
     // either).
-    aeon::core::PipelineScratchBuffers* scratch{nullptr};
+    aeon::core::V4ActivationScratch* scratch{nullptr};
     hipStream_t stream{0};
     uint8_t* d_payload[kRoutedExperts]{};
     std::vector<int32_t> last_ids;

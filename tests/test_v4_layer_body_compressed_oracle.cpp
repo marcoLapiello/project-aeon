@@ -116,7 +116,7 @@ bool run_class(const ClassRun& run, aeon::core::AeonModelLoader& loader,
 
     aeon::core::V4Layer layer;
     layer.init_with_loader(spec, loader, kMaxSeq);
-    aeon::core::PipelineScratchBuffers scratch;
+    aeon::core::V4ActivationScratch scratch;
     scratch.allocate();
 
     LayerBodyShape shape;

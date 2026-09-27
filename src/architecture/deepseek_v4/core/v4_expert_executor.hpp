@@ -100,21 +100,13 @@
 #include <functional>
 #include <vector>
 
-#ifndef CHECK_HIP
-#define CHECK_HIP(cmd) do { \
-    hipError_t err = (cmd); \
-    if (err != hipSuccess) { \
-        throw std::runtime_error(std::string("HIP Error: ") + hipGetErrorString(err) + \
-            " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
-    } \
-} while(0)
-#endif
+#include "infrastructure/hip_check.hpp"
 
 namespace aeon::core {
 
 // Device scratch owned by the routed-expert path.
 //
-// It is separate from `PipelineScratchBuffers` on purpose: those buffers belong to
+// It is separate from `V4ActivationScratch` on purpose: those buffers belong to
 // one token's activations, and these two belong to whichever supply tier is being
 // consumed. Keeping them apart is what lets the executor be handed to a gate with
 // nothing but this struct.

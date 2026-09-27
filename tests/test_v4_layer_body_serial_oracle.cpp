@@ -291,7 +291,7 @@ int main() {
     // -------------------------------------------------------------------
     // Device fixtures
     // -------------------------------------------------------------------
-    aeon::core::PipelineScratchBuffers scratch;
+    aeon::core::V4ActivationScratch scratch;
     scratch.allocate();
 
     // The device's RoPE tables are built from the oracle's, so this gate measures

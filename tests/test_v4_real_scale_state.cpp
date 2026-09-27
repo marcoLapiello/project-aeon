@@ -328,7 +328,7 @@ int main() {
         payloads[k] = aeon::testgate::make_synthetic_payload(k + 1);
     }
 
-    aeon::core::PipelineScratchBuffers scratch;
+    aeon::core::V4ActivationScratch scratch;
     scratch.allocate();
     GateExpertExecutor executor;
     executor.scratch = &scratch;

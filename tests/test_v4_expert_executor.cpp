@@ -394,7 +394,7 @@ public:
 std::vector<Harness::Traces> run_stack(
     Harness& h,
     std::vector<V4Layer*>& layers,
-    aeon::core::PipelineScratchBuffers& scratch,
+    aeon::core::V4ActivationScratch& scratch,
     const V4LayerBodyTables& view,
     V4RoutedExpertExecutor& executor,
     V4TieredExpertExecutor* production
@@ -517,7 +517,7 @@ int main() {
     std::vector<V4Layer*> production_ptrs;
     for (auto& layer : production_layers) production_ptrs.push_back(layer.get());
 
-    aeon::core::PipelineScratchBuffers production_scratch;
+    aeon::core::V4ActivationScratch production_scratch;
     production_scratch.allocate();
     V4TieredExpertExecutor production(h.supply, h.vram_pool, h.staging, h.registry,
                                       h.expert_scratch, h.streams(), h.telemetry,
@@ -562,7 +562,7 @@ int main() {
     reference_adapter.layer_ids.assign(std::begin(kLayerIds), std::end(kLayerIds));
     reference_adapter.by_layer = reference_as_base;
 
-    aeon::core::PipelineScratchBuffers reference_scratch;
+    aeon::core::V4ActivationScratch reference_scratch;
     reference_scratch.allocate();
     const std::vector<Harness::Traces> reference_trace = run_stack(
         h, reference_ptrs, reference_scratch, view, reference_adapter, nullptr);
@@ -620,7 +620,7 @@ int main() {
         probe_adapter.layer_ids.assign(std::begin(kLayerIds), std::end(kLayerIds));
         probe_adapter.by_layer = probe_as_base;
 
-        aeon::core::PipelineScratchBuffers probe_scratch;
+        aeon::core::V4ActivationScratch probe_scratch;
         probe_scratch.allocate();
         const std::vector<Harness::Traces> probe_trace = run_stack(
             h, probe_ptrs, probe_scratch, view, probe_adapter, nullptr);

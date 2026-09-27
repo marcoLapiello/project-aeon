@@ -122,7 +122,7 @@ int main() {
     aeon::core::V4LayerSpec spec0 = specs.at(0);
     spec0.sliding_window = static_cast<int32_t>(kRingTokens);
     layer.init_with_loader(spec0, loader, 256);
-    aeon::core::PipelineScratchBuffers scratch;
+    aeon::core::V4ActivationScratch scratch;
     scratch.allocate();
 
     const uint32_t ring_capacity = layer.local_cache_capacity();
