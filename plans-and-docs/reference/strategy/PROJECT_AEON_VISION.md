@@ -1,7 +1,7 @@
 # Project Aeon: RDNA-Native MoE Inference Engine
 *Architectural Vision, Strategic Roadmap, and System Principles*
 
-*Status: strategic vision. This document records long-term principles and aspirations, including multi-GPU scaling and future runtime capabilities; it is not a current implementation checklist. Use [DOCUMENTATION_STATUS.md](../../status/DOCUMENTATION_STATUS.md) and the active execution plans for present-state evidence.*
+*Status: strategic vision. This document records long-term principles and aspirations, including multi-GPU scaling and future runtime capabilities; it is not a current implementation checklist. Use [PROJECT_STATUS.md](../../status/PROJECT_STATUS.md) and the active execution plans for present-state evidence.*
 
 ---
 

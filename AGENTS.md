@@ -8,7 +8,7 @@
 
 ## 2. Documentation and References
 
-**Navigation** [Documentation Status](plans-and-docs/status/DOCUMENTATION_STATUS.md) owns the plan inventory, the document map (live / active / completed / superseded), the open gates, and the rules for historical documents. **This file does not duplicate that inventory.**
+**Status** [PROJECT_STATUS.md](plans-and-docs/status/PROJECT_STATUS.md) is the **single progress-tracking document** — what is done, in flight, open and future. Read it for state. **This file owns stable context only** (purpose, references, engineering rules) and is not updated per milestone.
 
 ### Local Reference Implementations
 
@@ -25,50 +25,7 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 
 ---
 
-## 3. Progress Tracking & State of Execution
-
-*Status: 2026-09-23.*
-
-### Past
-
-Oldest to newest. Each new milestone fuses the two older rows into one, so the top row stays a compaction of the earliest work.
-
-| Milestone | State | Detail |
-| :--- | :--- | :--- |
-| Phase 0–2: foundations, primitives, three-tier storage stack (oldest rows, fused) | complete | [Phase 0](plans-and-docs/execution/completed/PHASE_0_EXECUTION_PLAN.md), [Phase 1](plans-and-docs/execution/completed/PHASE_1_EXECUTION_PLAN.md), [Phase 2](plans-and-docs/execution/completed/PHASE_2_EXECUTION_PLAN.md), [Warm-tier repair](plans-and-docs/execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md) |
-| Native text path: tokenizer, prompt formatter, EOS-aware generation, CLI | complete | [TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md](plans-and-docs/execution/completed/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) |
-| Specification and oracle harness: Tier 0 research, Step 0 prompt encoding, Tier 1 primitives, Step 3 `hc_head` | verified | [DSV4 Inference Pipeline Plan](plans-and-docs/execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md) §Tier 0–1, §Step 0, §Step 3 |
-| Graph rewrite: Tiers 2–4 and composition P0–P4, the 43-layer text-in/text-out path | acceptance criterion met | [DSV4 Graph Composition Plan](plans-and-docs/execution/completed/DSV4_GRAPH_COMPOSITION_PLAN.md) §7; pipeline plan §Tier 2–4; ledger M28 |
-| Prefill supply strategy: prompt-length gate, bounded Hot drain, routed bank, Hot-set restore | complete | [PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md](plans-and-docs/execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md); ledger M44/M44b |
-| Supply-chain hot path: the corridor as a demand-driven pipeline | complete | [SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md](plans-and-docs/execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md); ledger M42–M46; evidence §8–§19 of [the analysis](plans-and-docs/analysis/current/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md) |
-
-### Present
-
-| Work in progress | State | Detail |
-| :--- | :--- | :--- |
-| Expert streaming and chunked prefill | in progress | [EXPERT_STREAMING_EXECUTION_PLAN.md](plans-and-docs/execution/active/EXPERT_STREAMING_EXECUTION_PLAN.md) — §6 open work: the `W`/`C` window sweep, the prefill body's `~120 ms/prompt-token`, the cold→warm fill path, the placement policy, and prefix reuse. Its prefill supply half is complete: [Prefill Supply Strategy](plans-and-docs/execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md), ledger M44/M44b; its corridor half is complete: [Supply-Chain Hot Path](plans-and-docs/execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md), ledger M42–M46 |
-| Session state and swap | open | [SESSION_STATE_AND_SWAP_ANALYSIS.md](plans-and-docs/analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) |
-| Host-memory pressure | open investigation | [HOST_MEMORY_PRESSURE_INVESTIGATION.md](plans-and-docs/analysis/current/HOST_MEMORY_PRESSURE_INVESTIGATION.md) |
-| Routing profile and placement study | open | [ROUTING_PROFILE_AND_PLACEMENT_STUDY.md](plans-and-docs/execution/active/ROUTING_PROFILE_AND_PLACEMENT_STUDY.md) |
-| Backend generalization: factory and second backend | open gates | [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](plans-and-docs/execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) |
-
-### Future
-
-Directions we have explicitly defined as future — researched or discussed, not yet admitted to Present.
-
-| Direction | Why it waits | Detail |
-| :--- | :--- | :--- |
-| Prefix matcher (block table, cache key, radix search, eviction) | needs an assembled graph and a fork workload | composition plan §9; session analysis |
-| MTP / DSpark draft head (`num_nextn_predict_layers=1`) | speculative decoding, not the base forward pass | composition plan §9; pipeline plan §Tier 0.2e |
-| Multi-GPU pipeline parallelism (Phase 3) | out of scope for this revision | composition plan §9; [vision](plans-and-docs/reference/strategy/PROJECT_AEON_VISION.md) |
-| Tool use beyond prompt encoding | frontend work; needs the logit-processor seam plus a tool workload | composition plan §9 |
-| KV fp8/E4M3 versus bf16 store | a delta that must be measured, not assumed | pipeline plan Gates 9/10 |
-| Expert-placement policy (routing-aware hotlists) | scheduling optimization, not a correctness requirement | expert streaming analysis |
-| Throughput targets (chunked-prefill amortization) | speed and correctness are separate gates | expert streaming analysis |
-
----
-
-## 4. Project Rules & Engineering Conventions
+## 3. Project Rules & Engineering Conventions
 
 ### Code Architecture & Runtime
 
@@ -82,7 +39,7 @@ Directions we have explicitly defined as future — researched or discussed, not
 1. **Incremental Micro-Steps**: Advance through small, verifiable steps. Never implement broad abstractions before underlying hardware primitives are verified on silicon.
 2. **Hardware-Grounded Verification**: Test and benchmark on physical hardware (`gfx1100`) at every step.
 3. **Commit Messages**: Follow conventional commits format (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `perf:`).
-4. **Maintenance of AGENTS.md**: Update the "Progress Tracking & State of Execution" section whenever milestones transition. This is an entry point, not a record: state a milestone as one row and point at the document that owns its detail. When a milestone advances, **change its row — do not append a narrative**. Detail added here is duplication that will drift.
+4. **Maintenance of PROJECT_STATUS.md**: [PROJECT_STATUS.md](plans-and-docs/status/PROJECT_STATUS.md) is the **single progress-tracking document** and the one that changes as work advances. Update its §3 whenever milestones transition, and keep it the same size: state a milestone as one row, **change its row rather than appending a narrative**, and let the oldest rows fuse so **Past** stays a compaction rather than a log. Detail added there is duplication that will drift. **This file (AGENTS.md) is stable** — change it only when the purpose, the references, or these rules change.
 5. **Anti-circularity**: A test must not compare a kernel against an oracle derived from that kernel's own helper — that proves self-consistency, not correctness. New graph tests compare against an independently written reference.
 6. **Empirical Milestone Logging**: For every significant milestone or architectural transition, log the exact test results in the [Performance & Accuracy Ledger](plans-and-docs/status/PERFORMANCE_LEDGER.md). Do not log noise for small code edits; log meaningful, comparable system-level milestones to provide clear before-and-after tracking on the path to production.
 7. **Modular, Scalable and Maintainable**: Avoid growing monolithic files with mixed concerns. Extract them into separate, focused modules; reuse and improve existing ones; avoid duplication and redundancy.

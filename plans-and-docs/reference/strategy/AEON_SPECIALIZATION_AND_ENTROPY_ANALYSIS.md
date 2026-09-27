@@ -1,6 +1,6 @@
 # Project Aeon: Architecture Specialization Strategy & Activation Entropy Analysis
 
-*Status: historical strategic analysis. Its specialization rationale and entropy methodology remain useful, but the phase roadmap near the end predates the current execution taxonomy. Current Phase 2 is the single-GPU storage/memory hierarchy effort and current Phase 3 is multi-GPU pipeline parallelism; use [DOCUMENTATION_STATUS.md](../../status/DOCUMENTATION_STATUS.md) for live status.*
+*Status: historical strategic analysis. Its specialization rationale and entropy methodology remain useful, but the phase roadmap near the end predates the current execution taxonomy. Current Phase 2 is the single-GPU storage/memory hierarchy effort and current Phase 3 is multi-GPU pipeline parallelism; use [PROJECT_STATUS.md](../../status/PROJECT_STATUS.md) for live status.*
 
 ## Executive Summary
 This document records the architectural decision-making regarding model scope (single-model specialization vs. broad multi-architecture support) and details the empirical methodology for analyzing Mixture-of-Experts (MoE) activation entropy.

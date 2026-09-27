@@ -1,6 +1,6 @@
 # V4 Pipeline Modularization Analysis
 
-*Status: historical pre-refactor analysis. The first three extraction and ownership steps are implemented; use [CODEBASE_MAP.md](../../status/CODEBASE_MAP.md) and [DOCUMENTATION_STATUS.md](../../status/DOCUMENTATION_STATUS.md) for the current structure.*
+*Status: historical pre-refactor analysis. The first three extraction and ownership steps are implemented; use [CODEBASE_MAP.md](../../status/CODEBASE_MAP.md) and [PROJECT_STATUS.md](../../status/PROJECT_STATUS.md) for the current structure.*
 
 ## Purpose
 

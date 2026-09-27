@@ -1,7 +1,7 @@
 # Phase 2: Single-GPU 3-Tier Storage & Memory Hierarchy Optimization
 *Architecture Target: DeepSeek-V4-Flash-0731 (INT4-W4A16 on AMD RDNA3 / gfx1100)*
 
-*Status: completed record. Spikes 0-3 were implemented. The runtime that consumed this work was subsequently rebuilt; the targets that were never reached (storage layout, host-memory pressure, model-backed throughput) are not restated here. See [DOCUMENTATION_STATUS.md](../../status/DOCUMENTATION_STATUS.md) for the project-wide status classification.*
+*Status: completed record. Spikes 0-3 were implemented. The runtime that consumed this work was subsequently rebuilt; the targets that were never reached (storage layout, host-memory pressure, model-backed throughput) are not restated here. See [PROJECT_STATUS.md](../../status/PROJECT_STATUS.md) for the project-wide status classification.*
 
 ---
 

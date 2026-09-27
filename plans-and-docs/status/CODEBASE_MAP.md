@@ -7,7 +7,7 @@
 > `text/dsv4_chat_formatter.*`, both gated parity tests, `tools/profile_routing.cpp` and
 > `tools/record_v4_gpu_evidence.cpp`, and the `AEON_ENABLE_LEGACY_V4_GRAPH` gate itself. The
 > "current engine path" below is the **rebuilt** graph; the storage, streaming, artifact-format
-> and kernel sections were always current. See [DOCUMENTATION_STATUS.md](DOCUMENTATION_STATUS.md).
+> and kernel sections were always current. See [PROJECT_STATUS.md](PROJECT_STATUS.md).
 
 *Status: current runtime map, audited 2026-09-12.*
 
