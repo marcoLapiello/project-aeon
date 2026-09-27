@@ -35,7 +35,7 @@ The production-facing implementation is:
 - `src/architecture/deepseek_v4/core/v4_graph.hpp` - the ordered forward pass (embed, 43 layers, head, LM head).
 - `src/architecture/deepseek_v4/core/v4_model_host.hpp` - what is resident: the whole assembly. It now delegates the layer-major prefill working set to `v4_prefill_workspace.hpp` (`V4PrefillWorkspace`), the Warm/staging boundary to `v4_host_partition.hpp` (`V4HostPartition`), and the prefill lifecycle and sweep to `v4_prefill_controller.hpp` (`V4PrefillController`), keeping its own API unchanged.
 - `src/architecture/deepseek_v4/core/v4_sampler.hpp` - the logit-processor seam and the sampler.
-- `src/architecture/deepseek_v4/core/v4_layer_body.hpp` - the single layer body (decode and chunk share it).
+- `src/architecture/deepseek_v4/core/v4_layer_body.hpp` - the single layer body (decode and chunk share it): the orchestrator for the per-token attention tail and the decode body. Its types live in `v4_layer_body_types.hpp`, its attention phases in `v4_layer_body_attention.hpp`, and its MoE phases (with the `V4RoutedExpertExecutor` seam) in `v4_layer_body_moe.hpp`.
 - `src/architecture/deepseek_v4/core/v4_model_resources.hpp` - RoPE caches and model-level resident weights.
 - `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` - six-expert V4 request adapter and Aeon payload-source mapping.
 - `src/infrastructure/core/tiered_expert_supply.hpp` - architecture-neutral tiered payload movement and transfer lifecycle.

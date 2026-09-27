@@ -55,12 +55,13 @@ The header itself says it is the G1 composition root; the target is to shrink it
 
 ## 3. Tier B — coherent pieces behind an orchestrator
 
-### B1. `v4_layer_body.hpp` → types + phases (fan-in 13)
-- [ ] `v4_layer_body_types.hpp` — `V4LayerBodyTables`, `V4LayerBodyObserver`, `V4NullLayerBodyObserver`, `trace_copy`, `V4LayerBodyRow`, `V4LayerBodyPre`, `V4LayerBodyOutput`, `select_indexer_topk`, `committed_entries_for`, `decode_layer_body_row`.
-- [ ] `v4_layer_body_attention.hpp` — `run_layer_body_pre_attention`, `run_layer_body_attention_and_norm`, `run_layer_body_attention_tail`.
-- [ ] `v4_layer_body_moe.hpp` — `V4RoutedExpertExecutor`, `run_layer_body_router`, `run_layer_body_moe_and_post`.
-- [ ] Leave `v4_layer_body.hpp` as `run_layer_body_decoding` + the umbrella. Do **not** change the phase split itself — it exists so a chunk can interleave (plan note at header line ~797).
-- [ ] **Gate:** `test_v4_layer_body_oracle`, `..._serial_oracle`, `..._compressed_oracle`, `..._chunk_oracle`, `test_v4_expert_executor` pass unchanged; `test_v4_graph_body` token stream identical.
+### B1. `v4_layer_body.hpp` → types + phases (fan-in 13) — ✅ done 2026-09-27
+- [x] `v4_layer_body_types.hpp` — `V4LayerBodyTables`, `V4LayerBodyObserver`, `V4NullLayerBodyObserver`, `trace_copy`, `V4LayerBodyRow`, `V4LayerBodyPre`, `V4LayerBodyOutput`, `select_indexer_topk`, `committed_entries_for`, `decode_layer_body_row`.
+- [x] `v4_layer_body_attention.hpp` — `run_layer_body_pre_attention`, `run_layer_body_attention_and_norm`.
+- [x] `v4_layer_body_moe.hpp` — `V4RoutedExpertExecutor`, `run_layer_body_router`, `run_layer_body_moe_and_post`.
+- [x] Leave `v4_layer_body.hpp` as `run_layer_body_attention_tail` + `run_layer_body_decoding` + the umbrella. Do **not** change the phase split itself.
+- **Deviation, deliberate:** `run_layer_body_attention_tail` stayed in the orchestrator rather than moving to the attention header as first sketched. It composes attention *and* router *and* MoE, so putting it in a phase header would force an attention→MoE (or MoE→attention) include edge between two peers. The orchestrator owns phase sequencing (it already owns `run_layer_body_decoding`), so both phase headers stay mutually independent. The function itself is unchanged.
+- **Verification:** the non-comment, non-include, non-blank code lines of the four new headers are a **multiset-identical** match to the original body's — a pure move, zero arithmetic touched. **Gate:** `test_v4_layer_body_oracle`, `..._serial_oracle`, `..._compressed_oracle`, `..._chunk_oracle`, `test_v4_expert_executor`, `test_v4_layer_body_lifecycle`, `test_v4_graph_body` pass unchanged; `test_v4_state_restore`, `test_v4_real_scale_state`, `test_v4_engine`, `aeon_chat` build.
 
 ### B2. `tiered_expert_supply.hpp` → collaborator seams (fan-in 2, but 1249 lines)
 Low fan-in, so low caller churn; the value is readability of the hot path.
@@ -131,7 +132,7 @@ Explicitly **not** scheduled. Listed so the inventory is complete and so a futur
 | :--- | :--- | :--- |
 | A1 | `memory_budget.hpp` → 3 units | ✅ |
 | A2 | `v4_model_host.hpp` → owner + 3 controllers | ✅ |
-| B1 | `v4_layer_body.hpp` → types + phases | ☐ |
+| B1 | `v4_layer_body.hpp` → types + phases | ✅ |
 | B2 | `tiered_expert_supply.hpp` → types + seams | ☐ |
 | C1 | `expert_registry.hpp` → registry + partition + residency + validation | ☐ |
 | C2 | `v4_prefill_sweep.hpp` → sweep + lookahead policy | ☐ |
