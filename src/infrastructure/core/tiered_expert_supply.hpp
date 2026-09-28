@@ -2,6 +2,7 @@
 
 #include "infrastructure/core/expert_payload_pool.hpp"
 #include "infrastructure/core/expert_registry.hpp"
+#include "infrastructure/core/expert_transfer_pipeline.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "infrastructure/core/pending_transfer_registry.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
@@ -94,6 +95,20 @@ public:
         expert_payload_bytes_ = expert_payload_bytes;
         demotion_queue_capacity_ = demotion_queue_capacity;
         telemetry_recorder_.bind(supply_telemetry, expert_payload_bytes);
+        // The transfer mechanisms get the same collaborators; they move bytes, the
+        // supply decides which bytes to move.
+        pipeline_.bind(ExpertTransferPipeline::Services{
+            prefetch_staging,
+            payload_pool,
+            host_pool,
+            expert_registry,
+            &registry_,
+            &counters_,
+            direct_io_reader,
+            direct_io_completions,
+            sdma_cold_stream,
+            expert_payload_bytes,
+            demotion_queue_capacity});
     }
 
     size_t expert_payload_bytes() const noexcept {
@@ -273,7 +288,7 @@ public:
                 ensure_registry_transfer(request.operation_id, request.global_expert_id);
 
                 if (can_direct_read) {
-                    bind_staging(request.operation_id, payload_request.staging_idx);
+                    pipeline_.bind_staging(request.operation_id, payload_request.staging_idx);
                     const auto location = source_.locate(request.global_expert_id);
                     if (location.byte_length != expert_payload_bytes_) {
                         throw std::runtime_error(
@@ -306,7 +321,7 @@ public:
                     // reservation, which the staging-derived depth bound cannot see.
                     const bool pinned = host_pool_ != nullptr && source_slot >= 0 &&
                         host_pool_->is_slot_pinned(static_cast<uint32_t>(source_slot));
-                    bind_staging(request.operation_id, payload_request.staging_idx);
+                    pipeline_.bind_staging(request.operation_id, payload_request.staging_idx);
                     if (pinned) {
                         // Borrow the slot for its completion event only.
                         prefetch_staging_->mark_ready(payload_request.staging_idx);
@@ -326,9 +341,9 @@ public:
                     state.io_complete = true;
                 } else if (source_is_warm && host_pool_ && source_slot >= 0 &&
                            host_pool_->is_slot_pinned(static_cast<uint32_t>(source_slot))) {
-                    bind_staging(request.operation_id, payload_request.staging_idx);
+                    pipeline_.bind_staging(request.operation_id, payload_request.staging_idx);
                     prefetch_staging_->begin_direct_transfer(payload_request.staging_idx);
-                    wait_for_demotion_dependency(request.operation_id, sdma_stream_);
+                    pipeline_.wait_for_demotion_dependency(request.operation_id, sdma_stream_);
                     payload_pool_->upload_from_host_expert(
                         static_cast<uint32_t>(request.vram_slot),
                         host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(source_slot)),
@@ -337,7 +352,7 @@ public:
                     check_hip(
                         hipEventRecord(prefetch_staging_->events[payload_request.staging_idx], sdma_stream_),
                         "hipEventRecord(Warm H2D)");
-                    record_h2d_event(
+                    pipeline_.record_h2d_event(
                         request.operation_id, sdma_stream_, payload_request.staging_idx, true,
                         source_slot, request.vram_slot);
 
@@ -354,14 +369,14 @@ public:
                     const uint8_t* pinned_payload =
                         prefetch_staging_->get_slot_ptr(payload_request.staging_idx);
                     prefetch_staging_->begin_gpu_transfer(payload_request.staging_idx);
-                    wait_for_demotion_dependency(request.operation_id, sdma_stream_);
+                    pipeline_.wait_for_demotion_dependency(request.operation_id, sdma_stream_);
                     payload_pool_->upload_from_host_expert(
                         static_cast<uint32_t>(request.vram_slot), pinned_payload, sdma_stream_);
                     check_hip(
                         hipEventRecord(
                             prefetch_staging_->events[payload_request.staging_idx], sdma_stream_),
                         "hipEventRecord(Warm staged H2D)");
-                    record_h2d_event(
+                    pipeline_.record_h2d_event(
                         request.operation_id, sdma_stream_, payload_request.staging_idx, true,
                         static_cast<int32_t>(payload_request.staging_idx), request.vram_slot);
 
@@ -373,29 +388,29 @@ public:
                         : nullptr;
 
                     if (src_ptr && prefetch_staging_) {
-                        bind_staging(request.operation_id, payload_request.staging_idx);
+                        pipeline_.bind_staging(request.operation_id, payload_request.staging_idx);
                         prefetch_staging_->stage_payload(payload_request.staging_idx, src_ptr);
                         const uint8_t* pinned_payload =
                             prefetch_staging_->get_slot_ptr(payload_request.staging_idx);
                         prefetch_staging_->begin_gpu_transfer(payload_request.staging_idx);
-                        wait_for_demotion_dependency(request.operation_id, sdma_stream_);
+                        pipeline_.wait_for_demotion_dependency(request.operation_id, sdma_stream_);
                         payload_pool_->upload_from_host_expert(
                             static_cast<uint32_t>(request.vram_slot), pinned_payload, sdma_stream_);
                         check_hip(
                             hipEventRecord(
                                 prefetch_staging_->events[payload_request.staging_idx], sdma_stream_),
                             "hipEventRecord(mapped H2D)");
-                        record_h2d_event(
+                        pipeline_.record_h2d_event(
                             request.operation_id, sdma_stream_, payload_request.staging_idx, true,
                             static_cast<int32_t>(payload_request.staging_idx), request.vram_slot);
 
                         state.is_prefetched = true;
                         state.staging_idx = payload_request.staging_idx;
                     } else if (src_ptr) {
-                        wait_for_demotion_dependency(request.operation_id, compute_stream_);
+                        pipeline_.wait_for_demotion_dependency(request.operation_id, compute_stream_);
                         payload_pool_->upload_from_host_expert(
                             static_cast<uint32_t>(request.vram_slot), src_ptr, compute_stream_);
-                        record_h2d_event(
+                        pipeline_.record_h2d_event(
                             request.operation_id, compute_stream_, 0, false,
                             -1, request.vram_slot);
                     } else {
@@ -404,7 +419,7 @@ public:
                     }
                 }
             } catch (...) {
-                mark_registry_request_failed(request.operation_id, "transfer_submission_failure");
+                pipeline_.mark_request_failed(request.operation_id, "transfer_submission_failure");
                 reap_registry_transfers();
                 throw;
             }
@@ -419,7 +434,7 @@ public:
             } catch (...) {
                 for (auto& state : batch.transfers) {
                     if (state.io_pending) {
-                        mark_registry_request_failed(
+                        pipeline_.mark_request_failed(
                             state.operation_id, "nvme_submit_failure");
                     }
                 }
@@ -454,272 +469,26 @@ public:
         return prefetch_staging_->in_use_slots();
     }
 
-    // Releases the staging slots a **streamed** batch borrowed, once its uploads
-    // have landed. The executor does this in `on_routed_consumed`; the prefill sweep
-    // has no such hook, so it calls this as soon as its batch is materialized — the
-    // sweep's loads are the only traffic on the arena at that moment, which is what
-    // makes an immediate release safe.
+    // The transfer mechanisms — read completion, the H2D copy leg, staging release
+    // — live in `ExpertTransferPipeline` (`expert_transfer_pipeline.hpp`). These are
+    // the supply's entry points to it; the policy that decides *what* to move stays
+    // here.
     void release_streamed_staging(PayloadBatch& batch) {
-        if (prefetch_staging_ == nullptr) return;
-        const auto drain_started = std::chrono::steady_clock::now();
-        for (auto& state : batch.transfers) {
-            if (!state.is_prefetched) continue;
-            const uint32_t staging_idx = state.staging_idx;
-            if (prefetch_staging_->slot_state(staging_idx) !=
-                PrefetchStagingArena::SlotState::GPU_TRANSFER_PENDING) {
-                state.is_prefetched = false;
-                continue;
-            }
-            check_hip(
-                hipEventSynchronize(prefetch_staging_->events[staging_idx]),
-                "hipEventSynchronize(stream staging)");
-            ++counters_.h2d_drain_calls;
-            prefetch_staging_->release_after_gpu_transfer(staging_idx);
-            state.is_prefetched = false;
-        }
-        counters_.h2d_drain_ns += elapsed_ns(drain_started);
+        pipeline_.release_streamed_staging(batch);
     }
 
-    void materialize(PayloadBatch& batch) {
-        // Enqueue the copy for every expert whose reads have **already** landed but
-        // whose copy was deferred by the non-blocking pump (plan P2.6): a staged-only
-        // expert that found no free VRAM slot at the moment its read completed. This
-        // pass is what makes the blocking materialize a *join* of the two legs rather
-        // than a read-only loop: without it an expert sits `io_complete` and
-        // unsubmitted, and the layer body's MoE dispatch — which joins a transfer only
-        // after its copy was submitted — surfaces it as
-        // "duplicate request joined before its transfer was submitted".
-        for (auto& state : batch.transfers) {
-            if (state.io_complete && !enqueue_expert_copy(state, state.staging_idx)) {
-                // The blocking path is used where a VRAM slot is guaranteed (the
-                // sweep's `materialize_entry`, after the previous layer released its
-                // block), so a refusal here is a real defect rather than the
-                // staged-only deferral.
-                throw std::runtime_error(
-                    "TieredExpertSupply: materialize found no VRAM slot for a staged-only "
-                    "expert — the lookahead over-committed its copy budget");
-            }
-        }
+    void materialize(PayloadBatch& batch) { pipeline_.materialize(batch); }
 
-        for (auto& state : batch.transfers) {
-            if (!state.io_pending) {
-                continue;
-            }
-
-            const auto io_wait_started = std::chrono::steady_clock::now();
-            const size_t request_count = state.io_request_count;
-            for (size_t chunk = 0; chunk < request_count; ++chunk) {
-                const uint64_t request_id = state.io_user_data + chunk;
-                if (direct_io_completions_ == nullptr) {
-                    mark_registry_request_failed(state.operation_id, "nvme_completion_store_unavailable");
-                    throw std::runtime_error(
-                        "TieredExpertSupply: direct I/O completion store is unavailable");
-                }
-                auto completion_it = direct_io_completions_->find(request_id);
-                const bool waited_for_completion = completion_it == direct_io_completions_->end();
-                const auto wait_started_at = std::chrono::steady_clock::now();
-                while (completion_it == direct_io_completions_->end()) {
-                    if (!direct_io_reader_) {
-                        mark_registry_request_failed(
-                            state.operation_id, "nvme_reader_unavailable");
-                        throw std::runtime_error("TieredExpertSupply: direct I/O request has no reader");
-                    }
-                    aeon::io::DirectIOCompletion completion;
-                    try {
-                        completion = direct_io_reader_->wait_for_completion();
-                    } catch (...) {
-                        mark_registry_request_failed(
-                            state.operation_id, "nvme_completion_wait_failure");
-                        throw;
-                    }
-                    direct_io_completions_->emplace(completion.user_data, completion);
-                    completion_it = direct_io_completions_->find(request_id);
-                }
-
-                const auto completion = completion_it->second;
-                direct_io_completions_->erase(completion_it);
-                const auto completed_at = std::chrono::steady_clock::now();
-                if (auto* transfer = registry_.find(state.operation_id)) {
-                    if (transfer->io_submitted_at.time_since_epoch().count() != 0) {
-                        transfer->nvme_read_service_ns += static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                completed_at - transfer->io_submitted_at).count());
-                    }
-                    if (waited_for_completion) {
-                        transfer->nvme_completion_wait_ns += static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                completed_at - wait_started_at).count());
-                    }
-                }
-                if (completion.result < 0) {
-                    mark_registry_request_failed(state.operation_id, "nvme_read_failure");
-                    throw std::runtime_error(
-                        "TieredExpertSupply: direct expert read failed: " +
-                        std::string(strerror(-completion.result)));
-                }
-                const size_t chunk_offset = chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
-                if (chunk_offset >= expert_payload_bytes_) {
-                    mark_registry_request_failed(state.operation_id, "nvme_invalid_chunk");
-                    throw std::runtime_error(
-                        "TieredExpertSupply: direct expert read returned an invalid chunk index");
-                }
-                const size_t expected_bytes = std::min(
-                    aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
-                    expert_payload_bytes_ - chunk_offset
-                );
-                if (completion.result != static_cast<int32_t>(expected_bytes)) {
-                    mark_registry_request_failed(state.operation_id, "nvme_short_read");
-                    throw std::runtime_error(
-                        "TieredExpertSupply: direct expert read returned a short payload");
-                }
-            }
-
-            const uint32_t staging_idx = state.staging_idx;
-            counters_.io_wait_ns += elapsed_ns(io_wait_started);
-            // The blocking path is used where a VRAM slot is guaranteed (the sweep's
-            // `materialize_entry`, after the previous layer released its block), so a
-            // refusal here is a real defect rather than the staged-only deferral.
-            if (!enqueue_expert_copy(state, staging_idx)) {
-                throw std::runtime_error(
-                    "TieredExpertSupply: materialize found no VRAM slot for a staged-only "
-                    "expert — the lookahead over-committed its copy budget");
-            }
-        }
-    }
-
-    // Enqueue one expert's H2D copy out of its (already landed) staging slot, and
-    // mark the transfer done. Shared by the blocking `materialize` and the
-    // non-blocking `materialize_available` so the two cannot diverge — the copy's
-    // stream, its gate event, and the registry record are identical either way.
-    //
-    // Returns `false` **without enqueuing** when the operation is staged-only and no
-    // VRAM slot is free: the expert stays in staging and the caller retries later
-    // (plan P2.6 — this is the whole point of decoupling the read leg from the copy
-    // leg; reads are bounded by staging, copies by VRAM).
-    bool enqueue_expert_copy(PayloadTransfer& state, uint32_t staging_idx) {
-        if (state.vram_slot < 0) {
-            // No destination yet: take it now, when the copy can actually run. Covers
-            // both a staged-only cold read and a deferred Warm hand-off (P2.7).
-            if (expert_registry_->free_vram_slot_count() == 0) {
-                return false;
-            }
-            state.vram_slot = expert_registry_->attach_vram_destination(
-                state.operation_id, demotion_queue_capacity_);
-        }
-        const auto h2d_enqueue_started = std::chrono::steady_clock::now();
-        // A Warm hand-off marked its slot `IO_COMPLETE` at dispatch, so the read leg is
-        // already accounted for; only a cold read still needs its completion recorded.
-        if (!state.staging_ready) {
-            prefetch_staging_->complete_io(staging_idx);
-        }
-        prefetch_staging_->begin_gpu_transfer(staging_idx);
-        wait_for_demotion_dependency(state.operation_id, sdma_cold_stream_);
-        // The upload source: the pinned Warm slot when there is one (no arena copy
-        // was made), else the staging slot the read landed in.
-        const uint8_t* source_ptr = state.warm_host_slot >= 0
-            ? host_pool_->get_expert_slot_ptr(static_cast<uint32_t>(state.warm_host_slot))
-            : prefetch_staging_->get_slot_ptr(staging_idx);
-        payload_pool_->upload_from_host_expert(
-            static_cast<uint32_t>(state.vram_slot),
-            source_ptr,
-            sdma_cold_stream_
-        );
-        check_hip(
-            hipEventRecord(prefetch_staging_->events[staging_idx], sdma_cold_stream_),
-            "hipEventRecord(cold H2D)");
-        record_h2d_event(
-            state.operation_id, sdma_cold_stream_, staging_idx, true,
-            state.warm_host_slot >= 0 ? state.warm_host_slot
-                                      : static_cast<int32_t>(staging_idx),
-            state.vram_slot);
-        counters_.h2d_enqueue_ns += elapsed_ns(h2d_enqueue_started);
-
-        state.is_prefetched = true;
-        state.io_pending = false;
-        state.io_complete = false;
-        state.staging_ready = false;
-        state.warm_host_slot = -1;
-        return true;
-    }
-
-    // The **non-blocking** materialize (plan P2.3 / R3): move every completion the CQ
-    // already holds into the store, then enqueue the copy for each expert whose reads
-    // have *all* landed, and return how many were enqueued. Experts whose reads are
-    // still in flight are left for the next call; nothing is waited on.
-    //
-    // This is what lets a layer's copies be issued as its reads land — during the
-    // previous layer's body — instead of in one block at the boundary. It is called
-    // from the per-token pump, which is the only host activity inside a body.
     size_t materialize_available(PayloadBatch& batch) {
-        if (direct_io_completions_ == nullptr) return 0;
-        if (direct_io_reader_ != nullptr) {
-            aeon::io::DirectIOCompletion completion;
-            while (direct_io_reader_->try_completion(completion)) {
-                direct_io_completions_->emplace(completion.user_data, completion);
-            }
-        }
-
-        size_t enqueued = 0;
-        for (auto& state : batch.transfers) {
-            // Phase 1: move this expert's landed reads out of the CQ, once. A read
-            // that is already marked complete skips straight to the copy below.
-            if (state.io_pending) {
-                bool complete = true;
-                for (size_t chunk = 0; chunk < state.io_request_count; ++chunk) {
-                    if (direct_io_completions_->find(state.io_user_data + chunk) ==
-                        direct_io_completions_->end()) {
-                        complete = false;
-                        break;
-                    }
-                }
-                if (!complete) continue;
-
-                const auto io_wait_started = std::chrono::steady_clock::now();
-                for (size_t chunk = 0; chunk < state.io_request_count; ++chunk) {
-                    const uint64_t request_id = state.io_user_data + chunk;
-                    auto completion_it = direct_io_completions_->find(request_id);
-                    const auto completed_at = std::chrono::steady_clock::now();
-                    if (auto* transfer = registry_.find(state.operation_id)) {
-                        if (transfer->io_submitted_at.time_since_epoch().count() != 0) {
-                            transfer->nvme_read_service_ns += static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    completed_at - transfer->io_submitted_at).count());
-                        }
-                    }
-                    const auto completion = completion_it->second;
-                    direct_io_completions_->erase(completion_it);
-                    if (completion.result < 0) {
-                        mark_registry_request_failed(state.operation_id, "nvme_read_failure");
-                        throw std::runtime_error(
-                            "TieredExpertSupply: direct expert read failed: " +
-                            std::string(strerror(-completion.result)));
-                    }
-                    const size_t chunk_offset =
-                        chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
-                    const size_t expected_bytes = std::min(
-                        aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
-                        expert_payload_bytes_ - chunk_offset);
-                    if (completion.result != static_cast<int32_t>(expected_bytes)) {
-                        mark_registry_request_failed(state.operation_id, "nvme_short_read");
-                        throw std::runtime_error(
-                            "TieredExpertSupply: direct expert read returned a short payload");
-                    }
-                }
-                counters_.io_wait_ns += elapsed_ns(io_wait_started);
-                state.io_pending = false;
-                state.io_complete = true;
-            }
-
-            // Phase 2: the copy. A staged-only expert whose VRAM is not free yet is
-            // left `io_complete` and retried on a later call — the deferral that
-            // decouples the copy leg from the read leg (plan P2.6).
-            if (state.io_complete && enqueue_expert_copy(state, state.staging_idx)) {
-                ++enqueued;
-            }
-        }
-        counters_.copies_pumped += static_cast<uint64_t>(enqueued);
-        return enqueued;
+        return pipeline_.materialize_available(batch);
     }
+
+    // The executor marks the start of its GPU-readiness wait through the supply; the
+    // record it touches lives on the transfer the pipeline owns.
+    void mark_gpu_readiness_wait_start(uint64_t operation_id) {
+        pipeline_.mark_gpu_readiness_wait_start(operation_id);
+    }
+
 
     // The catalog's tier and the telemetry phase are the two facts the registry
     // deliberately does not know, so they are resolved here and passed in.
@@ -838,74 +607,6 @@ public:
         }
     }
 
-    void wait_for_demotion_dependency(uint64_t operation_id, hipStream_t stream) {
-        const auto* transfer = registry_.find(operation_id);
-        if (transfer != nullptr && transfer->demotion_event != nullptr) {
-            check_hip(
-                hipStreamWaitEvent(stream, transfer->demotion_event, 0),
-                "hipStreamWaitEvent(demotion)");
-        }
-    }
-
-    void record_h2d_event(
-        uint64_t operation_id,
-        hipStream_t stream,
-        uint32_t staging_idx,
-        bool has_staging,
-        int32_t source_slot,
-        int32_t destination_slot
-    ) {
-        auto* transfer = registry_.find(operation_id);
-        if (transfer == nullptr) {
-            throw std::logic_error("TieredExpertSupply: H2D completion has no registry transfer");
-        }
-        if (transfer->h2d_event != nullptr) {
-            throw std::logic_error("TieredExpertSupply: duplicate H2D submission for one expert operation");
-        }
-        check_hip(
-            hipEventCreateWithFlags(&transfer->h2d_event, hipEventDisableTiming),
-            "hipEventCreateWithFlags(H2D)");
-        check_hip(hipEventRecord(transfer->h2d_event, stream), "hipEventRecord(H2D)");
-        transfer->staging_idx = staging_idx;
-        transfer->has_staging = has_staging;
-        transfer->h2d_source_slot = source_slot;
-        transfer->h2d_destination_slot = destination_slot;
-        transfer->h2d_enqueued_at = std::chrono::steady_clock::now();
-        if (has_staging && transfer->staging_acquired_at.time_since_epoch().count() != 0) {
-            transfer->staging_wait_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    transfer->h2d_enqueued_at - transfer->staging_acquired_at).count());
-        }
-        transfer->h2d_submitted = true;
-    }
-
-    void bind_staging(uint64_t operation_id, uint32_t staging_idx) {
-        auto* transfer = registry_.find(operation_id);
-        if (transfer == nullptr) {
-            throw std::logic_error("TieredExpertSupply: staging binding has no registry transfer");
-        }
-        transfer->staging_idx = staging_idx;
-        transfer->has_staging = true;
-        transfer->staging_acquired_at = std::chrono::steady_clock::now();
-        transfer->staging_reuse_wait_ns = prefetch_staging_->take_reuse_delay_ns(staging_idx);
-    }
-
-    void mark_gpu_readiness_wait_start(uint64_t operation_id) {
-        auto* transfer = registry_.find(operation_id);
-        if (transfer != nullptr && transfer->gpu_wait_started_at.time_since_epoch().count() == 0) {
-            transfer->gpu_wait_started_at = std::chrono::steady_clock::now();
-        }
-    }
-
-    void mark_registry_request_failed(uint64_t operation_id, const std::string& reason) {
-        auto* transfer = registry_.find(operation_id);
-        if (transfer == nullptr) return;
-        transfer->request_failed = true;
-        transfer->failure_reason = reason;
-        if (transfer->has_staging && !transfer->h2d_submitted && prefetch_staging_) {
-            prefetch_staging_->release_after_failure(transfer->staging_idx);
-        }
-    }
 
     void reap_registry_transfers() {
         for (size_t index = 0; index < registry_.size();) {
@@ -1088,6 +789,8 @@ private:
     // and destroys the HIP events its entries hold; the lifecycle below reads and
     // retires entries through it.
     PendingTransferRegistry registry_;
+    // The read-completion, H2D-copy and staging-release mechanisms.
+    ExpertTransferPipeline pipeline_;
 };
 
 } // namespace aeon::core

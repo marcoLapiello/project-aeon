@@ -63,12 +63,19 @@ The header itself says it is the G1 composition root; the target is to shrink it
 - **Deviation, deliberate:** `run_layer_body_attention_tail` stayed in the orchestrator rather than moving to the attention header as first sketched. It composes attention *and* router *and* MoE, so putting it in a phase header would force an attention→MoE (or MoE→attention) include edge between two peers. The orchestrator owns phase sequencing (it already owns `run_layer_body_decoding`), so both phase headers stay mutually independent. The function itself is unchanged.
 - **Verification:** the non-comment, non-include, non-blank code lines of the four new headers are a **multiset-identical** match to the original body's — a pure move, zero arithmetic touched. **Gate:** `test_v4_layer_body_oracle`, `..._serial_oracle`, `..._compressed_oracle`, `..._chunk_oracle`, `test_v4_expert_executor`, `test_v4_layer_body_lifecycle`, `test_v4_graph_body` pass unchanged; `test_v4_state_restore`, `test_v4_real_scale_state`, `test_v4_engine`, `aeon_chat` build.
 
-### B2. `tiered_expert_supply.hpp` → collaborator seams (fan-in 2, but 1249 lines) — ✅ done 2026-09-28
-Low fan-in, so low caller churn; the value is readability of the hot path.
-- [x] `tiered_expert_supply_types.hpp` — the six payload structs, defined at namespace scope; the supply re-exports them under their `TieredExpertSupply::X` spellings with `using` aliases, so no caller changed.
-- [x] `supply_telemetry_recorder.hpp` — `SupplyTelemetryRecorder` owns the two **derived** records (the request's logical/physical byte classification, and the pinned/unpinned Warm occupancy sampling).
-- **Deviation, deliberate:** only the two derived records were extracted. The lifecycle's other ~18 telemetry calls are pass-through forwards of values it already holds, so wrapping them would be pure indirection with no readability gain — and the plan's original "once the counters are the only telemetry left" premise does not hold: the sink is used in 20 places across 8 methods. The counters (a) stay in place, as agreed, because the deferred Phase 3 items still edit the code they instrument.
-- **Gate:** `test_v4_expert_tiering`, `test_supply_telemetry`, `test_v4_staging_depth`, and `test_v4_engine` pass unchanged.
+### B2. `tiered_expert_supply.hpp` → types + collaborators (fan-in 2, 1249 → 795 lines) — ✅ done 2026-09-28
+Low fan-in, so low caller churn; the value is readability of the hot path. Five mechanisms came out, each gated:
+- [x] `tiered_expert_supply_types.hpp` (113 L) — the six payload structs at namespace scope, re-exported as `TieredExpertSupply::X` so no caller changed.
+- [x] `supply_telemetry_recorder.hpp` (87 L) — `SupplyTelemetryRecorder` owns the two **derived** telemetry records (request classification, occupancy sampling).
+- [x] `supply_transfer_counters.hpp` (64 L) — `SupplyTransferCounters` owns the ten corridor counters + the phase-slicing reset.
+- [x] `pending_transfer_registry.hpp` (100 L) — `PendingTransferRegistry` owns the in-flight transfer table and the HIP events its entries hold.
+- [x] `expert_transfer_pipeline.hpp` (433 L) — `ExpertTransferPipeline` owns the read-completion leg, the H2D copy leg (`materialize` / `materialize_available` / `enqueue_expert_copy` / `release_streamed_staging`) and the shared bookkeeping (staging binding, H2D event recording, demotion dependency, failure marking).
+- **Deviation, corrected on review:** the first pass extracted only the types and the two derived record helpers, leaving the 1050-line method body intact — types-only dressing, not a decomposition. This was called out and reopened; the counters, registry and pipeline then came out in three further commits.
+- **What stays:** `dispatch` (reserve + read submission), `schedule_demotion`, `reap_registry_transfers`, the accessors, and the public delegating wrappers. The class is now the **policy/orchestrator**; the pipeline is the **mechanism**.
+- **Proof it is a move:** the non-comment code of the extracted copy-leg block is byte-identical to the pre-change revision after normalising the two member renames (`registry_.` → `transfers_->`, `mark_registry_request_failed` → `mark_request_failed`) — diff of 5 lines, all structural markers.
+- **Gate:** `test_v4_expert_tiering`, `test_supply_telemetry`, `test_v4_staging_depth`, `test_v4_prefill_sweep`, `test_v4_engine` pass unchanged. (`test_v4_staging_depth` tripped its timing-spread Gate A once at `1.058×` vs the `1.05` threshold and passed on rerun; Gates B and C — identical token, layers, experts, corridor overlap — passed throughout, and the same gate flaked on the earlier byte-preserving moves.)
+
+**Still monolithic inside the class, deferred:** `dispatch` (~289 lines), `reap_registry_transfers` (~140), `schedule_demotion` (~110). These are policy over shared state rather than separable mechanisms; a further split would extract a demotion scheduler and a reserve/read coordinator, which is a behavioural boundary, not a filing one.
 
 ---
 
