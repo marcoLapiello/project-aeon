@@ -7,9 +7,11 @@
 //   * `v4_attention_config.hpp`    — the DSV4_* hyperparameters;
 //   * `v4_attention_kernels.hpp`   — sliding / cached-sliding / cached-compressed
 //     attention, compressor state + materialization, and the indexer scores;
-//   * `v4_argmax.hpp`              — the LM-head argmax phase kernels;
 //   * `v4_grouped_wo.hpp`          — the grouped W_o_a projection and half->float;
 //   * `v4_hc_head_kernel.hpp`      — the Hyper-Connections head reduction.
+//
+// The LM-head argmax moved to `platform/ops/argmax.hpp`: it is a model-agnostic
+// reduction, not an attention kernel.
 //
 // The Wave32 RMSNorm, RoPE, and GEMV kernels are focused modules too, included
 // here for this header's callers; there is no second definition.
@@ -29,9 +31,10 @@
 
 #include "architecture/deepseek_v4/kernels/v4_attention_config.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention_kernels.hpp"
-#include "architecture/deepseek_v4/kernels/v4_argmax.hpp"
 #include "architecture/deepseek_v4/kernels/v4_grouped_wo.hpp"
 #include "architecture/deepseek_v4/kernels/v4_hc_head_kernel.hpp"
+
+#include "platform/ops/argmax.hpp"
 
 #include "architecture/deepseek_v4/kernels/v4_norm.hpp"
 #include "architecture/deepseek_v4/kernels/v4_rope.hpp"
