@@ -3,6 +3,7 @@
 #include "infrastructure/core/expert_payload_pool.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
+#include "infrastructure/core/pending_transfer_registry.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
 #include "infrastructure/core/supply_telemetry.hpp"
 #include "infrastructure/core/supply_telemetry_recorder.hpp"
@@ -203,7 +204,7 @@ public:
                     break;
                 }
 
-                const auto* pending = find_registry_transfer(request.operation_id);
+                const auto* pending = registry_.find(request.operation_id);
                 const auto& pending_entry = expert_registry_->catalog[request.global_expert_id];
                 if (pending_entry.operation != ExpertOperation::DEMOTION_PENDING) {
                     break;
@@ -247,7 +248,7 @@ public:
             }
 
             if (request.kind == ExpertRequestKind::PENDING) {
-                const auto* pending = find_registry_transfer(request.operation_id);
+                const auto* pending = registry_.find(request.operation_id);
                 if (pending == nullptr || !pending->h2d_submitted) {
                     throw std::runtime_error(
                         "TieredExpertSupply: duplicate request joined before its transfer was submitted "
@@ -313,7 +314,7 @@ public:
                     } else {
                         // A non-pinned Warm slot must be copied now: there is no later
                         // host read that could serve the upload.
-                        auto* transfer = find_registry_transfer(request.operation_id);
+                        auto* transfer = registry_.find(request.operation_id);
                         transfer->staging_idx = payload_request.staging_idx;
                         transfer->has_staging = true;
                         prefetch_staging_->stage_payload(
@@ -343,7 +344,7 @@ public:
                     state.is_prefetched = true;
                     state.staging_idx = payload_request.staging_idx;
                 } else if (source_is_warm) {
-                    auto* transfer = find_registry_transfer(request.operation_id);
+                    auto* transfer = registry_.find(request.operation_id);
                     transfer->staging_idx = payload_request.staging_idx;
                     transfer->has_staging = true;
                     prefetch_staging_->stage_payload(
@@ -432,7 +433,7 @@ public:
             const auto submitted_at = std::chrono::steady_clock::now();
             for (const auto& state : batch.transfers) {
                 if (!state.io_pending) continue;
-                auto* transfer = find_registry_transfer(state.operation_id);
+                auto* transfer = registry_.find(state.operation_id);
                 if (transfer != nullptr) {
                     transfer->io_submitted_at = submitted_at;
                 }
@@ -538,7 +539,7 @@ public:
                 const auto completion = completion_it->second;
                 direct_io_completions_->erase(completion_it);
                 const auto completed_at = std::chrono::steady_clock::now();
-                if (auto* transfer = find_registry_transfer(state.operation_id)) {
+                if (auto* transfer = registry_.find(state.operation_id)) {
                     if (transfer->io_submitted_at.time_since_epoch().count() != 0) {
                         transfer->nvme_read_service_ns += static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -678,7 +679,7 @@ public:
                     const uint64_t request_id = state.io_user_data + chunk;
                     auto completion_it = direct_io_completions_->find(request_id);
                     const auto completed_at = std::chrono::steady_clock::now();
-                    if (auto* transfer = find_registry_transfer(state.operation_id)) {
+                    if (auto* transfer = registry_.find(state.operation_id)) {
                         if (transfer->io_submitted_at.time_since_epoch().count() != 0) {
                             transfer->nvme_read_service_ns += static_cast<uint64_t>(
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -720,37 +721,11 @@ public:
         return enqueued;
     }
 
+    // The catalog's tier and the telemetry phase are the two facts the registry
+    // deliberately does not know, so they are resolved here and passed in.
     PendingTransfer& ensure_registry_transfer(uint64_t operation_id, uint32_t gid) {
-        for (auto& transfer : registry_transfers_) {
-            if (transfer.operation_id == operation_id) {
-                return transfer;
-            }
-        }
-        registry_transfers_.push_back(PendingTransfer{});
-        auto& transfer = registry_transfers_.back();
-        transfer.operation_id = operation_id;
-        transfer.global_expert_id = gid;
-        transfer.source_tier = expert_registry_->catalog[gid].owner;
-        transfer.phase = supply_telemetry_->current_phase();
-        return transfer;
-    }
-
-    PendingTransfer* find_registry_transfer(uint64_t operation_id) {
-        for (auto& transfer : registry_transfers_) {
-            if (transfer.operation_id == operation_id) {
-                return &transfer;
-            }
-        }
-        return nullptr;
-    }
-
-    const PendingTransfer* find_registry_transfer(uint64_t operation_id) const {
-        for (const auto& transfer : registry_transfers_) {
-            if (transfer.operation_id == operation_id) {
-                return &transfer;
-            }
-        }
-        return nullptr;
+        return registry_.ensure(operation_id, gid, expert_registry_->catalog[gid].owner,
+                                supply_telemetry_->current_phase());
     }
 
     void schedule_demotion(const ExpertRequestReservation& request) {
@@ -864,7 +839,7 @@ public:
     }
 
     void wait_for_demotion_dependency(uint64_t operation_id, hipStream_t stream) {
-        const auto* transfer = find_registry_transfer(operation_id);
+        const auto* transfer = registry_.find(operation_id);
         if (transfer != nullptr && transfer->demotion_event != nullptr) {
             check_hip(
                 hipStreamWaitEvent(stream, transfer->demotion_event, 0),
@@ -880,7 +855,7 @@ public:
         int32_t source_slot,
         int32_t destination_slot
     ) {
-        auto* transfer = find_registry_transfer(operation_id);
+        auto* transfer = registry_.find(operation_id);
         if (transfer == nullptr) {
             throw std::logic_error("TieredExpertSupply: H2D completion has no registry transfer");
         }
@@ -905,7 +880,7 @@ public:
     }
 
     void bind_staging(uint64_t operation_id, uint32_t staging_idx) {
-        auto* transfer = find_registry_transfer(operation_id);
+        auto* transfer = registry_.find(operation_id);
         if (transfer == nullptr) {
             throw std::logic_error("TieredExpertSupply: staging binding has no registry transfer");
         }
@@ -916,14 +891,14 @@ public:
     }
 
     void mark_gpu_readiness_wait_start(uint64_t operation_id) {
-        auto* transfer = find_registry_transfer(operation_id);
+        auto* transfer = registry_.find(operation_id);
         if (transfer != nullptr && transfer->gpu_wait_started_at.time_since_epoch().count() == 0) {
             transfer->gpu_wait_started_at = std::chrono::steady_clock::now();
         }
     }
 
     void mark_registry_request_failed(uint64_t operation_id, const std::string& reason) {
-        auto* transfer = find_registry_transfer(operation_id);
+        auto* transfer = registry_.find(operation_id);
         if (transfer == nullptr) return;
         transfer->request_failed = true;
         transfer->failure_reason = reason;
@@ -933,8 +908,8 @@ public:
     }
 
     void reap_registry_transfers() {
-        for (size_t index = 0; index < registry_transfers_.size();) {
-            auto& transfer = registry_transfers_[index];
+        for (size_t index = 0; index < registry_.size();) {
+            auto& transfer = registry_.entries()[index];
             bool demotion_ready = transfer.demotion_event == nullptr;
             if (transfer.demotion_event != nullptr) {
                 const hipError_t result = hipEventQuery(transfer.demotion_event);
@@ -998,8 +973,7 @@ public:
                     transfer.h2d_destination_slot,
                     "failed",
                     transfer.failure_reason.c_str());
-                registry_transfers_.erase(
-                    registry_transfers_.begin() + static_cast<std::ptrdiff_t>(index));
+                registry_.erase_at(index);
                 continue;
             }
 
@@ -1027,8 +1001,7 @@ public:
                     "failed",
                     "h2d_failure");
                 (void)hipEventDestroy(transfer.h2d_event);
-                registry_transfers_.erase(
-                    registry_transfers_.begin() + static_cast<std::ptrdiff_t>(index));
+                registry_.erase_at(index);
                 continue;
             }
 
@@ -1070,24 +1043,11 @@ public:
                 transfer.h2d_destination_slot,
                 "complete");
             (void)hipEventDestroy(transfer.h2d_event);
-            registry_transfers_.erase(
-                registry_transfers_.begin() + static_cast<std::ptrdiff_t>(index));
+            registry_.erase_at(index);
         }
     }
 
-    void clear() noexcept {
-        for (auto& transfer : registry_transfers_) {
-            if (transfer.demotion_event != nullptr) {
-                (void)hipEventDestroy(transfer.demotion_event);
-                transfer.demotion_event = nullptr;
-            }
-            if (transfer.h2d_event != nullptr) {
-                (void)hipEventDestroy(transfer.h2d_event);
-                transfer.h2d_event = nullptr;
-            }
-        }
-        registry_transfers_.clear();
-    }
+    void clear() noexcept { registry_.clear(); }
 
 private:
     static void check_hip(hipError_t error, const char* operation) {
@@ -1124,7 +1084,10 @@ private:
     // sampling). The pass-through transfer/demotion/timing events still call
     // `supply_telemetry_` directly; wrapping those would be pure indirection.
     SupplyTelemetryRecorder telemetry_recorder_;
-    std::vector<PendingTransfer> registry_transfers_;
+    // The transfers in flight, keyed by operation id. The registry owns the table
+    // and destroys the HIP events its entries hold; the lifecycle below reads and
+    // retires entries through it.
+    PendingTransferRegistry registry_;
 };
 
 } // namespace aeon::core
