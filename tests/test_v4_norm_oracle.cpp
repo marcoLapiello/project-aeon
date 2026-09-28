@@ -9,7 +9,7 @@
 //      rule is explicit: an oracle derived from the kernel proves only
 //      self-consistency, and that defect is why the previous implementation's
 //      tests passed on wrong logic.
-//   2. THE KERNEL IS THE KEPT ONE. `kernels/v4_norm.hpp`, not a local copy.
+//   2. THE KERNEL IS THE KEPT ONE. `platform/ops/rmsnorm.hpp`, not a local copy.
 //   3. THE GATE ASSERTS A NUMBER. "It produced output" is not a gate; a stated
 //      tolerance is.
 //
@@ -25,7 +25,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
-#include "architecture/deepseek_v4/kernels/v4_norm.hpp"
+#include "platform/ops/rmsnorm.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 
 #include <hip/hip_runtime.h>

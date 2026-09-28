@@ -13,8 +13,9 @@
 // The LM-head argmax moved to `platform/ops/argmax.hpp`: it is a model-agnostic
 // reduction, not an attention kernel.
 //
-// The Wave32 RMSNorm, RoPE, and GEMV kernels are focused modules too, included
-// here for this header's callers; there is no second definition.
+// The Wave32 RoPE and GEMV kernels are focused modules too, included here for
+// this header's callers; there is no second definition. The Wave32 RMSNorm moved
+// to `platform/ops/rmsnorm.hpp` (it is model-agnostic).
 //
 // The system and HIP includes below are kept exactly as they were so a caller
 // that relied on including this header for them still compiles.
@@ -36,6 +37,6 @@
 
 #include "platform/ops/argmax.hpp"
 
-#include "architecture/deepseek_v4/kernels/v4_norm.hpp"
+#include "platform/ops/rmsnorm.hpp"
 #include "architecture/deepseek_v4/kernels/v4_rope.hpp"
 #include "architecture/deepseek_v4/kernels/v4_gemv.hpp"

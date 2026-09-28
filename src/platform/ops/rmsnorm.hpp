@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// DeepSeek-V4 kept primitive: Wave32 RMSNorm.
+// Model-agnostic primitive: Wave32 RMSNorm.
 //
 // It lives in its own header so the primitive can be compiled, gated, and
 // certified on its own, without pulling in the composition that calls it;
