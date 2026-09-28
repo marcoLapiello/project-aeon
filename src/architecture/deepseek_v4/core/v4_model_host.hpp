@@ -54,7 +54,7 @@
 
 #include "architecture/deepseek_v4/core/config.hpp"
 #include "architecture/deepseek_v4/core/memory_budget.hpp"
-#include "architecture/deepseek_v4/core/v4_device_streams.hpp"
+#include "infrastructure/core/device_streams.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_executor.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_layer.hpp"

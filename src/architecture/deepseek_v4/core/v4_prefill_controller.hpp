@@ -23,7 +23,7 @@
 // because they are the host's blocking-read machinery and not prefill policy.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_device_streams.hpp"
+#include "infrastructure/core/device_streams.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_executor.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_host_partition.hpp"

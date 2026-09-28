@@ -77,7 +77,7 @@
 // trades correctness for the schedule.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_device_streams.hpp"
+#include "infrastructure/core/device_streams.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
@@ -158,9 +158,10 @@ private:
 public:
 };
 
-// The four streams the executor interacts with live in `core/v4_device_streams.hpp`,
-// owned by the host and borrowed here — one definition, because this class's
-// capacity fallback has to drain exactly the streams that carry expert traffic and
+// The four streams the executor interacts with live in
+// `infrastructure/core/device_streams.hpp`, owned by the host and borrowed here — one
+// definition, because this class's capacity fallback has to drain exactly the streams
+// that carry expert traffic and
 // a second definition of "the streams" is a way to hand it the wrong set.
 //
 // `compute` is where the expert kernels run and where the per-transfer staging
