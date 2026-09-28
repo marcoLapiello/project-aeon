@@ -46,6 +46,7 @@ The production-facing implementation is:
 - `src/infrastructure/core/host_expert_pool.hpp` - shared Tier 2 warm expert pool.
 - `src/infrastructure/core/expert_registry.hpp` - shared expert residency and usage tracking: the class declaration and the reservation / completion / demotion policy. Its data vocabulary is in `expert_registry_types.hpp`; the out-of-line definitions of the Warm/staging partition are in `warm_partition.hpp`, of the prefill streaming mode and frozen-prefill shadows in `prefill_residency.hpp`, and of the invariant audit in `expert_registry_validation.hpp`.
 - `src/infrastructure/core/prefetch_staging.hpp` - shared bounded pinned staging and HIP event ownership.
+- `src/infrastructure/core/routing_profile.hpp` - routing-profile prompt parsing, the run config, the aggregate, and the persistent store. Its JSONL / atomic-file / hashing helpers (namespace `routing_profile_detail`) live in `routing_profile_json.hpp`.
 - `src/infrastructure/io/direct_io_reader.hpp` - shared validated batched `io_uring`/`O_DIRECT` cold reads.
 - `src/architecture/deepseek_v4/text/` and `src/infrastructure/text/` - DSV4 and generic text support.
 - `src/architecture/deepseek_v4/kernels/` - V4 attention, routing, and Hyper-Connections kernels.

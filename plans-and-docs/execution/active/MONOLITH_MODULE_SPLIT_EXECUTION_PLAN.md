@@ -110,9 +110,12 @@ The header was a free-function bundle, not a class, so the split is a plain extr
 
 **Umbrella note:** `v4_attention.hpp` keeps its original system/HIP includes (`<vector>`, `<cmath>`, `<algorithm>`, `<iostream>`, `<cstdint>`, `<cassert>`, the two HIP headers) so a caller that relied on the old header for them still compiles.
 
-### C4. `routing_profile.hpp` → IO helpers split (fan-in 1)
-- [ ] `routing_profile_json.hpp` — `namespace routing_profile_detail` (parser helpers, `json_escape`, `write_string` / `read_string`, `write_value` / `read_value`, `fnv1a_*`).
-- [ ] Keep prompt parsing, `RoutingProfileAggregate`, `RoutingProfileStore` in the main header. **Gate:** `test_routing_profile`, `test_routing_reuse` pass unchanged.
+### C4. `routing_profile.hpp` → IO helpers split (fan-in 1) — ✅ done 2026-09-28
+- [x] `routing_profile_json.hpp` — the whole `namespace routing_profile_detail`: the JSONL field parser (`skip_whitespace`, `expect`, `parse_uint32`, `append_utf8`, `parse_string`, `parse_token_array`), `json_escape`, `write_string` / `read_string`, `write_value` / `read_value`, the atomic-file helpers (`rename_atomic`, `write_text_atomic`, `write_binary_atomic`), `fnv1a_bytes` / `fnv1a_file`, `read_text`, `extract_json_string_field`. Extracted verbatim (lines 32–331 of the original), with its own std includes so it reads on its own.
+- [x] Kept prompt parsing (`parse_routing_prompt`, `load_routing_prompts`, `routing_prompt_signature`), `RoutingPrompt`, `RoutingProfileRunConfig`, `RoutingProfileAggregate` and `RoutingProfileStore` in the main header, which includes `routing_profile_json.hpp` and keeps its original std includes.
+- **Gate:** `test_routing_profile`, `test_routing_reuse` pass unchanged; `aeon_chat` and the other consumers build. Proof of move: the normalised code lines of the two files are a multiset match to the original's — no body line lost, the only new lines being includes, `#pragma once`, namespaces and braces. 885 → 588 (umbrella) + 331 (json).
+
+**Tier C complete.** C1–C4 are done; D stays deferred (on-edit only).
 
 ---
 
@@ -153,5 +156,5 @@ Explicitly **not** scheduled. Listed so the inventory is complete and so a futur
 | C1 | `expert_registry.hpp` → registry + partition + residency + validation | ✅ |
 | C2 | `v4_prefill_sweep.hpp` → sweep + lookahead policy | ✅ |
 | C3 | `v4_attention.hpp` → kernels by concern (+ anti-circularity check) | ✅ |
-| C4 | `routing_profile.hpp` → IO helpers split | ☐ |
+| C4 | `routing_profile.hpp` → IO helpers split | ✅ |
 | D | `v4_layer_body_batch.hpp`, `dsv4_oracle.hpp` — deferred, on-edit only | — |
