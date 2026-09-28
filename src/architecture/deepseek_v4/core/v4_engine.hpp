@@ -65,7 +65,7 @@
 #include "architecture/deepseek_v4/core/memory_budget.hpp"
 #include "architecture/deepseek_v4/core/v4_graph.hpp"
 #include "architecture/deepseek_v4/core/v4_model_host.hpp"
-#include "architecture/deepseek_v4/core/v4_sampler.hpp"
+#include "infrastructure/core/sampler.hpp"
 #include "architecture/deepseek_v4/text/dsv4_prompt_encoder.hpp"
 #include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
 #include "infrastructure/core/json.hpp"

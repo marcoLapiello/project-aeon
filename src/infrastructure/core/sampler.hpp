@@ -61,7 +61,7 @@
 // nothing about prompts, turns or stop conditions.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/kernels/v4_attention.hpp"
+#include "platform/ops/argmax.hpp"
 #include "infrastructure/hip_check.hpp"
 
 #include <hip/hip_fp16.h>
