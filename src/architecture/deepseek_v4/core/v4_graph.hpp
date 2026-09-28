@@ -49,7 +49,7 @@
 #include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
 #include "architecture/deepseek_v4/core/v4_model_host.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
-#include "architecture/deepseek_v4/kernels/v4_gemv.hpp"
+#include "platform/ops/gemv.hpp"
 #include "platform/ops/rmsnorm.hpp"
 #include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
 #include "infrastructure/hip_check.hpp"

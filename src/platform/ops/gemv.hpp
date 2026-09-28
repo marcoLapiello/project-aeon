@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// DeepSeek-V4 kept primitive: FP16 GEMV (dense projections).
+// Model-agnostic primitive: FP16 GEMV (dense projections).
 //
 // The dense backbone's projections are all `y = W @ x` with fp16 weights and a
 // single token: `wq_a`, `wq_b`, `wkv`, the compressor gates, the indexer

@@ -25,7 +25,7 @@
 
 #include "platform/rdna3/device.hpp"
 #include "architecture/deepseek_v4/core/config.hpp"
-#include "architecture/deepseek_v4/kernels/v4_gemv.hpp"
+#include "platform/ops/gemv.hpp"
 #include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"

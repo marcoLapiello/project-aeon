@@ -32,7 +32,7 @@
 
 #include "platform/rdna3/device.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
-#include "architecture/deepseek_v4/kernels/v4_gemv.hpp"
+#include "platform/ops/gemv.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 
 #include <hip/hip_runtime.h>
