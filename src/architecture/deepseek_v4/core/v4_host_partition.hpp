@@ -39,7 +39,7 @@
 // is idempotent, so a caller may apply the same partition repeatedly.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/aeon_runtime_config.hpp"
+#include "infrastructure/core/runtime_config.hpp"
 #include "architecture/deepseek_v4/core/memory_budget_report.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_prefill_sweep.hpp"

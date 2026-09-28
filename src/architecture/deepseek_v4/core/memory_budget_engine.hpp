@@ -10,7 +10,7 @@
 // shape without pulling in the device query.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/aeon_runtime_config.hpp"
+#include "infrastructure/core/runtime_config.hpp"
 #include "architecture/deepseek_v4/core/config.hpp"
 #include "architecture/deepseek_v4/core/memory_budget_report.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_state.hpp"

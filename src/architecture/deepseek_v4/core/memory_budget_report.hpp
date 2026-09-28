@@ -14,7 +14,7 @@
 // report without a GPU.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/aeon_runtime_config.hpp"
+#include "infrastructure/core/runtime_config.hpp"
 #include "architecture/deepseek_v4/core/config.hpp"
 
 #include <algorithm>

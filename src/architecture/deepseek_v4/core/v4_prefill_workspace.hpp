@@ -14,7 +14,7 @@
 // can be read, allocated and freed without the assembly around it.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/aeon_runtime_config.hpp"
+#include "infrastructure/core/runtime_config.hpp"
 #include "architecture/deepseek_v4/core/config.hpp"
 #include "architecture/deepseek_v4/core/v4_layer.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
