@@ -104,7 +104,7 @@ These are the model-coupled G1 files and the genuinely mixed files. Each needs a
 
 | Deferred item | Why it waits | Nature of the seam |
 | :--- | :--- | :--- |
-| `memory_budget.hpp`, `memory_budget_engine.hpp`, `memory_budget_report.hpp` | Include `config.hpp` / `V4ModelSpec` | Neutral model-dimensions input instead of `DeepSeekV4Config` |
+| ~~`memory_budget.hpp`, `memory_budget_engine.hpp`, `memory_budget_report.hpp`~~ | ✅ **Done** (`c53e5f8`): moved to `infrastructure/core/` behind the neutral `ModelMemoryGeometry` seam (`model_memory_geometry.hpp`; V4 adapter `v4_memory_geometry.hpp`). Behaviour unchanged; `test_dynamic_expert_pool`, `test_v4_prefill_window`, `test_v4_engine` pass. | — |
 | `v4_prefill_controller/sweep/lookahead/workspace.hpp` | Include `v4_expert_supply.hpp`, `v4_layer*` | Neutral supply-adapter interface; template on the model type |
 | `v4_host_partition.hpp` | Includes `v4_expert_supply.hpp` | Same supply-adapter seam |
 | `v4_expert_executor.hpp` (mixed) | Model MoE execution + tiered-supply mechanics + backend dispatch | Lease/tier policy vs. V4 dispatch |
