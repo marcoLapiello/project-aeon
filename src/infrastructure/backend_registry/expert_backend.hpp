@@ -16,7 +16,10 @@ struct ExpertBackendDescriptor {
     ExpertFormatKind format_kind{ExpertFormatKind::UNKNOWN};
     uint32_t artifact_version{0};
     size_t payload_bytes{0};
-    bool supports_v4_pipeline{false};
+    // Whether the backend can execute fused MoE expert projections. The
+    // capability, not a model name: an architecture decides for itself whether
+    // this is what it needs (the V4 pipeline requires it today).
+    bool supports_fused_moe_experts{false};
 
     void validate_format(const ExpertFormatDescriptor& format) const {
         if (format.kind != format_kind ||

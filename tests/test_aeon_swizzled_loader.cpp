@@ -37,7 +37,7 @@ int main() {
     const auto& backend = aeon::core::ExpertBackendRegistry::resolve(
         manifest.weight_backend, loader.expert_format());
     assert(backend.name == "swizzled_w4a16");
-    assert(backend.supports_v4_pipeline);
+    assert(backend.supports_fused_moe_experts);
 
     auto incompatible_format = loader.expert_format();
     incompatible_format.artifact_version += 1;

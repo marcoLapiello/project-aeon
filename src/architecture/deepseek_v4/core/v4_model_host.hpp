@@ -123,7 +123,7 @@ public:
         loader_.open_model(model_dir);
         const auto& expert_format = loader_.expert_format();
         const auto& backend = ExpertBackendRegistry::resolve(expert_format);
-        if (!backend.supports_v4_pipeline) {
+        if (!backend.supports_fused_moe_experts) {
             throw std::runtime_error(
                 "V4ModelHost: the selected artifact requires a different weight backend");
         }
