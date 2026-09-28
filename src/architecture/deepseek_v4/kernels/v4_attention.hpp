@@ -9,8 +9,7 @@
 //     attention, compressor state + materialization, and the indexer scores;
 //   * `v4_argmax.hpp`              — the LM-head argmax phase kernels;
 //   * `v4_grouped_wo.hpp`          — the grouped W_o_a projection and half->float;
-//   * `v4_hc_head_kernel.hpp`      — the Hyper-Connections head reduction;
-//   * `v4_attention_reference.hpp` — the (unused) CPU reference implementations.
+//   * `v4_hc_head_kernel.hpp`      — the Hyper-Connections head reduction.
 //
 // The Wave32 RMSNorm, RoPE, and GEMV kernels are focused modules too, included
 // here for this header's callers; there is no second definition.
@@ -33,7 +32,6 @@
 #include "architecture/deepseek_v4/kernels/v4_argmax.hpp"
 #include "architecture/deepseek_v4/kernels/v4_grouped_wo.hpp"
 #include "architecture/deepseek_v4/kernels/v4_hc_head_kernel.hpp"
-#include "architecture/deepseek_v4/kernels/v4_attention_reference.hpp"
 
 #include "architecture/deepseek_v4/kernels/v4_norm.hpp"
 #include "architecture/deepseek_v4/kernels/v4_rope.hpp"
