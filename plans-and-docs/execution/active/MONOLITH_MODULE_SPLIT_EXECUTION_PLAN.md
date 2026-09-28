@@ -83,12 +83,13 @@ Low fan-in, so low caller churn; the value is readability of the hot path. Five 
 
 Single classes split by extracting collaborators. Each has a real regression surface, so each lands alone and is verified on `gfx1100`.
 
-### C1. `expert_registry.hpp` → registry + partition + residency + validation (fan-in 8)
-- [ ] `expert_registry_types.hpp` — enums and POD structs (`ExpertTier`, `ExpertOperation`, `ExpertGpuTransfer`, `ExpertDemotionDropReason` + name helper, `ExpertPublication`, `ExpertSlotState`, `ExpertRequestKind`, `ExpertCatalogEntry`, `ExpertDemotionReservation`, `ExpertRequestReservation`).
-- [ ] `warm_partition.hpp` — `admit_warm`, `grow_host_capacity`, `shrink_host_capacity`, `release_host_tail`, `take_free_host_slot`, `rebuild_free_host_slots`, `usable_host_capacity`, `host_restore_set` / `clear_host_restore_set`, `release_reserved_host_slot`, `find_reserved_host_slot`.
-- [ ] `prefill_residency.hpp` — `begin_prefill_stream` / `end_prefill_stream` / `prefill_streaming`, `release_layer`, `release_shadow_residency` + `release_shadow_residencies`, `shadow_touch`, `set_warm_frozen` / `warm_frozen`, shadow accessors.
-- [ ] `expert_registry_validation.hpp` — `invariants_hold`, `checked_validate`, `validate_invariants` (~190 lines), `validate_lru`.
-- [ ] **Gate:** `test_expert_registry_warm_state`, `test_dynamic_expert_pool`, `test_routing_reuse`, `test_v4_expert_tiering` pass unchanged, on hardware.
+### C1. `expert_registry.hpp` → registry + partition + residency + validation (fan-in 8) — ✅ done 2026-09-28
+- [x] `expert_registry_types.hpp` — enums and POD structs (`ExpertTier`, `ExpertOperation`, `ExpertGpuTransfer`, `ExpertDemotionDropReason` + name helper, `ExpertPublication`, `ExpertSlotState`, `ExpertRequestKind`, `ExpertCatalogEntry`, `ExpertDemotionReservation`, `ExpertRequestReservation`). Moved verbatim to `namespace aeon::core`.
+- [x] `warm_partition.hpp` — `admit_warm`, `grow_host_capacity`, `shrink_host_capacity`, `release_host_tail`, `take_free_host_slot`, `rebuild_free_host_slots`, `usable_host_capacity`, `host_restore_set` / `clear_host_restore_set`, `release_reserved_host_slot`, `find_reserved_host_slot`.
+- [x] `prefill_residency.hpp` — `begin_prefill_stream` / `end_prefill_stream` / `prefill_streaming`, `release_layer`, `release_shadow_residency` + `release_shadow_residencies`, `shadow_touch`, `set_warm_frozen` / `warm_frozen`, shadow accessors.
+- [x] `expert_registry_validation.hpp` — `invariants_hold`, `checked_validate`, `validate_invariants` (~190 lines), `validate_lru`.
+- **Mechanism (deviation, deliberate):** the class keeps its declaration, its private static LRU helpers, `reserve_vram_destination` / `reserve_warm_destination`, and the reservation/completion/demotion policy inline; the three concern headers hold **out-of-line `inline ExpertRegistry::` member definitions**, included at the foot of the umbrella after the class. This is the only split that keeps the plan's non-negotiable "no behaviour change — the only permitted diff is `#include` lines and file locations": a collaborator class would have to plumb the catalog, both slot maps, both LRUs and the counters through a shared state object, which is a behavioural boundary (the same reason B2 kept `dispatch`/`schedule_demotion`/`reap` in the policy class). Proof: the normalised (comment/blank-stripped, whitespace-trimmed) code lines of the four new files are a **multiset match** to the original body's — the only differences are the moved signatures (now a declaration in the class plus an `inline ExpertRegistry::` definition in the concern header) and the new `#include`/`namespace` lines. 1778 → 1076 (umbrella) + 128 (types) + 178 (partition) + 283 (residency) + 180 (validation).
+- [x] **Gate:** `test_expert_registry_warm_state`, `test_dynamic_expert_pool`, `test_routing_reuse`, `test_v4_expert_tiering` pass unchanged, on hardware; `aeon_chat`, `test_supply_telemetry`, `test_v4_staging_depth`, `test_v4_prefill_sweep`, `test_v4_expert_executor` build.
 
 ### C2. `v4_prefill_sweep.hpp` → sweep + lookahead policy (fan-in 1)
 - [ ] Extract the derived-depth / read-ahead policy (`derived_lookahead_capacity`, `read_lookahead_capacity`, `set_read_ahead_max`, `update_frontier`, `dispatch_ahead`, `advance_reads`, `reads_in_flight`) into a policy object the sweep drives.
@@ -142,7 +143,7 @@ Explicitly **not** scheduled. Listed so the inventory is complete and so a futur
 | A2 | `v4_model_host.hpp` → owner + 3 controllers | ✅ |
 | B1 | `v4_layer_body.hpp` → types + phases | ✅ |
 | B2 | `tiered_expert_supply.hpp` → types + seams | ✅ |
-| C1 | `expert_registry.hpp` → registry + partition + residency + validation | ☐ |
+| C1 | `expert_registry.hpp` → registry + partition + residency + validation | ✅ |
 | C2 | `v4_prefill_sweep.hpp` → sweep + lookahead policy | ☐ |
 | C3 | `v4_attention.hpp` → kernels by concern (+ anti-circularity check) | ☐ |
 | C4 | `routing_profile.hpp` → IO helpers split | ☐ |

@@ -43,7 +43,7 @@ The production-facing implementation is:
 - `src/architecture/deepseek_v4/core/memory_budget.hpp` - umbrella over the V4 memory budget: `aeon_runtime_config.hpp` (the knobs, safety margins, scratch allowances, staging slot counts), `memory_budget_report.hpp` (`MemoryBudgetReport` and its derived terms), and `memory_budget_engine.hpp` (the device/host query and feasibility evaluation).
 - `src/backend/swizzled_w4a16/core/vram_expert_pool.hpp` - current backend's Tier 1 hot expert pool.
 - `src/infrastructure/core/host_expert_pool.hpp` - shared Tier 2 warm expert pool.
-- `src/infrastructure/core/expert_registry.hpp` - shared expert residency and usage tracking.
+- `src/infrastructure/core/expert_registry.hpp` - shared expert residency and usage tracking: the class declaration and the reservation / completion / demotion policy. Its data vocabulary is in `expert_registry_types.hpp`; the out-of-line definitions of the Warm/staging partition are in `warm_partition.hpp`, of the prefill streaming mode and frozen-prefill shadows in `prefill_residency.hpp`, and of the invariant audit in `expert_registry_validation.hpp`.
 - `src/infrastructure/core/prefetch_staging.hpp` - shared bounded pinned staging and HIP event ownership.
 - `src/infrastructure/io/direct_io_reader.hpp` - shared validated batched `io_uring`/`O_DIRECT` cold reads.
 - `src/architecture/deepseek_v4/text/` and `src/infrastructure/text/` - DSV4 and generic text support.
