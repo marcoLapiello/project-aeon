@@ -49,6 +49,7 @@ The production-facing implementation is:
 - `src/infrastructure/io/direct_io_reader.hpp` - shared validated batched `io_uring`/`O_DIRECT` cold reads.
 - `src/architecture/deepseek_v4/text/` and `src/infrastructure/text/` - DSV4 and generic text support.
 - `src/architecture/deepseek_v4/kernels/` - V4 attention, routing, and Hyper-Connections kernels.
+- `src/architecture/deepseek_v4/kernels/v4_attention.hpp` - umbrella over the attention kernels: `v4_attention_config.hpp` (the DSV4_* hyperparameters), `v4_attention_kernels.hpp` (sliding / cached-sliding / cached-compressed attention, compressor state + materialization, indexer scores), `v4_argmax.hpp` (the LM-head argmax phases), `v4_grouped_wo.hpp` (the grouped W_o_a projection and half->float), `v4_hc_head_kernel.hpp` (the Hyper-Connections head reduction), and `v4_attention_reference.hpp` (unused CPU references).
 - `src/backend/swizzled_w4a16/kernels/` - current W4A16 swizzle, GEMV, and fused expert kernels.
 
 `V4Engine` is the runtime entry point (via `tools/aeon_chat.cpp`). It drives the graph,

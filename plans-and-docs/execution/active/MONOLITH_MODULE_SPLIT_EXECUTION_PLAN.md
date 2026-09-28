@@ -97,13 +97,18 @@ Single classes split by extracting collaborators. Each has a real regression sur
 - [x] **Constraint:** the corridor requirements R1–R8 of the [supply-chain plan](../completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md) §0.3 still hold — carried unchanged. The depth is still derived from the staging arena alone, bounded to one wave in flight, and re-derived each boundary; nothing in the relocation touches them.
 - [x] **Gate:** `test_v4_staging_depth` Gates A/B/C pass unchanged (run: Gate A `1.048×` PASS with `8 checks, 0 failures`; Gates B — token/layers/experts/released identical — and C — 0/43, 0/43, 42/43 overlapped — pass throughout). Gate A tripped its ≤`1.05` timing-spread bound at `1.055–1.062×` on four of five runs under host load average `67–82`; the split is a byte-identical move and the same gate flaked at the same values on the earlier byte-preserving moves, so this is environmental. `test_v4_prefill_sweep` passes `16 checks, 0 failures`; `test_v4_engine` and `aeon_chat` build.
 
-### C3. `v4_attention.hpp` → kernels by concern (fan-in 12)
-- [ ] `v4_attention_kernels.hpp` — sliding / cached-sliding / cached-compressed attention, compressor state + materialization, indexer scores.
-- [ ] `v4_argmax.hpp` — the two argmax phase kernels (LM head; currently misfiled here).
-- [ ] `v4_grouped_wo.hpp` — `v4_grouped_wo_a_wave32_kernel`, `v4_half_to_float_n_kernel`.
-- [ ] `v4_hc_head_kernel.hpp` — `hc_head_wave32_kernel`.
-- [ ] **Flag — anti-circularity.** The `cpu_rmsnorm` / `cpu_sliding_window_attention` references sit in the same header as the kernels they certify. Move them to a `_reference.hpp` and confirm the gate in `test_v4_attention_sink_oracle` still compares independent code ([AGENTS.md](../../../AGENTS.md) §3 rule 5, *Anti-circularity*). Investigate, do not silently relocate.
-- [ ] **Gate:** `test_v4_attention_sink_oracle`, `test_v4_mla_oracle` pass unchanged, on hardware.
+### C3. `v4_attention.hpp` → kernels by concern (fan-in 12) — ✅ done 2026-09-28
+The header was a free-function bundle, not a class, so the split is a plain extraction of whole kernels at namespace scope behind the umbrella — no declaration/definition seam was needed.
+- [x] `v4_attention_config.hpp` — the `DSV4_*` hyperparameters. **Not in the plan's list but required:** the constants are used by the kernel modules, by other engine headers and by tests, and they cannot stay in the umbrella (a module including the umbrella would be circular). They get their own header, which each kernel module includes directly.
+- [x] `v4_attention_kernels.hpp` — sliding / cached-sliding / cached-compressed attention, compressor state + materialization, indexer scores.
+- [x] `v4_argmax.hpp` — the two argmax phase kernels (LM head; they were misfiled here).
+- [x] `v4_grouped_wo.hpp` — `v4_grouped_wo_a_wave32_kernel`, `v4_half_to_float_n_kernel`.
+- [x] `v4_hc_head_kernel.hpp` — `hc_head_wave32_kernel`.
+- [x] `v4_attention_reference.hpp` — `cpu_rmsnorm`, `cpu_sliding_window_attention`.
+- [x] **Flag — anti-circularity. Investigated; no circularity to fix.** The `cpu_rmsnorm` / `cpu_sliding_window_attention` references are **not called by anything** — a grep over `src/` and `tests/` finds only their own definitions. The gate that certifies the sliding-window kernel, `test_v4_attention_sink_oracle`, compares against the independent fp64 `aeon::reference::attention_scores_sink` in `reference/dsv4_oracle.hpp`, so the kernel and its oracle already share no helper. The two functions are dead code; they were relocated to `v4_attention_reference.hpp` as a **file-location-only** change (the split step's rule), with their **deletion** left as a separate task. Recorded in the new header's banner.
+- [x] **Gate:** `test_v4_attention_sink_oracle`, `test_v4_mla_oracle` pass unchanged on hardware; the other kernel-consumer gates `test_v4_grouped_wo_oracle`, `test_v4_hc_head_oracle` (25 checks, 0 failed), `test_v4_compressor_oracle`, `test_v4_indexer_oracle` also pass. Proof of the move: brace balance per file is exact and the normalised code lines (brace-only lines excluded) are a multiset match to the original's — no body line lost, the only new lines being includes, namespaces and `#pragma once`. (An initial extraction truncated two closing braces of `cpu_sliding_window_attention`; the brace-balance check caught it, the byte-content check did not, since repeated single-character lines mask a small loss in a multiset diff.)
+
+**Umbrella note:** `v4_attention.hpp` keeps its original system/HIP includes (`<vector>`, `<cmath>`, `<algorithm>`, `<iostream>`, `<cstdint>`, `<cassert>`, the two HIP headers) so a caller that relied on the old header for them still compiles.
 
 ### C4. `routing_profile.hpp` → IO helpers split (fan-in 1)
 - [ ] `routing_profile_json.hpp` — `namespace routing_profile_detail` (parser helpers, `json_escape`, `write_string` / `read_string`, `write_value` / `read_value`, `fnv1a_*`).
@@ -147,6 +152,6 @@ Explicitly **not** scheduled. Listed so the inventory is complete and so a futur
 | B2 | `tiered_expert_supply.hpp` → types + seams | ✅ |
 | C1 | `expert_registry.hpp` → registry + partition + residency + validation | ✅ |
 | C2 | `v4_prefill_sweep.hpp` → sweep + lookahead policy | ✅ |
-| C3 | `v4_attention.hpp` → kernels by concern (+ anti-circularity check) | ☐ |
+| C3 | `v4_attention.hpp` → kernels by concern (+ anti-circularity check) | ✅ |
 | C4 | `routing_profile.hpp` → IO helpers split | ☐ |
 | D | `v4_layer_body_batch.hpp`, `dsv4_oracle.hpp` — deferred, on-edit only | — |
