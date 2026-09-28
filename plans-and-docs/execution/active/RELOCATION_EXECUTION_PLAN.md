@@ -63,23 +63,23 @@ K1 is first because the sampler's only model include is the argmax kernel, so mo
 
 \* `v4_argmax.hpp` has one includer inside the kernel tree (`v4_attention.hpp` umbrella) plus test users.
 
-### Stage 2 — The ready G1 moves (`src/infrastructure/core/`)
+### Stage 2 — The ready G1 moves (`src/infrastructure/core/`) — ✅ complete
 
-| Step | Action | From | To | Fan-in |
-| :--- | :--- | :--- | :--- | ---: |
-| **S1** | MOVE + rename | `architecture/deepseek_v4/core/aeon_runtime_config.hpp` | `infrastructure/core/runtime_config.hpp` | 5 |
-| **S2** | MOVE + rename | `architecture/deepseek_v4/core/v4_sampler.hpp` | `infrastructure/core/sampler.hpp` | 5 |
-| **S3** | MOVE + rename | `architecture/deepseek_v4/core/v4_device_streams.hpp` | `infrastructure/core/device_streams.hpp` | 3 |
+| Step | Action | From | To | Fan-in | Commit |
+| :--- | :--- | :--- | :--- | ---: | :--- |
+| **S1** | MOVE + rename | `architecture/deepseek_v4/core/aeon_runtime_config.hpp` | `infrastructure/core/runtime_config.hpp` | 5 | `9082ebd` |
+| **S2** | MOVE + rename | `architecture/deepseek_v4/core/v4_sampler.hpp` | `infrastructure/core/sampler.hpp` | 5 | `3c452b4` |
+| **S3** | MOVE + rename | `architecture/deepseek_v4/core/v4_device_streams.hpp` | `infrastructure/core/device_streams.hpp` | 3 | `f2dcb43` |
 
-S2 depends on K1 (its only model include is the argmax kernel). S1 and S3 are independent.
+All three landed with the normalized code-line multiset identical to the pre-move version (S2 differs by exactly the include swap that made it model-free). S1 also removed a stray untracked duplicate of the former kernel file `v4_gemv.hpp` that the editor restored at the old path. The heavy gates `test_v4_engine`, `test_v4_graph_body`, `test_v4_sampler`, `test_v4_expert_executor`, and `test_v4_expert_tiering` all pass.
 
-### Stage 3 — Neutral-registry cleanliness (independent)
+### Stage 3 — Neutral-registry cleanliness (independent) — ✅ complete
 
-| Step | Action | Detail |
-| :--- | :--- | :--- |
-| **R1** | Rename a field | `ExpertBackendDescriptor::supports_v4_pipeline` → `supports_fused_moe_experts`. Touch-points: the declaration and both `resolve()` descriptors in `expert_backend.hpp`, the reader in `v4_model_host.hpp:126`, and the assertion in `test_aeon_swizzled_loader.cpp:40`. |
+| Step | Action | Detail | Commit |
+| :--- | :--- | :--- | :--- |
+| **R1** | Rename a field | `ExpertBackendDescriptor::supports_v4_pipeline` → `supports_fused_moe_experts`. Touch-points: the descriptor and its comment in `expert_backend.hpp`, the reader in `v4_model_host.hpp:126`, and the assertion in `test_aeon_swizzled_loader.cpp:40`. | `10f713c` |
 
-R1 is not a file move and can run at any time. It removes a model name from the neutral backend contract.
+R1 removes a model name from the neutral backend contract. Verified: full rename, no residual old name, `test_aeon_swizzled_loader` passes.
 
 ---
 
@@ -118,8 +118,10 @@ Once the seams exist, each deferred file moves by the ordinary MOVE recipe into 
 
 ## 7. Done when
 
-- No G1 file remains under `architecture/deepseek_v4/`; the ready set is in `infrastructure/core/`.
-- The reusable kernels live in `platform/ops/` under neutral names.
+**Ready scope (Stages 1–3) — ✅ met.**
+
+- The reusable kernels live in `platform/ops/` under neutral names (`rmsnorm`, `gemv`, `argmax`).
+- The ready G1 set is in `infrastructure/core/` (`runtime_config`, `sampler`, `device_streams`).
 - The neutral backend registry no longer names the model.
 - Every step left the build and its selective tests green, and each MOVE was proven by the multiset diff plus brace balance.
 
