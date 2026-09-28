@@ -49,13 +49,15 @@ This is expected, not a setback: it is the same decouple-then-move shape the bac
 
 Ordered so that each commit builds and passes, leaves the tree consistent, and does the lowest-risk work first. Moves are sequenced by include fan-in (low first) so each step touches few files.
 
-### Stage 1 — Reusable kernels to G2 (`src/platform/ops/`)
+### Stage 1 — Reusable kernels to G2 (`src/platform/ops/`) — ✅ complete
 
-| Step | Action | From | To | Fan-in |
-| :--- | :--- | :--- | :--- | ---: |
-| **K1** | MOVE + rename | `architecture/deepseek_v4/kernels/v4_argmax.hpp` | `platform/ops/argmax.hpp` | 1* |
-| **K2** | MOVE + rename | `architecture/deepseek_v4/kernels/v4_norm.hpp` | `platform/ops/rmsnorm.hpp` | 4 |
-| **K3** | MOVE + rename | `architecture/deepseek_v4/kernels/v4_gemv.hpp` | `platform/ops/gemv.hpp` | 5 |
+| Step | Action | From | To | Fan-in | Commit |
+| :--- | :--- | :--- | :--- | ---: | :--- |
+| **K1** | MOVE + rename | `architecture/deepseek_v4/kernels/v4_argmax.hpp` | `platform/ops/argmax.hpp` | 1* | `01eb3cd` |
+| **K2** | MOVE + rename | `architecture/deepseek_v4/kernels/v4_norm.hpp` | `platform/ops/rmsnorm.hpp` | 4 | `0d31224` |
+| **K3** | MOVE + rename | `architecture/deepseek_v4/kernels/v4_gemv.hpp` | `platform/ops/gemv.hpp` | 5 | `3e313a1` |
+
+All three landed with the normalized code-line multiset identical to the pre-move version (a single comment-title line corrected per file), brace balance intact, a full-tree build, and the seven kernel/graph gates green (`test_v4_{norm,mla,grouped_wo,shared_expert,attention_sink}_oracle`, `test_v4_graph_head`, `test_v4_sampler`).
 
 K1 is first because the sampler's only model include is the argmax kernel, so moving it unblocks the sampler (S2). K2 and K3 are independent. `v4_pipeline_ops.hpp` is **excluded** — it carries the model's SwiGLU clamp and stays a deferred split (§6).
 

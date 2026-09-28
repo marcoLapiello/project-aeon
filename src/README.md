@@ -19,6 +19,7 @@ src/backend/swizzled_w4a16/         Current quantized expert representation and 
   kernels/                           W4A16 swizzle, GEMV, and fused expert kernels
 
 src/platform/rdna3/                 RDNA3/HIP device selection and platform hooks
+src/platform/ops/                   Model-agnostic GPU primitives (rmsnorm, gemv, argmax)
 ```
 
 The infrastructure owns where model bytes live and how they move. The
