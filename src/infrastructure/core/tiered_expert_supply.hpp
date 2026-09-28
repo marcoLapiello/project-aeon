@@ -6,6 +6,7 @@
 #include "infrastructure/core/prefetch_staging.hpp"
 #include "infrastructure/core/supply_telemetry.hpp"
 #include "infrastructure/core/supply_telemetry_recorder.hpp"
+#include "infrastructure/core/supply_transfer_counters.hpp"
 #include "infrastructure/core/tiered_expert_supply_types.hpp"
 #include "infrastructure/io/direct_io_reader.hpp"
 
@@ -107,62 +108,51 @@ public:
     // whole layer's reads at once (1024 SQEs, ~4 GiB in flight) can block on the
     // device queue rather than on the CPU — a distinction the total dispatch time
     // cannot make.
-    uint64_t direct_io_submit_ns() const noexcept { return direct_io_submit_ns_; }
+    uint64_t direct_io_submit_ns() const noexcept { return counters_.direct_io_submit_ns; }
     uint64_t direct_io_requests_submitted() const noexcept {
-        return direct_io_requests_submitted_;
+        return counters_.direct_io_requests_submitted;
     }
-    uint64_t direct_io_submit_calls() const noexcept { return direct_io_submit_calls_; }
+    uint64_t direct_io_submit_calls() const noexcept { return counters_.direct_io_submit_calls; }
 
     // The transfer split, accumulated over **every** caller of this supply — the
     // swept prefill and decode both drive `dispatch`/`materialize`, so one set of
     // counters attributes both phases without a second instrumentation path.
     //
-    //   io_wait_ns_      host time blocked waiting for NVMe completions (`materialize`)
-    //   h2d_enqueue_ns_  CPU time to submit the H2D copies and record their events
-    //   h2d_drain_ns_    host time blocked waiting for those copies to land
-    //                    (`release_streamed_staging`'s per-slot event sync; sweep-only)
-    //   h2d_drain_calls_ how many `hipEventSynchronize` calls that took
+    //   counters_.io_wait_ns     host time blocked waiting for NVMe completions (`materialize`)
+    //   counters_.h2d_enqueue_ns CPU time to submit the H2D copies and record their events
+    //   counters_.h2d_drain_ns   host time blocked waiting for those copies to land
+    //                            (`release_streamed_staging`'s per-slot event sync; sweep-only)
+    //   counters_.h2d_drain_calls how many `hipEventSynchronize` calls that took
     //
     // The three answer two different questions: `io_wait` vs `h2d_drain` says whether
-    // the exposed load is disk-bound or PCIe-bound, and `h2d_drain_calls_` says how
+    // the exposed load is disk-bound or PCIe-bound, and `h2d_drain_calls` says how
     // much of the drain is the copy versus the per-slot driver round-trips.
-    uint64_t io_wait_ns() const noexcept { return io_wait_ns_; }
-    uint64_t h2d_enqueue_ns() const noexcept { return h2d_enqueue_ns_; }
-    uint64_t h2d_drain_ns() const noexcept { return h2d_drain_ns_; }
-    uint64_t h2d_drain_calls() const noexcept { return h2d_drain_calls_; }
+    uint64_t io_wait_ns() const noexcept { return counters_.io_wait_ns; }
+    uint64_t h2d_enqueue_ns() const noexcept { return counters_.h2d_enqueue_ns; }
+    uint64_t h2d_drain_ns() const noexcept { return counters_.h2d_drain_ns; }
+    uint64_t h2d_drain_calls() const noexcept { return counters_.h2d_drain_calls; }
     // CPU time in `dispatch`'s per-request loop: registry reservation, the two
     // `O(catalog)` scans, and the transfer record-keeping. The region the analysis's
     // §4 estimated and that no other counter covers.
-    uint64_t dispatch_cpu_ns() const noexcept { return dispatch_cpu_ns_; }
+    uint64_t dispatch_cpu_ns() const noexcept { return counters_.dispatch_cpu_ns; }
     // Staging slots released by the **completion** path rather than as a boundary
     // block: one per expert whose H2D copy's event fired and whose slot was therefore
     // handed back immediately (plan P2.2 / R3). A numerator against
     // `prefetch_staging_->slot_count()` it says how much of the arena drains
     // incrementally instead of at a boundary.
     uint64_t staging_released_on_completion() const noexcept {
-        return staging_released_on_completion_;
+        return counters_.staging_released_on_completion;
     }
 
     // Copy enqueues issued by the **non-blocking pump** (P2.3) rather than by the
     // blocking `materialize`. A numerator against the streamed expert count: it says
     // how much of a layer's upload was moved off the boundary into the previous body.
-    uint64_t copies_pumped() const noexcept { return copies_pumped_; }
+    uint64_t copies_pumped() const noexcept { return counters_.copies_pumped; }
 
     // Zeroes every transfer counter above so a caller can slice one phase (prefill,
     // then decode) without re-instantiating the supply. Counters only — no state is
     // reset, and the registry/arena are untouched.
-    void reset_transfer_counters() noexcept {
-        direct_io_submit_ns_ = 0;
-        direct_io_requests_submitted_ = 0;
-        direct_io_submit_calls_ = 0;
-        io_wait_ns_ = 0;
-        h2d_enqueue_ns_ = 0;
-        h2d_drain_ns_ = 0;
-        h2d_drain_calls_ = 0;
-        dispatch_cpu_ns_ = 0;
-        staging_released_on_completion_ = 0;
-        copies_pumped_ = 0;
-    }
+    void reset_transfer_counters() noexcept { counters_.reset(); }
 
     PayloadBatch dispatch(
         const std::vector<PayloadRequest>& requests,
@@ -418,7 +408,7 @@ public:
                 throw;
             }
         }
-        dispatch_cpu_ns_ += elapsed_ns(dispatch_cpu_started);
+        counters_.dispatch_cpu_ns += elapsed_ns(dispatch_cpu_started);
 
         if (submitted_direct_io) {
             const auto submit_started = std::chrono::steady_clock::now();
@@ -434,11 +424,11 @@ public:
                 }
                 throw;
             }
-            direct_io_submit_ns_ += static_cast<uint64_t>(
+            counters_.direct_io_submit_ns += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - submit_started).count());
-            direct_io_requests_submitted_ += submitted;
-            ++direct_io_submit_calls_;
+            counters_.direct_io_requests_submitted += submitted;
+            ++counters_.direct_io_submit_calls;
             const auto submitted_at = std::chrono::steady_clock::now();
             for (const auto& state : batch.transfers) {
                 if (!state.io_pending) continue;
@@ -482,11 +472,11 @@ public:
             check_hip(
                 hipEventSynchronize(prefetch_staging_->events[staging_idx]),
                 "hipEventSynchronize(stream staging)");
-            ++h2d_drain_calls_;
+            ++counters_.h2d_drain_calls;
             prefetch_staging_->release_after_gpu_transfer(staging_idx);
             state.is_prefetched = false;
         }
-        h2d_drain_ns_ += elapsed_ns(drain_started);
+        counters_.h2d_drain_ns += elapsed_ns(drain_started);
     }
 
     void materialize(PayloadBatch& batch) {
@@ -584,7 +574,7 @@ public:
             }
 
             const uint32_t staging_idx = state.staging_idx;
-            io_wait_ns_ += elapsed_ns(io_wait_started);
+            counters_.io_wait_ns += elapsed_ns(io_wait_started);
             // The blocking path is used where a VRAM slot is guaranteed (the sweep's
             // `materialize_entry`, after the previous layer released its block), so a
             // refusal here is a real defect rather than the staged-only deferral.
@@ -641,7 +631,7 @@ public:
             state.warm_host_slot >= 0 ? state.warm_host_slot
                                       : static_cast<int32_t>(staging_idx),
             state.vram_slot);
-        h2d_enqueue_ns_ += elapsed_ns(h2d_enqueue_started);
+        counters_.h2d_enqueue_ns += elapsed_ns(h2d_enqueue_started);
 
         state.is_prefetched = true;
         state.io_pending = false;
@@ -714,7 +704,7 @@ public:
                             "TieredExpertSupply: direct expert read returned a short payload");
                     }
                 }
-                io_wait_ns_ += elapsed_ns(io_wait_started);
+                counters_.io_wait_ns += elapsed_ns(io_wait_started);
                 state.io_pending = false;
                 state.io_complete = true;
             }
@@ -726,7 +716,7 @@ public:
                 ++enqueued;
             }
         }
-        copies_pumped_ += static_cast<uint64_t>(enqueued);
+        counters_.copies_pumped += static_cast<uint64_t>(enqueued);
         return enqueued;
     }
 
@@ -1052,7 +1042,7 @@ public:
             // simply reports `false`.
             if (transfer.has_staging && prefetch_staging_ != nullptr &&
                 prefetch_staging_->release_if_copying(transfer.staging_idx)) {
-                ++staging_released_on_completion_;
+                ++counters_.staging_released_on_completion;
             }
             const auto ready_at = std::chrono::steady_clock::now();
             const auto h2d_ns = transfer.h2d_enqueued_at.time_since_epoch().count() == 0
@@ -1119,16 +1109,9 @@ private:
     PrefetchStagingArena* prefetch_staging_{nullptr};
     SupplyTelemetry* supply_telemetry_{nullptr};
     aeon::io::DirectIOReader* direct_io_reader_{nullptr};
-    uint64_t direct_io_submit_ns_{0};
-    uint64_t direct_io_requests_submitted_{0};
-    uint64_t direct_io_submit_calls_{0};
-    uint64_t io_wait_ns_{0};
-    uint64_t h2d_enqueue_ns_{0};
-    uint64_t h2d_drain_ns_{0};
-    uint64_t h2d_drain_calls_{0};
-    uint64_t dispatch_cpu_ns_{0};
-    uint64_t staging_released_on_completion_{0};
-    uint64_t copies_pumped_{0};
+    // The transfer instrumentation: storage for the ten corridor counters. The
+    // mutation sites stay in `dispatch`/`materialize`/`reap`, next to what they cost.
+    SupplyTransferCounters counters_;
     std::unordered_map<uint64_t, aeon::io::DirectIOCompletion>* direct_io_completions_{nullptr};
     uint64_t* next_direct_io_id_{nullptr};
     hipStream_t compute_stream_{nullptr};
