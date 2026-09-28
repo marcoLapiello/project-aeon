@@ -5,6 +5,7 @@
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
 #include "infrastructure/core/supply_telemetry.hpp"
+#include "infrastructure/core/supply_telemetry_recorder.hpp"
 #include "infrastructure/core/tiered_expert_supply_types.hpp"
 #include "infrastructure/io/direct_io_reader.hpp"
 
@@ -90,6 +91,7 @@ public:
         demotion_stream_ = demotion_stream;
         expert_payload_bytes_ = expert_payload_bytes;
         demotion_queue_capacity_ = demotion_queue_capacity;
+        telemetry_recorder_.bind(supply_telemetry, expert_payload_bytes);
     }
 
     size_t expert_payload_bytes() const noexcept {
@@ -246,8 +248,8 @@ public:
             state.vram_slot = request.vram_slot;
             state.source_tier = request.source_tier;
 
-            record_supply_request(request);
-            observe_supply_occupancy(request.source_tier);
+            telemetry_recorder_.record_request(request);
+            telemetry_recorder_.observe_occupancy(request.source_tier, *expert_registry_, host_pool_);
             leased_experts.push_back(request.global_expert_id);
 
             if (request.kind == ExpertRequestKind::HOT_HIT) {
@@ -1083,44 +1085,6 @@ public:
         }
     }
 
-    void record_supply_request(const ExpertRequestReservation& request) {
-        const bool physical_transfer = request.kind != ExpertRequestKind::HOT_HIT &&
-                                       request.kind != ExpertRequestKind::PENDING;
-        const uint64_t logical_bytes = request.source_tier == ExpertTier::HOT_VRAM
-            ? 0
-            : expert_payload_bytes();
-        supply_telemetry_->record_request(
-            supply_telemetry_->current_phase(),
-            request.source_tier,
-            logical_bytes,
-            physical_transfer ? expert_payload_bytes() : 0,
-            request.source_tier == ExpertTier::COLD_NVME && physical_transfer
-                ? expert_payload_bytes() : 0,
-            request.source_tier == ExpertTier::WARM_HOST && physical_transfer
-                ? expert_payload_bytes() : 0,
-            request.source_tier == ExpertTier::COLD_NVME && physical_transfer
-                ? expert_payload_bytes() : 0
-        );
-    }
-
-    void observe_supply_occupancy(ExpertTier source_tier) {
-        const uint64_t warm_pinned_bytes = host_pool_
-            ? static_cast<uint64_t>(host_pool_->pinned_slot_count()) * host_pool_->payload_bytes()
-            : 0;
-        const uint64_t warm_unpinned_bytes = host_pool_
-            ? static_cast<uint64_t>(host_pool_->unpinned_slot_count()) * host_pool_->payload_bytes()
-            : 0;
-        supply_telemetry_->observe_occupancy(
-            expert_registry_->published_hot_slots(),
-            expert_registry_->published_warm_slots(),
-            expert_registry_->pending_transfer_count(),
-            expert_registry_->pending_demotion_count,
-            warm_pinned_bytes,
-            warm_unpinned_bytes,
-            source_tier
-        );
-    }
-
     void clear() noexcept {
         for (auto& transfer : registry_transfers_) {
             if (transfer.demotion_event != nullptr) {
@@ -1173,6 +1137,10 @@ private:
     hipStream_t demotion_stream_{nullptr};
     size_t expert_payload_bytes_{0};
     uint64_t demotion_queue_capacity_{0};
+    // The two derived telemetry records (request classification, occupancy
+    // sampling). The pass-through transfer/demotion/timing events still call
+    // `supply_telemetry_` directly; wrapping those would be pure indirection.
+    SupplyTelemetryRecorder telemetry_recorder_;
     std::vector<PendingTransfer> registry_transfers_;
 };
 

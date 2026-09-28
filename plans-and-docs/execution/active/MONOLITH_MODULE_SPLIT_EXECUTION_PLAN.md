@@ -63,11 +63,12 @@ The header itself says it is the G1 composition root; the target is to shrink it
 - **Deviation, deliberate:** `run_layer_body_attention_tail` stayed in the orchestrator rather than moving to the attention header as first sketched. It composes attention *and* router *and* MoE, so putting it in a phase header would force an attention→MoE (or MoE→attention) include edge between two peers. The orchestrator owns phase sequencing (it already owns `run_layer_body_decoding`), so both phase headers stay mutually independent. The function itself is unchanged.
 - **Verification:** the non-comment, non-include, non-blank code lines of the four new headers are a **multiset-identical** match to the original body's — a pure move, zero arithmetic touched. **Gate:** `test_v4_layer_body_oracle`, `..._serial_oracle`, `..._compressed_oracle`, `..._chunk_oracle`, `test_v4_expert_executor`, `test_v4_layer_body_lifecycle`, `test_v4_graph_body` pass unchanged; `test_v4_state_restore`, `test_v4_real_scale_state`, `test_v4_engine`, `aeon_chat` build.
 
-### B2. `tiered_expert_supply.hpp` → collaborator seams (fan-in 2, but 1249 lines)
+### B2. `tiered_expert_supply.hpp` → collaborator seams (fan-in 2, but 1249 lines) — ✅ done 2026-09-28
 Low fan-in, so low caller churn; the value is readability of the hot path.
-- [ ] Move `PayloadLocation` / `PayloadSource` / `PayloadRequest` / `PayloadTransfer` / `PayloadBatch` / `PendingTransfer` to `tiered_expert_supply_types.hpp`.
-- [ ] Separate the module from any remaining telemetry surface once §0 of the [supply-chain plan](../completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md) §1 counters are the only telemetry left (do not move counters that a deferred Phase 3 item still edits).
-- [ ] **Gate:** `test_v4_expert_tiering`, `test_supply_telemetry`, `test_v4_staging_depth` pass unchanged.
+- [x] `tiered_expert_supply_types.hpp` — the six payload structs, defined at namespace scope; the supply re-exports them under their `TieredExpertSupply::X` spellings with `using` aliases, so no caller changed.
+- [x] `supply_telemetry_recorder.hpp` — `SupplyTelemetryRecorder` owns the two **derived** records (the request's logical/physical byte classification, and the pinned/unpinned Warm occupancy sampling).
+- **Deviation, deliberate:** only the two derived records were extracted. The lifecycle's other ~18 telemetry calls are pass-through forwards of values it already holds, so wrapping them would be pure indirection with no readability gain — and the plan's original "once the counters are the only telemetry left" premise does not hold: the sink is used in 20 places across 8 methods. The counters (a) stay in place, as agreed, because the deferred Phase 3 items still edit the code they instrument.
+- **Gate:** `test_v4_expert_tiering`, `test_supply_telemetry`, `test_v4_staging_depth`, and `test_v4_engine` pass unchanged.
 
 ---
 
@@ -133,7 +134,7 @@ Explicitly **not** scheduled. Listed so the inventory is complete and so a futur
 | A1 | `memory_budget.hpp` → 3 units | ✅ |
 | A2 | `v4_model_host.hpp` → owner + 3 controllers | ✅ |
 | B1 | `v4_layer_body.hpp` → types + phases | ✅ |
-| B2 | `tiered_expert_supply.hpp` → types + seams | ☐ |
+| B2 | `tiered_expert_supply.hpp` → types + seams | ✅ |
 | C1 | `expert_registry.hpp` → registry + partition + residency + validation | ☐ |
 | C2 | `v4_prefill_sweep.hpp` → sweep + lookahead policy | ☐ |
 | C3 | `v4_attention.hpp` → kernels by concern (+ anti-circularity check) | ☐ |

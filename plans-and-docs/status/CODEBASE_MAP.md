@@ -38,7 +38,7 @@ The production-facing implementation is:
 - `src/architecture/deepseek_v4/core/v4_layer_body.hpp` - the single layer body (decode and chunk share it): the orchestrator for the per-token attention tail and the decode body. Its types live in `v4_layer_body_types.hpp`, its attention phases in `v4_layer_body_attention.hpp`, and its MoE phases (with the `V4RoutedExpertExecutor` seam) in `v4_layer_body_moe.hpp`.
 - `src/architecture/deepseek_v4/core/v4_model_resources.hpp` - RoPE caches and model-level resident weights.
 - `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` - six-expert V4 request adapter and Aeon payload-source mapping.
-- `src/infrastructure/core/tiered_expert_supply.hpp` - architecture-neutral tiered payload movement and transfer lifecycle.
+- `src/infrastructure/core/tiered_expert_supply.hpp` - architecture-neutral tiered payload movement and transfer lifecycle. Its payload vocabulary lives in `tiered_expert_supply_types.hpp` (re-exported as `TieredExpertSupply::X`), and its two derived telemetry records in `supply_telemetry_recorder.hpp`.
 - `src/infrastructure/core/aeon_loader.hpp` - native `.aeon` dense and expert container access.
 - `src/architecture/deepseek_v4/core/memory_budget.hpp` - umbrella over the V4 memory budget: `aeon_runtime_config.hpp` (the knobs, safety margins, scratch allowances, staging slot counts), `memory_budget_report.hpp` (`MemoryBudgetReport` and its derived terms), and `memory_budget_engine.hpp` (the device/host query and feasibility evaluation).
 - `src/backend/swizzled_w4a16/core/vram_expert_pool.hpp` - current backend's Tier 1 hot expert pool.
