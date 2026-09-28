@@ -53,7 +53,7 @@
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/core/config.hpp"
-#include "architecture/deepseek_v4/core/memory_budget.hpp"
+#include "infrastructure/core/memory_budget.hpp"
 #include "infrastructure/core/device_streams.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_executor.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
@@ -66,6 +66,7 @@
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_model_resources.hpp"
 #include "architecture/deepseek_v4/core/v4_model_spec.hpp"
+#include "architecture/deepseek_v4/core/v4_memory_geometry.hpp"
 #include "architecture/deepseek_v4/core/v4_activation_scratch.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "infrastructure/backend_registry/expert_backend.hpp"
@@ -140,7 +141,8 @@ public:
         // authority on the uploaded set — the same table that validates the
         // artifact — so the budget cannot drift from what is placed on the device.
         budget_ = MemoryBudgetEngine::evaluate(
-            runtime_cfg, config_, V4ModelContract::uploaded_dense_bytes(config_), expert_format);
+            runtime_cfg, make_v4_memory_geometry(config_),
+            V4ModelContract::uploaded_dense_bytes(config_), expert_format);
         if (!budget_.is_feasible) {
             throw std::runtime_error(
                 "V4ModelHost: the memory budget rejected this configuration: " +

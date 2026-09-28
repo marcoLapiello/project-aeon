@@ -4,16 +4,16 @@
 // The memory budget engine: the code that queries the device and host, evaluates
 // feasibility, and derives the tier partition from the runtime knobs.
 //
-// It reads `AeonRuntimeConfig` (the input), produces `MemoryBudgetReport` (the
-// output), and is the only part of the budget that touches HIP or `sysinfo`. The
-// report and the config are separate headers so a caller can read the report's
-// shape without pulling in the device query.
+// It reads `AeonRuntimeConfig` (the knobs) and `ModelMemoryGeometry` (what only the
+// architecture knows), produces `MemoryBudgetReport` (the output), and is the only
+// part of the budget that touches HIP or `sysinfo`. The report and the geometry are
+// separate headers so a caller can read the report's shape without pulling in the
+// device query, and so the engine reads no model type at all.
 // -----------------------------------------------------------------------------
 
+#include "infrastructure/core/model_memory_geometry.hpp"
+#include "infrastructure/core/memory_budget_report.hpp"
 #include "infrastructure/core/runtime_config.hpp"
-#include "architecture/deepseek_v4/core/config.hpp"
-#include "architecture/deepseek_v4/core/memory_budget_report.hpp"
-#include "architecture/deepseek_v4/core/v4_layer_state.hpp"
 #include "infrastructure/core/expert_format.hpp"
 
 #include <hip/hip_runtime.h>
@@ -32,33 +32,9 @@ namespace aeon::core {
 
 class MemoryBudgetEngine {
 public:
-    static AttentionStateMemory attention_state_memory(
-        const DeepSeekV4Config& model_cfg,
-        uint32_t context_size
-    ) {
-        if (context_size == 0) {
-            throw std::invalid_argument("MemoryBudgetEngine: attention context cannot be 0");
-        }
-        const auto layer_specs = V4ModelSpec::resolve_layers(model_cfg);
-        AttentionStateMemory memory;
-        for (const auto& layer_spec : layer_specs) {
-            const auto layout = V4LayerStateLayout::from_spec(layer_spec, context_size);
-            memory.local_kv_bytes += layout.local_cache_bytes();
-            memory.compressed_kv_bytes += layout.compressed_cache_bytes();
-            memory.compressor_state_bytes += layout.compressor_state_bytes();
-            memory.indexer_state_bytes += layout.indexer_cache_bytes() + layout.indexer_workspace_bytes();
-            memory.metadata_bytes += layout.local_metadata_bytes() + layout.compressed_metadata_bytes();
-            memory.layer_state_bytes += layout.total_device_bytes();
-        }
-
-        const size_t rope_half = static_cast<size_t>(model_cfg.qk_rope_head_dim / 2);
-        memory.rope_bytes = static_cast<size_t>(context_size) * rope_half * sizeof(float) * 4;
-        return memory;
-    }
-
     static MemoryBudgetReport evaluate(
         const AeonRuntimeConfig& runtime_cfg,
-        const DeepSeekV4Config& model_cfg,
+        const ModelMemoryGeometry& geometry,
         size_t dense_weights_bytes,
         const ExpertFormatDescriptor& expert_format
     ) {
@@ -71,9 +47,9 @@ public:
             return report;
         }
 
-        if (model_cfg.num_hidden_layers < 0 || model_cfg.n_routed_experts < 0 ||
-            expert_format.num_layers != static_cast<uint32_t>(model_cfg.num_hidden_layers) ||
-            expert_format.experts_per_layer != static_cast<uint32_t>(model_cfg.n_routed_experts)) {
+        if (geometry.num_hidden_layers < 0 || geometry.routed_experts < 0 ||
+            expert_format.num_layers != static_cast<uint32_t>(geometry.num_hidden_layers) ||
+            expert_format.experts_per_layer != static_cast<uint32_t>(geometry.routed_experts)) {
             report.rejection_reason =
                 "Expert format catalog does not match the model configuration";
             return report;
@@ -120,17 +96,17 @@ public:
             return report;
         }
 
-        if (runtime_cfg.context_size > static_cast<uint32_t>(model_cfg.max_position_embeddings)) {
+        if (runtime_cfg.context_size > static_cast<uint32_t>(geometry.max_position_embeddings)) {
             report.is_feasible = false;
             report.rejection_reason = "Requested context size (" + std::to_string(runtime_cfg.context_size) +
                 ") exceeds model max_position_embeddings (" +
-                std::to_string(model_cfg.max_position_embeddings) + ")";
+                std::to_string(geometry.max_position_embeddings) + ")";
             return report;
         }
 
         AttentionStateMemory attention_memory;
         try {
-            attention_memory = attention_state_memory(model_cfg, runtime_cfg.context_size);
+            attention_memory = geometry.attention_state_memory(runtime_cfg.context_size);
         } catch (const std::exception& error) {
             report.rejection_reason = error.what();
             return report;
@@ -152,7 +128,7 @@ public:
         // The `100 MiB` literal this replaces was wrong in both directions — it
         // over-counted decode scratch several-fold and did not cover the batch scratch
         // at all.
-        const size_t carry_bytes = prefill_carry_bytes(runtime_cfg, model_cfg);
+        const size_t carry_bytes = prefill_carry_bytes(runtime_cfg, geometry);
         report.vram_prefill_carry_bytes = runtime_cfg.prefill_sweep ? carry_bytes : 0;
         report.vram_batch_scratch_bytes = runtime_cfg.prefill_sweep
             ? batch_scratch_allowance_bytes(std::max<uint32_t>(1, runtime_cfg.prefill_chunk))
@@ -170,7 +146,7 @@ public:
 
         // Minimum active experts needed for execution:
         // 2 * num_experts_per_tok to guarantee compute + prefetch buffering without stalling
-        uint32_t min_active_slots = static_cast<uint32_t>(2 * model_cfg.num_experts_per_tok);
+        uint32_t min_active_slots = static_cast<uint32_t>(2 * geometry.experts_per_tok);
         report.vram_min_active_bytes = static_cast<size_t>(min_active_slots) *
                            expert_format.payload_bytes;
 
@@ -186,10 +162,10 @@ public:
                                                report.vram_headroom_bytes + report.vram_min_active_bytes;
         if (report.usable_vram_bytes > non_attention_required) {
             size_t low = 0;
-            size_t high = static_cast<size_t>(model_cfg.max_position_embeddings);
+            size_t high = static_cast<size_t>(geometry.max_position_embeddings);
             while (low < high) {
                 const size_t midpoint = low + (high - low + 1) / 2;
-                const auto candidate = attention_state_memory(model_cfg, static_cast<uint32_t>(midpoint));
+                const auto candidate = geometry.attention_state_memory(static_cast<uint32_t>(midpoint));
                 if (non_attention_required + candidate.total_bytes() <= report.usable_vram_bytes) {
                     low = midpoint;
                 } else {
@@ -317,16 +293,16 @@ public:
 
     static MemoryBudgetReport evaluate(
         const AeonRuntimeConfig& runtime_cfg,
-        const DeepSeekV4Config& model_cfg,
+        const ModelMemoryGeometry& geometry,
         size_t dense_weights_bytes
     ) {
         return evaluate(
             runtime_cfg,
-            model_cfg,
+            geometry,
             dense_weights_bytes,
             make_current_swizzled_expert_format(
-                model_cfg.num_hidden_layers,
-                model_cfg.n_routed_experts));
+                static_cast<uint32_t>(geometry.num_hidden_layers),
+                static_cast<uint32_t>(geometry.routed_experts)));
     }
 };
 

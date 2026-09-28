@@ -62,7 +62,7 @@
 // the conversation, which is what the model was trained on.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/memory_budget.hpp"
+#include "infrastructure/core/memory_budget.hpp"
 #include "architecture/deepseek_v4/core/v4_graph.hpp"
 #include "architecture/deepseek_v4/core/v4_model_host.hpp"
 #include "infrastructure/core/sampler.hpp"

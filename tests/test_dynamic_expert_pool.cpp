@@ -1,8 +1,9 @@
 #include "infrastructure/core/aeon_loader.hpp"
 #include "architecture/deepseek_v4/core/config.hpp"
+#include "architecture/deepseek_v4/core/v4_memory_geometry.hpp"
 #include "platform/rdna3/device.hpp"
 #include "infrastructure/core/expert_registry.hpp"
-#include "architecture/deepseek_v4/core/memory_budget.hpp"
+#include "infrastructure/core/memory_budget.hpp"
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 
@@ -23,6 +24,7 @@ int main() {
     std::string aeon_model_dir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
     std::string config_path = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon/config.json";
     auto model_cfg = aeon::core::DeepSeekV4Config::load_from_json(config_path);
+    const auto geometry = aeon::core::make_v4_memory_geometry(model_cfg);
     aeon::core::AeonModelLoader loader;
     loader.open_model(aeon_model_dir);
     // What the graph uploads, not the container's file size — the same basis
@@ -39,7 +41,7 @@ int main() {
     overbudget_cfg.warm_host_bytes = 0;   // Warm disabled
 
     auto overbudget_report = aeon::core::MemoryBudgetEngine::evaluate(
-        overbudget_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
+        overbudget_cfg, geometry, dense_weights_bytes, loader.expert_format());
     std::cout << overbudget_report.to_string() << std::endl;
     assert(!overbudget_report.is_feasible);
     assert(overbudget_report.max_viable_context_size > 0);
@@ -55,7 +57,7 @@ int main() {
     valid_cfg.warm_host_bytes = 0; // Warm disabled
 
     auto valid_report = aeon::core::MemoryBudgetEngine::evaluate(
-        valid_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
+        valid_cfg, geometry, dense_weights_bytes, loader.expert_format());
     std::cout << valid_report.to_string() << std::endl;
     assert(valid_report.is_feasible);
     assert(valid_report.hot_vram_slots >= 12); // Must guarantee at least 2*num_experts_per_tok
@@ -79,20 +81,20 @@ int main() {
 
         capped_cfg.max_hot_vram_slots = 12;
         auto capped = aeon::core::MemoryBudgetEngine::evaluate(
-            capped_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
+            capped_cfg, geometry, dense_weights_bytes, loader.expert_format());
         assert(capped.is_feasible);
         assert(capped.hot_vram_slots == 12);
         assert(capped.hot_vram_slots < valid_report.hot_vram_slots);
 
         capped_cfg.max_hot_vram_slots = 3;  // below one layer's experts -> floored to 6
         auto floored = aeon::core::MemoryBudgetEngine::evaluate(
-            capped_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
+            capped_cfg, geometry, dense_weights_bytes, loader.expert_format());
         assert(floored.is_feasible);
         assert(floored.hot_vram_slots == 6);
 
         capped_cfg.max_hot_vram_slots = valid_report.hot_vram_slots + 1000;  // above derived -> no effect
         auto uncapped = aeon::core::MemoryBudgetEngine::evaluate(
-            capped_cfg, model_cfg, dense_weights_bytes, loader.expert_format());
+            capped_cfg, geometry, dense_weights_bytes, loader.expert_format());
         assert(uncapped.is_feasible);
         assert(uncapped.hot_vram_slots == valid_report.hot_vram_slots);
 

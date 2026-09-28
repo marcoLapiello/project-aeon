@@ -1,21 +1,23 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// The memory budget's *output*: the report a caller inspects, plus the two
-// derived quantities that belong to it.
+// The memory budget's *output*: the report a caller inspects, plus the derived
+// quantity that belongs to it.
 //
 // `MemoryBudgetReport` is pure data plus a `to_string()` dump — no hardware query
-// and no policy. `AttentionStateMemory` is the per-context attention-state
-// breakdown the engine fills it from, and `prefill_carry_bytes` is the residual
-// carry for the configured window, which the report carries as its own term.
+// and no policy. `AttentionStateMemory` (the per-context attention-state breakdown)
+// and `ModelMemoryGeometry` the engine consumes live in
+// `model_memory_geometry.hpp`; this header holds only the output and the residual
+// carry derived from it.
 //
 // Splitting the report from the engine keeps the data a caller reads independent
 // of the code that queries the device, which is what lets a test construct a
-// report without a GPU.
+// report without a GPU. Splitting it from the model config is what lets it live in
+// `infrastructure/`.
 // -----------------------------------------------------------------------------
 
+#include "infrastructure/core/model_memory_geometry.hpp"
 #include "infrastructure/core/runtime_config.hpp"
-#include "architecture/deepseek_v4/core/config.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -25,23 +27,6 @@
 #include <string>
 
 namespace aeon::core {
-
-// The attention-state cost of one context, broken down by the owner of each term.
-// Produced by `MemoryBudgetEngine::attention_state_memory` from the resolved layer
-// specs; held here because it is report data, not engine policy.
-struct AttentionStateMemory {
-    size_t local_kv_bytes{0};
-    size_t compressed_kv_bytes{0};
-    size_t compressor_state_bytes{0};
-    size_t indexer_state_bytes{0};
-    size_t metadata_bytes{0};
-    size_t layer_state_bytes{0};
-    size_t rope_bytes{0};
-
-    size_t total_bytes() const {
-        return layer_state_bytes + rope_bytes;
-    }
-};
 
 struct MemoryBudgetReport {
     bool is_feasible{false};
@@ -176,18 +161,17 @@ struct MemoryBudgetReport {
 };
 
 // The residual carry's bytes for the configured prefill window: the fp16 broadcast
-// and the fp32 copy, per token, over the `hc_mult * hidden_size` stream width.
-// Derived rather than assumed, because it scales with the configured window and at
-// a whole-context window it is gigabytes — not a rounding error on the expert pool.
+// and the fp32 copy, per token, over the residual stream width. The per-token
+// figure comes from the model's geometry; the window comes from the knobs. Derived
+// rather than assumed, because it scales with the configured window and at a
+// whole-context window it is gigabytes — not a rounding error on the expert pool.
 inline size_t prefill_carry_bytes(const AeonRuntimeConfig& runtime_cfg,
-                                  const DeepSeekV4Config& model_cfg) {
+                                  const ModelMemoryGeometry& geometry) {
     const uint32_t ctx = runtime_cfg.context_size;
     const uint32_t window = runtime_cfg.prefill_window == 0
         ? ctx
         : std::min(runtime_cfg.prefill_window, ctx);
-    const size_t hc_dim = static_cast<size_t>(model_cfg.hc_mult) *
-                          static_cast<size_t>(model_cfg.hidden_size);
-    return static_cast<size_t>(window) * hc_dim * (sizeof(uint16_t) + sizeof(float));
+    return static_cast<size_t>(window) * geometry.prefill_carry_bytes_per_token;
 }
 
 } // namespace aeon::core
