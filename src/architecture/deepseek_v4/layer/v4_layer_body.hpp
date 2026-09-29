@@ -31,9 +31,9 @@
 //     weights came from, and a gate can supply experts directly.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_layer_body_types.hpp"
-#include "architecture/deepseek_v4/core/v4_layer_body_attention.hpp"
-#include "architecture/deepseek_v4/core/v4_layer_body_moe.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body_types.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body_attention.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body_moe.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>

@@ -32,7 +32,7 @@
 
 #include "platform/rdna3/device.hpp"
 #include "architecture/deepseek_v4/kernels/moe_router.hpp"
-#include "architecture/deepseek_v4/core/config.hpp"
+#include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
 

@@ -1760,7 +1760,7 @@ inline std::vector<double> dense_ffn(size_t intermediate, size_t hidden,
 // exists to certify: the primitives are proved individually, and the failure
 // mode of a layer is the wiring between them, not the pieces.
 //
-// One function, mirroring the device: `core/v4_layer_body.hpp` is a single body
+// One function, mirroring the device: `layer/v4_layer_body.hpp` is a single body
 // with exactly one structural branch — the attention class. So is this.
 //
 //   HC attention pre-mix + Sinkhorn            -> x_pre        (all)
@@ -2569,7 +2569,7 @@ inline LayerBodyResult layer_body(
 //     model's Hyper-Connections dimension enters as `hc_mult x hidden` with the
 //     identical row in every stream;
 //   * the head is exactly `hc_head_reduce` -> `rmsnorm` -> `matvec`, which is the
-//     order `core/v4_graph.hpp::head_stage` dispatches its three kernels in.
+//     order `runtime/v4_graph.hpp::head_stage` dispatches its three kernels in.
 //
 // The oracle is written **before** the driver that is checked against it: an
 // oracle written after the implementation is written to agree with it. Nothing

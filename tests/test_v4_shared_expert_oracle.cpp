@@ -24,7 +24,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
-#include "architecture/deepseek_v4/core/config.hpp"
+#include "architecture/deepseek_v4/spec/config.hpp"
 #include "platform/ops/gemv.hpp"
 #include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"

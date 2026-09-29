@@ -22,7 +22,7 @@
 //     spend their budget on the serial state and the compressed path.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_layer_body.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"

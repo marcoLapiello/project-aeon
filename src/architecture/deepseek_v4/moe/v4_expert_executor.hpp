@@ -49,8 +49,8 @@
 
 #include "infrastructure/core/device_streams.hpp"
 #include "infrastructure/core/expert_lease_holder.hpp"
-#include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
-#include "architecture/deepseek_v4/core/v4_layer_body.hpp"
+#include "architecture/deepseek_v4/moe/v4_expert_supply.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
 #include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"

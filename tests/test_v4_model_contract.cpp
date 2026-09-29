@@ -1,5 +1,5 @@
-#include "architecture/deepseek_v4/core/config.hpp"
-#include "architecture/deepseek_v4/core/v4_model_contract.hpp"
+#include "architecture/deepseek_v4/spec/config.hpp"
+#include "architecture/deepseek_v4/spec/v4_model_contract.hpp"
 
 #include <cassert>
 #include <functional>

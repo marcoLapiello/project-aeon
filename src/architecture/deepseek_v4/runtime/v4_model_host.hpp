@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------------
 // The model host — what is resident, in the order the assembly has to happen.
 //
-// Deliberately *not* the forward pass: the graph (`core/v4_graph.hpp`) owns the order
+// Deliberately *not* the forward pass: the graph (`runtime/v4_graph.hpp`) owns the order
 // of operations, and this owns the objects they read and write. The split is what
 // keeps the graph small enough to read — nothing in this file knows what a token is,
 // and nothing in the graph knows how a tensor got into VRAM.
@@ -42,22 +42,22 @@
 // own accounting is cross-checked against what was actually allocated.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/config.hpp"
+#include "architecture/deepseek_v4/spec/config.hpp"
 #include "infrastructure/core/memory_budget.hpp"
 #include "infrastructure/core/device_streams.hpp"
-#include "architecture/deepseek_v4/core/v4_expert_executor.hpp"
-#include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
-#include "architecture/deepseek_v4/core/v4_layer.hpp"
-#include "architecture/deepseek_v4/core/v4_layer_body.hpp"
-#include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
-#include "architecture/deepseek_v4/core/v4_prefill_workspace.hpp"
+#include "architecture/deepseek_v4/moe/v4_expert_executor.hpp"
+#include "architecture/deepseek_v4/moe/v4_expert_supply.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body_batch.hpp"
+#include "architecture/deepseek_v4/runtime/v4_prefill_workspace.hpp"
 #include "infrastructure/core/host_partition.hpp"
 #include "infrastructure/core/prefill_controller.hpp"
-#include "architecture/deepseek_v4/core/v4_model_contract.hpp"
-#include "architecture/deepseek_v4/core/v4_model_resources.hpp"
-#include "architecture/deepseek_v4/core/v4_model_spec.hpp"
-#include "architecture/deepseek_v4/core/v4_memory_geometry.hpp"
-#include "architecture/deepseek_v4/core/v4_activation_scratch.hpp"
+#include "architecture/deepseek_v4/spec/v4_model_contract.hpp"
+#include "architecture/deepseek_v4/runtime/v4_model_resources.hpp"
+#include "architecture/deepseek_v4/spec/v4_model_spec.hpp"
+#include "architecture/deepseek_v4/spec/v4_memory_geometry.hpp"
+#include "architecture/deepseek_v4/layer/v4_activation_scratch.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "infrastructure/backend_registry/expert_backend.hpp"
 #include "infrastructure/core/aeon_loader.hpp"

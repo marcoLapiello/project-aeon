@@ -57,10 +57,10 @@
 
 #include "platform/rdna3/device.hpp"
 
-#include "architecture/deepseek_v4/core/config.hpp"
-#include "architecture/deepseek_v4/core/v4_graph.hpp"
-#include "architecture/deepseek_v4/core/v4_model_host.hpp"
-#include "architecture/deepseek_v4/core/v4_model_spec.hpp"
+#include "architecture/deepseek_v4/spec/config.hpp"
+#include "architecture/deepseek_v4/runtime/v4_graph.hpp"
+#include "architecture/deepseek_v4/runtime/v4_model_host.hpp"
+#include "architecture/deepseek_v4/spec/v4_model_spec.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
 #include "support/v4_layer_body_gate.hpp"

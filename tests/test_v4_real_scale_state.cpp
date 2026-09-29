@@ -68,10 +68,10 @@
 
 #include "platform/rdna3/device.hpp"
 
-#include "architecture/deepseek_v4/core/config.hpp"
-#include "architecture/deepseek_v4/core/v4_layer.hpp"
-#include "architecture/deepseek_v4/core/v4_layer_body.hpp"
-#include "architecture/deepseek_v4/core/v4_model_spec.hpp"
+#include "architecture/deepseek_v4/spec/config.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
+#include "architecture/deepseek_v4/spec/v4_model_spec.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
 #include "support/v4_layer_body_gate.hpp"
 

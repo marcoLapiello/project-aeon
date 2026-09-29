@@ -31,8 +31,8 @@
 // sampler, where there is a consumer.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
-#include "architecture/deepseek_v4/core/v4_model_host.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body_batch.hpp"
+#include "architecture/deepseek_v4/runtime/v4_model_host.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "platform/ops/gemv.hpp"
 #include "platform/ops/rmsnorm.hpp"

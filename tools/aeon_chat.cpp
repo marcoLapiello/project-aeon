@@ -26,7 +26,7 @@
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/core/memory_budget.hpp"
-#include "architecture/deepseek_v4/core/v4_engine.hpp"
+#include "architecture/deepseek_v4/runtime/v4_engine.hpp"
 #include "platform/rdna3/device.hpp"
 
 #include <cstdlib>

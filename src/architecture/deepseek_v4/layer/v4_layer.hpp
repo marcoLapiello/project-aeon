@@ -1,7 +1,7 @@
 #pragma once
 
-#include "architecture/deepseek_v4/core/v4_dense_weight_binding.hpp"
-#include "architecture/deepseek_v4/core/v4_layer_state.hpp"
+#include "architecture/deepseek_v4/spec/v4_dense_weight_binding.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_state.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 
 #include <hip/hip_fp16.h>

@@ -16,7 +16,7 @@
 //
 // A caller that wants only the report shape can include that header directly; a
 // caller that evaluates the budget supplies a `ModelMemoryGeometry` built by its
-// architecture (V4's is `architecture/deepseek_v4/core/v4_memory_geometry.hpp`).
+// architecture (V4's is `architecture/deepseek_v4/spec/v4_memory_geometry.hpp`).
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/core/runtime_config.hpp"

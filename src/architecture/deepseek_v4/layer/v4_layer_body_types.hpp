@@ -10,9 +10,9 @@
 // `v4_layer_body.hpp` so the phase headers can share it without a cycle.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_activation_scratch.hpp"
-#include "architecture/deepseek_v4/core/v4_attention_trace.hpp"
-#include "architecture/deepseek_v4/core/v4_layer.hpp"
+#include "architecture/deepseek_v4/layer/v4_activation_scratch.hpp"
+#include "architecture/deepseek_v4/layer/v4_attention_trace.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer.hpp"
 #include "infrastructure/hip_check.hpp"
 
 #include <hip/hip_fp16.h>

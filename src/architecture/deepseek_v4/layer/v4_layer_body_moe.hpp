@@ -9,7 +9,7 @@
 // See `v4_layer_body_types.hpp` for the shared row and tables.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_layer_body_types.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body_types.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "architecture/deepseek_v4/kernels/moe_router.hpp"
 #include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"

@@ -39,7 +39,7 @@
 // token in the chunk can reach its slot. A chunk of any length is therefore safe.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_layer_body.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
 
 #include <hip/hip_runtime.h>
 

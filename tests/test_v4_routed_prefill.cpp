@@ -22,8 +22,8 @@
 #include "platform/rdna3/device.hpp"
 
 #include "infrastructure/core/memory_budget.hpp"
-#include "architecture/deepseek_v4/core/v4_graph.hpp"
-#include "architecture/deepseek_v4/core/v4_model_host.hpp"
+#include "architecture/deepseek_v4/runtime/v4_graph.hpp"
+#include "architecture/deepseek_v4/runtime/v4_model_host.hpp"
 #include "infrastructure/hip_check.hpp"
 
 #include <hip/hip_fp16.h>

@@ -11,7 +11,7 @@
 // tables.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_layer_body_types.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body_types.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "platform/ops/cast.hpp"
 

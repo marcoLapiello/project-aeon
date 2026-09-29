@@ -69,8 +69,8 @@
 
 #include "platform/rdna3/device.hpp"
 
-#include "architecture/deepseek_v4/core/v4_graph.hpp"
-#include "architecture/deepseek_v4/core/v4_model_host.hpp"
+#include "architecture/deepseek_v4/runtime/v4_graph.hpp"
+#include "architecture/deepseek_v4/runtime/v4_model_host.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "support/v4_layer_body_gate.hpp"
 

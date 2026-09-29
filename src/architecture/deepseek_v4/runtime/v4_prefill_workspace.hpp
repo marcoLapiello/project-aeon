@@ -22,9 +22,9 @@
 
 #include "infrastructure/core/prefill_carry.hpp"
 #include "infrastructure/core/runtime_config.hpp"
-#include "architecture/deepseek_v4/core/config.hpp"
-#include "architecture/deepseek_v4/core/v4_layer.hpp"
-#include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
+#include "architecture/deepseek_v4/spec/config.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer_body_batch.hpp"
 #include "infrastructure/hip_check.hpp"
 
 #include <hip/hip_runtime.h>
