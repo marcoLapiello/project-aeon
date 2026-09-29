@@ -52,6 +52,12 @@ if(AEON_BUILD_BENCHMARKS)
             tests/bench_supply_split.cpp
             src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
             src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp)
+
+    # The expert pair A/B that sizes the chunk: GEMV-pair versus grouped-WMMA
+    # time on a DRAM-resident pool, plus the analytic weight traffic each arm
+    # costs at the measured routing distribution. No model load — the routing
+    # comes from a recorded profile, so this runs in seconds.
+    aeon_add_benchmark(bench_expert_pair_ab SOURCES tests/bench_expert_pair_ab.cpp)
 endif()
 
 # --- Backend kernels and artifact format -------------------------------------

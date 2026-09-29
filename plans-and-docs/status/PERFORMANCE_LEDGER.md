@@ -71,6 +71,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `supply-split` | Exposed-load split (io wait / H2D enqueue / H2D drain) for prefill and decode | M45 |
 | `supply-corridor` | Deep swept corridors (`3E`+): read-wave serialization, corridor sizing, Warm borrow | M46 |
 | `e2e-post-relocation` | Post-reorganisation e2e vs the pre-relocation baseline (TTFT, decode, bytes) | M47 |
+| `expert-pair-ab` | GEMV-pair vs grouped-WMMA expert compute: time, weight traffic, crossover | M48 |
 
 ## 4. Milestone cards
 
@@ -376,3 +377,22 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: coherent thinking-mode reply (truncated at the cap); `registry.invariants_hold = true`, `outstanding_leases = 0`, `forced_drains = 0`, `staging_in_use = 0`; budget `[FEASIBLE / APPROVED]`. No code change — this run is the check that the module split, the G1–G4 relocation and the comment pass left the numbers untouched.
 - **Conclusion / next gate**: **No regression.** Prefill is `121.4 ms/prompt-token`, matching the ledger's `~120` target and M43 run 3's `123.2`; decode `3.16 tok/s` sits inside the recorded spread (`3.04–3.64` across M28/M43). The relocation commits were separately audited **path-only** (every rename's content diff, after `#include`/comment lines, is empty), so the reorganisation is performance- and behaviour-neutral. **Caveat:** the run is at the host ceiling — `98%` of the RAM allowance — and will fail on a host without headroom rather than in the engine; that fragility is the open host-memory investigation, not this milestone.
 - **Evidence**: `build/bin/aeon_chat` at `b272cd4`, `/tmp/telemetry_m47.jsonl`, `plans-and-docs/status/CODEBASE_MAP.md`
+
+### M48: Expert pair A/B — the grouped WMMA path is worth it above `T ≈ 32`, and the kernel leaves a factor of 5 on the table
+- **Run**: `2026-09-29`; branch `main`; commit `76bd7fe`; synthetic experts in the real swizzled format, resident pool `128` experts (`1.69 GiB`, well past the `96 MiB` Infinity Cache)
+- **Class / comparison key**: `Benchmark / expert-pair-ab`
+- **Platform**: `baseline`, Device 0 only
+- **Workload / configuration**: draws sampled from the measured layer-0 prefill expert distribution of `routing-profile/first-real-prompt/counts.csv` (6 distinct experts per token, router-shaped weights); chunk sizes `T = 16, 64, 256, 1024`; `n = 3` per arm per configuration, best-of reported; both arms compared elementwise per draw (`max |Δ| ≤ 1e-3 · scale`) at every configuration and **agreeing**
+- **Metrics**:
+
+  | T | draws | distinct | tok/expt | GEMV ms | grouped ms | speedup | traffic GEMV | grouped | reused-slab target |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 16 | 96 | 51 | 1.9 | `2.55` | `3.28` | **`0.78x`** | `1.27 GiB` | `0.67 GiB` | `1.9x` |
+  | 64 | 384 | 75 | 5.1 | `10.19` | `5.03` | **`2.02x`** | `5.06 GiB` | `0.99 GiB` | `5.1x` |
+  | 256 | 1536 | 76 | 20.2 | `40.00` | `7.31` | **`5.47x`** | `20.25 GiB` | `1.69 GiB` | `20.2x` |
+  | 1024 | 6144 | 76 | 80.8 | `160.69` | `15.18` | **`10.58x`** | `81.00 GiB` | `5.51 GiB` | `80.8x` |
+
+  Traffic columns: GEMV reads each expert once per draw; grouped-as-implemented once per M tile an expert spans; the target is once per distinct expert. Delivered reduction `14.7x` at `T = 1024` against a `80.8x` ceiling.
+- **Correctness / service**: arms agree at all four configurations; `test_rdna3_wmma_oracle` and `test_v4_grouped_wmma_oracle` green; `test_w4a16_swizzle`, `test_w4a16_swizzled_gemv`, `test_w4a16_swizzled_dual_gemv`, `test_v4_expert_oracle` unchanged
+- **Conclusion / next gate**: Three findings. (1) **The crossover sits between `T = 16` and `T = 64`** — grouped is `0.78x` at 16 (it loses) and `2.02x` at 64 — so the plan's Step 3 threshold of `T ≥ 16` is right but thin; `T ≥ 64` is where the choice is not close. (2) **Distinct experts saturate at ~76 of 256 by `T = 256`**, after which tokens-per-expert grows linearly and grouping keeps paying: `5.47x` at 256 to `10.58x` at 1024. The plan's Step 6 target of `≥16` tokens per expert is reached at `T = 256`, but the reward keeps rising well past it, so chunk size should be set by supply and VRAM, not by that target. (3) **The kernel re-dequantizes the weight slab once per M tile**, so it reads `5.51 GiB` where the plan's per-K-tile reuse would read `1.00 GiB`. Making K the outer loop with per-M-tile accumulators is the difference between `14.7x` and `80.8x`, and is the next kernel change.
+- **Evidence**: `tests/bench_expert_pair_ab.cpp`, `tests/test_rdna3_wmma_oracle.cpp`, `tests/test_v4_grouped_wmma_oracle.cpp`, `build/bin/bench_expert_pair_ab`, `plans-and-docs/execution/active/KERNELS_IMPROVEMENT.md` (Step 1)
