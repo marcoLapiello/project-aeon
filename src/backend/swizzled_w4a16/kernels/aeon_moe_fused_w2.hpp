@@ -185,12 +185,12 @@ inline void dispatch_aeon_moe_fused_w2_accum(
 //
 //   * `aeon_moe_fused_w2_accum_kernel` accumulates with `atomicAdd`, whose order
 //     across experts is the scheduler's and so is not reproducible (trap 38);
-//   * the `v4_pipeline_accumulate_expert_kernel` path is reproducible but keeps its
+//   * the `moe_accumulate_expert_kernel` path is reproducible but keeps its
 //     accumulator in **fp16** and re-rounds on each of the six steps, which is what
 //     plan §2.10.3 forbids ("accumulate in fp32").
 //
 // Neither had both properties, so every gate that needed reproducibility had to
-// accept the less accurate one. Stage 2 (`v4_moe_accumulate_fixed_order_kernel`)
+// accept the less accurate one. Stage 2 (`moe_accumulate_fixed_order_kernel`)
 // sums these slices in slot order in fp32 and rounds once, which is both.
 //
 // The per-expert arithmetic is `swizzled_w2_row_dot`, shared with the atomic path,

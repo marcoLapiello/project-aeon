@@ -13,7 +13,8 @@
 #include "architecture/deepseek_v4/core/v4_layer_body_types.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "architecture/deepseek_v4/kernels/moe_router.hpp"
-#include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
+#include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"
+#include "platform/ops/cast.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -187,7 +188,7 @@ inline void run_layer_body_moe_and_post(
         constexpr int swiglu_threads = 256;
         const int swiglu_blocks = (INTER_DIM + swiglu_threads - 1) / swiglu_threads;
         hipLaunchKernelGGL(
-            kernel::v4_pipeline_swiglu_clamp_kernel,
+            kernel::v4_swiglu_clamp_kernel,
             dim3(swiglu_blocks), dim3(swiglu_threads), 0, stream,
             scratch.d_shared_gate, scratch.d_shared_up, scratch.d_shared_swiglu,
             INTER_DIM, 10.0f);
@@ -232,7 +233,7 @@ inline void run_layer_body_moe_and_post(
     // Hand the output back as the next layer's input.
     CHECK_HIP(hipMemcpyAsync(scratch.d_res_in_half, scratch.d_res_out_half,
                              HC_DIM * sizeof(half), hipMemcpyDeviceToDevice, stream));
-    kernel::v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
+    kernel::half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
         scratch.d_res_in_half, scratch.d_res_in, HC_DIM);
 }
 

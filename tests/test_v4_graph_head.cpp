@@ -12,7 +12,7 @@
 //     across the four streams. The Step-3 gate already builds that residual, but
 //     it builds it **on the host** in fp64 to feed the kernel; nothing has ever
 //     exercised the device path that has to produce it (`hc_mult` H2D copies plus
-//     `v4_half_to_float_kernel`), and nothing has ever asserted the four streams
+//     `half_to_float_kernel`), and nothing has ever asserted the four streams
 //     are identical to each other and to the checkpoint row.
 //
 //  2. THE COMPOSITION `hc_head -> final RMSNorm -> LM head`. Nothing in the tree

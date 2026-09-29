@@ -8,7 +8,7 @@
 //     whose order across the six experts is the scheduler's, so its result is not
 //     reproducible — trap 38, and the reason item 18's gate failed roughly one run
 //     in ten;
-//   * the `v4_pipeline_accumulate_expert_kernel` path *is* reproducible but keeps
+//   * the `moe_accumulate_expert_kernel` path *is* reproducible but keeps
 //     its accumulator in **fp16** and re-rounds on every one of the six steps,
 //     which is what plan §2.10.3 forbids ("accumulate in fp32"). Item 15 recorded
 //     this at Tier 1 and flagged that it is "strictly *less* accurate, which is
@@ -19,7 +19,7 @@
 // `aeon_moe_fused_w2_contrib_kernel` writes one weighted contribution per expert
 // into its own fp32 slice — one writer per element, so determinism follows from
 // the structure rather than from observation — and
-// `v4_moe_accumulate_fixed_order_kernel` sums those slices in slot order in fp32
+// `moe_accumulate_fixed_order_kernel` sums those slices in slot order in fp32
 // and rounds once.
 //
 // What is asserted:
@@ -52,7 +52,7 @@
 
 #include "platform/rdna3/device.hpp"
 
-#include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
+#include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
@@ -194,7 +194,7 @@ std::vector<double> fp16_chain_sum(const std::vector<double>& contrib) {
 
 void run_reduce(DeviceBuffers& b, const half* shared) {
     const int blocks = (kHidden + 255) / 256;
-    aeon::kernel::v4_moe_accumulate_fixed_order_kernel<<<blocks, 256, 0, b.stream>>>(
+    aeon::kernel::moe_accumulate_fixed_order_kernel<<<blocks, 256, 0, b.stream>>>(
         b.d_contrib, static_cast<int>(kExperts), shared, b.d_out,
         static_cast<int>(kHidden));
     CHECK_HIP(hipStreamSynchronize(b.stream));

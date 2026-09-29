@@ -26,7 +26,7 @@
 #include "platform/rdna3/device.hpp"
 #include "architecture/deepseek_v4/core/config.hpp"
 #include "platform/ops/gemv.hpp"
-#include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
+#include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
@@ -141,7 +141,7 @@ int main() {
                            dim3(kIntermediate), dim3(32), 0, 0,
                            d_x, d_w3, d_up, kHidden);
         CHECK_HIP(hipGetLastError());
-        hipLaunchKernelGGL(aeon::kernel::v4_pipeline_swiglu_clamp_kernel,
+        hipLaunchKernelGGL(aeon::kernel::v4_swiglu_clamp_kernel,
                            dim3((kIntermediate + 255) / 256), dim3(256), 0, 0,
                            d_gate, d_up, d_hidden, kIntermediate,
                            static_cast<float>(kLimit));

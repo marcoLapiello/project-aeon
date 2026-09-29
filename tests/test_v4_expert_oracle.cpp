@@ -26,7 +26,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
-#include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
+#include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
@@ -315,7 +315,7 @@ int main() {
                             hipMemcpyHostToDevice));
         CHECK_HIP(hipMemcpy(d_up, up_h.data(), kSwigluCount * sizeof(__half),
                             hipMemcpyHostToDevice));
-        aeon::kernel::v4_pipeline_swiglu_clamp_kernel<<<
+        aeon::kernel::v4_swiglu_clamp_kernel<<<
             dim3(static_cast<unsigned>((kSwigluCount + 63) / 64)), dim3(64)>>>(
             d_gate, d_up, d_swiglu, static_cast<int>(kSwigluCount),
             static_cast<float>(kLimit));

@@ -29,6 +29,7 @@
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
+#include "platform/ops/moe_accumulate.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -340,7 +341,7 @@ public:
                 expert_down, scratch->d_swizzled_counters, 1, kHidden, 2048, stream);
 
             const int blocks = (kHidden + 255) / 256;
-            aeon::kernel::v4_pipeline_accumulate_expert_kernel
+            aeon::kernel::moe_accumulate_expert_kernel
                 <<<blocks, 256, 0, stream>>>(moe_accum, expert_down,
                                              expert_weights[k], kHidden);
         }

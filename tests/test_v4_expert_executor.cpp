@@ -345,7 +345,7 @@ public:
             scratch.d_expert_hidden, w2, expert_weights, scratch.d_contrib, kExperts,
             kHidden, 2048, stream);
         constexpr int kThreads = 256;
-        aeon::kernel::v4_moe_accumulate_fixed_order_kernel
+        aeon::kernel::moe_accumulate_fixed_order_kernel
             <<<(kHidden + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
                 scratch.d_contrib, kExperts, moe_accum, moe_accum, kHidden);
     }

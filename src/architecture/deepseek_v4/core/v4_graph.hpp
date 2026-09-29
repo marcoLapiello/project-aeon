@@ -51,7 +51,7 @@
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "platform/ops/gemv.hpp"
 #include "platform/ops/rmsnorm.hpp"
-#include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
+#include "platform/ops/cast.hpp"
 #include "infrastructure/hip_check.hpp"
 
 #include <hip/hip_fp16.h>
@@ -114,7 +114,7 @@ public:
         // than inside every downstream kernel.
         const int total = static_cast<int>(hc_mult * hidden);
         constexpr int kThreads = 256;
-        kernel::v4_half_to_float_kernel<<<(total + kThreads - 1) / kThreads, kThreads,
+        kernel::half_to_float_kernel<<<(total + kThreads - 1) / kThreads, kThreads,
                                           0, stream>>>(
             scratch.d_res_in_half, scratch.d_res_in, total);
     }
@@ -262,7 +262,7 @@ public:
 
         const int total = static_cast<int>(count * hc_dim);
         constexpr int kThreads = 256;
-        kernel::v4_half_to_float_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        kernel::half_to_float_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
             host_.prefill_carry_half(), host_.prefill_carry(), total);
     }
 

@@ -13,7 +13,7 @@
 
 #include "architecture/deepseek_v4/core/v4_layer_body_types.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
-#include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
+#include "platform/ops/cast.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -544,7 +544,7 @@ inline void run_layer_body_attention_and_norm(
     // -----------------------------------------------------------------
     // F. HC attention post expansion: res_mid = comb_a · res_in + post_a · attn_proj
     // -----------------------------------------------------------------
-    kernel::v4_float_to_half_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
+    kernel::float_to_half_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
         scratch.d_res_in, scratch.d_res_in_half, HC_DIM);
 
     hipLaunchKernelGGL(
@@ -558,7 +558,7 @@ inline void run_layer_body_attention_and_norm(
                    scratch.d_res_mid_half, HC_DIM);
     }
 
-    kernel::v4_half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
+    kernel::half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
         scratch.d_res_mid_half, scratch.d_res_mid, HC_DIM);
 
     // -----------------------------------------------------------------

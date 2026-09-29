@@ -27,7 +27,7 @@
 //   1. `aeon_moe_fused_w2_contrib_kernel` gives each of the six experts its own
 //      fp32 slice of the 4096-wide output. One writer per element, so the result
 //      is deterministic **by construction** rather than by observation.
-//   2. `v4_moe_accumulate_fixed_order_kernel` sums those six slices in slot order
+//   2. `moe_accumulate_fixed_order_kernel` sums those six slices in slot order
 //      in fp32 and rounds to fp16 **once**.
 //
 // Neither of the two older paths had both required properties: the `atomicAdd`
@@ -81,7 +81,7 @@
 #include "infrastructure/core/expert_lease_holder.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
-#include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
+#include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
@@ -360,7 +360,7 @@ public:
 
         // 3. fp32, slot order, one rounding, shared expert as the initial value.
         constexpr int kThreads = 256;
-        kernel::v4_moe_accumulate_fixed_order_kernel
+        kernel::moe_accumulate_fixed_order_kernel
             <<<(V4RoutedExpertScratch::kHidden + kThreads - 1) / kThreads,
                kThreads, 0, streams_.compute>>>(
                 scratch_.d_contrib,

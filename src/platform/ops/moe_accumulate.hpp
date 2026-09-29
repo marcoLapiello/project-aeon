@@ -1,29 +1,23 @@
 #pragma once
 
-#include <hip/hip_fp16.h>
+// -----------------------------------------------------------------------------
+// Model-agnostic primitive: reduce per-expert MoE contributions into a token.
+//
+// Split out of the former `v4_pipeline_ops.hpp`, which mixed them with the
+// model's clamped SwiGLU. These kernels are parameterised (expert count, hidden
+// dim, nullable shared output) and carry no model choice, so any MoE
+// architecture can use them.
+//
+// Two variants of the same reduction, and the choice between them matters:
+// `moe_accumulate_expert_kernel` keeps its accumulator in fp16 (superseded, kept
+// only as a gate control), while `moe_accumulate_fixed_order_kernel` accumulates
+// in fp32 in slot order with a single rounding.
+// -----------------------------------------------------------------------------
+
 #include <hip/hip_runtime.h>
-#include <cmath>
+#include <hip/hip_fp16.h>
 
 namespace aeon::kernel {
-
-// Clamped SwiGLU Kernel
-__global__ void v4_pipeline_swiglu_clamp_kernel(
-    const half* __restrict__ gate,
-    const half* __restrict__ up,
-    half* __restrict__ out,
-    int total_elements,
-    float limit
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total_elements) {
-        float g = __half2float(gate[idx]);
-        float u = __half2float(up[idx]);
-        g = fminf(g, limit);
-        u = fminf(fmaxf(u, -limit), limit);
-        float silu_g = g / (1.0f + expf(-g));
-        out[idx] = __float2half(silu_g * u);
-    }
-}
 
 // Accumulate weighted expert output into token hidden state.
 //
@@ -34,8 +28,8 @@ __global__ void v4_pipeline_swiglu_clamp_kernel(
 // gate control**: the deterministic fixtures use it to check that a run
 // reproducing the fp16 order still matches, so its reader is `tests/support/`.
 // The replacement is `aeon_moe_fused_w2_contrib_kernel` +
-// `v4_moe_accumulate_fixed_order_kernel`, which is fp32 *and* has a fixed order.
-__global__ void v4_pipeline_accumulate_expert_kernel(
+// `moe_accumulate_fixed_order_kernel`, which is fp32 *and* has a fixed order.
+__global__ void moe_accumulate_expert_kernel(
     half* __restrict__ accum_out,
     const half* __restrict__ expert_out,
     float weight,
@@ -61,7 +55,7 @@ __global__ void v4_pipeline_accumulate_expert_kernel(
 // path did:
 //
 //   * plan §2.10.3 requires **fp32 accumulation**. The fp16 read-modify-write
-//     above (`v4_pipeline_accumulate_expert_kernel`) violates that: it stores its
+//     above (`moe_accumulate_expert_kernel`) violates that: it stores its
 //     accumulator in fp16 and re-rounds on each of the six steps.
 //   * trap 38 requires a **fixed order**. `atomicAdd` cannot provide one, because
 //     the order in which the six expert blocks reach a given element is the
@@ -77,7 +71,7 @@ __global__ void v4_pipeline_accumulate_expert_kernel(
 // which is the reference's own fused shape: the shared expert's contribution enters
 // as an addend of the accumulation, not as a post-hoc `+=` on a completed sum.
 // Pass `nullptr` when there is no shared expert (the sequential gates do).
-__global__ void v4_moe_accumulate_fixed_order_kernel(
+__global__ void moe_accumulate_fixed_order_kernel(
     const float* __restrict__ contrib,       // [expert_count, hidden_dim]
     int expert_count,
     const half* __restrict__ shared_output,  // [hidden_dim], nullable
@@ -96,30 +90,6 @@ __global__ void v4_moe_accumulate_fixed_order_kernel(
         accumulator += contrib[static_cast<size_t>(expert) * hidden_dim + idx];
     }
     out[idx] = __float2half(accumulator);
-}
-
-// Convert FP16 array to float array
-__global__ void v4_half_to_float_kernel(
-    const half* __restrict__ src,
-    float* __restrict__ dst,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] = __half2float(src[idx]);
-    }
-}
-
-// Convert float array to FP16 array
-__global__ void v4_float_to_half_kernel(
-    const float* __restrict__ src,
-    half* __restrict__ dst,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] = __float2half(src[idx]);
-    }
 }
 
 } // namespace aeon::kernel
