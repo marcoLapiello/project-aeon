@@ -1,13 +1,13 @@
 // -----------------------------------------------------------------------------
-// Tier-1 gate: RoPE (Step 2.3), two bases — versus an independent fp64 reference.
+// Tier-1 gate: RoPE, two bases — versus an independent fp64 reference.
 //
 // This gate carries more weight than the RMSNorm one, because RoPE has four
-// recorded traps that all produce output which "looks like" attention:
+// recorded ways to produce output which "looks like" attention:
 //
-//   trap 27 — the *last* 64 dims rotate, not the first.
-//   trap 7  — two bases (theta 10000 plain / 160000 YaRN), never one.
-//   trap 8  — inverse RoPE exists and is a separate operation.
-//   and the interleave is GPT-J (adjacent pairs), not NeoX.
+//   — the *last* 64 dims rotate, not the first.
+//   — two bases (theta 10000 plain / 160000 YaRN), never one.
+//   — inverse RoPE exists and is a separate operation.
+//   — and the interleave is GPT-J (adjacent pairs), not NeoX.
 //
 // So the gate does not merely compare numbers; it *discriminates*. It asserts
 // that the two bases are distinguishable, that the nope region is untouched, and
@@ -65,7 +65,7 @@ constexpr int kTokens = 8;
 constexpr int kHeads  = 4;
 
 // 65536 = original_max_position_embeddings, so 65537 is the first position past
-// the YaRN regime boundary. The plan asks for a check beyond it.
+// the YaRN regime boundary, which the gate probes.
 constexpr uint32_t kFarPos  = 65537;
 constexpr uint32_t kTableLen = kFarPos + 1;
 
@@ -169,7 +169,7 @@ std::vector<double> oracle_rotate_at(const std::vector<__half>& src,
 }
 
 // Bitwise check that the nope region [0, 448) of every head row is untouched.
-// This is what makes trap 27 impossible to pass silently.
+// This is what makes a wrongly-rotated region impossible to pass silently.
 bool nope_region_intact(const std::vector<__half>& before,
                         const std::vector<__half>& after,
                         int tokens, int heads) {
@@ -290,7 +290,7 @@ int main() {
                  aeon::reference::compare(ref_compressed_flat, kern_compressed_flat, kAbsOnly),
                  kFp32AngleAbs, kFp32AngleRel);
 
-    // B5/B6. The plan's named position: the first one past
+    // B5/B6. The boundary position: the first one past
     //        original_max_position_embeddings = 65536.
     ok &= report("table @pos65537 (sliding) [fp32 angle]", "",
                  aeon::reference::compare(

@@ -5,7 +5,7 @@
 // tuned to one machine's disk, PCIe link, or GPU. A frozen constant that happens to
 // suit this box is invisible in a benchmark run here and wrong on hardware that is
 // faster or slower — a faster SSD, PCIe 5, a slower GPU all move the balance the
-// constant silently encodes. The plan's answer is not a new constant; it is to make
+// constant silently encodes. The fix is not a new constant; it is to make
 // the corridor a resource the pipeline consumes and then prove the property. Two
 // gates test it without fitting anything to this machine:
 //
@@ -117,13 +117,13 @@ struct Row {
     uint32_t layers_sampled{0};
     uint32_t layers_overlapped{0};
     uint32_t peak_reserved_ahead{0};
-    // Staging slots freed by their own copy's completion event (P2.2) rather than as
+    // Staging slots freed by their own copy's completion event rather than as
     // a boundary block.
     uint64_t released_on_completion{0};
-    // Copies the mid-body pump issued (P2.3) — the lookahead layer's uploads that
+    // Copies the mid-body pump issued — the lookahead layer's uploads that
     // moved off the boundary into the previous layer's body.
     uint64_t copies_pumped{0};
-    // The lookahead length the free blocks allowed at the sample — derived, not fixed (R5).
+    // The lookahead length the free blocks allowed at the sample — derived, not fixed.
     uint32_t derived_depth{0};
     // The same, at the mid-window steady state (the max is seeded at the start, when
     // the whole pool is briefly free, and is not representative).
@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
     // `AEON_WARM_GIB`: it is a shell variable the scripts translate into a binary
     // *argument*. Prefixing this binary with it was therefore a silent no-op, and this
     // line used to hardcode 0 besides — so a documented `AEON_WARM_GIB=30` run was
-    // really a Warm-0 run. Both shapes are required here (plan guardrail #7): Warm 0
+    // really a Warm-0 run. Both shapes are required here: Warm 0
     // exercises the corridor on its own, Warm 30 is the production shape where Warm
     // residency removes part of the cold stream.
     const char* warm_env = std::getenv("AEON_WARM_GIB");

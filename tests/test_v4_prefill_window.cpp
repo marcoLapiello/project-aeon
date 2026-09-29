@@ -1,11 +1,10 @@
 // -----------------------------------------------------------------------------
-// Step 6 gate — the layer-major prefill window is `window == serial`.
+// Gate — the layer-major prefill window is `window == serial`.
 //
-// The plan's Step 6 opens with a decision (D-a): prefill is **layer-major within
-// a bounded window**, because that fetches each layer's routed-expert set once
-// per window instead of once per body chunk. This gate certifies the *equality*
-// half of that decision before any of its speed is claimed, for the reason the
-// plan gives: correctness and speed are two gates, and correctness comes first.
+// Prefill is **layer-major within a bounded window**, because that fetches each
+// layer's routed-expert set once per window instead of once per body chunk. This
+// gate certifies the *equality* half of that decision before any of its speed is
+// claimed: correctness and speed are two gates, and correctness comes first.
 //
 // What is asserted:
 //
@@ -26,33 +25,31 @@
 //
 // ## Why the equality can be exact
 //
-// The reference is the *certified* serial path (`forward_token`, the composition
-// plan's acceptance-criterion path), not a second copy of the new code, which is
-// what keeps this from proving self-consistency. The batched body's equality to
-// the decode body is Tier-3 item 19's result; this gate sits above it and adds
-// the two things item 19 deliberately did not cover: the **host** (43 layers, the
-// real expert supply) and the **layer stack**.
+// The reference is the *certified* serial path (`forward_token`), not a second copy
+// of the new code, which is what keeps this from proving self-consistency. The
+// batched body's equality to the decode body is certified below this; this gate sits
+// above it and adds the two things the body-level gate deliberately did not cover:
+// the **host** (43 layers, the real expert supply) and the **layer stack**.
 //
 // ## The read-ordering trap this gate walked into first
 //
 // The forward paths enqueue on the **compute** stream, which is non-default and
-// non-blocking. A plain `hipMemcpy` is not guaranteed to order against it, so a
-// read taken right after a forward pass can return the *previous* run's buffer.
-// That is exactly what happened: an earlier version of this gate read without
-// synchronizing and reported ~76% of the logits "differing" — a fabricated
-// divergence that cost a long investigation and pointed at the wrong component
-// (staging, then the residual chain). `read_bytes` therefore synchronizes the
-// device first, and that is load-bearing, not hygiene. The body's own
-// `hipStreamSynchronize` sits *before* its final stages, so it does not cover
-// them.
+// non-blocking. A plain `hipMemcpy` is not guaranteed to order against it, so a read
+// taken right after a forward pass can return the *previous* run's buffer. That is
+// exactly what happened: an earlier version of this gate read without synchronizing
+// and reported ~76% of the logits "differing" — a fabricated divergence that cost a
+// long investigation and pointed at the wrong component (staging, then the residual
+// chain). `read_bytes` therefore synchronizes the device first, and that is
+// load-bearing, not hygiene. The body's own `hipStreamSynchronize` sits *before* its
+// final stages, so it does not cover them.
 //
 // Deliberately NOT covered here:
-//   * throughput. Speed is Step 6's separate outcome, measured with the ledger.
-//   * the chunk-wide expert dispatch and dedup (build items 4–5). This gate runs
-//     the existing per-token dispatch through the windowed driver, so it
-//     certifies the driver, not the dispatch.
-//   * the double-buffered sweep (item 6): the window serializes sweep against
-//     compute here. That is slower, and identical.
+//   * throughput. Speed is a separate measurement.
+//   * the chunk-wide expert dispatch and dedup: this gate runs the existing per-token
+//     dispatch through the windowed driver, so it certifies the driver, not the
+//     dispatch.
+//   * the double-buffered sweep: the window serializes sweep against compute here.
+//     That is slower, and identical.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -163,17 +160,17 @@ Snapshot capture_serial(V4ModelHost& host, V4Graph& graph, const std::vector<uin
 
 int main() {
     std::printf("================================================================================\n");
-    std::printf("  Step 6 — layer-major prefill: window == serial, bit-exact\n");
+    std::printf("  layer-major prefill: window == serial, bit-exact\n");
     std::printf("================================================================================\n");
     aeon::core::select_compute_device(true);
 
     aeon::core::AeonRuntimeConfig runtime;
     runtime.context_size = kContext;
     // The layer-major window dispatches a chunk's `6C` routed requests as one
-    // deduplicated set (Step 6 item 4), each distinct expert held in a staging slot
-    // while in transit. Configure a prefill chunk at least as large as the window
-    // so the host sizes the arena for it (Step 6 D4); a smaller configuration would
-    // be refused by `forward_window` rather than silently colliding two transfers.
+    // deduplicated set, each distinct expert held in a staging slot while in
+    // transit. Configure a prefill chunk at least as large as the window so the
+    // host sizes the arena for it; a smaller configuration would be refused by
+    // `forward_window` rather than silently colliding two transfers.
     runtime.prefill_chunk = kWindow;
     // This gate certifies the **driver** — that a layer-major pass equals serial and
     // that the chunk size is not observable — not the swept residency policy. The
@@ -253,7 +250,7 @@ int main() {
 
     // D — the dispatch really is the layer-wide one, and it really deduplicates.
     // Without these a byte-exact pass could be the per-token dispatch under the
-    // batch's name, and `window == serial` would prove nothing about item 4.
+    // batch's name, and `window == serial` would prove nothing about dedup.
     assert_that("D: the window issued one layer-wide batch",
                 window_batch_tokens == kWindow,
                 std::to_string(window_batch_tokens) + " tokens in the last dispatch");

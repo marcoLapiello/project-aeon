@@ -1,6 +1,5 @@
 // -----------------------------------------------------------------------------
-// Step 3 gate — Hyper-Connections head reduction, versus an independent fp64
-// reference.
+// Gate — Hyper-Connections head reduction, versus an independent fp64 reference.
 //
 // This closes the one graph op that had **no code, no oracle and no gate**. It is
 // the last operation before the LM head: `hc_head` collapses the model's four
@@ -19,12 +18,12 @@
 //
 // `[V vllm/model_executor/kernels/mhc/triton.py  hc_head_reduce_triton_kernel]`
 //
-// It *looks* like Step 2.0's pre-mix and differs in four ways, each of which is
+// It *looks* like the layer's pre-mix and differs in four ways, each of which is
 // silent if got wrong. Three are asserted here as discriminating checks rather
 // than asserted by construction:
 //
 //   1. THE NORM HAS NO LEARNED WEIGHT. Every other norm in the model has one
-//      (2.1's attention norm, 2.8's FFN norm, Step 4's final norm). This one does
+//      (the attention norm, the FFN norm, the final norm). This one does
 //      not, so there is no tensor to load — and a `weight`-multiplying
 //      implementation is reading something the artifact does not contain. The
 //      gate asserts the tensor's absence structurally *and* measures that
@@ -56,8 +55,8 @@
 // 1 and require `pre == hc_eps` and `1 + hc_eps` exactly), and the gate reports
 // the delta that omitting the eps would cause in `out`: at these magnitudes it is
 // ~1e-6 relative, i.e. two orders below one fp16 ulp, so **no output comparison
-// can discriminate it**. That is the same honest limitation trap 35 records for
-// the sink-in-the-max, and it is stated rather than papered over.
+// can discriminate it**. That is the same honest limitation recorded for the
+// sink-in-the-max, and it is stated rather than papered over.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -149,7 +148,7 @@ HeadParams load_head_params() {
 }
 
 // One embedding row, expanded identically across the four HC streams — which is
-// what Step 1 does before layer 0.
+// what the graph feeds the stack before layer 0.
 std::vector<double> residual_from_embedding(uint32_t token) {
     const auto* embed = reinterpret_cast<const uint16_t*>(
         g_loader->get_tensor("embed.weight").data);
@@ -267,7 +266,7 @@ HcHeadResult oracle_of(const std::vector<double>& residual, const HeadParams& p)
 
 int run() {
     std::printf("================================================================================\n");
-    std::printf("  Step 3 — Hyper-Connections head reduction vs an independent fp64 reference\n");
+    std::printf("  Hyper-Connections head reduction vs an independent fp64 reference\n");
     std::printf("================================================================================\n");
 
     aeon::core::select_compute_device(true);
@@ -335,7 +334,7 @@ int run() {
     std::printf("\n[B] The reduction: kernel vs the fp64 reference\n");
 
     // The residual every discriminating check below is built on: a real embedding
-    // row broadcast across the four streams, which is exactly what Step 1 hands
+    // row broadcast across the four streams, which is exactly what the graph hands
     // the stack.
     const std::vector<double> probe = residual_from_embedding(kRealTokens[0]);
 
@@ -611,7 +610,7 @@ int run() {
     }
 
     // -------------------------------------------------------------------------
-    std::printf("\n[Step 3 hc_head] %s — %u checks, %u failed\n",
+    std::printf("\n[hc_head] %s — %u checks, %u failed\n",
                 harness.failures == 0 ? "PASS" : "FAIL", harness.checks, harness.failures);
     std::printf("  dimensions: hc_mult=%u, hidden=%u, flattened=%u; params from the artifact\n",
                 kHcMult, kHidden, kFlat);

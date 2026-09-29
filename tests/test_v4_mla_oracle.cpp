@@ -1,17 +1,17 @@
 // -----------------------------------------------------------------------------
-// Tier-1 gate: MLA Q and KV paths (Step 2.2) — versus an independent fp64 reference.
+// Tier-1 gate: MLA Q and KV paths — versus an independent fp64 reference.
 //
 // This is a *composition* gate. MLA is not one kernel: it is a wiring of GEMV,
 // RMSNorm and a weightless per-head norm, and the thing that can go wrong is the
 // wiring, not the arithmetic. Specifically:
 //
-//   trap 5 — the Q path is low-rank with TWO norms, and the first sits BETWEEN
+//   — the Q path is low-rank with TWO norms, and the first sits BETWEEN
 //            wq_a and wq_b. Collapsing the matmuls, or moving the norm, yields
 //            plausible-but-wrong output.
-//   trap 6 — there is no separate V. One 512-wide row is both key and value.
+//   — there is no separate V. One 512-wide row is both key and value.
 //
 // So the gate replays the pipeline's exact kernel order, stage by stage, and
-// compares every intermediate the plan names (`q_lora`, `q_lora_norm`, `q`,
+// compares every intermediate (`q_lora`, `q_lora_norm`, `q`,
 // `kv`) against the oracle. Each stage's oracle input is the kernel's own fp16
 // output, so the delta measures the kernel and not the input quantization.
 //
@@ -209,8 +209,8 @@ int main() {
 
     // Discriminating check (a): the mid-path norm must be load-bearing. If
     // dropping it barely changed q, then "norm between wq_a and wq_b" would be
-    // indistinguishable from "no norm", and this gate could not tell trap 5
-    // apart from a correct implementation.
+    // indistinguishable from "no norm", and this gate could not distinguish a
+    // misplaced norm from a correct implementation.
     {
         const std::vector<double> collapsed_reference =
             aeon::reference::matvec(kQWidth, kQLoraRank, widen(h_qa), wq_b);
@@ -296,11 +296,11 @@ int main() {
                 aeon::reference::mla_kv_path(x_norm, widen(h_kv_norm_w), kHeadDim, kEps, wkv),
                 h_kv);
 
-    // Discriminating check (c): trap 6 — one KV row serves as both key and value.
+    // Discriminating check (c): one KV row serves as both key and value.
     // The gate asserts the shape the graph depends on: `kv` is exactly head_dim
     // wide. A second (V) tensor of the same width would be a structural change,
     // and nothing in the contract or the reference provides one.
-    ok &= check("single KV row (trap 6)", h_kv.size() == kHeadDim,
+    ok &= check("single KV row", h_kv.size() == kHeadDim,
                 "kv width = " + std::to_string(h_kv.size()) + " = head_dim, no separate V");
 
     // --- Cleanup -------------------------------------------------------------

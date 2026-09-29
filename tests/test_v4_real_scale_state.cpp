@@ -1,25 +1,24 @@
 // -----------------------------------------------------------------------------
-// Real-scale state gate — the model's own window (128) and its own
-// `index_topk` (512), together, in one layer.
+// Real-scale state gate — the model's own window (128) and its own `index_topk`
+// (512), together, in one layer.
 //
 // ## Why this gate exists
 //
-// The plan records one open gap in so many words: *"the real 128-token window with
-// `index_topk = 512` (shrunk, as in items 16–18)"* — every layer-body gate so far
-// shrinks both, and item 20 runs the real window but shrinks `index_topk` to 8.
-// So neither half has ever met the other at the model's own scale, and the state
-// layout has only ever been exercised under-scaled.
+// Every layer-body gate so far shrinks the window and the top-k; one runs the real
+// window but shrinks `index_topk` to 8. So neither half has ever met the other at
+// the model's own scale, and the state layout has only ever been exercised
+// under-scaled.
 //
-// There is a second, less obvious reason the two must be raised **together**, and
-// it is the reason the token count here is ~2200 rather than a few hundred:
+// There is a second, less obvious reason the two must be raised **together**, and it
+// is the reason the token count here is ~2200 rather than a few hundred:
 //
 //   **`index_topk = 512` is nominal until there are more than 512 candidates.**
 //
 // A CSA layer commits one compressed entry per `ratio = 4` tokens, so `index_topk`
 // becomes a *real* selection only past position 2048. Below that,
 // `select_indexer_topk` takes the degenerate branch — `candidates <= index_topk`
-// selects every candidate with no padding — and a gate that claimed to exercise
-// the top-k would in fact be exercising the `take all` path. Section A asserts the
+// selects every candidate with no padding — and a gate that claimed to exercise the
+// top-k would in fact be exercising the `take all` path. Section A asserts the
 // selection is strict (some candidates excluded) and the selected set is exactly
 // `index_topk` long, distinct and in range, so "real selection" is a measurement
 // rather than an assumption.
@@ -27,47 +26,44 @@
 // ## What it asserts (and what the instrument is)
 //
 // This is a **state** gate, not an arithmetic one, and it compares **run against
-// run** rather than against an fp64 oracle. Tier 1 and items 16–18 own the
-// arithmetic; what is under test here is that a restored state continues exactly
-// like one that never stopped, at real dimensions. The instrument is therefore the
-// plan's own (identical in shape to the item-22 R3 gate and item 19's C2):
+// run** rather than against an fp64 oracle. The per-op gates own the arithmetic;
+// what is under test here is that a restored state continues exactly like one that
+// never stopped, at real dimensions. The instrument is therefore:
 //
 //   reference   tokens 0 … 2199 in one uninterrupted run, snapshotting the state
 //               as it stood **after** 2100 tokens
 //   restored    reset, restore that mid-run snapshot, then tokens 2100 … 2199
 //
 // and the requirement is that the restored continuation is bit-identical to the
-// reference's, and that the two final states are byte-identical. The mid-run
-// snapshot is taken *during* the reference run rather than by a separate prefix
-// run, which is both cheaper and stricter: the state being restored is provably
-// the reference's own, at a real position, with the ring wrapped and the
-// compressor mid-window (2100 % 4 == 0 is a boundary; 2100 is chosen so the
-// continuation below it still crosses boundaries at 2104, 2108, …).
+// reference's, and that the two final states are byte-identical. The mid-run snapshot
+// is taken *during* the reference run rather than by a separate prefix run, which is
+// both cheaper and stricter: the state being restored is provably the reference's
+// own, at a real position, with the ring wrapped and the compressor mid-window (2100
+// % 4 == 0 is a boundary; 2100 is chosen so the continuation below it still crosses
+// boundaries at 2104, 2108, …).
 //
 // Determinism is **structural**, not observed. There is no fp64 oracle, so no
 // rounding is compared; the accumulation is fixed-order
-// (`executor.deterministic = true`, stated here per the plan's rule that a gate
-// must say which MoE accumulation it requires, trap 38); and the comparison is on
-// raw fp16 bit patterns. At window 8 the equivalent comparison already reads
-// exactly `0 differing values`, and the same holds at 128 because both sides run
-// identical kernels over bit-identical state.
+// (`executor.deterministic = true`); and the comparison is on raw fp16 bit patterns.
+// At window 8 the equivalent comparison already reads exactly `0 differing values`,
+// and the same holds at 128 because both sides run identical kernels over
+// bit-identical state.
 //
 // ## What is covered, and what is not
 //
-// Covered for real: the window (128), `index_topk` (512) as a strict selection,
-// 549 CSA boundaries crossed, the ring wrapped many times, the compressor's
-// partial state mid-window, the indexer's key cache at real size, and the restore
-// contract at ~4 MiB of live state instead of ~20 tokens of it.
+// Covered for real: the window (128), `index_topk` (512) as a strict selection, 549
+// CSA boundaries crossed, the ring wrapped many times, the compressor's partial state
+// mid-window, the indexer's key cache at real size, and the restore contract at
+// ~4 MiB of live state instead of ~20 tokens of it.
 //
 // NOT covered, and named so it is not mistaken for coverage:
-//   * the other 42 layers — this is one layer at real scale, not the stack
-//     (item 23's driver).
-//   * the routed-expert arithmetic (synthetic payloads, as in items 16–19).
-//   * HCA: `layers.3` has the real window but **no indexer at all** (trap 33), so
-//     it cannot exercise `index_topk` and is deliberately not the layer here.
+//   * the other 42 layers — this is one layer at real scale, not the stack.
+//   * the routed-expert arithmetic (synthetic payloads).
+//   * HCA: `layers.3` has the real window but **no indexer at all**, so it cannot
+//     exercise `index_topk` and is deliberately not the layer here.
 //   * throughput, and the indexer top-k's per-token host round-trip in
 //     `select_indexer_topk` — which at this scale is the dominant cost, and which
-//     changes no value, so this gate cannot see it (item 19's second half).
+//     changes no value, so this gate cannot see it.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -225,7 +221,7 @@ int main() {
     // (`num_hash_layers = 3`), so routing comes from `tid2eid` and varies with the
     // token id — which makes the state evolution non-repetitive without any
     // special fixture. HCA (`layers.3`) is deliberately NOT used: it has the real
-    // window but no indexer, so it cannot exercise `index_topk` at all (trap 33).
+    // window but no indexer, so it cannot exercise `index_topk` at all.
     constexpr uint32_t kLayerId = 2;
     const aeon::core::V4LayerSpec spec = specs.at(kLayerId);
 
@@ -376,7 +372,7 @@ int main() {
     // provably the reference's own state at position `kPrefix`, so a later
     // disagreement cannot be blamed on two runs having diverged before the
     // boundary.
-    std::cout << "\n--- B. R3 at real scale: a restored layer continues like one that never stopped ---\n";
+    std::cout << "\n--- B. At real scale: a restored layer continues like one that never stopped ---\n";
     reset();
     std::vector<TokenRecord> reference(kTokens);
     V4LayerStateSnapshot prefix_state;

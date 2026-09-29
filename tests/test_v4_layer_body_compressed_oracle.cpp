@@ -1,10 +1,10 @@
 // -----------------------------------------------------------------------------
-// Tier-2 gate, item 17 — the compressed layer classes (CSA ratio 4, then HCA
-// ratio 128), versus the same independent fp64 composition.
+// Gate — the compressed layer classes (CSA ratio 4, then HCA ratio 128), versus
+// the same independent fp64 composition.
 //
-// Item 16 certified the Sliding class: `core/v4_layer_body.hpp` with no
-// compressor and no indexer. This gate certifies the *other* two branches of that
-// same body, which is where the plan's trap 33 lives:
+// The Sliding class is certified by the layer-body gate: `core/v4_layer_body.hpp`
+// with no compressor and no indexer. This gate certifies the *other* two branches of
+// that same body:
 //
 //   ratio  4 — CSA: local rows + the indexer-selected `index_topk` compressed rows
 //   ratio 128 — HCA: local rows + EVERY committed compressed row, and no indexer
@@ -26,14 +26,13 @@
 //      evidence for the one property that separates the classes.
 //
 // Deliberately NOT covered here, and named so it is not mistaken for coverage:
-//   * serial multi-token state evolution *without* re-seeding — the loop locks
-//     the residual to the oracle between steps so this measures one layer's
-//     composition rather than the drift of a long loop. That is item 18;
-//   * the SwiGLU/quantization arithmetic of the routed experts — Tier-1 gates
-//     13/15 and item 16 own it, so here the experts are synthetic payloads
-//     encoded with the oracle's own encoder. The 257-token HCA run would
-//     otherwise spend minutes paging a 145 GB container for a path already
-//     certified.
+//   * serial multi-token state evolution *without* re-seeding — the loop holds the
+//     residual to the oracle between steps so this measures one layer's composition
+//     rather than the drift of a long loop;
+//   * the SwiGLU/quantization arithmetic of the routed experts — the per-op gates
+//     own it, so here the experts are synthetic payloads encoded with the oracle's
+//     own encoder. The 257-token HCA run would otherwise spend minutes paging a
+//     145 GB container for a path already certified.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -88,9 +87,8 @@ constexpr uint32_t kMaxSeq = 512;
 const std::array<uint32_t, 10> kTokenIds = {1000, 42, 7777, 1780, 90125, 130, 55, 4096, 22222, 396};
 
 // One class's test parameters. The local window is shrunk so the ring wraps
-// within a handful of tokens (as in item 16), and for CSA `index_topk` is shrunk
-// so a *real* selection — more candidates than slots — happens inside a short
-// run.
+// within a handful of tokens, and for CSA `index_topk` is shrunk so a *real*
+// selection — more candidates than slots — happens inside a short run.
 struct ClassRun {
     const char* label;
     uint32_t layer_id;
@@ -172,9 +170,9 @@ bool run_class(const ClassRun& run, aeon::core::AeonModelLoader& loader,
     for (uint32_t k = 0; k < kRoutedExperts; ++k) w.routed_payloads[k] = payloads[k].data();
 
     // Decode the six fixed payloads once. The routed-expert arithmetic is
-    // certified by Tier-1 gates 13/15 and by item 16 on the artifact's real
-    // experts; decoding them again for every one of 257 tokens would be the whole
-    // cost of this gate and would certify nothing new.
+    // certified elsewhere on the artifact's real experts; decoding them again for
+    // every one of 257 tokens would be the whole cost of this gate and would
+    // certify nothing new.
     std::vector<aeon::reference::DecodedExpertWeights> decoded(kRoutedExperts);
     for (uint32_t k = 0; k < kRoutedExperts; ++k) {
         decoded[k] = aeon::reference::decode_expert_weights(payloads[k].data());
@@ -192,7 +190,7 @@ bool run_class(const ClassRun& run, aeon::core::AeonModelLoader& loader,
     oracle_state.reset(shape, layer.local_cache_capacity());
 
     // Seed both sides from the same fp16-rounded embedding row, broadcast to the
-    // four HC streams (plan Step 1).
+    // four HC streams.
     std::vector<double> residual(kHcDim, 0.0);
     {
         const __half* embed = loader.get_data_ptr<__half>("embed.weight");
@@ -295,8 +293,8 @@ bool run_class(const ClassRun& run, aeon::core::AeonModelLoader& loader,
 
         // The materializer reads a full window and produces a finite, normalized
         // row. (The window reduction itself, including the two-segment overlap
-        // layout, is gated at Tier 1, item 10; this line keeps the composition's
-        // hand-off honest.)
+        // layout, is gated separately; this line keeps the composition's hand-off
+        // honest.)
         CompressorRing filled;
         filled.reset(width, shape.compressor_capacity());
         for (uint32_t p = 0; p < shape.compressor_capacity(); ++p) {
@@ -414,7 +412,7 @@ bool run_class(const ClassRun& run, aeon::core::AeonModelLoader& loader,
             for (uint32_t d = 0; d < kHeadDim; ++d) {
                 identical = identical && (got_entry[d] == got_value[d]);
             }
-            ok &= check("    compressed value row equals the key row (trap 6)",
+            ok &= check("    compressed value row equals the key row",
                         identical, "bit-identical");
         }
 
@@ -534,7 +532,7 @@ bool run_class(const ClassRun& run, aeon::core::AeonModelLoader& loader,
         oracle_state = next_state;
 
         // Lock the next step to the oracle's residual: this measures the layer's
-        // composition, not the drift of a long loop (that is item 18's gate).
+        // composition, not the drift of a long loop.
         const std::vector<__half> next_half = to_half(want.res_out);
         std::vector<float> next_float(kHcDim);
         for (size_t i = 0; i < next_float.size(); ++i) next_float[i] = __half2float(next_half[i]);

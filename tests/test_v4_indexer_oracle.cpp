@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Tier-1 gate: lightning indexer + top-k (Step 2.4.3) — versus an independent
+// Tier-1 gate: lightning indexer + top-k — versus an independent
 // fp64 reference.
 //
 // This gate has two jobs, and the second is a measurement rather than a
@@ -7,12 +7,12 @@
 //
 // JOB 1 — certify the scoring. The reference's whole indexer path is five
 // readable lines, and the one that matters is `F.relu(score)` applied to the
-// per-head dot **before** the weighting (trap 11). A missing ReLU still produces
+// per-head dot **before** the weighting. A missing ReLU still produces
 // a plausible attention score, which is why it survives review.
 //
-// JOB 2 — SETTLE GATE 11, the Hadamard rotation. The plan has mis-stated this
-// three separate times, so this gate measures it instead of arguing: apply a
-// normalized Hadamard to both Q and K and show the scores and the top-k set are
+// JOB 2 — SETTLE THE HADAMARD ROTATION. The easy mistake is to apply a
+// normalized Hadamard to only one side, so this gate measures instead of arguing:
+// apply it to both Q and K and show the scores and the top-k set are
 // unchanged; apply it to only one side and show the scores move. That is the
 // whole decision — the rotation is orthogonal, so two-sided is a no-op and
 // one-sided is a bug.
@@ -228,7 +228,7 @@ int main() {
                     "top-k strictly non-increasing");
     }
 
-    // Tie-breaking: equal scores select the lower index (trap 18). Constructed
+    // Tie-breaking: equal scores select the lower index. Constructed
     // directly, since random scores essentially never tie.
     {
         std::vector<double> tied(candidates, 0.0);
@@ -259,9 +259,9 @@ int main() {
     }
 
     // =======================================================================
-    // C. GATE 11 — the Hadamard rotation, measured
+    // C. THE HADAMARD ROTATION, measured
     // =======================================================================
-    std::cout << "\n  --- Gate 11: the Hadamard rotation (measurement, not assertion) ---\n";
+    std::cout << "\n  --- the Hadamard rotation (measurement, not assertion) ---\n";
     {
         // Rotate BOTH Q and K, per head.
         const std::vector<double> q_rot =
@@ -272,8 +272,8 @@ int main() {
         const std::vector<double> two_sided = aeon::reference::indexer_scores(
             q_rot, k_rot, w, kHeads, kHeadDim, kSoftmaxScale, kHeadScale);
 
-        // (1) Two-sided rotation is score-preserving. This is the claim the plan
-        //     makes and this is the measurement that settles it.
+        // (1) Two-sided rotation is score-preserving. This is the claim under
+        //     test, and this is the measurement that settles it.
         {
             const ErrorStats s = aeon::reference::compare(want, two_sided, 1.0);
             ok &= check("two-sided Hadamard leaves scores unchanged",
@@ -290,8 +290,8 @@ int main() {
             ok &= check("two-sided Hadamard leaves top-k unchanged", same, detail);
         }
 
-        // (3) One-sided rotation is NOT harmless. This is the failure mode the
-        //     plan warns about: applying it to Q and forgetting K silently
+        // (3) One-sided rotation is NOT harmless. This is the failure mode to
+        //     guard against: applying it to Q and forgetting K silently
         //     changes every score.
         {
             const std::vector<double> one_sided = aeon::reference::indexer_scores(

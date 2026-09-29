@@ -1,19 +1,18 @@
 // -----------------------------------------------------------------------------
-// P1 gate — the graph's head end: a token id in, logits out.
+// Gate — the graph's head end: a token id in, logits out.
 //
-// The composition plan's P1 builds the three ops at the tail of the forward pass
-// plus the minimal host that owns their inputs. This gate is what makes it
-// evidence rather than construction.
+// The head end is the tail of the forward pass plus the minimal host that owns its
+// inputs. This gate is what makes it evidence rather than construction.
 //
 // WHAT THIS GATE OWNS, and why each is genuinely uncovered:
 //
-//  1. THE DEVICE-SIDE EMBEDDING EXPANSION (plan Step 1). The state entering the
-//     layer stack is `hc_mult x 4096` per token — the embedding row broadcast
-//     across the four streams. The Step-3 gate already builds that residual, but
-//     it builds it **on the host** in fp64 to feed the kernel; nothing has ever
-//     exercised the device path that has to produce it (`hc_mult` H2D copies plus
-//     `half_to_float_kernel`), and nothing has ever asserted the four streams
-//     are identical to each other and to the checkpoint row.
+//  1. THE DEVICE-SIDE EMBEDDING EXPANSION. The state entering the layer stack is
+//     `hc_mult x 4096` per token — the embedding row broadcast across the four
+//     streams. The hc-head gate already builds that residual, but it builds it
+//     **on the host** in fp64 to feed the kernel; nothing has ever exercised the
+//     device path that has to produce it (`hc_mult` H2D copies plus
+//     `half_to_float_kernel`), and nothing has ever asserted the four streams are
+//     identical to each other and to the checkpoint row.
 //
 //  2. THE COMPOSITION `hc_head -> final RMSNorm -> LM head`. Nothing in the tree
 //     has run the final norm or the LM head at all: `head.weight` appears in the
@@ -25,14 +24,13 @@
 //
 //  * It does **not** re-certify `hc_head_wave32_kernel`. `tests/test_v4_hc_head_oracle.cpp`
 //    owns that, at every discriminating property (weightless norm, flattened RMS,
-//    scalar scale, saturated and eps-floor regimes, 6 of 6 mutations killed), and
-//    re-deriving it here would be the duplication this rewrite exists to remove.
-//    Its coverage is *consumed*: this gate compares the device's `hc_head_out`
-//    against `reference::hc_head_reduce`, which is the same instrument that gate
-//    uses, pointed at a residual the *device* produced.
-//  * It does **not** certify a forward pass. There are no layers in P1; the
-//    residual the head consumes is an embedding, not a 43-layer trajectory. The
-//    graph driver and its oracle are P2's.
+//    scalar scale, saturated and eps-floor regimes), and re-deriving it here would
+//    be the duplication this rewrite exists to remove. Its coverage is *consumed*:
+//    this gate compares the device's `hc_head_out` against
+//    `reference::hc_head_reduce`, pointed at a residual the *device* produced.
+//  * It does **not** certify a forward pass. There are no layers here; the residual
+//    the head consumes is an embedding, not a 43-layer trajectory. The graph driver
+//    and its oracle are the graph-body gate's.
 //
 // THE ORACLE IS COMPOSED, NOT REUSED WHOLESALE. The three ops are certified
 // separately *and* as a chain — the same "isolate, then chain" structure the
@@ -251,7 +249,7 @@ std::vector<double> oracle_logits(const std::vector<double>& head_norm,
 int main() {
     std::printf(
         "================================================================================\n");
-    std::printf("  P1 — the graph's head end: embedding -> hc_head -> final norm -> LM head\n");
+    std::printf("  graph head: embedding -> hc_head -> final norm -> LM head\n");
     std::printf(
         "================================================================================\n");
 
@@ -322,7 +320,8 @@ int main() {
     }
     {
         // A token id outside the table is refused, not wrapped into it. The same
-        // rule as trap 40: an out-of-range index must not produce finite numbers.
+        // rule as the embedding expansion: an out-of-range index must not produce
+        // finite numbers.
         bool refused = false;
         try {
             graph.embed_token(params.vocab, stream);
@@ -367,7 +366,7 @@ int main() {
 
         // The oracle's residual is built from the artifact on the host, not from
         // the device's readback: a broken broadcast must fail B1 *and* B2, and an
-        // oracle fed the device's own residual could not see it at all (trap 37).
+        // oracle fed the device's own residual could not see it at all.
         const std::vector<double> oracle_residual = residual_from_embedding(token);
         step.want_hc_head = oracle_hc_head(oracle_residual, params);
         step.want_norm = aeon::reference::rmsnorm(step.hc_head_out, params.norm, kRmsEps);
@@ -510,8 +509,7 @@ int main() {
     // 129280-wide vector has many exact ties and an index comparison would be flaky
     // for reasons that have nothing to do with the stage. Values are compared
     // instead — a wrong head moves them wholesale — and a differing argmax is
-    // accepted only when the two candidates agree to within one fp16 ulp, the same
-    // allowance item 17's gate arrived at for a discrete selection (trap 37).
+    // accepted only when the two candidates agree to within one fp16 ulp.
     {
         size_t argmax_mismatches = 0;
         size_t tied_mismatches = 0;
@@ -668,10 +666,10 @@ int main() {
     std::printf(
         "--------------------------------------------------------------------------------\n");
     if (harness.failures == 0) {
-        std::printf("[P1 — graph head stage] PASS — %u checks, 0 failed\n", harness.checks);
+        std::printf("[graph head] PASS — %u checks, 0 failed\n", harness.checks);
         return 0;
     }
-    std::printf("[P1 — graph head stage] FAIL — %u checks, %u failed\n", harness.checks,
+    std::printf("[graph head] FAIL — %u checks, %u failed\n", harness.checks,
                 harness.failures);
     return 1;
 }

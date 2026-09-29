@@ -6,13 +6,13 @@
 //
 //   * the fused `aeon_moe_fused_w2_accum_kernel` accumulates with `atomicAdd`,
 //     whose order across the six experts is the scheduler's, so its result is not
-//     reproducible — trap 38, and the reason item 18's gate failed roughly one run
-//     in ten;
+//     reproducible — which is why the gate that needed byte-exactness failed
+//     roughly one run in ten;
 //   * the `moe_accumulate_expert_kernel` path *is* reproducible but keeps
 //     its accumulator in **fp16** and re-rounds on every one of the six steps,
-//     which is what plan §2.10.3 forbids ("accumulate in fp32"). Item 15 recorded
-//     this at Tier 1 and flagged that it is "strictly *less* accurate, which is
-//     the opposite of what the option name suggests".
+//     which violates the requirement to accumulate in fp32. Its error is
+//     "strictly *less* accurate, which is the opposite of what the option name
+//     suggests".
 //
 // So every gate that needed reproducibility had to accept the less accurate path,
 // and there was no correct option to choose. The replacement is a pair:
@@ -29,7 +29,7 @@
 //      passes vacuously.
 //   B. THE ACCUMULATION IS FP32 — the reduce kernel is compared against an fp64
 //      slot-order sum of the *same* contributions, which isolates the accumulation
-//      from the W2 projection (Tier-1 item 14 and item 16 own that projection).
+//      from the W2 projection (its own gate owns that projection).
 //      The error must be at the single fp16 store.
 //   C. THE OLD fp16 PATH IS MATERIALLY WORSE, and this is the point of the gate.
 //      The fp16 read-modify-write chain is emulated on the host — rounding to fp16
@@ -39,8 +39,7 @@
 //      asserting a preference rather than a property.
 //   D. DETERMINISM — the whole pair is run eight times and the fp16 outputs must be
 //      **bit-identical**. Combined with B this is what makes the path usable by a
-//      byte-exact gate, which is the requirement trap 38 imposes on items 19, 22
-//      and 23.
+//      byte-exact gate.
 //   E. THE SHARED EXPERT IS AN ADDEND OF THE fp32 ACCUMULATOR — not a post-hoc
 //      `+=` on a finished fp16 sum. The two orders are computed and the kernel
 //      must match the accumulator form, which is the reference's own fused shape.
@@ -312,8 +311,8 @@ int run_gate() {
     // The check is closed-form and needs no weight decoding: run the same kernel
     // with unit routing weights to get `raw[k][h] = W2_k · activation_k`, then
     // require `contrib[k][h] == weights[k] · raw[k][h]`. The projection arithmetic
-    // inside the shared `swizzled_w2_row_dot` is Tier-1 item 14's and item 16's to
-    // certify; what is certified here is that the routing weight is applied, once
+    // inside the shared `swizzled_w2_row_dot` is certified elsewhere; what is
+    // certified here is that the routing weight is applied, once
     // and to the right expert.
     std::vector<double> raw;
     {
@@ -379,7 +378,8 @@ int run_gate() {
     // The claim is **strictly worse**, not "dramatically worse", and the difference
     // is modest at six experts: both paths end in at least one fp16 store, and the
     // fp16 chain's six roundings partially cancel. The primary justification for
-    // this pair is not accuracy — it is that the fp16 path violates §2.10.3 and the
+    // this pair is not accuracy — it is that the fp16 path violates the
+    // accumulate-in-fp32 requirement and the
     // atomic path cannot fix an order. The accuracy result is reported as what it
     // is: a real but small improvement in this regime, and a larger one at higher
     // expert counts, where more roundings accumulate.
@@ -460,8 +460,8 @@ int run_gate() {
         // *targeted* comparison: the kernel must sit on the accumulator side of
         // the fork, not merely be within tolerance of it. A peak-relative bound
         // cannot express this — the two forms differ by ~1e-3 of peak, which any
-        // sensible tolerance admits. This is the M9/M9b lesson, and it is the
-        // reason that mutation survived the first sweep of this gate.
+        // sensible tolerance admits. This is why the gate needs a targeted
+        // comparison rather than a bound.
         const double to_folded = max_abs_of(with_shared, folded);
         const double to_post_hoc = max_abs_of(with_shared, post_hoc);
         assert_that("E: the kernel sits on the fp32-accumulator side of that fork",

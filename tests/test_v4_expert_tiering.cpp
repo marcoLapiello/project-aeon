@@ -1,16 +1,11 @@
 // -----------------------------------------------------------------------------
-// Tier-4 gate, item 21 — streaming / tiering.
+// Supply tiering gate — expert bytes bit-exact across Hot / Warm / Cold.
 //
-// Gate (plan Part V, item 21): **expert bytes bit-exact across Hot / Warm /
-// Cold.**
-//
-// The same statement is Stage D of the checkpoint plan: "prove the three-tier
-// hierarchy is transparent to the numerics — load an expert to VRAM, dequantize,
-// record; evict, reload from host RAM, compare — expected bit-exact; evict,
-// reload from NVMe via `O_DIRECT`/`io_uring`, compare — expected bit-exact", with
-// the deliverable "confirmation that tier placement does not change a single bit —
-// i.e. any numerical difference is attributable to the graph, never to the memory
-// system."
+// The property: the three-tier hierarchy is transparent to the numerics — load an
+// expert to VRAM, dequantize, record; evict, reload from host RAM, compare —
+// expected bit-exact; evict, reload from NVMe via `O_DIRECT`/`io_uring`, compare —
+// expected bit-exact. Tier placement must not change a single bit, i.e. any
+// numerical difference is attributable to the graph, never to the memory system.
 //
 // What this gate adds over the two tiers of evidence that already exist is the
 // **supply path itself**. `test_model_direct_io.cpp` proves that a standalone
@@ -21,8 +16,7 @@
 // answers a request, which staging slot an I/O lands in, which host slot a
 // demotion writes to, and which stream a copy is enqueued on. A defect in any of
 // those decisions is invisible to both of them and would show up only as
-// "identical artifact, different result on reload" (checkpoint plan §6, failure
-// triage).
+// "identical artifact, different result on reload".
 //
 // The route each tier takes:
 //
@@ -88,15 +82,15 @@
 //     whichever one runs must deliver the artifact's bytes — which is exactly
 //     what the byte comparisons measure.
 //   * **Concurrency.** Requests are dispatched and materialized one round at a
-//     time. The plan's item 21 gate is byte-exactness, not overlap; the overlap
-//     and prefetch behaviour is what the warm-tier A/B report and the supply
-//     telemetry already cover, and item 19's throughput half is a separate gate.
+//     time. This gate is byte-exactness, not overlap; the overlap and prefetch
+//     behaviour is what the warm-tier A/B report and the supply telemetry already
+//     cover.
 //   * **The numerics of the expert itself.** Dequantization and the specialized
-//     kernels are Tier-1 and items 14–18; this gate never dequantizes. It compares
-//     the *packed payload bytes*, which is the thing a tier can corrupt and a
-//     kernel cannot.
+//     kernels are certified by the per-op gates; this gate never dequantizes. It
+//     compares the *packed payload bytes*, which is the thing a tier can corrupt
+//     and a kernel cannot.
 //   * **Tiering across a real layer schedule, prefix reuse, and eviction policy
-//     quality** — Tier-4 items 22/23.
+//     quality.**
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -284,7 +278,7 @@ struct TieringGate {
     // the arena.
     //
     // The release is `release_if_copying` rather than `release_after_gpu_transfer`
-    // because the reap above is now **completion-driven** (plan P2.2): the reaper
+    // because the reap above is now **completion-driven**: the reaper
     // frees each slot the moment its own copy event fires, so by the time this block
     // runs the slot may already be back in the arena. The idempotent form tolerates
     // exactly that — which is why it exists — whereas the strict form throws on it.
@@ -326,7 +320,7 @@ struct TieringGate {
                       /*preload_warm_host=*/false);
         // The audit after every operation: this gate is exactly where a bookkeeping
         // defect should be localised to its cause, so it pays the cost the production
-        // path leaves off (ledger M43).
+        // path leaves off.
         registry.set_validate_each_request(true);
 
         CHECK_HIP(hipStreamCreateWithFlags(&compute_stream, hipStreamNonBlocking));
@@ -365,7 +359,7 @@ struct TieringGate {
     int run() {
         std::printf("================================================================================"
                     "================\n");
-        std::printf("  Tier-4 item 21 — expert bytes bit-exact across Hot / Warm / Cold\n");
+        std::printf("  expert bytes bit-exact across Hot / Warm / Cold\n");
         std::printf("================================================================================"
                     "================\n");
 
@@ -755,7 +749,7 @@ struct TieringGate {
                         std::to_string(registry.demotion_drops));
 
         // ---------------------------------------------------------------------
-        std::printf("\n[Tier-4 item 21 tiering] %s — %u checks, %u failed\n",
+        std::printf("\n[tiering] %s — %u checks, %u failed\n",
                     failures == 0 ? "PASS" : "FAIL", checks, failures);
         std::printf("  routes: hot (O_DIRECT seed) / cold (O_DIRECT via the arena) / warm "
                     "(D2H to the host pool, then H2D back)\n");

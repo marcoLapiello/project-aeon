@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Item 23, first gate — the production routed-expert executor.
+// The production routed-expert executor.
 //
 // `core/v4_expert_executor.hpp` is the implementation of the layer body's
 // `V4RoutedExpertExecutor` seam that the *runtime* uses: the tiered supply system
@@ -14,10 +14,10 @@
 // bytes the artifact holds, for the expert the router actually selected, with the
 // staging and lease protocol ordered correctly.
 //
-// It does **not** certify the expert arithmetic. That is Tier 1 item 14 (format,
-// clamp, composed FFN against an independent decoder), item 15 (shared expert),
-// item 16 (`moe_out` against an fp64 oracle on real `layers.0` experts) and the
-// item-19b accumulation pair (`tests/test_v4_moe_accum_oracle.cpp`). Those own the
+// It does **not** certify the expert arithmetic. That is the format / clamp /
+// composed-FFN gate against an independent decoder, the shared-expert gate, the
+// `moe_out` fp64 oracle on real `layers.0` experts, and the accumulation pair
+// (`tests/test_v4_moe_accum_oracle.cpp`). Those own the
 // dequantization, the clamped SwiGLU, the W2 reduction and the fp32 fixed-order
 // combine. Re-certifying them here would be duplication; writing a *new* reference
 // for them would be worse, because it would be a second oracle for an
@@ -73,12 +73,12 @@
 // executor's header.
 //
 // Deliberately NOT covered here, named so it is not mistaken for coverage:
-//   * the 43-layer stack and the model head (item 23's later gates);
-//   * tier *quality* — whether the LRU chooses well; item 21 and the routing
-//     placement study own that, and this gate only requires that whichever tier
+//   * the 43-layer stack and the model head, which later gates own;
+//   * tier *quality* — whether the LRU chooses well; the routing placement study
+//     owns that, and this gate only requires that whichever tier
 //     answers delivers the artifact's bytes;
-//   * streaming while the graph runs on other layers (checkpoint plan Stage D.2),
-//     which has no caller until the graph is assembled.
+//   * streaming while the graph runs on other layers, which has no caller until
+//     the graph is assembled.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -140,7 +140,7 @@ constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon
 // A two-layer stack, so leases accumulate across layers within one token and the
 // executor's capacity fallback is genuinely reached. Layer 2 is CSA (ratio 4, so
 // six tokens commit one compressed entry and the indexer runs); layer 3 is HCA
-// (ratio 128, no indexer at all — trap 33). Between them the gate drives both
+// (ratio 128, no indexer at all). Between them the gate drives both
 // compressed classes through the production executor.
 constexpr uint32_t kLayerIds[2] = {2, 3};
 constexpr uint32_t kStackDepth = 2;
