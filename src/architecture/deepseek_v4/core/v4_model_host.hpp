@@ -73,14 +73,13 @@
 #include "infrastructure/core/aeon_loader.hpp"
 #include "infrastructure/core/expert_direct_io.hpp"
 #include "infrastructure/core/expert_registry.hpp"
+#include "infrastructure/core/expert_tier_loader.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "infrastructure/core/expert_host_region.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
 #include "infrastructure/core/prefill_sweep.hpp"
 #include "infrastructure/core/supply_telemetry.hpp"
 #include "infrastructure/hip_check.hpp"
-#include "infrastructure/io/aligned_allocator.hpp"
-#include "infrastructure/io/direct_io_reader.hpp"
 #include "platform/rdna3/device.hpp"
 
 #include <algorithm>
@@ -89,7 +88,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -875,10 +873,18 @@ private:
         // and `invariants_hold()` run regardless of it.
         registry_.set_validate_each_request(runtime_cfg.validate_registry_each_request);
 
+        // The tier's bulk I/O (load and restore) is neutral; bind it now that the
+        // registry, pools and reader exist. `preload_*` runs below; `restore_residents`
+        // runs at a window boundary, reading the demotion capacity through the pointer
+        // (the supply sets it a few lines down).
+        tier_loader_.bind(ExpertTierLoader::Services{
+            &registry_, &vram_pool_, &host_pool_, &direct_io_, &loader_, &budget_,
+            streams_.compute, &demotion_queue_capacity_});
+
         // 12 — Hot, then Warm, filled by batched `O_DIRECT` reads. This is the
         // only step with real mass; the byte-exactness of every route it uses is
         // the item-21 gate's subject, so nothing here re-checks it.
-        preload_hot_experts(format);
+        tier_loader_.preload_hot(format);
         if (warm_slots > 0) {
             // The Warm pool is a **view** over the region's head when one is shared,
             // and an allocation of its own otherwise. Either way it is `warm_slots`
@@ -890,7 +896,7 @@ private:
                 host_pool_.allocate(warm_slots, format);
             }
             if (runtime_cfg.preload_warm_host) {
-                preload_warm_experts(format);
+                tier_loader_.preload_warm(format);
             }
         }
 
@@ -963,7 +969,7 @@ private:
         prefill_controller_.bind(PrefillController::Services{
             &streams_, &supply_, executor_.get(), &registry_, &host_partition_,
             [this] { restore_prefill_warm(loader_.expert_format()); },
-            [this] { restore_prefill_residents(loader_.expert_format()); }});
+            [this] { tier_loader_.restore_residents(loader_.expert_format()); }});
         prefill_controller_.configure(runtime_cfg.prefill_sweep, sweep_min_tokens);
         // P2.3: let the per-token hook pump the swept lookahead's copies. The executor
         // does not know about the sweep, so it gets a callback; the sweep ignores the
@@ -983,119 +989,6 @@ private:
 
     uint32_t experts_per_layer() const noexcept {
         return static_cast<uint32_t>(config_.n_routed_experts);
-    }
-
-    // Every Hot resident, read straight from the artifact and uploaded once. The
-    // physical slots come from the registry's own `vram_slots` rather than being
-    // re-derived from the round-robin order.
-    void preload_hot_experts(const ExpertFormatDescriptor& format) {
-        const size_t batch = std::max<size_t>(
-            1, direct_io_.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
-        for (uint32_t start = 0; start < budget_.hot_vram_slots;
-             start += static_cast<uint32_t>(batch)) {
-            const uint32_t end = std::min<uint32_t>(
-                budget_.hot_vram_slots, start + static_cast<uint32_t>(batch));
-
-            std::vector<std::pair<uint32_t, uint32_t>> expert_ids;
-            std::vector<aeon::io::AlignedBuffer> buffers;
-            for (uint32_t slot = start; slot < end; ++slot) {
-                const int32_t gid = registry_.vram_slots[slot];
-                if (gid < 0) continue;
-                const auto& entry = registry_.catalog[static_cast<size_t>(gid)];
-                expert_ids.emplace_back(entry.layer_id, entry.expert_id);
-                buffers.emplace_back(format.payload_bytes, format.sector_size);
-            }
-
-            std::vector<uint8_t*> destinations;
-            destinations.reserve(buffers.size());
-            for (auto& buffer : buffers) {
-                destinations.push_back(static_cast<uint8_t*>(buffer.data()));
-            }
-            direct_io_.read_blocking(loader_, expert_ids, destinations);
-
-            size_t index = 0;
-            for (uint32_t slot = start; slot < end; ++slot) {
-                if (registry_.vram_slots[slot] < 0) continue;
-                vram_pool_.upload_from_host_expert(
-                    slot, destinations[index++], streams_.compute);
-            }
-            CHECK_HIP(hipStreamSynchronize(streams_.compute));
-        }
-    }
-
-    // The Warm pool is filled in place — the registry chose the owning experts at
-    // construction, so this writes their payloads into the pinned slots it
-    // reserved rather than deciding residency again.
-    void preload_warm_experts(const ExpertFormatDescriptor& format) {
-        const size_t batch = std::max<size_t>(
-            1, direct_io_.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
-        for (uint32_t start = 0; start < budget_.warm_host_slots;
-             start += static_cast<uint32_t>(batch)) {
-            const uint32_t end = std::min<uint32_t>(
-                budget_.warm_host_slots, start + static_cast<uint32_t>(batch));
-
-            std::vector<std::pair<uint32_t, uint32_t>> expert_ids;
-            std::vector<uint8_t*> destinations;
-            for (uint32_t slot = start; slot < end; ++slot) {
-                const int32_t gid = registry_.host_slots[slot];
-                if (gid < 0) continue;
-                const auto& entry = registry_.catalog[static_cast<size_t>(gid)];
-                expert_ids.emplace_back(entry.layer_id, entry.expert_id);
-                destinations.push_back(host_pool_.get_expert_slot_ptr(slot));
-            }
-            direct_io_.read_blocking(loader_, expert_ids, destinations);
-        }
-    }
-
-    // Reloads the Hot residents a prefill drained, so the pool returns to the set it
-    // held before the pass (the plan's restore requirement). The gids come from the
-    // registry's `restore_set()`; each is admitted through the normal cold path —
-    // reserve a slot, read the payload, publish it — which is the same machinery
-    // decode uses, so nothing here is a second code path. It runs at a boundary (the
-    // prefill has already ended), so its blocking reads are off the hot path, and it
-    // is batched exactly like `preload_hot_experts`.
-    void restore_prefill_residents(const ExpertFormatDescriptor& format) {
-        const std::vector<uint32_t> restore = registry_.restore_set();
-        if (restore.empty()) return;
-        const uint32_t per_layer = registry_.experts_per_layer;
-        const size_t batch = std::max<size_t>(
-            1, direct_io_.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
-        for (size_t start = 0; start < restore.size(); start += batch) {
-            const size_t end = std::min(restore.size(), start + batch);
-            std::vector<uint32_t> operation_ids;
-            std::vector<int32_t> slots;
-            std::vector<std::pair<uint32_t, uint32_t>> expert_ids;
-            std::vector<aeon::io::AlignedBuffer> buffers;
-            operation_ids.reserve(end - start);
-            for (size_t i = start; i < end; ++i) {
-                const uint32_t gid = restore[i];
-                const auto request = registry_.reserve_request_by_gid(
-                    gid, 0, demotion_queue_capacity_);
-                if (request.kind != ExpertRequestKind::COLD_MISS || request.vram_slot < 0) {
-                    throw std::runtime_error(
-                        "V4ModelHost: a drained prefill resident was not cold at restore");
-                }
-                operation_ids.push_back(request.operation_id);
-                slots.push_back(request.vram_slot);
-                expert_ids.emplace_back(gid / per_layer, gid % per_layer);
-                buffers.emplace_back(format.payload_bytes, format.sector_size);
-            }
-            std::vector<uint8_t*> destinations;
-            destinations.reserve(buffers.size());
-            for (auto& buffer : buffers) {
-                destinations.push_back(static_cast<uint8_t*>(buffer.data()));
-            }
-            direct_io_.read_blocking(loader_, expert_ids, destinations);
-            for (size_t i = 0; i < slots.size(); ++i) {
-                vram_pool_.upload_from_host_expert(
-                    static_cast<uint32_t>(slots[i]), destinations[i], streams_.compute);
-            }
-            CHECK_HIP(hipStreamSynchronize(streams_.compute));
-            for (size_t i = 0; i < operation_ids.size(); ++i) {
-                registry_.complete_request(operation_ids[i]);
-                registry_.release_lease(restore[start + i]);
-            }
-        }
     }
 
     bool verbose_{false};
@@ -1137,6 +1030,10 @@ private:
     // completion map and the request-id counter, shared with the supply. See
     // `expert_direct_io.hpp`.
     ExpertDirectIO direct_io_;
+    // The tier's bulk load and restore (Hot preload, Warm preload, drained-resident
+    // restore), bound to the pools, registry and reader above. See
+    // `expert_tier_loader.hpp`.
+    ExpertTierLoader tier_loader_;
     V4ExpertSupplyCoordinator supply_;
     V4RoutedExpertScratch expert_scratch_;
     std::unique_ptr<V4TieredExpertExecutor> executor_;
