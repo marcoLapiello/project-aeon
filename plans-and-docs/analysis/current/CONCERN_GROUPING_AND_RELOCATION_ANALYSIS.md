@@ -88,7 +88,7 @@ How to read a row: **Group** is the concern the file *is*; **Action** is the pro
 | `v4_layer_body_types.hpp` | 304 | MDL | Body types | STAY |
 | `v4_layer_body_attention.hpp` | 614 | MDL | Attention phases | STAY |
 | `v4_layer_body_moe.hpp` | 239 | MDL | MoE phases | STAY |
-| `v4_layer_body_batch.hpp` | 689 | **MIXED** | Batch/chunk driver: engine prefill strategy *and* model row-set assembly | SPLIT → §6 |
+| `v4_layer_body_batch.hpp` | 689 | **MDL** | The model's *chunked* layer body: the per-token batch scratch, the composed row-set, and the chunk driver. Every symbol is bound to `V4Layer`/`V4LayerBody*` and to DSV4 semantics (the SWA-ring composition of trap 39, the D1 layer-wide dispatch), so it is the batched twin of `v4_layer_body.hpp` and not engine strategy. | STAY (re-assessed — see §6) |
 | `v4_graph.hpp` | 430 | MDL | Ordered forward pass | STAY |
 | `v4_expert_supply.hpp` | 402 | MDL | Six-expert V4 request adapter over the neutral supply | STAY |
 | `v4_expert_executor.hpp` | 516 | **MIXED** | Model's MoE execution *and* the tiered-supply mechanics *and* backend dispatch | DECOUPLE → §6 |
@@ -236,17 +236,18 @@ The professional way to remove the tradeoff between (2) and (3) is **templating*
 
 ---
 
-## 6. The three files that need splitting, not moving
+## 6. The files that need splitting, not moving
 
-These are `MIXED` / `SPLIT` in §4. They cannot be relocated as-is because more than one concern lives inside them.
+These are the `MIXED` / `SPLIT` files in §4 whose concerns cannot be relocated as-is because more than one concern lives inside them.
 
 | File | The two (or three) concerns inside | Split shape |
 | :--- | :--- | :--- |
 | `v4_model_host.hpp` (1227) | **G4** model residency (weights, config, 43 layers) + **G1** engine assembly (streams, pools, registry, staging, supply) | Keep the model-resident half; extract the engine-assembly half to an engine-owned host/assembly type |
-| `v4_expert_executor.hpp` (516) | **G4** the model's routed-MoE execution + **G1** tiered-supply mechanics (leases, drains) + **G3/G2** backend kernel dispatch | Separate the lease/tier policy (G1) from the V4 dispatch (G4); the backend call becomes a seam |
-| `v4_layer_body_batch.hpp` (689) | **G1** engine prefill strategy + **G4** model row-set assembly | Extract the strategy/progression from the per-row model work |
+| `v4_expert_executor.hpp` (516) | **G4** the model's routed-MoE execution + **G1** tiered-supply mechanics (leases, drains) + **G3/G2** backend kernel dispatch | Re-assessed: **stays.** The MoE shape, the backend dispatch and the scratch are model-specific; only the lease *contract* was generic and is now `ExpertLeaseHolder`. |
 
-`v4_pipeline_ops.hpp` is a fourth split (§5.3): generic casts + generic MoE accumulate stay reusable; the clamped SwiGLU is a model feature.
+`v4_pipeline_ops.hpp` was a fourth split (§5.3): done — generic casts + generic MoE accumulate are now reusable; the clamped SwiGLU stayed a model feature.
+
+**`v4_layer_body_batch.hpp` was re-assessed to STAY** (it was listed as `MIXED` here). Its name suggested an engine chunk-driver, but every symbol is the model's own: the `V4LayerBodyBatchScratch` is written in `DSV4_*` dimensions and hands out `V4LayerBodyRow` views; `compose_local_rows` reads the DSV4 SWA ring and exists to fix trap 39; `run_layer_body_chunk` drives the model's phase functions in the order the model's semantics force (keys to the chunk buffer, then a single layer-wide dispatch). The engine strategy that did look separable — the window/chunk/layer-major progression — is in `v4_graph::forward_window` (model, stays) and the already-moved `prefill_sweep` / `prefill_controller`, which reach the model only through the `LayerBatchSupply` port. There is no model-free fragment to lift, so it stays whole.
 
 ---
 
