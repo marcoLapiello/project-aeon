@@ -1,14 +1,14 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// Grouped W4A16 expert GEMM on the Wave32 WMMA unit.
+// Grouped W4A16 expert pair (gate/up + SwiGLU, then W2) on the Wave32 WMMA unit.
 //
 // The single-token expert kernels (`aeon_moe_fused_w13_swiglu`, ...) are GEMVs:
 // one token per launch, so a weight byte fetched for one token cannot be reused
 // by the next. Over a chunk of T tokens every expert weight is therefore read
-// once per token that routes to it. This kernel instead sorts the chunk's
-// (token, slot) pairs by expert — a device-side permutation supplied by the
-// caller — and runs one GEMM per expert with the tokens of that expert as the M
+// once per token that routes to it. These kernels instead sort the chunk's
+// (token, slot) draws by expert — a device-side permutation supplied by the
+// caller — and run one GEMM per expert with the tokens of that expert as the M
 // dimension, so each weight byte is read once no matter how many tokens want it.
 //
 // Shape and why:
@@ -30,9 +30,15 @@
 // are padded by repeating a resident token's row; the rows past the count are
 // masked at the store. Giving them a separate GEMV path would need a second set
 // of launch shapes for a case the permutation can absorb.
+//
+// Two indexings travel through both kernels and they are not the same one: a
+// **token** names a row of the chunk's activations, and a **draw** — a (token,
+// slot) pair — names an output row. The gate reads activations by token; the
+// output projection writes contributions by draw, one writer per element, so the
+// executor's slot-ordered reduce still sees a single contribution per slot.
 // -----------------------------------------------------------------------------
 
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
+#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
 #include "platform/rdna3/wmma.hpp"
 
 #include <hip/hip_fp16.h>
@@ -62,7 +68,7 @@ inline constexpr int kGroupedWmmaKBlock = 64;
 // the slab is small and re-read every K step, so the cost is accepted rather than
 // worked around with a second on-device transpose.
 template <int RPW, int LPR>
-__device__ __forceinline__ void grouped_dequant_w13_slab(
+__device__ __forceinline__ void grouped_dequant_w4a16_slab(
     const uint4* __restrict__ packed,
     const half* __restrict__ scale,
     half* __restrict__ tile,
@@ -164,10 +170,10 @@ void aeon_moe_grouped_w13_swiglu_wmma_kernel(
         aeon::rdna3::f32_vec8 up_accumulator = aeon::rdna3::wmma_zero_accumulator();
 
         for (int k_base = 0; k_base < K; k_base += kGroupedWmmaKBlock) {
-            grouped_dequant_w13_slab<RPW, LPR>(
+            grouped_dequant_w4a16_slab<RPW, LPR>(
                 weights.w1[expert], weights.s1[expert], w1_slab, kNTile, n_base, k_base,
                 iterations);
-            grouped_dequant_w13_slab<RPW, LPR>(
+            grouped_dequant_w4a16_slab<RPW, LPR>(
                 weights.w3[expert], weights.s3[expert], w3_slab, kNTile, n_base, k_base,
                 iterations);
             __syncthreads();
@@ -238,6 +244,132 @@ inline void dispatch_aeon_moe_grouped_w13_swiglu_wmma(
         <<<grid, block, 0, stream>>>(activation, expert_offsets, token_indices, weights,
                                      expert_hidden, expert_count, expert_hidden_tokens, N,
                                      K, swiglu_limit);
+}
+
+// The second half of the routed pair: `[tokens, 2048] -> [tokens, 4096]` per
+// expert, scaled by the routing weight and written to the draw's own output row.
+//
+// The output is indexed by **draw** — a (token, slot) pair — and not by token,
+// so every element has exactly one writer. That is the property the executor's
+// slot-ordered summation depends on, and it has to survive at batch width: the
+// reduce reads these rows back in slot order and must find a single contribution
+// per slot, not a sum whose order came from the scheduler.
+//
+// Row `m` of `expert_hidden` is where the gate kernel left this expert's `m`-th
+// token, so the A rows are read by group position and only the store consults
+// `draw_indices` — the two indexings are deliberately separate arrays, and a
+// kernel that confused them would scatter entries across draws.
+template <int WAVES, int RPW, int LPR>
+__global__ __launch_bounds__(WAVES * 32)
+void aeon_moe_grouped_w2_wmma_kernel(
+    const half* __restrict__ expert_hidden,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ draw_indices,
+    const float* __restrict__ draw_weights,
+    SwizzledW2ExpertPtrs weights,
+    float* __restrict__ contrib,
+    int expert_count,
+    int expert_hidden_tokens,
+    int N,
+    int K
+) {
+    constexpr int kNTile = WAVES * 16;
+    constexpr int kM = 16;
+
+    const int expert = blockIdx.y;
+    if (expert >= expert_count) {
+        return;
+    }
+
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int lane_axis = aeon::rdna3::wmma_lane_axis(lane);
+    const int lane_parity = aeon::rdna3::wmma_lane_parity(lane);
+    const int n_base = blockIdx.x * kNTile;
+    const int n_wave = wave * kM;
+
+    __shared__ half w2_slab[kGroupedWmmaKBlock * kNTile];
+
+    const int first = expert_offsets[expert];
+    const int count = expert_offsets[expert + 1] - first;
+    const int iterations = (K / 32) / LPR;
+
+    for (int m_base = 0; m_base < count; m_base += kM) {
+        const int row_in_group = m_base + lane_axis;
+        // The gate kernel writes only the group's first `count` rows, so the
+        // padding rows of the last M tile have no defined value to read. Row 0
+        // always exists and its products are discarded by the store below.
+        const int m = row_in_group < count ? row_in_group : 0;
+        const half* activation_row =
+            expert_hidden +
+            (static_cast<size_t>(expert) * expert_hidden_tokens + m) * K;
+
+        aeon::rdna3::f32_vec8 accumulator = aeon::rdna3::wmma_zero_accumulator();
+
+        for (int k_base = 0; k_base < K; k_base += kGroupedWmmaKBlock) {
+            grouped_dequant_w4a16_slab<RPW, LPR>(
+                weights.w2[expert], weights.s2[expert], w2_slab, kNTile, n_base, k_base,
+                iterations);
+            __syncthreads();
+
+            #pragma unroll
+            for (int k_sub = 0; k_sub < kGroupedWmmaKBlock / aeon::rdna3::kWmmaTileK;
+                 ++k_sub) {
+                const aeon::rdna3::f16_vec16 a_fragment = aeon::rdna3::wmma_load_a_row(
+                    activation_row + k_base + k_sub * aeon::rdna3::kWmmaTileK);
+                const aeon::rdna3::f16_vec16 b_fragment =
+                    aeon::rdna3::wmma_load_b_from_lds(
+                        w2_slab + k_sub * aeon::rdna3::kWmmaTileK * kNTile, kNTile,
+                        n_wave + lane_axis);
+                accumulator =
+                    aeon::rdna3::wmma_mma(a_fragment, b_fragment, accumulator);
+            }
+            __syncthreads();
+        }
+
+        const int n = n_base + n_wave + lane_axis;
+        #pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            if (m_base + 2 * slot + lane_parity < count) {
+                const int position = first + m_base + 2 * slot + lane_parity;
+                contrib[static_cast<size_t>(draw_indices[position]) * N + n] =
+                    draw_weights[position] * accumulator[slot];
+            }
+        }
+    }
+}
+
+template <int WAVES, int RPW, int LPR>
+inline void dispatch_aeon_moe_grouped_w2_wmma(
+    const half* expert_hidden,
+    const int* expert_offsets,
+    const int* draw_indices,
+    const float* draw_weights,
+    const SwizzledW2ExpertPtrs& weights,
+    float* contrib,
+    int expert_count,
+    int expert_hidden_tokens,
+    int N,
+    int K,
+    hipStream_t stream = 0
+) {
+    static_assert(RPW * LPR == 32, "RPW and LPR must describe one Wave32");
+    if (expert_count <= 0 || expert_count > kAeonSwizzledMaxExperts) {
+        throw std::invalid_argument(
+            "dispatch_aeon_moe_grouped_w2_wmma: incompatible expert count");
+    }
+    if (N <= 0 || N % (WAVES * 16) != 0 || K <= 0 || K % kGroupedWmmaKBlock != 0 ||
+        (K / 32) % LPR != 0 || contrib == nullptr) {
+        throw std::invalid_argument(
+            "dispatch_aeon_moe_grouped_w2_wmma: incompatible N/K shape");
+    }
+
+    const dim3 block(WAVES * 32);
+    const dim3 grid(N / (WAVES * 16), expert_count);
+    aeon_moe_grouped_w2_wmma_kernel<WAVES, RPW, LPR>
+        <<<grid, block, 0, stream>>>(expert_hidden, expert_offsets, draw_indices,
+                                     draw_weights, weights, contrib, expert_count,
+                                     expert_hidden_tokens, N, K);
 }
 
 } // namespace aeon::kernel
