@@ -29,18 +29,6 @@ namespace aeon::core {
 
 class TieredExpertSupply {
 public:
-    // Demotions allowed in flight before further candidates are dropped with
-    // `queue_pressure`. A layer dispatches up to 6 experts and each may evict a
-    // victim, so a capacity below 6 cannot admit a whole layer's worth of
-    // evictions and silently discards the rest.
-    //
-    // Measured (ledger M33): at 2, decode dropped 43% of demotions and read
-    // 19.75 GB from NVMe; at 6, drops fell to 0, Warm service rose, and decode
-    // NVMe fell to 11.86 GB (-40%) for a D2H rise that nets ~30 ms/token saved
-    // at the measured stream rates. The queue never overflowed at 6 in either
-    // phase, so 6 is the smallest capacity that stops the waste.
-    static constexpr uint64_t DEFAULT_DEMOTION_QUEUE_CAPACITY = 6;
-
     // The payload vocabulary is defined in `tiered_expert_supply_types.hpp`; these
     // aliases keep the established `TieredExpertSupply::X` spellings for callers
     // and for the lifecycle below, while the definitions themselves are nameable

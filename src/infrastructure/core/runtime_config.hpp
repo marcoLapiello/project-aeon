@@ -228,13 +228,13 @@ struct AeonRuntimeConfig {
 // There are **three** distinct corridor requirements, because there are three
 // dispatch paths and each binds a different number of staging indices at once:
 //
-//   * **decode** — `dispatch_layer_prefetch` stages one token's six routed experts
-//     into `(layer % 2) * 6 + 0..5`, so it needs `TOTAL_STAGING_SLOTS` (`2 x 6`, the
-//     double buffer) and nothing more. This is the certified decode shape.
+//   * **decode** — `dispatch_layer_prefetch` stages one token's `experts_per_token`
+//     routed experts into two banks, so it needs `decode_slot_count(experts_per_token)`
+//     (the double buffer) and nothing more. This is the certified decode shape.
 //   * **routed batched prefill** — `dispatch_layer_prefetch_batch` stages the layer's
-//     deduplicated distinct set into `0 .. D-1` with `D <= min(6C, E)`, so it needs
-//     `min(6C, E)` slots — one layer's worth at any useful chunk. **Not 12**: the two
-//     are different requirements and only coincide at `C = 2`.
+//     deduplicated distinct set into `0 .. D-1` with `D <= min(experts_per_token * C, E)`,
+//     so it needs `min(experts_per_token * C, E)` slots — one layer's worth at any
+//     useful chunk.
 //   * **swept batched prefill** — `dispatch_layer_stream` stages a whole layer into
 //     `(layer % banks) * E` and keeps `banks` of them live, so it needs
 //     `blocks x E` slots; and it needs **at least one whole layer** regardless of the
@@ -243,10 +243,10 @@ struct AeonRuntimeConfig {
 // The corridor is sized to its largest requirement, and the Warm/staging boundary is
 // cut to the requirement of the phase actually running (`ExpertHostRegion`), so the
 // two smaller phases hand the difference back to Warm residency — which is where
-// decode's NVMe hits are decided, and where a mistyped `min(6C, E)` was costing a
-// full layer's worth of residency for no reason.
+// decode's NVMe hits are decided, and where a mistyped `min(experts_per_token * C, E)`
+// was costing a full layer's worth of residency for no reason.
 struct StagingSlotCounts {
-    // Decode: one token's six experts, double-buffered.
+    // Decode: one token's routed experts, double-buffered.
     uint32_t decode{0};
     // A chunked (routed) prefill: the layer's deduplicated distinct set.
     uint32_t batch{0};
@@ -259,12 +259,13 @@ struct StagingSlotCounts {
 
 inline StagingSlotCounts staging_slot_counts(
     const AeonRuntimeConfig& cfg,
-    uint32_t experts_per_layer
+    uint32_t experts_per_layer,
+    uint32_t experts_per_token
 ) {
     StagingSlotCounts counts;
-    counts.decode = PrefetchStagingArena::TOTAL_STAGING_SLOTS;
+    counts.decode = PrefetchStagingArena::decode_slot_count(experts_per_token);
     const uint32_t chunk_ceiling = std::min<uint32_t>(
-        6u * std::max<uint32_t>(1, cfg.prefill_chunk), experts_per_layer);
+        experts_per_token * std::max<uint32_t>(1, cfg.prefill_chunk), experts_per_layer);
     counts.batch = std::max<uint32_t>(counts.decode, chunk_ceiling);
     // A swept dispatch binds a whole layer, so the prefill size is at least one layer
     // even at `blocks = 0`; at least two by default, one to read into and one to copy
@@ -281,8 +282,9 @@ inline StagingSlotCounts staging_slot_counts(
 
 // The corridor's allocation size — its largest requirement, shared by the budget
 // report and the artifact's own arena construction.
-inline uint32_t staging_slot_count(const AeonRuntimeConfig& cfg, uint32_t experts_per_layer) {
-    return staging_slot_counts(cfg, experts_per_layer).peak;
+inline uint32_t staging_slot_count(const AeonRuntimeConfig& cfg, uint32_t experts_per_layer,
+                                   uint32_t experts_per_token) {
+    return staging_slot_counts(cfg, experts_per_layer, experts_per_token).peak;
 }
 
 } // namespace aeon::core

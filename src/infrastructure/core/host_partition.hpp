@@ -109,6 +109,9 @@ public:
         staging_decode_slots_ = (active && !phase_cuts) ? staging.batch : staging.decode;
         staging_batch_slots_ = staging.batch;
         staging_prefill_slots_ = staging.prefill;
+        // The smallest corridor that can still run the certified decode path: one
+        // token's routed experts, double-buffered. `resize` refuses to go below it.
+        staging_floor_slots_ = staging.decode;
         if (active) {
             warm_slots_decode_ = region_slots - staging_decode_slots_;
             warm_slots_routed_ = region_slots - staging.batch;
@@ -151,7 +154,7 @@ public:
         if (services_.staging == nullptr) return false;
         if (services_.staging->in_use_slots() != 0) return false;
         if (outstanding_leases != 0) return false;
-        if (slots < PrefetchStagingArena::TOTAL_STAGING_SLOTS) return false;
+        if (slots < staging_floor_slots_) return false;
         // A shared region has a **fixed** total: its corridor can only be resized by
         // moving the boundary, which is what the phase transitions do. Letting a
         // caller resize the arena alone would silently over-commit the region, so the
@@ -222,6 +225,8 @@ private:
     uint32_t staging_decode_slots_{0};
     uint32_t staging_batch_slots_{0};
     uint32_t staging_prefill_slots_{0};
+    // The decode shape, the smallest corridor `resize` will leave in place.
+    uint32_t staging_floor_slots_{0};
     uint32_t warm_slots_decode_{0};
     uint32_t warm_slots_routed_{0};
     uint32_t warm_slots_prefill_{0};

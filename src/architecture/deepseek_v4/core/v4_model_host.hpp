@@ -794,11 +794,12 @@ private:
         // the supply-chain hot-path plan). `staging_slot_count` is shared with the
         // budget report, so the figure the plan prints is the figure allocated here.
         const uint32_t experts_per_layer = static_cast<uint32_t>(config_.n_routed_experts);
+        const uint32_t experts_per_token = static_cast<uint32_t>(config_.num_experts_per_tok);
         const uint32_t dedup_ceiling = std::min<uint32_t>(
-            PrefetchStagingArena::EXPERTS_PER_HORIZON *
-                std::max<uint32_t>(1, runtime_cfg.prefill_chunk),
+            experts_per_token * std::max<uint32_t>(1, runtime_cfg.prefill_chunk),
             experts_per_layer);
-        const auto staging = aeon::core::staging_slot_counts(runtime_cfg, experts_per_layer);
+        const auto staging = aeon::core::staging_slot_counts(
+            runtime_cfg, experts_per_layer, experts_per_token);
         const uint32_t staging_slots = staging.peak;
 
         // The host region: **one** pinned allocation shared by the Warm tier and the
@@ -920,7 +921,7 @@ private:
             runtime_cfg.demotion_queue_capacity > 0
                 ? runtime_cfg.demotion_queue_capacity
                 : (runtime_cfg.enable_warm_refill
-                    ? V4ExpertSupplyCoordinator::DEFAULT_DEMOTION_QUEUE_CAPACITY : 0));
+                    ? static_cast<uint64_t>(config_.num_experts_per_tok) : 0));
         demotion_queue_capacity_ = supply_.demotion_queue_capacity();
         freeze_warm_during_prefill_ = runtime_cfg.freeze_warm_during_prefill;
 

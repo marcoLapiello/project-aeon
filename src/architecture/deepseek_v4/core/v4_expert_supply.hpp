@@ -19,9 +19,9 @@ namespace aeon::core {
 
 class V4ExpertSupplyCoordinator : public LayerBatchSupply {
 public:
-    static constexpr uint64_t DEFAULT_DEMOTION_QUEUE_CAPACITY =
-        TieredExpertSupply::DEFAULT_DEMOTION_QUEUE_CAPACITY;
-
+    // Six routed experts per token: the model's top-k. The supply's per-request
+    // vocabulary is the model's, so this constant lives with the model adapter, not
+    // in the neutral supply.
     // One routed expert per token, the `k` of the top-k selection. An expert is
     // selected at most once per token (the router's top-k is a set), so a token's
     // six entries are distinct; only across tokens does an expert repeat.

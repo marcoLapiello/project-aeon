@@ -13,14 +13,14 @@
 #include <vector>
 
 // The arena's slot count is a **construction parameter**, not a compile-time fact
-// (Step 6 / Step 0 D4). Decode's `C = 1` dispatch double-buffers one token — two
-// banks of six, `TOTAL_STAGING_SLOTS` — but a layer-wide chunk dispatch issues up
-// to `6C` transfers as one set, and each distinct expert's transfer needs its own
-// slot for as long as it is in transit. Sizing that as `NUM_BUFFERS * 6` would
-// silently collide the second distinct expert with the first. The default
-// therefore stays the decode shape (12) so nothing on the certified path moves;
-// a caller that dispatches a chunk constructs the arena large enough for its
-// deduplicated set, and `V4ModelHost` sizes it from the configured prefill chunk.
+// (Step 6 / Step 0 D4). Decode's `C = 1` dispatch double-buffers one token —
+// `NUM_BUFFERS` banks of the model's `experts_per_token` selection — but a
+// layer-wide chunk dispatch issues up to `experts_per_token * C` transfers as one
+// set, and each distinct expert's transfer needs its own slot for as long as it is
+// in transit. Sizing that as the decode shape would silently collide the second
+// distinct expert with the first. The decode shape is therefore a **function of the
+// model** (`decode_slot_count`), supplied by the caller; this class bakes in no
+// expert count. `V4ModelHost` sizes it from the configured prefill chunk.
 
 #include "infrastructure/hip_check.hpp"
 
@@ -37,9 +37,16 @@ public:
         GPU_TRANSFER_PENDING
     };
 
-    static constexpr uint32_t EXPERTS_PER_HORIZON = 6;
-    static constexpr uint32_t NUM_BUFFERS = 2; // Double-buffering: Buffer 0 & Buffer 1
-    static constexpr uint32_t TOTAL_STAGING_SLOTS = NUM_BUFFERS * EXPERTS_PER_HORIZON; // 12 slots
+    // Double-buffering: one bank in flight and one being filled. A *mechanical* fact
+    // about the pipeline, not a model property.
+    static constexpr uint32_t NUM_BUFFERS = 2;
+
+    // The **decode shape** for a model that routes `experts_per_token` experts per
+    // token: double-buffer one token's selection. It is a function of the model, so
+    // the model supplies the argument; this class bakes in no number.
+    static constexpr uint32_t decode_slot_count(uint32_t experts_per_token) noexcept {
+        return NUM_BUFFERS * experts_per_token;
+    }
 
     uint8_t* h_pinned_base{nullptr};
     bool is_allocated_{false};
@@ -48,14 +55,23 @@ public:
     hipEvent_t* events{nullptr};
     std::vector<SlotState> slot_states{};
 
-    PrefetchStagingArena() {
+    // Unsized: `bind` or the sized constructors below must run before use. The size
+    // is a policy input this class cannot know (the model's per-token expert count
+    // times the buffer count), so it is never guessed.
+    PrefetchStagingArena() = default;
+
+    // The **decode shape**: double-buffer one token's `experts_per_token` experts.
+    explicit PrefetchStagingArena(uint32_t experts_per_token)
+        : slot_count_(decode_slot_count(experts_per_token)) {
         allocate();
     }
 
-    explicit PrefetchStagingArena(const ExpertFormatDescriptor& format,
-                                  uint32_t slots = TOTAL_STAGING_SLOTS)
-        : format_(format) {
-        slot_count_ = slots == 0 ? TOTAL_STAGING_SLOTS : slots;
+    explicit PrefetchStagingArena(const ExpertFormatDescriptor& format, uint32_t slots)
+        : slot_count_(slots), format_(format) {
+        if (slot_count_ == 0) {
+            throw std::invalid_argument(
+                "PrefetchStagingArena: an explicit, non-zero slot count is required");
+        }
         allocate();
     }
 
@@ -92,7 +108,10 @@ public:
 
     void allocate() {
         if (is_allocated_) return;
-        if (slot_count_ == 0) slot_count_ = TOTAL_STAGING_SLOTS;
+        if (slot_count_ == 0) {
+            throw std::invalid_argument(
+                "PrefetchStagingArena: cannot allocate without a slot count");
+        }
 
         format_.validate_payload();
         size_t total_bytes = static_cast<size_t>(slot_count_) * format_.payload_bytes;
@@ -342,7 +361,7 @@ public:
     }
 
 private:
-    uint32_t slot_count_{TOTAL_STAGING_SLOTS};
+    uint32_t slot_count_{0};
     bool uses_hip_host_malloc_{false};
     bool uses_hip_host_register_{false};
     // False when the arena is a view over another owner's memory (`bind`); `free()`
@@ -418,7 +437,7 @@ private:
         other.uses_hip_host_register_ = false;
         other.format_ = make_current_swizzled_expert_format();
         other.is_allocated_ = false;
-        other.slot_count_ = TOTAL_STAGING_SLOTS;
+        other.slot_count_ = 0;
         other.slot_states.clear();
         other.available_since_.clear();
     }

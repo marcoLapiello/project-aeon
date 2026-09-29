@@ -226,7 +226,8 @@ public:
         // is the phase that wants the most of it.
         const uint32_t experts_per_layer =
             static_cast<uint32_t>(expert_format.experts_per_layer);
-        const auto staging = aeon::core::staging_slot_counts(runtime_cfg, experts_per_layer);
+        const auto staging = aeon::core::staging_slot_counts(
+            runtime_cfg, experts_per_layer, static_cast<uint32_t>(geometry.experts_per_tok));
         report.transient_staging_bytes =
             static_cast<size_t>(staging.peak) * expert_format.payload_bytes;
         report.staging_decode_bytes =

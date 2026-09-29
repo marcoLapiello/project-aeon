@@ -142,7 +142,7 @@ int main() {
     }
     assert(observed_pinned_slots == host_pool.pinned_slot_count());
 
-    aeon::core::PrefetchStagingArena staging;
+    aeon::core::PrefetchStagingArena staging{6};  // the decode shape: one token's six
     std::vector<uint8_t> payload(aeon::core::AEON_EXPERT_BYTES, 0xA5);
     staging.stage_payload(0, payload.data());
     staging.begin_gpu_transfer(0);

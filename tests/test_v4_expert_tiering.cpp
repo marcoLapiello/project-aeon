@@ -204,7 +204,7 @@ struct TieringGate {
     aeon::core::AeonModelLoader loader;
     ExpertPayloadPool vram_pool;
     HostExpertPool host_pool;
-    PrefetchStagingArena staging;
+    PrefetchStagingArena staging{6};  // the decode shape: one token's six experts
     ExpertRegistry registry;
     SupplyTelemetry telemetry;
     aeon::io::DirectIOReader supply_reader{64};
@@ -761,8 +761,8 @@ struct TieringGate {
                     "(D2H to the host pool, then H2D back)\n");
         std::printf("  pool: %u VRAM slots (saturated), %u host slots, %u staging slots "
                     "(%.1f MiB), demotion queue %llu\n",
-                    kVramSlots, kHostSlots, PrefetchStagingArena::TOTAL_STAGING_SLOTS,
-                    (PrefetchStagingArena::TOTAL_STAGING_SLOTS * kPayloadBytes) /
+                    kVramSlots, kHostSlots, staging.slot_count(),
+                    (staging.slot_count() * kPayloadBytes) /
                         (1024.0 * 1024.0),
                     static_cast<unsigned long long>(kDemotionQueueCapacity));
         std::printf("  experts moved: %zu resident seeds + %zu cold misses + 1 make-room + "

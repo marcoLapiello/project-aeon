@@ -173,7 +173,7 @@ struct Harness {
     aeon::core::AeonModelLoader loader;
     UnifiedVRAMExpertPool vram_pool;
     HostExpertPool host_pool;
-    PrefetchStagingArena staging;
+    PrefetchStagingArena staging{6};  // the decode shape: one token's six experts
     ExpertRegistry registry;
     SupplyTelemetry telemetry;
     aeon::io::DirectIOReader reader{64};

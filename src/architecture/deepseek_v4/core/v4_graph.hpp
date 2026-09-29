@@ -298,7 +298,8 @@ public:
         // begins — a caller that runs a wider chunk than it configured still fails
         // here, before any work, rather than mid-window at the arena.
         const uint32_t staging_needed = std::min<uint32_t>(
-            6u * chunk, static_cast<uint32_t>(host_.config().n_routed_experts));
+            static_cast<uint32_t>(host_.config().num_experts_per_tok) * chunk,
+            static_cast<uint32_t>(host_.config().n_routed_experts));
         const uint32_t staging_capacity = host_.batch_staging_capacity();
         if (staging_needed > staging_capacity) {
             throw std::invalid_argument(
