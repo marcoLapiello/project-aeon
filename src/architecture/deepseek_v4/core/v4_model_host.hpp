@@ -71,6 +71,7 @@
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "infrastructure/backend_registry/expert_backend.hpp"
 #include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/core/expert_direct_io.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "infrastructure/core/expert_host_region.hpp"
@@ -240,9 +241,7 @@ public:
         // The partition's bound staging pointer is now stale; clear it so nothing
         // reaches a freed arena before the next `initialize` re-binds it.
         host_partition_.bind(HostPartition::Services{});
-        io_reader_.reset();
-        completions_.clear();
-        next_io_id_ = 1;
+        direct_io_.free();
 
         // The layers free their own dense weights and attention state, the
         // resources and the scratch free theirs, and every `free()` nulls what it
@@ -630,7 +629,7 @@ public:
         if (restore.empty()) return;
         const uint32_t per_layer = registry_.experts_per_layer;
         const size_t batch = std::max<size_t>(
-            1, io_reader_->submission_capacity() / direct_requests_per_expert(format));
+            1, direct_io_.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
         // Advance a single cursor rather than stepping `start` by a whole batch: a batch
         // that runs out of room must **stop**, not skip the experts it could not place.
         // (Stepping the outer loop by `batch` after an inner break silently dropped the
@@ -657,7 +656,7 @@ public:
                     host_pool_.get_expert_slot_ptr(static_cast<uint32_t>(slot)));
             }
             if (!expert_ids.empty()) {
-                read_experts_direct_blocking(expert_ids, destinations);
+                direct_io_.read_blocking(loader_, expert_ids, destinations);
             }
         }
         registry_.clear_host_restore_set();
@@ -853,16 +852,15 @@ private:
         // `2 x SQ`); the kernel then cannot post completions and `wait_for_completion`
         // stalls, which measured as `io_wait 1.7 -> 12.8 s`. So the ring follows the
         // staging depth.
-        size_t batch_requests = direct_requests_per_expert(format) * dedup_ceiling;
+        size_t batch_requests = ExpertDirectIO::requests_per_fragment(format) * dedup_ceiling;
         if (runtime_cfg.prefill_sweep) {
             batch_requests = std::max<size_t>(
                 batch_requests,
-                direct_requests_per_expert(format) * static_cast<size_t>(staging_slots));
+                ExpertDirectIO::requests_per_fragment(format) * static_cast<size_t>(staging_slots));
         }
         const uint32_t io_queue_depth = static_cast<uint32_t>(
             std::max<size_t>(64, batch_requests));
-        io_reader_ = std::make_unique<aeon::io::DirectIOReader>(
-            io_queue_depth, true, format.sector_size);
+        direct_io_.initialize(io_queue_depth, format.sector_size);
 
         // 11 — the registry. It is what decides residency for every request, and
         // it saturates VRAM at construction: every Hot slot is owned from the
@@ -904,9 +902,9 @@ private:
             &registry_,
             staging_.get(),
             &telemetry_,
-            io_reader_.get(),
-            &completions_,
-            &next_io_id_,
+            direct_io_.reader(),
+            direct_io_.completions(),
+            direct_io_.next_id(),
             streams_.compute, streams_.sdma, streams_.sdma_cold, streams_.demotion,
             format.payload_bytes,
             runtime_cfg.demotion_queue_capacity > 0
@@ -983,13 +981,6 @@ private:
             runtime_cfg.prefill_chunk > 0 ? runtime_cfg.prefill_chunk : 1);
     }
 
-    size_t direct_requests_per_expert(const ExpertFormatDescriptor& format) const noexcept {
-        return (format.payload_bytes + aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES - 1) /
-               aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
-    }
-
-    // The layer width `E`, the unit the staging partition and the sweep's bank count
-    // are expressed in.
     uint32_t experts_per_layer() const noexcept {
         return static_cast<uint32_t>(config_.n_routed_experts);
     }
@@ -999,7 +990,7 @@ private:
     // re-derived from the round-robin order.
     void preload_hot_experts(const ExpertFormatDescriptor& format) {
         const size_t batch = std::max<size_t>(
-            1, io_reader_->submission_capacity() / direct_requests_per_expert(format));
+            1, direct_io_.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
         for (uint32_t start = 0; start < budget_.hot_vram_slots;
              start += static_cast<uint32_t>(batch)) {
             const uint32_t end = std::min<uint32_t>(
@@ -1020,7 +1011,7 @@ private:
             for (auto& buffer : buffers) {
                 destinations.push_back(static_cast<uint8_t*>(buffer.data()));
             }
-            read_experts_direct_blocking(expert_ids, destinations);
+            direct_io_.read_blocking(loader_, expert_ids, destinations);
 
             size_t index = 0;
             for (uint32_t slot = start; slot < end; ++slot) {
@@ -1037,7 +1028,7 @@ private:
     // reserved rather than deciding residency again.
     void preload_warm_experts(const ExpertFormatDescriptor& format) {
         const size_t batch = std::max<size_t>(
-            1, io_reader_->submission_capacity() / direct_requests_per_expert(format));
+            1, direct_io_.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
         for (uint32_t start = 0; start < budget_.warm_host_slots;
              start += static_cast<uint32_t>(batch)) {
             const uint32_t end = std::min<uint32_t>(
@@ -1052,7 +1043,7 @@ private:
                 expert_ids.emplace_back(entry.layer_id, entry.expert_id);
                 destinations.push_back(host_pool_.get_expert_slot_ptr(slot));
             }
-            read_experts_direct_blocking(expert_ids, destinations);
+            direct_io_.read_blocking(loader_, expert_ids, destinations);
         }
     }
 
@@ -1068,7 +1059,7 @@ private:
         if (restore.empty()) return;
         const uint32_t per_layer = registry_.experts_per_layer;
         const size_t batch = std::max<size_t>(
-            1, io_reader_->submission_capacity() / direct_requests_per_expert(format));
+            1, direct_io_.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
         for (size_t start = 0; start < restore.size(); start += batch) {
             const size_t end = std::min(restore.size(), start + batch);
             std::vector<uint32_t> operation_ids;
@@ -1094,7 +1085,7 @@ private:
             for (auto& buffer : buffers) {
                 destinations.push_back(static_cast<uint8_t*>(buffer.data()));
             }
-            read_experts_direct_blocking(expert_ids, destinations);
+            direct_io_.read_blocking(loader_, expert_ids, destinations);
             for (size_t i = 0; i < slots.size(); ++i) {
                 vram_pool_.upload_from_host_expert(
                     static_cast<uint32_t>(slots[i]), destinations[i], streams_.compute);
@@ -1103,77 +1094,6 @@ private:
             for (size_t i = 0; i < operation_ids.size(); ++i) {
                 registry_.complete_request(operation_ids[i]);
                 registry_.release_lease(restore[start + i]);
-            }
-        }
-    }
-
-    // A batched, blocking `O_DIRECT` read of whole expert payloads. The batch is
-    // sized to the reader's own submission capacity, so the chunk count per
-    // request is the artifact's (a payload is 3.375 of the 4 MiB chunks) and the
-    // short final request is expected rather than an error.
-    void read_experts_direct_blocking(
-        const std::vector<std::pair<uint32_t, uint32_t>>& expert_ids,
-        const std::vector<uint8_t*>& destinations) {
-        if (expert_ids.size() != destinations.size()) {
-            throw std::invalid_argument("V4ModelHost: a direct expert read batch is mismatched");
-        }
-        if (expert_ids.empty()) return;
-
-        const size_t requests_per_expert = direct_requests_per_expert(loader_.expert_format());
-        const size_t max_batch = std::max<size_t>(
-            1, io_reader_->submission_capacity() / requests_per_expert);
-
-        struct ReadJob {
-            uint64_t first_user_data{0};
-            size_t request_count{0};
-        };
-
-        for (size_t start = 0; start < expert_ids.size(); start += max_batch) {
-            const size_t end = std::min(expert_ids.size(), start + max_batch);
-            std::vector<ReadJob> jobs;
-            size_t total_requests = 0;
-
-            for (size_t i = start; i < end; ++i) {
-                const auto location = loader_.get_expert_location(
-                    expert_ids[i].first, expert_ids[i].second);
-                const uint64_t first_user_data = next_io_id_;
-                const size_t request_count = io_reader_->submit_read_chunks(
-                    loader_.expert_direct_fd(), destinations[i], location.byte_length,
-                    location.file_offset, first_user_data);
-                next_io_id_ += request_count;
-                total_requests += request_count;
-                jobs.push_back(ReadJob{first_user_data, request_count});
-            }
-
-            if (io_reader_->submit_pending_reads() != total_requests) {
-                throw std::runtime_error(
-                    "V4ModelHost: a direct expert batch submitted an unexpected request count");
-            }
-
-            std::unordered_map<uint64_t, aeon::io::DirectIOCompletion> completions;
-            completions.reserve(total_requests);
-            for (size_t i = 0; i < total_requests; ++i) {
-                const auto completion = io_reader_->wait_for_completion();
-                completions.emplace(completion.user_data, completion);
-            }
-
-            for (const auto& job : jobs) {
-                for (size_t chunk = 0; chunk < job.request_count; ++chunk) {
-                    const auto it = completions.find(job.first_user_data + chunk);
-                    if (it == completions.end() || it->second.result < 0) {
-                        throw std::runtime_error(
-                            "V4ModelHost: a direct expert read failed");
-                    }
-                    const size_t chunk_offset =
-                        chunk * aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES;
-                    const size_t expected = std::min(
-                        aeon::io::DirectIOReader::DEFAULT_CHUNK_BYTES,
-                        loader_.expert_format().payload_bytes - chunk_offset);
-                    if (it->second.result != static_cast<int32_t>(expected)) {
-                        throw std::runtime_error(
-                            "V4ModelHost: a direct expert read returned a short payload");
-                    }
-                }
             }
         }
     }
@@ -1213,9 +1133,10 @@ private:
     HostPartition host_partition_;
     SupplyTelemetry telemetry_;
     RoutingReuseProfiler reuse_profiler_;
-    std::unique_ptr<aeon::io::DirectIOReader> io_reader_;
-    std::unordered_map<uint64_t, aeon::io::DirectIOCompletion> completions_;
-    uint64_t next_io_id_{1};
+    // The direct (`O_DIRECT`) expert-fragment I/O: the reader, the in-flight
+    // completion map and the request-id counter, shared with the supply. See
+    // `expert_direct_io.hpp`.
+    ExpertDirectIO direct_io_;
     V4ExpertSupplyCoordinator supply_;
     V4RoutedExpertScratch expert_scratch_;
     std::unique_ptr<V4TieredExpertExecutor> executor_;
