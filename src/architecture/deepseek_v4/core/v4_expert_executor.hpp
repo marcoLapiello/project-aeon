@@ -78,6 +78,7 @@
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/core/device_streams.hpp"
+#include "infrastructure/core/expert_lease_holder.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/kernels/v4_pipeline_ops.hpp"
@@ -173,7 +174,7 @@ public:
 // "no reclaimable Hot VRAM slot" error.
 
 // The production executor. Borrows everything it needs; owns only its bookkeeping.
-class V4TieredExpertExecutor final : public V4RoutedExpertExecutor {
+class V4TieredExpertExecutor final : public V4RoutedExpertExecutor, public ExpertLeaseHolder {
 public:
     V4TieredExpertExecutor(
         V4ExpertSupplyCoordinator& supply,
@@ -390,14 +391,14 @@ public:
     // must read the logits back), so every lease held for this token can be handed
     // back without an additional synchronization. See the lease policy above for why
     // the boundary is a *precondition* and not an implementation detail.
-    void release_leases() {
+    void release_leases() override {
         for (const uint32_t gid : leases_) {
             registry_.release_lease(gid);
         }
         leases_.clear();
     }
 
-    size_t outstanding_leases() const noexcept {
+    size_t outstanding_leases() const noexcept override {
         return leases_.size();
     }
 

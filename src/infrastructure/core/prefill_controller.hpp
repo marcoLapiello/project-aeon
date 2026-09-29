@@ -24,8 +24,8 @@
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/core/device_streams.hpp"
-#include "architecture/deepseek_v4/core/v4_expert_executor.hpp"
-#include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
+#include "infrastructure/core/expert_lease_holder.hpp"
+#include "infrastructure/core/layer_batch_supply.hpp"
 #include "infrastructure/core/host_partition.hpp"
 #include "infrastructure/core/prefill_sweep.hpp"
 #include "infrastructure/core/expert_registry.hpp"
@@ -39,15 +39,15 @@
 
 namespace aeon::core {
 
-class V4PrefillController {
+class PrefillController {
 public:
     // The collaborators the lifecycle edits, plus the two host-side restore steps.
     // The executor is nullable (a budget with no Hot slot leaves the graph
     // unbuildable but constructible, and the lifecycle still runs).
     struct Services {
         const DeviceStreams* streams{nullptr};
-        V4ExpertSupplyCoordinator* supply{nullptr};
-        V4TieredExpertExecutor* executor{nullptr};
+        LayerBatchSupply* supply{nullptr};
+        ExpertLeaseHolder* executor{nullptr};
         ExpertRegistry* registry{nullptr};
         HostPartition* partition{nullptr};
         // Re-admit the Warm residents a boundary move surrendered, and the Hot

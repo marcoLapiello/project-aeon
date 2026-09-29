@@ -62,7 +62,7 @@
 #include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
 #include "architecture/deepseek_v4/core/v4_prefill_workspace.hpp"
 #include "infrastructure/core/host_partition.hpp"
-#include "architecture/deepseek_v4/core/v4_prefill_controller.hpp"
+#include "infrastructure/core/prefill_controller.hpp"
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_model_resources.hpp"
 #include "architecture/deepseek_v4/core/v4_model_spec.hpp"
@@ -590,8 +590,8 @@ public:
     // ---- Step 6 item 6: the prefill sweep / routed bank ----------------------
     //
     // `forward_window` drives the window lifecycle below; the strategy, the
-    // prompt-length gate and the sweep itself live in `V4PrefillController`
-    // (`v4_prefill_controller.hpp`). These are the host's entry points to it.
+    // prompt-length gate and the sweep itself live in `PrefillController`
+    // (`prefill_controller.hpp`). These are the host's entry points to it.
     bool prefill_sweep_enabled() const noexcept { return prefill_controller_.enabled(); }
 
     // The prompt-length gate, resolved at load (`E / 4` unless configured). Reported
@@ -962,7 +962,7 @@ private:
             ? runtime_cfg.prefill_sweep_min_tokens
             : std::max<uint32_t>(
                   1, (static_cast<uint32_t>(config_.n_routed_experts) * 3u) / 4u);
-        prefill_controller_.bind(V4PrefillController::Services{
+        prefill_controller_.bind(PrefillController::Services{
             &streams_, &supply_, executor_.get(), &registry_, &host_partition_,
             [this] { restore_prefill_warm(loader_.expert_format()); },
             [this] { restore_prefill_residents(loader_.expert_format()); }});
@@ -1221,9 +1221,9 @@ private:
     std::unique_ptr<V4TieredExpertExecutor> executor_;
     // The layer-major prefill lifecycle and the sweep: the strategy switch, the
     // prompt-length gate, and the window begin/end that move the partition. It
-    // reaches its collaborators as bound services (see `v4_prefill_controller.hpp`);
+    // reaches its collaborators as bound services (see `prefill_controller.hpp`);
     // the host still owns the arena, region and sweep storage lifetime.
-    V4PrefillController prefill_controller_;
+    PrefillController prefill_controller_;
 };
 
 } // namespace aeon::core
