@@ -115,6 +115,8 @@ constexpr int kGemvIterations = 16;
 constexpr int kGroupedWaves = 4;
 constexpr int kGroupedW13Rpw = 4, kGroupedW13Lpr = 8;
 constexpr int kGroupedW2Rpw = 8, kGroupedW2Lpr = 4;
+// M windows swept: 1, 2, 4 and 8 token tiles, i.e. 16 to 128 tokens per slab.
+constexpr int kMTileSweep[] = {1, 2, 4, 8};
 
 constexpr int kM = 16;
 
@@ -146,19 +148,19 @@ struct Permutation {
 
     // How many times the grouped kernel actually reads a whole expert.
     //
-    // The kernel assigns one workgroup to one (N tile, M tile) pair and loops K
-    // inside it, so an expert spanning `ceil(count / 16)` M tiles is read that many
-    // times — the weight slab is re-dequantized per M tile rather than held across
-    // them. The plan's Step 1 asks for the reuse ("dequantise once per K-tile and
-    // reuse it across every token tile of that expert"); this counter is what makes
-    // the shortfall between the kernel and that target visible instead of letting
-    // the ideal figure stand in for the measured one.
-    long expert_reads() const {
+    // The kernel walks K inside a fixed (N tile, M window) workgroup, so an expert
+    // spanning `ceil(count / (16 * window_tiles))` windows has its weight slab
+    // dequantized that many times. A window large enough to hold the expert makes it
+    // one read, which is the target; the plan's per-K-tile reuse is exactly this
+    // quantity reaching `distinct`. This is what keeps the ideal figure from
+    // standing in for the measured one.
+    long expert_reads(int window_tiles) const {
+        const int window = 16 * window_tiles;
         long reads = 0;
         for (int e = 0; e < distinct(); ++e) {
             const int count = expert_offsets[static_cast<size_t>(e + 1)] -
                               expert_offsets[static_cast<size_t>(e)];
-            reads += (count + kM - 1) / kM;
+            reads += (count + window - 1) / window;
         }
         return reads;
     }
@@ -364,7 +366,9 @@ void run_gemv_arm(const Device& device, const Permutation& permutation, int toke
 }
 
 // The grouped pair: distinct experts in batches of at most the kernel's maximum,
-// one launch pair per batch.
+// one launch pair per batch. Templated on the M window so the same source measures
+// several window sizes; the kernel is the same code in each case.
+template <int MTILES>
 void run_grouped_arm(const Device& device, const Permutation& permutation,
                      int expert_hidden_tokens) {
     const int distinct = permutation.distinct();
@@ -404,11 +408,11 @@ void run_grouped_arm(const Device& device, const Permutation& permutation,
                             batch_draws * sizeof(float), hipMemcpyHostToDevice));
 
         kernel::dispatch_aeon_moe_grouped_w13_swiglu_wmma<kGroupedWaves, kGroupedW13Rpw,
-                                                          kGroupedW13Lpr>(
+                                                          kGroupedW13Lpr, MTILES>(
             device.activation, d_offsets, d_tokens, w13, device.expert_hidden, count,
             expert_hidden_tokens, kIntermediate, kHidden, kLimit);
         kernel::dispatch_aeon_moe_grouped_w2_wmma<kGroupedWaves, kGroupedW2Rpw,
-                                                  kGroupedW2Lpr>(
+                                                  kGroupedW2Lpr, MTILES>(
             device.expert_hidden, d_offsets, d_draws, d_weights, w2,
             device.contrib_grouped, count, expert_hidden_tokens, kHidden, kIntermediate);
 
@@ -480,7 +484,7 @@ float time_arm(hipEvent_t start, hipEvent_t stop, int repetitions, Pass pass) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::vector<int> chunk_sizes = {16, 64, 256, 1024};
+    std::vector<int> chunk_sizes;
     std::string profile = "routing-profile/first-real-prompt/counts.csv";
 
     for (int i = 1; i < argc; ++i) {
@@ -490,6 +494,13 @@ int main(int argc, char** argv) {
         } else {
             chunk_sizes.push_back(std::stoi(arg));
         }
+    }
+    // Positional sizes replace the default sweep rather than extending it: the
+    // permutation depends on the RNG's position, so a run that silently measured
+    // eight sizes instead of four would report different routing for the same T as
+    // a run that measured four.
+    if (chunk_sizes.empty()) {
+        chunk_sizes = {16, 64, 256, 1024};
     }
 
     std::cout << "[Bench] Expert pair A/B: GEMV pair vs grouped WMMA pair\n";
@@ -576,7 +587,7 @@ int main(int argc, char** argv) {
 
         // One warm-up pass per arm, so neither pays alone for a cold allocator.
         run_gemv_arm(device, permutation, token_count);
-        run_grouped_arm(device, permutation, rows_per_expert);
+        run_grouped_arm<4>(device, permutation, rows_per_expert);
         CHECK_HIP(hipDeviceSynchronize());
 
         hipEvent_t start = nullptr;
@@ -589,57 +600,69 @@ int main(int argc, char** argv) {
             run_gemv_arm(device, permutation, token_count);
         });
 
-        CHECK_HIP(hipMemset(device.contrib_grouped, 0, contrib_elements * sizeof(float)));
-        const float grouped_ms = time_arm(start, stop, kRepetitions, [&] {
-            run_grouped_arm(device, permutation, rows_per_expert);
-        });
-
-        CHECK_HIP(hipEventDestroy(start));
-        CHECK_HIP(hipEventDestroy(stop));
-
-        // The arms must compute the same function or the timing means nothing.
+        // The baseline arm's output is the reference every window is checked against.
         const size_t live = static_cast<size_t>(draws) * kHidden;
         std::vector<float> host_gemv(live);
-        std::vector<float> host_grouped(live);
         CHECK_HIP(hipMemcpy(host_gemv.data(), device.contrib_gemv, live * sizeof(float),
                             hipMemcpyDeviceToHost));
-        CHECK_HIP(hipMemcpy(host_grouped.data(), device.contrib_grouped,
-                            live * sizeof(float), hipMemcpyDeviceToHost));
-
         double scale = 0.0;
         for (float value : host_gemv) {
             scale = std::max(scale, std::abs(static_cast<double>(value)));
         }
-        double max_delta = 0.0;
-        for (size_t i = 0; i < live; ++i) {
-            max_delta = std::max(max_delta,
-                                 std::abs(static_cast<double>(host_gemv[i]) -
-                                          static_cast<double>(host_grouped[i])));
-        }
-        const bool agrees = max_delta <= 1e-3 * std::max(scale, 1.0);
 
-        // Weight traffic, analytic. The GEMV arm reads each expert once per draw.
-        // The grouped arm reads each expert once per **M tile it spans**, because
-        // the kernel loops K inside a fixed (N tile, M tile) workgroup — so the
-        // measured figure is `expert_reads()`, and `distinct` is the target the
-        // plan's per-K-tile reuse would reach. Both are reported; the difference is
-        // the remaining work in the kernel, not a rounding artefact.
         const double gemv_bytes = static_cast<double>(draws) * expert_bytes;
-        const double grouped_bytes = static_cast<double>(permutation.expert_reads()) * expert_bytes;
-        const double grouped_ideal_bytes = static_cast<double>(distinct) * expert_bytes;
 
-        std::printf("  %6d %8d %8d %9.1f %10.3f %10.3f %9.2f %9.2f %8.2fx %7s\n",
-                    token_count, draws, distinct,
-                    static_cast<double>(draws) / static_cast<double>(distinct), gemv_ms,
-                    grouped_ms, gemv_bytes / (mib * 1024.0), grouped_bytes / (mib * 1024.0),
-                    gemv_ms / grouped_ms, agrees ? "yes" : "NO");
-        std::printf("         %-28s %-34s %6.1fx\n", "weight traffic (GEMV / grouped)",
-                    "", gemv_bytes / grouped_bytes);
-        std::printf("         %-28s %-34s %6.1fx\n",
-                    "  ... had the kernel reused slabs", "", gemv_bytes / grouped_ideal_bytes);
-        if (!agrees) {
-            std::printf("      max |gemv - grouped| = %.3e (scale %.3e)\n", max_delta, scale);
+        std::vector<float> host_grouped(live);
+        for (int window_tiles : kMTileSweep) {
+            CHECK_HIP(hipMemset(device.contrib_grouped, 0, contrib_elements * sizeof(float)));
+            float grouped_ms = 0.0f;
+            switch (window_tiles) {
+                case 1: grouped_ms = time_arm(start, stop, kRepetitions, [&] {
+                            run_grouped_arm<1>(device, permutation, rows_per_expert); }); break;
+                case 2: grouped_ms = time_arm(start, stop, kRepetitions, [&] {
+                            run_grouped_arm<2>(device, permutation, rows_per_expert); }); break;
+                case 4: grouped_ms = time_arm(start, stop, kRepetitions, [&] {
+                            run_grouped_arm<4>(device, permutation, rows_per_expert); }); break;
+                case 8: grouped_ms = time_arm(start, stop, kRepetitions, [&] {
+                            run_grouped_arm<8>(device, permutation, rows_per_expert); }); break;
+                default: throw std::logic_error("uninstantiated M window");
+            }
+
+            CHECK_HIP(hipMemcpy(host_grouped.data(), device.contrib_grouped,
+                                live * sizeof(float), hipMemcpyDeviceToHost));
+            double max_delta = 0.0;
+            for (size_t i = 0; i < live; ++i) {
+                max_delta = std::max(max_delta,
+                                     std::abs(static_cast<double>(host_gemv[i]) -
+                                              static_cast<double>(host_grouped[i])));
+            }
+            const bool agrees = max_delta <= 1e-3 * std::max(scale, 1.0);
+
+            // The grouped arm reads each expert once per M window it spans; a window
+            // large enough to hold the expert makes it one read, which is the target
+            // the plan's per-K-tile reuse names.
+            const double grouped_bytes =
+                static_cast<double>(permutation.expert_reads(window_tiles)) * expert_bytes;
+            const double ideal_bytes = static_cast<double>(distinct) * expert_bytes;
+
+            std::printf("  %6d %8d %8d %9.1f %10.3f %10.3f %9.2f %9.2f %8.2fx %7s\n",
+                        token_count, draws, distinct,
+                        static_cast<double>(draws) / static_cast<double>(distinct), gemv_ms,
+                        grouped_ms, gemv_bytes / (mib * 1024.0),
+                        grouped_bytes / (mib * 1024.0), gemv_ms / grouped_ms,
+                        agrees ? "yes" : "NO");
+            std::printf("         window %d tiles (%d tokens): traffic %5.2fx vs GEMV,"
+                        " %5.2fx vs the one-read target\n",
+                        window_tiles, window_tiles * kM, gemv_bytes / grouped_bytes,
+                        ideal_bytes / grouped_bytes);
+            if (!agrees) {
+                std::printf("      max |gemv - grouped| = %.3e (scale %.3e)\n", max_delta,
+                            scale);
+            }
         }
+
+        CHECK_HIP(hipEventDestroy(start));
+        CHECK_HIP(hipEventDestroy(stop));
     }
 
     for (uint8_t* host : device.host_payloads) delete[] host;

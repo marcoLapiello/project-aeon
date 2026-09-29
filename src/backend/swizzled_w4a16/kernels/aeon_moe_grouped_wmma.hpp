@@ -53,6 +53,12 @@ namespace aeon::kernel {
 // exactly `WAVES * 16 * 2` int4 words — one per thread, no loop and no divisor.
 inline constexpr int kGroupedWmmaKBlock = 64;
 
+// Token tiles (of 16 tokens) per M window, i.e. how many tiles share one
+// dequantized slab. Four is 64 tokens, which holds every expert of a 256-token
+// chunk in one window — the one-read case — and is the time optimum there. The
+// sweep that settled it is in the header of the kernel below.
+inline constexpr int kGroupedWmmaMTiles = 4;
+
 // Dequantizes one `[kBlock, nTile]` slab of a swizzled matrix into LDS in the
 // `[K][N]` order the WMMA B fragment reads.
 //
@@ -117,7 +123,33 @@ __device__ __forceinline__ void grouped_dequant_w4a16_slab(
 // `expert_offsets` and `token_indices` are the permutation: expert e owns
 // `expert_offsets[e] .. expert_offsets[e+1]` of `token_indices`, and each entry is
 // a row of `activation`.
-template <int WAVES, int RPW, int LPR>
+//
+// ## The loop nest, and why K is outer
+//
+// The dequantized slab is the expensive operand: it is the only data this kernel
+// reads from memory, and it is identical for every token tile of the expert. So the
+// nest has to be `K outer, M inner`, with the slab for one 64-wide K block held in
+// LDS across every token tile that consumes it — dequantized once per (K block, M
+// window) rather than once per (K block, M tile). `MTILES` is how many token tiles
+// one window holds; an expert whose token count fits one window is read exactly
+// once, which is the property the whole grouped design is for.
+//
+// The bound on `MTILES` is register pressure, not LDS: each token tile needs two
+// live fp32 accumulators of eight floats per lane, so a window of `MTILES` costs
+// `16 * MTILES` registers per thread before the fragments and addresses. Widening
+// the window past what fits makes the compiler spill the accumulators, which costs
+// more than the slab reuse saves.
+//
+// Measured (`bench_expert_pair_ab`, `M48`), and the numbers say something a
+// register argument alone would not: **window 4 is the time optimum up to a
+// 256-token chunk, and past it more reuse buys bytes rather than speed.** At a
+// 1024-token chunk, window 8 reads `1.15 GiB` where window 4 reads `1.78 GiB` — a
+// `1.55x` traffic cut — at the same elapsed time (`9.99` vs `10.07 ms`). So beyond
+// window 4 the kernel is no longer bound by weight traffic; the remaining cost is
+// the dequant and LDS work, and shrinking traffic further cannot help it. Which
+// window to run is therefore a dispatcher choice keyed on what the chunk pays for
+// (bytes in a tiered run, time in a resident one), not a constant to tune upward.
+template <int WAVES, int RPW, int LPR, int MTILES>
 __global__ __launch_bounds__(WAVES * 32)
 void aeon_moe_grouped_w13_swiglu_wmma_kernel(
     const half* __restrict__ activation,
@@ -133,6 +165,7 @@ void aeon_moe_grouped_w13_swiglu_wmma_kernel(
 ) {
     constexpr int kNTile = WAVES * 16;
     constexpr int kM = 16;
+    constexpr int kMWindow = MTILES * kM;
 
     const int expert = blockIdx.y;
     if (expert >= expert_count) {
@@ -157,19 +190,28 @@ void aeon_moe_grouped_w13_swiglu_wmma_kernel(
 
     const int iterations = (K / 32) / LPR;
 
-    for (int m_base = 0; m_base < count; m_base += kM) {
-        // A padded row repeats `pad_row`, which is always in range, so the A
+    for (int m_window = 0; m_window < count; m_window += kMWindow) {
+        // A padded token tile repeats `pad_row`, which is always in range, so the A
         // fragment load never touches memory past the group's token list.
-        const int row_in_group = m_base + lane_axis;
-        const int activation_row = row_in_group < count
-            ? token_indices[first + row_in_group]
-            : pad_row;
-        const half* activation_row_ptr = activation + static_cast<size_t>(activation_row) * K;
+        const half* row_ptr[MTILES];
+        #pragma unroll
+        for (int tile = 0; tile < MTILES; ++tile) {
+            const int row_in_group = m_window + tile * kM + lane_axis;
+            const int activation_row =
+                row_in_group < count ? token_indices[first + row_in_group] : pad_row;
+            row_ptr[tile] = activation + static_cast<size_t>(activation_row) * K;
+        }
 
-        aeon::rdna3::f32_vec8 gate_accumulator = aeon::rdna3::wmma_zero_accumulator();
-        aeon::rdna3::f32_vec8 up_accumulator = aeon::rdna3::wmma_zero_accumulator();
+        aeon::rdna3::f32_vec8 gate_accumulator[MTILES];
+        aeon::rdna3::f32_vec8 up_accumulator[MTILES];
+        #pragma unroll
+        for (int tile = 0; tile < MTILES; ++tile) {
+            gate_accumulator[tile] = aeon::rdna3::wmma_zero_accumulator();
+            up_accumulator[tile] = aeon::rdna3::wmma_zero_accumulator();
+        }
 
         for (int k_base = 0; k_base < K; k_base += kGroupedWmmaKBlock) {
+            // Once per K block, and the enclosing M loop is what makes that possible.
             grouped_dequant_w4a16_slab<RPW, LPR>(
                 weights.w1[expert], weights.s1[expert], w1_slab, kNTile, n_base, k_base,
                 iterations);
@@ -181,8 +223,7 @@ void aeon_moe_grouped_w13_swiglu_wmma_kernel(
             #pragma unroll
             for (int k_sub = 0; k_sub < kGroupedWmmaKBlock / aeon::rdna3::kWmmaTileK;
                  ++k_sub) {
-                const aeon::rdna3::f16_vec16 a_fragment = aeon::rdna3::wmma_load_a_row(
-                    activation_row_ptr + k_base + k_sub * aeon::rdna3::kWmmaTileK);
+                const int k_offset = k_base + k_sub * aeon::rdna3::kWmmaTileK;
                 const aeon::rdna3::f16_vec16 gate_fragment =
                     aeon::rdna3::wmma_load_b_from_lds(
                         w1_slab + k_sub * aeon::rdna3::kWmmaTileK * kNTile, kNTile,
@@ -191,29 +232,40 @@ void aeon_moe_grouped_w13_swiglu_wmma_kernel(
                     aeon::rdna3::wmma_load_b_from_lds(
                         w3_slab + k_sub * aeon::rdna3::kWmmaTileK * kNTile, kNTile,
                         n_wave + lane_axis);
-                gate_accumulator =
-                    aeon::rdna3::wmma_mma(a_fragment, gate_fragment, gate_accumulator);
-                up_accumulator =
-                    aeon::rdna3::wmma_mma(a_fragment, up_fragment, up_accumulator);
+                // The A fragment is per tile; the two B fragments above are shared by
+                // every tile of the window, which is the reuse this nest buys.
+                #pragma unroll
+                for (int tile = 0; tile < MTILES; ++tile) {
+                    const aeon::rdna3::f16_vec16 a_fragment =
+                        aeon::rdna3::wmma_load_a_row(row_ptr[tile] + k_offset);
+                    gate_accumulator[tile] = aeon::rdna3::wmma_mma(
+                        a_fragment, gate_fragment, gate_accumulator[tile]);
+                    up_accumulator[tile] = aeon::rdna3::wmma_mma(
+                        a_fragment, up_fragment, up_accumulator[tile]);
+                }
             }
             __syncthreads();
         }
 
         const int n = n_base + n_wave + lane_axis;
         #pragma unroll
-        for (int slot = 0; slot < 8; ++slot) {
-            const int m = m_base + 2 * slot + lane_parity;
-            if (m < count) {
-                expert_hidden[(static_cast<size_t>(expert) * expert_hidden_tokens + m) * N +
-                              n] =
-                    __float2half(aeon_swiglu_clamped(gate_accumulator[slot],
-                                                     up_accumulator[slot], swiglu_limit));
+        for (int tile = 0; tile < MTILES; ++tile) {
+            #pragma unroll
+            for (int slot = 0; slot < 8; ++slot) {
+                const int m = m_window + tile * kM + 2 * slot + lane_parity;
+                if (m < count) {
+                    expert_hidden[(static_cast<size_t>(expert) * expert_hidden_tokens + m) * N +
+                                  n] =
+                        __float2half(aeon_swiglu_clamped(gate_accumulator[tile][slot],
+                                                         up_accumulator[tile][slot],
+                                                         swiglu_limit));
+                }
             }
         }
     }
 }
 
-template <int WAVES, int RPW, int LPR>
+template <int WAVES, int RPW, int LPR, int MTILES>
 inline void dispatch_aeon_moe_grouped_w13_swiglu_wmma(
     const half* activation,
     const int* expert_offsets,
@@ -228,6 +280,7 @@ inline void dispatch_aeon_moe_grouped_w13_swiglu_wmma(
     hipStream_t stream = 0
 ) {
     static_assert(RPW * LPR == 32, "RPW and LPR must describe one Wave32");
+    static_assert(MTILES > 0, "MTILES must be positive");
     if (expert_count <= 0 || expert_count > kAeonSwizzledMaxExperts) {
         throw std::invalid_argument(
             "dispatch_aeon_moe_grouped_w13_swiglu_wmma: incompatible expert count");
@@ -240,7 +293,7 @@ inline void dispatch_aeon_moe_grouped_w13_swiglu_wmma(
 
     const dim3 block(WAVES * 32);
     const dim3 grid(N / (WAVES * 16), expert_count);
-    aeon_moe_grouped_w13_swiglu_wmma_kernel<WAVES, RPW, LPR>
+    aeon_moe_grouped_w13_swiglu_wmma_kernel<WAVES, RPW, LPR, MTILES>
         <<<grid, block, 0, stream>>>(activation, expert_offsets, token_indices, weights,
                                      expert_hidden, expert_count, expert_hidden_tokens, N,
                                      K, swiglu_limit);
@@ -259,7 +312,9 @@ inline void dispatch_aeon_moe_grouped_w13_swiglu_wmma(
 // token, so the A rows are read by group position and only the store consults
 // `draw_indices` — the two indexings are deliberately separate arrays, and a
 // kernel that confused them would scatter entries across draws.
-template <int WAVES, int RPW, int LPR>
+// Same loop nest as the gate half: K outer, the dequantized slab held in LDS
+// across every token tile of the M window.
+template <int WAVES, int RPW, int LPR, int MTILES>
 __global__ __launch_bounds__(WAVES * 32)
 void aeon_moe_grouped_w2_wmma_kernel(
     const half* __restrict__ expert_hidden,
@@ -275,6 +330,7 @@ void aeon_moe_grouped_w2_wmma_kernel(
 ) {
     constexpr int kNTile = WAVES * 16;
     constexpr int kM = 16;
+    constexpr int kMWindow = MTILES * kM;
 
     const int expert = blockIdx.y;
     if (expert >= expert_count) {
@@ -294,17 +350,24 @@ void aeon_moe_grouped_w2_wmma_kernel(
     const int count = expert_offsets[expert + 1] - first;
     const int iterations = (K / 32) / LPR;
 
-    for (int m_base = 0; m_base < count; m_base += kM) {
-        const int row_in_group = m_base + lane_axis;
-        // The gate kernel writes only the group's first `count` rows, so the
-        // padding rows of the last M tile have no defined value to read. Row 0
-        // always exists and its products are discarded by the store below.
-        const int m = row_in_group < count ? row_in_group : 0;
-        const half* activation_row =
-            expert_hidden +
-            (static_cast<size_t>(expert) * expert_hidden_tokens + m) * K;
+    for (int m_window = 0; m_window < count; m_window += kMWindow) {
+        const half* row_ptr[MTILES];
+        #pragma unroll
+        for (int tile = 0; tile < MTILES; ++tile) {
+            const int row_in_group = m_window + tile * kM + lane_axis;
+            // The gate kernel writes only the group's first `count` rows, so the
+            // padding rows of the last M tile have no defined value to read. Row 0
+            // always exists and its products are discarded by the store below.
+            const int m = row_in_group < count ? row_in_group : 0;
+            row_ptr[tile] = expert_hidden +
+                            (static_cast<size_t>(expert) * expert_hidden_tokens + m) * K;
+        }
 
-        aeon::rdna3::f32_vec8 accumulator = aeon::rdna3::wmma_zero_accumulator();
+        aeon::rdna3::f32_vec8 accumulator[MTILES];
+        #pragma unroll
+        for (int tile = 0; tile < MTILES; ++tile) {
+            accumulator[tile] = aeon::rdna3::wmma_zero_accumulator();
+        }
 
         for (int k_base = 0; k_base < K; k_base += kGroupedWmmaKBlock) {
             grouped_dequant_w4a16_slab<RPW, LPR>(
@@ -315,31 +378,39 @@ void aeon_moe_grouped_w2_wmma_kernel(
             #pragma unroll
             for (int k_sub = 0; k_sub < kGroupedWmmaKBlock / aeon::rdna3::kWmmaTileK;
                  ++k_sub) {
-                const aeon::rdna3::f16_vec16 a_fragment = aeon::rdna3::wmma_load_a_row(
-                    activation_row + k_base + k_sub * aeon::rdna3::kWmmaTileK);
+                const int k_offset = k_base + k_sub * aeon::rdna3::kWmmaTileK;
                 const aeon::rdna3::f16_vec16 b_fragment =
                     aeon::rdna3::wmma_load_b_from_lds(
                         w2_slab + k_sub * aeon::rdna3::kWmmaTileK * kNTile, kNTile,
                         n_wave + lane_axis);
-                accumulator =
-                    aeon::rdna3::wmma_mma(a_fragment, b_fragment, accumulator);
+                #pragma unroll
+                for (int tile = 0; tile < MTILES; ++tile) {
+                    const aeon::rdna3::f16_vec16 a_fragment =
+                        aeon::rdna3::wmma_load_a_row(row_ptr[tile] + k_offset);
+                    accumulator[tile] =
+                        aeon::rdna3::wmma_mma(a_fragment, b_fragment, accumulator[tile]);
+                }
             }
             __syncthreads();
         }
 
         const int n = n_base + n_wave + lane_axis;
         #pragma unroll
-        for (int slot = 0; slot < 8; ++slot) {
-            if (m_base + 2 * slot + lane_parity < count) {
-                const int position = first + m_base + 2 * slot + lane_parity;
-                contrib[static_cast<size_t>(draw_indices[position]) * N + n] =
-                    draw_weights[position] * accumulator[slot];
+        for (int tile = 0; tile < MTILES; ++tile) {
+            #pragma unroll
+            for (int slot = 0; slot < 8; ++slot) {
+                const int row = m_window + tile * kM + 2 * slot + lane_parity;
+                if (row < count) {
+                    const int position = first + row;
+                    contrib[static_cast<size_t>(draw_indices[position]) * N + n] =
+                        draw_weights[position] * accumulator[tile][slot];
+                }
             }
         }
     }
 }
 
-template <int WAVES, int RPW, int LPR>
+template <int WAVES, int RPW, int LPR, int MTILES>
 inline void dispatch_aeon_moe_grouped_w2_wmma(
     const half* expert_hidden,
     const int* expert_offsets,
@@ -354,6 +425,7 @@ inline void dispatch_aeon_moe_grouped_w2_wmma(
     hipStream_t stream = 0
 ) {
     static_assert(RPW * LPR == 32, "RPW and LPR must describe one Wave32");
+    static_assert(MTILES > 0, "MTILES must be positive");
     if (expert_count <= 0 || expert_count > kAeonSwizzledMaxExperts) {
         throw std::invalid_argument(
             "dispatch_aeon_moe_grouped_w2_wmma: incompatible expert count");
@@ -366,7 +438,7 @@ inline void dispatch_aeon_moe_grouped_w2_wmma(
 
     const dim3 block(WAVES * 32);
     const dim3 grid(N / (WAVES * 16), expert_count);
-    aeon_moe_grouped_w2_wmma_kernel<WAVES, RPW, LPR>
+    aeon_moe_grouped_w2_wmma_kernel<WAVES, RPW, LPR, MTILES>
         <<<grid, block, 0, stream>>>(expert_hidden, expert_offsets, draw_indices,
                                      draw_weights, weights, contrib, expert_count,
                                      expert_hidden_tokens, N, K);
