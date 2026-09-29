@@ -481,6 +481,132 @@ float time_arm(hipEvent_t start, hipEvent_t stop, int repetitions, Pass pass) {
     return best;
 }
 
+// ---------------------------------------------------------------------------
+// Attribution arms. These are diagnostics, not engine code: they reproduce the
+// production loop nest with one half removed, so the time can be split between
+// staging and matrix multiply instead of argued about.
+//
+// Both mirror `aeon_moe_grouped_w13_swiglu_wmma_kernel`'s trip counts exactly —
+// same grid, same M window, same K blocks, same number of MMAs per K sub-block —
+// so the difference between them and the real kernel is attributable.
+// ---------------------------------------------------------------------------
+
+// Staging only: the dequant and its LDS stores, no MMA. The read-back is what
+// keeps the stores from being dropped as dead.
+template <int WAVES, int RPW, int LPR, int MTILES>
+__global__ __launch_bounds__(WAVES * 32)
+void staging_only_kernel(
+    const int* __restrict__ expert_offsets,
+    kernel::SwizzledW13ExpertPtrs weights,
+    float* __restrict__ sink,
+    int expert_count,
+    int N,
+    int K
+) {
+    constexpr int kNTile = WAVES * 16;
+    constexpr int kMWindow = MTILES * 16;
+
+    const int expert = blockIdx.y;
+    if (expert >= expert_count) {
+        return;
+    }
+
+    const int n_base = blockIdx.x * kNTile;
+    __shared__ half w1_slab[kernel::kGroupedWmmaKBlock * kNTile];
+    __shared__ half w3_slab[kernel::kGroupedWmmaKBlock * kNTile];
+
+    const int first = expert_offsets[expert];
+    const int count = expert_offsets[expert + 1] - first;
+    const int iterations = (K / 32) / LPR;
+
+    for (int m_window = 0; m_window < count; m_window += kMWindow) {
+        for (int k_base = 0; k_base < K; k_base += kernel::kGroupedWmmaKBlock) {
+            kernel::grouped_dequant_w4a16_slab<RPW, LPR>(
+                weights.w1[expert], weights.s1[expert], w1_slab, kNTile, n_base, k_base,
+                iterations);
+            kernel::grouped_dequant_w4a16_slab<RPW, LPR>(
+                weights.w3[expert], weights.s3[expert], w3_slab, kNTile, n_base, k_base,
+                iterations);
+            __syncthreads();
+            // Unconditional read-back: a conditional one lets the compiler sink the
+            // stores into the branch and report a single register, which is how this
+            // arm first measured 0.09 ms for work it was not doing.
+            if (threadIdx.x == 0) {
+                sink[blockIdx.y] = __half2float(w1_slab[0]) + __half2float(w3_slab[0]);
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// MMA only: identical grid and trip counts to the production gate kernel, with the
+// fragments built from a small LDS buffer instead of from dequantized weights. The
+// `projection` loop stands in for gate and up so the MMA count matches.
+template <int WAVES, int MTILES>
+__global__ __launch_bounds__(WAVES * 32)
+void mma_only_kernel(
+    const int* __restrict__ expert_offsets,
+    float* __restrict__ sink,
+    int expert_count,
+    int K
+) {
+    constexpr int kM = 16;
+    constexpr int kMWindow = MTILES * kM;
+
+    const int expert = blockIdx.y;
+    if (expert >= expert_count) {
+        return;
+    }
+
+    const int lane_axis = aeon::rdna3::wmma_lane_axis(threadIdx.x & 31);
+
+    __shared__ half dummy[64];
+    if (threadIdx.x < 64) {
+        dummy[threadIdx.x] = __float2half(static_cast<float>(threadIdx.x) * 0.001f);
+    }
+    __syncthreads();
+
+    const int first = expert_offsets[expert];
+    const int count = expert_offsets[expert + 1] - first;
+
+    aeon::rdna3::f32_vec8 accumulator[MTILES];
+    #pragma unroll
+    for (int tile = 0; tile < MTILES; ++tile) {
+        accumulator[tile] = aeon::rdna3::wmma_zero_accumulator();
+    }
+
+    for (int m_window = 0; m_window < count; m_window += kMWindow) {
+        for (int k_base = 0; k_base < K; k_base += kernel::kGroupedWmmaKBlock) {
+            #pragma unroll
+            for (int k_sub = 0; k_sub < kernel::kGroupedWmmaKBlock / aeon::rdna3::kWmmaTileK;
+                 ++k_sub) {
+                // Indexed by the loop variables so no fragment folds to a constant.
+                const int offset = (k_sub * 16) & 48;
+                const aeon::rdna3::f16_vec16 a_fragment =
+                    aeon::rdna3::wmma_load_a_row(dummy + offset);
+                const aeon::rdna3::f16_vec16 b_fragment =
+                    aeon::rdna3::wmma_load_a_row(dummy + ((offset + 16) & 48));
+                #pragma unroll
+                for (int projection = 0; projection < 2; ++projection) {
+                    #pragma unroll
+                    for (int tile = 0; tile < MTILES; ++tile) {
+                        accumulator[tile] = aeon::rdna3::wmma_mma(a_fragment, b_fragment,
+                                                                  accumulator[tile]);
+                    }
+                }
+            }
+        }
+    }
+
+    // One store per thread, so the accumulators are live.
+    float total = 0.0f;
+    #pragma unroll
+    for (int tile = 0; tile < MTILES; ++tile) {
+        total += accumulator[tile][lane_axis & 7];
+    }
+    sink[threadIdx.x] = total;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -663,6 +789,145 @@ int main(int argc, char** argv) {
 
         CHECK_HIP(hipEventDestroy(start));
         CHECK_HIP(hipEventDestroy(stop));
+    }
+
+    // ---------------------------------------------------------------------
+    // Attribution: the production gate kernel's time split into staging and
+    // matrix multiply by running each half alone over the *same* batches. Sampling
+    // one batch would be meaningless — the permutation is sorted by expert id, so
+    // the first batch is whatever experts happen to have the lowest ids, not a
+    // typical one. All three arms therefore share one prepared batch list.
+    // ---------------------------------------------------------------------
+    {
+        Permutation permutation = build_permutation(distribution, max_tokens, rng);
+        const int distinct = permutation.distinct();
+
+        struct Batch {
+            int count;
+            int draws;
+            int* offsets;
+            int* tokens;
+            kernel::SwizzledW13ExpertPtrs w13;
+        };
+        std::vector<Batch> batches;
+
+        for (int first = 0; first < distinct; first += kMaxExpertsPerDispatch) {
+            Batch batch{};
+            batch.count = std::min(kMaxExpertsPerDispatch, distinct - first);
+            const int begin = permutation.expert_offsets[static_cast<size_t>(first)];
+            const int end =
+                permutation.expert_offsets[static_cast<size_t>(first + batch.count)];
+            batch.draws = end - begin;
+
+            std::vector<int> local(permutation.expert_offsets.begin() + first,
+                                   permutation.expert_offsets.begin() + first + batch.count + 1);
+            for (int& value : local) value -= begin;
+
+            CHECK_HIP(hipMalloc(&batch.offsets, local.size() * sizeof(int)));
+            CHECK_HIP(hipMalloc(&batch.tokens, static_cast<size_t>(batch.draws) * sizeof(int)));
+            CHECK_HIP(hipMemcpy(batch.offsets, local.data(), local.size() * sizeof(int),
+                                hipMemcpyHostToDevice));
+            CHECK_HIP(hipMemcpy(batch.tokens, permutation.token_indices.data() + begin,
+                                static_cast<size_t>(batch.draws) * sizeof(int),
+                                hipMemcpyHostToDevice));
+            fill_w13_table(device, first, batch.count, batch.w13);
+            batches.push_back(batch);
+        }
+
+        float* d_sink = nullptr;
+        CHECK_HIP(hipMalloc(&d_sink, 4096 * sizeof(float)));
+
+        hipEvent_t a_start = nullptr;
+        hipEvent_t a_stop = nullptr;
+        CHECK_HIP(hipEventCreate(&a_start));
+        CHECK_HIP(hipEventCreate(&a_stop));
+
+        const float production_ms = time_arm(a_start, a_stop, kRepetitions, [&] {
+            for (const Batch& batch : batches) {
+                kernel::dispatch_aeon_moe_grouped_w13_swiglu_wmma<
+                    kGroupedWaves, kGroupedW13Rpw, kGroupedW13Lpr, 4>(
+                    device.activation, batch.offsets, batch.tokens, batch.w13,
+                    device.expert_hidden, batch.count, kIntermediate, kIntermediate,
+                    kHidden, kLimit);
+            }
+        });
+
+        const float staging_ms = time_arm(a_start, a_stop, kRepetitions, [&] {
+            for (const Batch& batch : batches) {
+                staging_only_kernel<kGroupedWaves, kGroupedW13Rpw, kGroupedW13Lpr, 4>
+                    <<<dim3(kIntermediate / (kGroupedWaves * 16), batch.count),
+                       kGroupedWaves * 32>>>(batch.offsets, batch.w13, d_sink, batch.count,
+                                             kIntermediate, kHidden);
+            }
+        });
+
+        const float mma_ms = time_arm(a_start, a_stop, kRepetitions, [&] {
+            for (const Batch& batch : batches) {
+                mma_only_kernel<kGroupedWaves, 4>
+                    <<<dim3(kIntermediate / (kGroupedWaves * 16), batch.count),
+                       kGroupedWaves * 32>>>(batch.offsets, d_sink, batch.count, kHidden);
+            }
+        });
+
+        CHECK_HIP(hipEventDestroy(a_start));
+        CHECK_HIP(hipEventDestroy(a_stop));
+
+        // Effective rate of the production arm: two projections, N rows, K per draw.
+        const double gflop = 2.0 * 2.0 * static_cast<double>(permutation.draws()) *
+                             kIntermediate * kHidden / 1e9;
+
+        std::printf("\n  attribution at T=%d (all %zu expert batches, gate half only)\n",
+                    max_tokens, batches.size());
+        std::printf("    staging alone          %8.3f ms\n", staging_ms);
+        std::printf("    matrix multiply alone  %8.3f ms\n", mma_ms);
+        std::printf("    production (W13 half)  %8.3f ms   %7.1f TFLOP/s\n", production_ms,
+                    gflop / production_ms);
+        std::printf("    production / (staging + mma) = %.2f  (1.0 = perfectly overlapped,\n"
+                    "                                              >1 = the two serialise)\n",
+                    production_ms / (staging_ms + mma_ms));
+
+        // Why the halves do not add up: the whole kernel gets far fewer resident
+        // blocks than either half does alone. Reported rather than inferred, because
+        // the fix (which resource to cut) follows from which one is binding.
+        const int lds_per_cu = 64 * 1024;
+        const int waves_per_cu = 32;
+        auto report_kernel = [&](const char* label, const void* function, int lds_bytes,
+                                 int threads) {
+            hipFuncAttributes attributes{};
+            CHECK_HIP(hipFuncGetAttributes(&attributes, function));
+            const int blocks_by_lds = lds_bytes > 0 ? lds_per_cu / lds_bytes : waves_per_cu;
+            const int waves = std::min(blocks_by_lds * (threads / 32), waves_per_cu);
+            std::printf("    %-22s regs %4d, LDS %6d B, wave slots %2d/%d (%.0f%%)\n", label,
+                        attributes.numRegs, lds_bytes, waves, waves_per_cu,
+                        100.0 * waves / waves_per_cu);
+        };
+        report_kernel("gate half (MTILES=4)",
+                      reinterpret_cast<const void*>(&kernel::aeon_moe_grouped_w13_swiglu_wmma_kernel<
+                          kGroupedWaves, kGroupedW13Rpw, kGroupedW13Lpr, 4>),
+                      2 * kernel::kGroupedWmmaKBlock * (kGroupedWaves * 16) * 2,
+                      kGroupedWaves * 32);
+        report_kernel("gate half (MTILES=1)",
+                      reinterpret_cast<const void*>(&kernel::aeon_moe_grouped_w13_swiglu_wmma_kernel<
+                          kGroupedWaves, kGroupedW13Rpw, kGroupedW13Lpr, 1>),
+                      2 * kernel::kGroupedWmmaKBlock * (kGroupedWaves * 16) * 2,
+                      kGroupedWaves * 32);
+        report_kernel("staging arm",
+                      reinterpret_cast<const void*>(&staging_only_kernel<
+                          kGroupedWaves, kGroupedW13Rpw, kGroupedW13Lpr, 4>),
+                      2 * kernel::kGroupedWmmaKBlock * (kGroupedWaves * 16) * 2,
+                      kGroupedWaves * 32);
+        report_kernel("mma arm",
+                      reinterpret_cast<const void*>(&mma_only_kernel<kGroupedWaves, 4>),
+                      static_cast<int>(64 * sizeof(half)), kGroupedWaves * 32);
+        std::printf("    (gfx1100: 64 KiB LDS and 32 wave slots per CU; the slab of\n"
+                    "     %d B per wave caps the real kernel at 16 waves even at 1 reg)\n",
+                    2 * 2 * kernel::kGroupedWmmaKBlock * 16);
+
+        for (const Batch& batch : batches) {
+            CHECK_HIP(hipFree(batch.offsets));
+            CHECK_HIP(hipFree(batch.tokens));
+        }
+        CHECK_HIP(hipFree(d_sink));
     }
 
     for (uint8_t* host : device.host_payloads) delete[] host;

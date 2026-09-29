@@ -149,6 +149,17 @@ __device__ __forceinline__ void grouped_dequant_w4a16_slab(
 // the dequant and LDS work, and shrinking traffic further cannot help it. Which
 // window to run is therefore a dispatcher choice keyed on what the chunk pays for
 // (bytes in a tiered run, time in a resident one), not a constant to tune upward.
+// ## Why the staging is *not* double-buffered
+//
+// Two LDS buffers per matrix, staging K block `n+1` while block `n` multiplies,
+// was built and measured: it made the gate half **slower**, `6.2 ms` to `8.8 ms`
+// at a 1024-token chunk. The slab costs 4 KiB per wave, so the kernel's occupancy
+// is already capped by LDS (gfx1100 has 64 KiB per CU and 32 wave slots: 4 KiB
+// per wave means at most 16 waves, i.e. 50%). Doubling the buffers halves that
+// again, and the occupancy lost outweighs the latency hidden.
+//
+// `__launch_bounds__(WAVES * 32)` states the intended block size but does not
+// reserve registers; the measured register counts are in the A/B benchmark.
 template <int WAVES, int RPW, int LPR, int MTILES>
 __global__ __launch_bounds__(WAVES * 32)
 void aeon_moe_grouped_w13_swiglu_wmma_kernel(
@@ -313,7 +324,8 @@ inline void dispatch_aeon_moe_grouped_w13_swiglu_wmma(
 // `draw_indices` — the two indexings are deliberately separate arrays, and a
 // kernel that confused them would scatter entries across draws.
 // Same loop nest as the gate half: K outer, the dequantized slab held in LDS
-// across every token tile of the M window.
+// across every token tile of the M window. Single-buffered, for the measured
+// reason given on the gate kernel.
 template <int WAVES, int RPW, int LPR, int MTILES>
 __global__ __launch_bounds__(WAVES * 32)
 void aeon_moe_grouped_w2_wmma_kernel(
