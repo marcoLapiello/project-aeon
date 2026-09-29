@@ -26,7 +26,7 @@
 #include "infrastructure/core/device_streams.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_executor.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
-#include "architecture/deepseek_v4/core/v4_host_partition.hpp"
+#include "infrastructure/core/host_partition.hpp"
 #include "infrastructure/core/prefill_sweep.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/hip_check.hpp"
@@ -49,7 +49,7 @@ public:
         V4ExpertSupplyCoordinator* supply{nullptr};
         V4TieredExpertExecutor* executor{nullptr};
         ExpertRegistry* registry{nullptr};
-        V4HostPartition* partition{nullptr};
+        HostPartition* partition{nullptr};
         // Re-admit the Warm residents a boundary move surrendered, and the Hot
         // residents a prefill drain freed. Injected because both use the host's
         // blocking `O_DIRECT` restore path, which is not prefill policy.

@@ -61,7 +61,7 @@
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
 #include "architecture/deepseek_v4/core/v4_prefill_workspace.hpp"
-#include "architecture/deepseek_v4/core/v4_host_partition.hpp"
+#include "infrastructure/core/host_partition.hpp"
 #include "architecture/deepseek_v4/core/v4_prefill_controller.hpp"
 #include "architecture/deepseek_v4/core/v4_model_contract.hpp"
 #include "architecture/deepseek_v4/core/v4_model_resources.hpp"
@@ -239,7 +239,7 @@ public:
         staging_.reset();
         // The partition's bound staging pointer is now stale; clear it so nothing
         // reaches a freed arena before the next `initialize` re-binds it.
-        host_partition_.bind(V4HostPartition::Services{});
+        host_partition_.bind(HostPartition::Services{});
         io_reader_.reset();
         completions_.clear();
         next_io_id_ = 1;
@@ -420,7 +420,7 @@ public:
 
     // Re-size the staging arena at runtime: a **depth** change, not a format change.
     // The contract, its preconditions and the region's fixed-total refusal live in
-    // `V4HostPartition::resize` (`v4_host_partition.hpp`); this is the host's entry
+    // `HostPartition::resize` (`host_partition.hpp`); this is the host's entry
     // point to it.
     bool resize_staging_slots(uint32_t slots) {
         return host_partition_.resize(slots, experts_per_layer(), outstanding_expert_leases());
@@ -431,7 +431,7 @@ public:
     // Warm and the corridor are one pinned region cut by a boundary the phases move.
     // The partition's contract — the three dispatch requirements, why the phases are
     // cut separately, and why moving the boundary is cheap — lives in
-    // `V4HostPartition` (`v4_host_partition.hpp`). This is the host's entry point.
+    // `HostPartition` (`host_partition.hpp`). This is the host's entry point.
     void apply_host_partition(uint32_t warm_slots, uint32_t staging_slots) {
         host_partition_.apply(warm_slots, staging_slots, experts_per_layer(),
                               outstanding_expert_leases());
@@ -819,7 +819,7 @@ private:
             }
             host_region_.allocate(region_slots, format);
             // The corridor's **resting** size, and therefore the partition every phase
-            // cuts back to, is decided by `V4HostPartition::configure`: with the sweep
+            // cuts back to, is decided by `HostPartition::configure`: with the sweep
             // enabled a window is a cleanly delimited phase, so the resting cut is
             // decode's `2 x 6` and the boundary moves out for a window. With the sweep
             // **off** the engine runs the per-token path, where decode and a chunked
@@ -839,7 +839,7 @@ private:
         // count is `staging_slots / experts_per_layer` whole layer-sized banks — a
         // depth change moves the arena and this derivation together, so there is no
         // second place for the two to disagree (see `apply_host_partition`).
-        host_partition_.bind(V4HostPartition::Services{
+        host_partition_.bind(HostPartition::Services{
             &registry_, &host_pool_, staging_.get(), &host_region_,
             &prefill_controller_.sweep(), &supply_, &budget_});
         host_partition_.refresh_sweep_banks(experts_per_layer);
@@ -1208,9 +1208,9 @@ private:
     ExpertHostRegion host_region_;
     // The Warm/staging partition: the phase slot arithmetic and the boundary move.
     // It owns the partition numbers and reaches the region, arena, registry, pool,
-    // sweep and budget as bound services (see `v4_host_partition.hpp`); the host
+    // sweep and budget as bound services (see `host_partition.hpp`); the host
     // still owns the region's allocation and the arena's lifetime.
-    V4HostPartition host_partition_;
+    HostPartition host_partition_;
     SupplyTelemetry telemetry_;
     RoutingReuseProfiler reuse_profiler_;
     std::unique_ptr<aeon::io::DirectIOReader> io_reader_;

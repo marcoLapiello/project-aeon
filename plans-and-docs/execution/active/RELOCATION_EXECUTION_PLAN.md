@@ -109,9 +109,9 @@ These are the model-coupled G1 files and the genuinely mixed files. Each needs a
 | :--- | :--- | :--- |
 | ~~`memory_budget.hpp`, `memory_budget_engine.hpp`, `memory_budget_report.hpp`~~ | ✅ **Done** (`c53e5f8`): moved to `infrastructure/core/` behind the neutral `ModelMemoryGeometry` seam (`model_memory_geometry.hpp`; V4 adapter `v4_memory_geometry.hpp`). Behaviour unchanged; `test_dynamic_expert_pool`, `test_v4_prefill_window`, `test_v4_engine` pass. | — |
 | ~~`v4_prefill_sweep.hpp`, `v4_prefill_lookahead.hpp`~~ | ✅ **Done**: moved to `infrastructure/core/` as `prefill_sweep.hpp` / `prefill_lookahead.hpp` behind the neutral `LayerBatchSupply` port (`layer_batch_supply.hpp`); the V4 adapter `V4ExpertSupplyCoordinator` implements it, and its `LayerPrefetchState` now derives from the neutral `LayerBatchState`. All 7 correctness checks in `test_v4_staging_depth` pass (Gate A's wall-time flatness is the known load-sensitive flake). | — |
-| `v4_prefill_controller.hpp` | Drives the sweep (now neutral) but holds `V4TieredExpertExecutor*` and `V4HostPartition*` | Needs the executor and host-partition seams first |
+| `v4_prefill_controller.hpp` | Drives the sweep (now neutral) but still holds `V4TieredExpertExecutor*` | Needs the executor seam first |
 | `v4_prefill_workspace.hpp` | Owns a `V4LayerBodyBatchScratch` (a model device buffer) | Model-owned working set; the carry alone is engine |
-| `v4_host_partition.hpp` | Includes `v4_expert_supply.hpp`, `V4PrefillSweep` | Same supply-adapter seam |
+| ~~`v4_host_partition.hpp`~~ | ✅ **Done**: moved to `infrastructure/core/host_partition.hpp` as `HostPartition`; its `V4ExpertSupplyCoordinator*` became the neutral `LayerBatchSupply*`. `test_v4_prefill_window`, `test_v4_warm_frozen_prefill`, `test_v4_staging_depth`, `test_v4_engine` pass. | — |
 | `v4_expert_executor.hpp` (mixed) | Model MoE execution + tiered-supply mechanics + backend dispatch | Lease/tier policy vs. V4 dispatch |
 | `v4_model_host.hpp` (mixed, 1227 lines) | Model residency + engine assembly | **The one hard step.** Engine-owned assembly type; defer to last |
 | `v4_layer_body_batch.hpp` (mixed) | Engine prefill strategy + model row-set assembly | Strategy/progression extraction |

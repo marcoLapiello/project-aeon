@@ -41,7 +41,7 @@
 
 #include "infrastructure/core/runtime_config.hpp"
 #include "infrastructure/core/memory_budget_report.hpp"
-#include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
+#include "infrastructure/core/layer_batch_supply.hpp"
 #include "infrastructure/core/prefill_sweep.hpp"
 #include "infrastructure/core/expert_host_region.hpp"
 #include "infrastructure/core/expert_registry.hpp"
@@ -56,7 +56,7 @@
 
 namespace aeon::core {
 
-class V4HostPartition {
+class HostPartition {
 public:
     // The collaborators a boundary move edits. Bound once from the host once the
     // region, arena, registry, pool, sweep and budget exist; the owner is
@@ -67,7 +67,7 @@ public:
         PrefetchStagingArena* staging{nullptr};
         ExpertHostRegion* region{nullptr};
         PrefillSweep* sweep{nullptr};
-        V4ExpertSupplyCoordinator* supply{nullptr};
+        LayerBatchSupply* supply{nullptr};
         MemoryBudgetReport* budget{nullptr};
     };
 
@@ -186,14 +186,14 @@ public:
         // enforces, and it is what a phase boundary leaves.
         if (services_.staging->in_use_slots() != 0 || outstanding_leases != 0) {
             throw std::logic_error(
-                "V4HostPartition: cannot move the host partition with a transfer or lease live "
+                "HostPartition: cannot move the host partition with a transfer or lease live "
                 "(staging_in_use=" + std::to_string(services_.staging->in_use_slots()) +
                 " of " + std::to_string(services_.staging->slot_count()) +
                 ", leases=" + std::to_string(outstanding_leases) + ")");
         }
         if (warm_slots + staging_slots != services_.region->slot_count()) {
             throw std::logic_error(
-                "V4HostPartition: the host partition does not cover the region exactly");
+                "HostPartition: the host partition does not cover the region exactly");
         }
 
         // Shrink: demote the Warm tail **before** the capacity moves under it, so the
