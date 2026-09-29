@@ -84,6 +84,12 @@ All three landed with the normalized code-line multiset identical to the pre-mov
 
 R1 removes a model name from the neutral backend contract. Verified: full rename, no residual old name, `test_aeon_swizzled_loader` passes.
 
+### Stage 4 — Split the mixed kernel file (independent) — ✅ complete
+
+| Step | Action | Detail | Commit |
+| :--- | :--- | :--- | :--- |
+| **P1** | SPLIT + rename | `v4_pipeline_ops.hpp` mixed three unrelated things. The two FP16↔FP32 casts and the MoE accumulate pair are model-agnostic, so they moved to `platform/ops/cast.hpp` (`half_to_float_kernel`, `float_to_half_kernel`) and `platform/ops/moe_accumulate.hpp` (`moe_accumulate_fixed_order_kernel`, plus the superseded fp16 control `moe_accumulate_expert_kernel`). The clamped SwiGLU is a DSV4 choice — `swiglu_limit` is a config knob — so the residual file was renamed `v4_swiglu_clamp.hpp` and its kernel `v4_pipeline_swiglu_clamp_kernel` → `v4_swiglu_clamp_kernel`. Every kernel body is byte-identical to the pre-split version; only the location and the name changed. Verified: `test_v4_expert_oracle`, `test_v4_shared_expert_oracle`, `test_v4_moe_accum_oracle`, `test_v4_expert_executor`, `test_v4_graph_head`, `test_swiglu_clamp`, `test_v4_layer_body_serial_oracle`. | `9e7bb2d` |
+
 ---
 
 ## 5. Verification protocol (every step)
@@ -115,7 +121,7 @@ These are the model-coupled G1 files and the genuinely mixed files. Each needs a
 | `v4_expert_executor.hpp` (mixed) | Model MoE execution + tiered-supply mechanics + backend dispatch | **Re-assessed: stays.** The MoE shape (six experts, clamped SwiGLU, fixed-order accumulation), the backend kernel dispatch, and the scratch are all model-specific; only its lease *contract* was generic and is now `ExpertLeaseHolder`. The lease *policy* (`ensure_pool_headroom`) remains executor-local, entangled with dispatch victim selection — extract only if a second model needs it. |
 | `v4_model_host.hpp` (mixed, 1227 lines) | Model residency + engine assembly | **The one hard step.** Engine-owned assembly type; defer to last |
 | `v4_layer_body_batch.hpp` (mixed) | Engine prefill strategy + model row-set assembly | Strategy/progression extraction |
-| `v4_pipeline_ops.hpp` (split) | Carries the model's SwiGLU clamp | Split casts/accumulate (reusable) from clamped SwiGLU (model) |
+| ~~`v4_pipeline_ops.hpp` (split)~~ | ✅ **Done**: split into `platform/ops/cast.hpp` (casts), `platform/ops/moe_accumulate.hpp` (the MoE reduce pair), and the renamed model file `v4_swiglu_clamp.hpp` (the clamped SwiGLU). See Stage 4. | — |
 
 Once the seams exist, each deferred file moves by the ordinary MOVE recipe into the same destinations (`infrastructure/core/` for G1; the backend GPU halves to `platform/` per decision 3).
 
@@ -131,6 +137,9 @@ Once the seams exist, each deferred file moves by the ordinary MOVE recipe into 
 | `v4_gemv_fp16_kernel` → `gemv_fp16_kernel`, `v4_gemv_fp16_vec8_kernel` → `gemv_fp16_vec8_kernel` | `platform/ops/gemv.hpp` | kernels |
 | `v4_rmsnorm_wave32_kernel` → `rmsnorm_wave32_kernel`, `v4_rmsnorm_unit_wave32_kernel` → `rmsnorm_unit_wave32_kernel` | `platform/ops/rmsnorm.hpp` | kernels |
 | `v4_argmax_fp16_partial_kernel` → `argmax_fp16_partial_kernel`, `v4_argmax_partial_reduce_kernel` → `argmax_partial_reduce_kernel` | `platform/ops/argmax.hpp` | kernels |
+| `v4_half_to_float_kernel` → `half_to_float_kernel`, `v4_float_to_half_kernel` → `float_to_half_kernel` | `platform/ops/cast.hpp` | kernels |
+| `v4_moe_accumulate_fixed_order_kernel` → `moe_accumulate_fixed_order_kernel`, `v4_pipeline_accumulate_expert_kernel` → `moe_accumulate_expert_kernel` | `platform/ops/moe_accumulate.hpp` | kernels |
+| `v4_pipeline_swiglu_clamp_kernel` → `v4_swiglu_clamp_kernel` (model-specific; only the stale `pipeline` token dropped) | `v4_swiglu_clamp.hpp` | kernel |
 
 26 files touched, all as usages. Audited: no model-specific symbol (`V4ModelHost`, `V4Graph`, `V4Layer*`, `V4Attention*`, …) was renamed; the only such tokens in the diff are unchanged context on comment lines that also carried a renamed generic symbol. Builds; the seven gates pass.
 
@@ -138,9 +147,9 @@ Once the seams exist, each deferred file moves by the ordinary MOVE recipe into 
 
 ## 7. Done when
 
-**Ready scope (Stages 1–3) — ✅ met.**
+**Ready scope (Stages 1–4) — ✅ met.**
 
-- The reusable kernels live in `platform/ops/` under neutral names (`rmsnorm`, `gemv`, `argmax`).
+- The reusable kernels live in `platform/ops/` under neutral names (`rmsnorm`, `gemv`, `argmax`, `cast`, `moe_accumulate`).
 - The ready G1 set is in `infrastructure/core/` (`runtime_config`, `sampler`, `device_streams`).
 - The neutral backend registry no longer names the model.
 - Every step left the build and its selective tests green, and each MOVE was proven by the multiset diff plus brace balance.

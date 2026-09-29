@@ -49,9 +49,9 @@ The production-facing implementation is:
 - `src/infrastructure/core/routing_profile.hpp` - routing-profile prompt parsing, the run config, the aggregate, and the persistent store. Its JSONL / atomic-file / hashing helpers (namespace `routing_profile_detail`) live in `routing_profile_json.hpp`.
 - `src/infrastructure/io/direct_io_reader.hpp` - shared validated batched `io_uring`/`O_DIRECT` cold reads.
 - `src/architecture/deepseek_v4/text/` and `src/infrastructure/text/` - DSV4 and generic text support.
-- `src/architecture/deepseek_v4/kernels/` - V4 attention, routing, and Hyper-Connections kernels.
+- `src/architecture/deepseek_v4/kernels/` - V4 attention, routing, and Hyper-Connections kernels, plus `v4_swiglu_clamp.hpp` (the model's clamped SwiGLU — `swiglu_limit` is a config knob).
 - `src/architecture/deepseek_v4/kernels/v4_attention.hpp` - umbrella over the attention kernels: `v4_attention_config.hpp` (the DSV4_* hyperparameters), `v4_attention_kernels.hpp` (sliding / cached-sliding / cached-compressed attention, compressor state + materialization, indexer scores), `v4_grouped_wo.hpp` (the grouped W_o_a projection and half->float), and `v4_hc_head_kernel.hpp` (the Hyper-Connections head reduction).
-- `src/platform/ops/` - model-agnostic GPU primitives shared by any architecture: `rmsnorm.hpp` (weighted/unit RMSNorm), `gemv.hpp` (FP16 GEMV), and `argmax.hpp` (the LM-head argmax). Moved out of the model tree because they take their shapes as arguments and know nothing of DeepSeek-V4.
+- `src/platform/ops/` - model-agnostic GPU primitives shared by any architecture: `rmsnorm.hpp` (weighted/unit RMSNorm), `gemv.hpp` (FP16 GEMV), `argmax.hpp` (the LM-head argmax), `cast.hpp` (FP16↔FP32 elementwise casts), and `moe_accumulate.hpp` (the per-expert MoE reduction — the fp32 fixed-order path and its superseded fp16 control). Moved out of the model tree because they take their shapes as arguments and know nothing of DeepSeek-V4.
 - `src/backend/swizzled_w4a16/kernels/` - current W4A16 swizzle, GEMV, and fused expert kernels.
 
 `V4Engine` is the runtime entry point (via `tools/aeon_chat.cpp`). It drives the graph,
@@ -107,7 +107,7 @@ for coverage. Removed: `core/v4_pipeline.hpp`, `reference/v4_int4_reference.hpp`
 `V4_ARGMAX_BLOCKS`. All of it is recoverable from git history and from `main`.
 
 `tools/aeon_model_contract.cpp` was **promoted** into the default build (it uses
-only kept components), and `v4_pipeline_accumulate_expert_kernel` was **kept** as
+only kept components), and `moe_accumulate_expert_kernel` was **kept** as
 the fp16 reproducibility control that the deterministic gate fixtures use.
 
 ## Manual diagnostics and benchmarks
