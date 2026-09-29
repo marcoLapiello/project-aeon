@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Mutation sweep for the 43-layer driver (composition plan P2).
+"""Mutation sweep for the 43-layer driver.
 
-Per the plan's second rule: for each property the gate certifies, inject the
+For each property the gate certifies, inject the
 specific wrong variant into the *implementation* and require the gate to go red.
 A survivor is either a gate defect to repair or an equivalent mutation to name as
 such — never something to ignore.
 
 Every mutation here targets `core/v4_graph.hpp`'s **driver wiring** — the loop, the
-embedding, the head's position in the sequence — because that is what P2 adds.
-The layer body is Tier 2's and the kernels are Tier 1's; a phase gate has to be
-able to see a mis-composition of correct parts, which is the same split the Tier-2
-layer gates and the P1 sweep used.
+embedding, the head's position in the sequence.
+A phase gate has to be
+able to see a mis-composition of correct parts, which is the same split the
+per-layer gates used.
 
 No mutation here is a numerical change to a kernel, and that is deliberate: a
 kernel defect is the wrong instrument for a driver sweep, so it would prove

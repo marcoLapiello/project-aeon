@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Step 6 outcome 5 — the prefill A/B.
+# The prefill A/B.
 #
 # Measures the certified serial prefill (one `forward_token` per prompt token)
 # against the swept layer-major window (one `forward_window` over the whole prompt),

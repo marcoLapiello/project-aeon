@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Step 3 — the tier-invariance gate.
+# The tier-invariance gate.
 #
 # Two runs, same context, same prompt, both greedy. They differ in exactly one
 # thing: which tier answers the non-Hot misses.

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Mutation sweep for the graph's head stage (composition plan P1).
+"""Mutation sweep for the graph's head stage.
 
-Per the plan's second rule: for each property the gate certifies, inject the
+For each property the gate certifies, inject the
 specific wrong variant into the *implementation* and require the gate to go red.
 A survivor is either a gate defect to repair or an equivalent mutation to name as
 such — never something to ignore.
 
-The mutations target `core/v4_graph.hpp`'s **wiring**, not a kernel. Tier 1 already
-owns the kernels (`hc_head_wave32_kernel` has its own 6-of-6 sweep in the Step-3
-gate), and what a stage gate has to be able to see is a mis-wiring between correct
-kernels — which is the same split the Tier-2 layer gates used.
+The mutations target `core/v4_graph.hpp`'s **wiring**, not a kernel. The kernel
+gates already
+own `hc_head_wave32_kernel` (it has its own 6-of-6 sweep), and what a stage gate
+has to be able to see is a mis-wiring between correct
+kernels.
 
 Any replacement that does not apply exactly once is an error, so a no-op mutation
 cannot be mistaken for a survivor.

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Mutation sweep for the text binding (composition plan P4).
+"""Mutation sweep for the text binding.
 
-Per the plan's second rule: for each property the gate certifies, inject the
+For each property the gate certifies, inject the
 specific wrong variant into the *implementation* and require the gate to go red.
 A survivor is either a gate defect to repair or an equivalent mutation to name as
 such — never something to ignore.
 
 Every mutation here targets `core/v4_engine.hpp`, because the binding is the whole
-of what P4 adds: the tokenizer, the encoder, the generation loop, the graph and the
+of what the text layer adds: the tokenizer, the encoder, the generation loop, the graph and the
 sampler are each owned and gated by their own phase, and mutating one of them would
 prove something about *that* gate rather than about this one. What is under test is
 whether `chat` composes them the way it claims — resets, reseeds, positions,
@@ -25,7 +25,7 @@ record_position re-derives every count from the position — `local_valid_count_
 `compressor_partial_count_`, `compressed_entry_count_`, `indexer_candidate_count_`.
 Every ring read is gated by one of those counts, so a fresh sequence starting at
 position 0 overwrites exactly the slots it later reads and never touches a stale
-row. That is requirement **R2** ("addressed by absolute position") doing real work,
+row. That is the "addressed by absolute position" requirement doing real work,
 not an accident.
 
 The reset is **kept anyway**, and that is the point: it is the sequence-start

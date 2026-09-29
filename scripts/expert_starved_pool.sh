@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Step 4 — the starved-pool gate.
+# The starved-pool gate.
 #
-# Re-runs Run A from the tier-invariance gate at `--max-hot-slots 12` (two
+# Re-runs the tier-invariance run at `--max-hot-slots 12` (two
 # layers' worth). Every layer now forces a drain, which is the only configuration
 # that exercises the emergency valve, the eviction-under-lease-pressure path, and
 # the asynchronous-demotion hazard.

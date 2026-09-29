@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Mutation sweep for the sampler and its logit-processor seam (composition plan P3).
+"""Mutation sweep for the sampler and its logit-processor seam.
 
-Per the plan's second rule: for each property the gate certifies, inject the
+For each property the gate certifies, inject the
 specific wrong variant into the *implementation* and require the gate to go red.
 A survivor is either a gate defect to repair or an equivalent mutation to name as
 such — never something to ignore.
@@ -10,7 +10,7 @@ Every mutation here targets `core/v4_sampler.hpp`: the seam's presence and its
 position in the order, the nucleus's boundary, the generator's role in the draw,
 the device fast path, and the argmax's tie direction. Those are the six things the
 gate's clauses are about. No mutation is a change to a kernel: the certified
-argmax pair is Tier-1 territory and a kernel defect would prove nothing about this
+argmax pair is its own gate's territory and a kernel defect would prove nothing about this
 gate.
 
 **One named equivalent is included on purpose**, because discovering it is worth
@@ -18,7 +18,7 @@ recording. `SP-7` changes top-p's `accumulated >= top_p` to `>`: the two differ
 only when the running mass lands *exactly* on the threshold, which is a
 measure-zero event, so the two are behaviourally identical and the sweep must
 report it as an equivalent rather than call it a survivor or pretend it was
-killed. It is the same discipline as trap 42/43 — say what the instrument can and
+killed. Say what the instrument can and
 cannot see.
 
 `SP-5` deserves a note too. It is not a numerical change at all: it makes `select`

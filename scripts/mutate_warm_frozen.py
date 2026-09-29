@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Mutation sweep for the frozen-prefill policy (Step 6 D-b).
+"""Mutation sweep for the frozen-prefill policy.
 
-Per the plan's second rule: for each property the outcome-3 gate certifies, inject
+For each property the Warm-frozen gate certifies, inject
 the specific wrong variant into the *implementation* and require the gate to go
 red. The gate asserts two things that must be true together — Warm is unchanged,
 and the prefill really read Warm — so each has a mutation that breaks exactly it.

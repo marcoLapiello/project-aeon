@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Step 5 — the demotion-queue A/B.
+# The demotion-queue A/B.
 #
 # `TieredExpertSupply::DEFAULT_DEMOTION_QUEUE_CAPACITY` is 2. One layer dispatches
 # up to 6 experts and each may evict a victim, with the bookkeeping cleared once

@@ -13,8 +13,8 @@
 // a documented fact rather than a surprise:
 //
 //   * `--deterministic-experts` — the **rewrite always** accumulates the routed
-//     experts in the fixed slot order with a single fp32 rounding (plan §8, "one
-//     accumulation"); the pre-rewrite graph had a selectable atomic path and that
+//     experts in the fixed slot order with a single fp32 rounding; the pre-rewrite
+//     graph had a selectable atomic path and that
 //     is what the flag used to choose. It therefore changes nothing here, and a
 //     green run cannot be produced by turning it on.
 //
@@ -108,7 +108,7 @@ void print_usage(const char* executable) {
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill\n"
         << "  --deterministic-experts  Accepted and inert; the rewrite always uses the fixed-order\n"
-        << "                           fp32 accumulator (plan section 8, \"one accumulation\")\n"
+        << "                           fp32 accumulator (one accumulation)\n"
         << "  --verbose                Print the memory budget report and the residency summary\n"
         << "  --diagnostic             Print the rendered prompt, token ids, stop reason and timings\n"
         << "  --help                   Show this help\n";

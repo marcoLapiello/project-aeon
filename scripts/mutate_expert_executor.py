@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mutation sweep for the production routed-expert executor.
 
-Per the plan's second rule: for each property the gate certifies, inject the
+For each property the gate certifies, inject the
 specific wrong variant into the *implementation* and require the gate to go red.
 A survivor is either a gate defect to repair or an equivalent mutation to name as
 such — never something to ignore.

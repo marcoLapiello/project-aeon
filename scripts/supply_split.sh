@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Supply-chain hot-path analysis, Step 1 — the exposed-load split.
+# Supply-chain hot-path analysis — the exposed-load split.
 #
 # Runs `bench_supply_split` twice at a modest matrix of prompt lengths: once with no
 # Warm (maximal NVMe signal, the disk/H2D legs at full size) and once at the
