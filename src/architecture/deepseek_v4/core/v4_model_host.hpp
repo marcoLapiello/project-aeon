@@ -75,7 +75,7 @@
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "infrastructure/core/expert_host_region.hpp"
 #include "infrastructure/core/prefetch_staging.hpp"
-#include "architecture/deepseek_v4/core/v4_prefill_sweep.hpp"
+#include "infrastructure/core/prefill_sweep.hpp"
 #include "infrastructure/core/supply_telemetry.hpp"
 #include "infrastructure/hip_check.hpp"
 #include "infrastructure/io/aligned_allocator.hpp"

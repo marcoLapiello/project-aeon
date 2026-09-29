@@ -2,6 +2,7 @@
 
 #include "infrastructure/core/aeon_loader.hpp"
 #include "infrastructure/core/expert_payload_pool.hpp"
+#include "infrastructure/core/layer_batch_supply.hpp"
 #include "infrastructure/core/tiered_expert_supply.hpp"
 
 #include <hip/hip_runtime.h>
@@ -16,7 +17,7 @@
 
 namespace aeon::core {
 
-class V4ExpertSupplyCoordinator {
+class V4ExpertSupplyCoordinator : public LayerBatchSupply {
 public:
     static constexpr uint64_t DEFAULT_DEMOTION_QUEUE_CAPACITY =
         TieredExpertSupply::DEFAULT_DEMOTION_QUEUE_CAPACITY;
@@ -29,28 +30,15 @@ public:
     // The state of one dispatch. It is **the layer's deduplicated set**, not one
     // token's six experts: the `C = 1` case (decode) deduplicates to exactly six,
     // and a chunk of `C` tokens collapses its `6C` requests to the layer's union
-    // (Step 6 D2). The parallel per-expert arrays are indexed by position in that
-    // distinct set; `token_indices[t][k]` is the distinct index of token `t`'s
-    // `k`-th expert, so a slot is stage-once and read by every token that chose it
-    // without ever permuting the slot-sum order (step §7).
-    struct LayerPrefetchState {
-        std::vector<int32_t> vram_slots;
-        std::vector<uint32_t> global_expert_ids;
-        std::vector<uint64_t> operation_ids;
-        std::vector<uint8_t> is_prefetched;
-        std::vector<uint32_t> staging_indices;
-        std::vector<uint8_t> io_pending;
-        std::vector<uint64_t> io_user_data;
-        std::vector<uint32_t> io_request_counts;
-        TieredExpertSupply::PayloadBatch supply_batch;
-
+    // (Step 6 D2). The parallel per-expert arrays live in the neutral
+    // `LayerBatchState`; this adds the one model-shaped piece — `token_indices[t][k]`,
+    // the distinct index of token `t`'s `k`-th expert, so a slot is stage-once and
+    // read by every token that chose it without ever permuting the slot-sum order
+    // (step §7).
+    struct LayerPrefetchState : LayerBatchState {
         // The batch shape. Decode leaves this as one token whose six indices are
         // `0..5`; a chunk fills `token_indices` with one row per token.
-        uint32_t first_position{0};
-        uint32_t token_count{0};
         std::vector<std::array<uint32_t, ROUTED_EXPERTS>> token_indices;
-
-        size_t expert_count() const noexcept { return supply_batch.transfers.size(); }
     };
 
     V4ExpertSupplyCoordinator() = default;
@@ -269,7 +257,7 @@ public:
         return state;
     }
 
-    void materialize_layer_prefetch(LayerPrefetchState& state) {
+    void materialize_layer_prefetch(LayerBatchState& state) override {
         supply_.materialize(state.supply_batch);
         sync_state(state);
     }
@@ -282,13 +270,13 @@ public:
     // arena to the layer and picks the bank: the sweep alternates banks by layer
     // parity, which is what lets one layer's copies stay in flight through its body
     // while the next layer's reads fill the other bank.
-    LayerPrefetchState dispatch_layer_stream(
+    LayerBatchState dispatch_layer_stream(
         uint32_t layer,
         const std::vector<uint32_t>& local_expert_ids,
         std::vector<uint32_t>& leased_experts,
         uint32_t staging_base = 0,
         bool stage_only = false
-    ) {
+    ) override {
         if (expert_registry_ == nullptr) {
             throw std::logic_error("V4ExpertSupplyCoordinator: coordinator is not configured");
         }
@@ -304,7 +292,7 @@ public:
                 staging_base + index
             });
         }
-        LayerPrefetchState state;
+        LayerBatchState state;
         state.supply_batch = supply_.dispatch(requests, layer, leased_experts, stage_only);
         if (state.supply_batch.transfers.size() != local_expert_ids.size()) {
             throw std::logic_error(
@@ -325,7 +313,7 @@ public:
     // at the layer boundary — where the driver has synchronized the compute stream, so
     // the per-slot event sync inside is instant and charges ~nothing to
     // `h2d_drain_ns_`.
-    void finish_streamed_batch(LayerPrefetchState& state) {
+    void finish_streamed_batch(LayerBatchState& state) override {
         supply_.release_streamed_staging(state.supply_batch);
         sync_state(state);
     }
@@ -334,7 +322,7 @@ public:
     // expert of `state` whose reads have all landed, and return without waiting (P2.3).
     // The per-token pump calls this on the **lookahead** layer, so its VRAM block is
     // filled during the previous layer's body instead of at the next boundary.
-    size_t pump_layer_prefetch(LayerPrefetchState& state) {
+    size_t pump_layer_prefetch(LayerBatchState& state) override {
         const size_t enqueued = supply_.materialize_available(state.supply_batch);
         // Always re-sync, not only when a copy was enqueued: `materialize_available`
         // also clears each transfer's `io_pending` as its reads land, and the sweep's
@@ -345,13 +333,13 @@ public:
         return enqueued;
     }
 
-    void reap_registry_transfers() {
+    void reap_registry_transfers() override {
         supply_.reap_registry_transfers();
     }
 
     // The staging arena's occupancy by pipeline stage — the corridor's fill, as
     // opposed to its size. Read at a layer boundary by the sweep's readout.
-    PrefetchStagingArena::StateCounts staging_state_counts() const {
+    PrefetchStagingArena::StateCounts staging_state_counts() const override {
         return supply_.staging_state_counts();
     }
 
@@ -359,7 +347,7 @@ public:
 
     // Free staging slots — the resource the sweep's lookahead depth is derived from
     // (plan R5), alongside the registry's free VRAM slots.
-    uint32_t staging_free_slots() const {
+    uint32_t staging_free_slots() const override {
         return supply_.staging_state_counts().free;
     }
 
@@ -373,7 +361,7 @@ public:
     }
 
 private:
-    void sync_state(LayerPrefetchState& state) const {
+    void sync_state(LayerBatchState& state) const {
         const size_t count = state.supply_batch.transfers.size();
         state.vram_slots.assign(count, -1);
         state.global_expert_ids.assign(count, 0);

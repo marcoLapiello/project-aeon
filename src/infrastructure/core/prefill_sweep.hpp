@@ -88,7 +88,7 @@
 // layer order. LRU is not a slower way to do this; it is the wrong instrument.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
+#include "infrastructure/core/layer_batch_supply.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 
 #include <algorithm>
@@ -113,7 +113,7 @@ public:
     // bank a layer's reads land in: layer `L` uses bank `L % staging_banks`, so with
     // two banks the layer whose copies are still in flight and the layer being read
     // ahead never share a slot. The bank count must match the arena the host built.
-    void configure(V4ExpertSupplyCoordinator* supply, ExpertRegistry* registry,
+    void configure(LayerBatchSupply* supply, ExpertRegistry* registry,
                    uint32_t staging_banks = 1) {
         supply_ = supply;
         registry_ = registry;
@@ -334,7 +334,7 @@ public:
     // sliding window, measured rather than assumed.
     uint32_t frontier_depth() const noexcept { return frontier_depth_; }
     // The read-ahead policy: the derived lookahead length and its cap. Definitions
-    // live in `v4_prefill_lookahead.hpp`; the derivation rules are documented there.
+    // live in `prefill_lookahead.hpp`; the derivation rules are documented there.
     uint32_t derived_lookahead_capacity() const noexcept;
     uint32_t read_lookahead_capacity() const noexcept;
     void set_read_ahead_max(uint32_t max_depth) noexcept;
@@ -342,7 +342,7 @@ public:
 private:
     // One dispatched-ahead layer: its reads are in flight (or landed), in layer order.
     struct LookaheadEntry {
-        V4ExpertSupplyCoordinator::LayerPrefetchState state{};
+        LayerBatchState state{};
         uint32_t layer{0};
     };
 
@@ -368,7 +368,7 @@ private:
     // Issue one layer's reads and return without waiting. The bytes are in flight
     // when this returns; nothing is resident yet. Returns `false` when the layer has
     // nothing missing (so the caller does not queue an empty entry).
-    bool dispatch_layer_into(uint32_t layer, V4ExpertSupplyCoordinator::LayerPrefetchState& out) {
+    bool dispatch_layer_into(uint32_t layer, LayerBatchState& out) {
         const auto started = std::chrono::steady_clock::now();
         supply_->reap_registry_transfers();
         std::vector<uint32_t> missing;
@@ -475,7 +475,7 @@ private:
     }
 
     // The read-ahead mechanism: issuing one wave at a time and tracking what is in
-    // flight. Definitions live in `v4_prefill_lookahead.hpp`.
+    // flight. Definitions live in `prefill_lookahead.hpp`.
     void dispatch_ahead(uint32_t from);
     void advance_reads();
     bool reads_in_flight() const noexcept;
@@ -507,7 +507,7 @@ private:
         occupancy_samples_.push_back(sample);
     }
 
-    V4ExpertSupplyCoordinator* supply_{nullptr};
+    LayerBatchSupply* supply_{nullptr};
     ExpertRegistry* registry_{nullptr};
     bool active_{false};
     // The lookahead queue: layers whose reads have been dispatched and whose bytes are
@@ -520,7 +520,7 @@ private:
     // The layer whose reads are settled and whose uploads are ordered behind the
     // compute stream, but whose staging bank is still held: the deferred-drain state.
     // `after_layer` returns it, so the upload overlaps the body instead of fronting it.
-    V4ExpertSupplyCoordinator::LayerPrefetchState resident_state_{};
+    LayerBatchState resident_state_{};
     uint32_t resident_layer_{0};
     bool resident_valid_{false};
     // Layer-sized staging banks the arena holds. `1` restores the pre-Phase-1 shape;
@@ -552,5 +552,5 @@ private:
 // The out-of-line read-ahead policy definitions. Included after the class so the
 // header sees a complete `V4PrefillSweep`; it includes this file, so it is also
 // includable on its own.
-#include "architecture/deepseek_v4/core/v4_prefill_lookahead.hpp"
+#include "infrastructure/core/prefill_lookahead.hpp"
 

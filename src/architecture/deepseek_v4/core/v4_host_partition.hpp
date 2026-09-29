@@ -42,7 +42,7 @@
 #include "infrastructure/core/runtime_config.hpp"
 #include "infrastructure/core/memory_budget_report.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
-#include "architecture/deepseek_v4/core/v4_prefill_sweep.hpp"
+#include "infrastructure/core/prefill_sweep.hpp"
 #include "infrastructure/core/expert_host_region.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"

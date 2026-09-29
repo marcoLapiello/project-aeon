@@ -7,7 +7,7 @@
 // This header holds the out-of-line definitions of the `V4PrefillSweep` members
 // that decide the lookahead depth from the **free blocks** (never a constant) and
 // that issue one read wave at a time as the previous lands; the class declares
-// them in `v4_prefill_sweep.hpp`.
+// them in `prefill_sweep.hpp`.
 //
 // The corridor requirements R1–R8 of the supply-chain plan §0.3 are carried
 // unchanged: the depth is derived from the staging arena alone, bounded to one
@@ -15,7 +15,7 @@
 // the definitions — same bodies, same private access.
 // -----------------------------------------------------------------------------
 
-#include "architecture/deepseek_v4/core/v4_prefill_sweep.hpp"
+#include "infrastructure/core/prefill_sweep.hpp"
 
 #include <algorithm>
 #include <cstdint>

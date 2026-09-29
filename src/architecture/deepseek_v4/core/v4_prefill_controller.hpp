@@ -27,7 +27,7 @@
 #include "architecture/deepseek_v4/core/v4_expert_executor.hpp"
 #include "architecture/deepseek_v4/core/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/core/v4_host_partition.hpp"
-#include "architecture/deepseek_v4/core/v4_prefill_sweep.hpp"
+#include "infrastructure/core/prefill_sweep.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/hip_check.hpp"
 
