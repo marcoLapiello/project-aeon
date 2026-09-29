@@ -12,8 +12,15 @@
 // holds no reference to the host: `allocate` and `ensure_prefill_carry` take the
 // layer vector and the model config they size themselves from, so the workspace
 // can be read, allocated and freed without the assembly around it.
+//
+// Of the two buffers, only the carry is engine-owned: it is the neutral
+// `infrastructure/core/prefill_carry.hpp` (`PrefillCarry`), sized by the model's
+// residual width. The chunk workspace is the model's own `V4LayerBodyBatchScratch`
+// — its layout is written in the model's dimensions and its worst case is taken
+// across the model's layers, so it stays here.
 // -----------------------------------------------------------------------------
 
+#include "infrastructure/core/prefill_carry.hpp"
 #include "infrastructure/core/runtime_config.hpp"
 #include "architecture/deepseek_v4/core/config.hpp"
 #include "architecture/deepseek_v4/core/v4_layer.hpp"
@@ -119,59 +126,46 @@ public:
     // What was allocated, for the report and the gates.
     uint32_t prefill_window_tokens() const noexcept { return prefill_window_tokens_; }
     uint32_t prefill_chunk_tokens() const noexcept { return prefill_chunk_tokens_; }
-    size_t prefill_carry_bytes(const DeepSeekV4Config& config) const noexcept {
-        const size_t hc_dim = static_cast<size_t>(config.hc_mult) *
-                              static_cast<size_t>(config.hidden_size);
-        return static_cast<size_t>(prefill_carry_tokens_) * hc_dim *
-               (sizeof(uint16_t) + sizeof(float));
-    }
+    size_t prefill_carry_bytes() const noexcept { return carry_.bytes(); }
     size_t prefill_batch_scratch_bytes() const noexcept { return batch_scratch_.bytes(); }
 
     // The residual carry: one window's worth of per-token residual, both fp16 and
     // fp32, held in VRAM for the whole layer-major pass. Grows only, so a window
     // of a given size is allocated once and reused by every later pass that fits.
+    //
+    // The buffer is the neutral `PrefillCarry`; the model supplies only its width
+    // (`hc_mult × hidden_size`), so the growth policy and the sizing live in the
+    // engine and no model type reaches them.
     void ensure_prefill_carry(uint32_t tokens, const DeepSeekV4Config& config) {
-        if (tokens == 0) {
-            throw std::invalid_argument("V4PrefillWorkspace: a prefill carry cannot be zero tokens");
-        }
-        if (tokens <= prefill_carry_tokens_) return;
-
-        if (d_prefill_carry_half_) { (void)hipFree(d_prefill_carry_half_); d_prefill_carry_half_ = nullptr; }
-        if (d_prefill_carry_) { (void)hipFree(d_prefill_carry_); d_prefill_carry_ = nullptr; }
-        prefill_carry_tokens_ = 0;
-
-        const uint32_t hc_dim = static_cast<uint32_t>(config.hc_mult) *
-                                static_cast<uint32_t>(config.hidden_size);
-        CHECK_HIP(hipMalloc(&d_prefill_carry_half_,
-                            static_cast<size_t>(tokens) * hc_dim * sizeof(half)));
-        CHECK_HIP(hipMalloc(&d_prefill_carry_,
-                            static_cast<size_t>(tokens) * hc_dim * sizeof(float)));
-        prefill_carry_tokens_ = tokens;
+        carry_.ensure(tokens, carry_dim(config));
     }
 
-    half* prefill_carry_half() noexcept { return d_prefill_carry_half_; }
-    float* prefill_carry() noexcept { return d_prefill_carry_; }
-    uint32_t prefill_carry_tokens() const noexcept { return prefill_carry_tokens_; }
+    half* prefill_carry_half() noexcept { return carry_.half_ptr(); }
+    float* prefill_carry() noexcept { return carry_.float_ptr(); }
+    uint32_t prefill_carry_tokens() const noexcept { return carry_.tokens(); }
 
     void free() noexcept {
         batch_scratch_.free();
         batch_scratch_layer_ = UINT32_MAX;
         batch_scratch_count_ = 0;
-        if (d_prefill_carry_half_) { (void)hipFree(d_prefill_carry_half_); d_prefill_carry_half_ = nullptr; }
-        if (d_prefill_carry_) { (void)hipFree(d_prefill_carry_); d_prefill_carry_ = nullptr; }
-        prefill_carry_tokens_ = 0;
+        carry_.free();
         prefill_window_tokens_ = 0;
         prefill_chunk_tokens_ = 0;
         prefill_workspace_ready_ = false;
     }
 
 private:
+    // The residual width the carry is sized by: the HC streams times the hidden
+    // size. A model property, so it is resolved here and passed as a scalar.
+    static uint32_t carry_dim(const DeepSeekV4Config& config) noexcept {
+        return static_cast<uint32_t>(config.hc_mult) *
+               static_cast<uint32_t>(config.hidden_size);
+    }
+
     V4LayerBodyBatchScratch batch_scratch_;
     uint32_t batch_scratch_layer_{UINT32_MAX};
     uint32_t batch_scratch_count_{0};
-    half* d_prefill_carry_half_{nullptr};
-    float* d_prefill_carry_{nullptr};
-    uint32_t prefill_carry_tokens_{0};
+    PrefillCarry carry_;
     // Step 6 item 7: the configured knobs and whether the workspace was allocated at
     // load for them.
     uint32_t prefill_window_tokens_{0};

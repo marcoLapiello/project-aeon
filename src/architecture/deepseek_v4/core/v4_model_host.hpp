@@ -325,7 +325,7 @@ public:
         return prefill_workspace_.prefill_chunk_tokens();
     }
     size_t prefill_carry_bytes() const noexcept {
-        return prefill_workspace_.prefill_carry_bytes(config_);
+        return prefill_workspace_.prefill_carry_bytes();
     }
     size_t prefill_batch_scratch_bytes() const noexcept {
         return prefill_workspace_.prefill_batch_scratch_bytes();
