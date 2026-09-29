@@ -33,18 +33,16 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 2. **Standard Ecosystem Compatibility**: Never invent custom lossy quantization formats. Ingest standard community formats (GGUF, Safetensors).
 3. **Hardware Precision Discipline**: Golden reference tests must verify that GPU GEMM / dequant kernels match reference precision within standard FP16/BF16 tolerances ($\epsilon < 10^{-3}$).
 4. **Direct I/O Discipline**: All streaming file reads must be strictly 4096-byte aligned (`O_DIRECT` compliant) to eliminate kernel page-cache contention and buffer copies.
-5. **Comment Discipline**: A comment explains *why* the code is the way it is — the constraint, the hazard, the measurement that forced it — and nothing else.
-   - **Never reference a planning artifact.** No execution plan, step, stage, tier, phase, gate label, trap/item number, milestone id, ledger entry, spike, or any other identifier minted by a planning document. Such a reference reads as noise (it usually does not even name its source) and it is stale the moment the code is refactored or moved, which is continuously. Explain the concept directly instead.
-   - **Delete stale comments; do not preserve them.** If a comment no longer matches the code, remove it. A comment that has drifted is worse than no comment, because it is trusted.
-   - **Compact what remains.** Keep the reasoning, cut the length: same information in markedly fewer lines. Prefer one sentence to a paragraph, and one paragraph to a section. Comments are read far more often than they are written, so their length is a recurring cost.
-   - **Do not restate the code.** If the next line already says it, the comment is not needed.
-6. **Concern Separation (G1–G4)**: Every file under `src/` belongs to exactly one concern, and dependencies point one way only. A file changes for exactly one reason, and it lives in the group that owns that reason.
-   - **G1 Engine — `src/infrastructure/`**: the engine's own strategy — budget allocation, cache and supply policy, prefill strategy, sampling, streams, the text loop, routing instrumentation. It changes when *we* make a design decision, and it is **model-agnostic**: G1 must never include G2's or G4's model types (`src/architecture/`, model-specific symbols).
-   - **G2 GPU architecture — `src/platform/`**: how an operation is *executed* on a specific GPU — wave width, lane mapping, tile shape, intrinsics. It changes with the GPU.
-   - **G3 Weight format — `src/backend/`**: how weights are *stored and decoded*. It changes with the quant/artifact format, independently of the GPU.
-   - **G4 Model architecture — `src/architecture/`**: what the model *computes* — attention sinking, Hyper-Connections, MLA, the router rule, RoPE, the tokenizer. It changes with the checkpoint.
+5. **Comment Discipline**: A comment explains *why* — the constraint, hazard, or measurement behind the code — never *what* the code already says.
+   - **Never cite a planning artifact.** No plan, step, stage, tier, gate, trap/item number, milestone, or ledger id. Explain the concept directly; the reference is noise and goes stale immediately.
+   - **Delete stale comments**, and compact the rest to the fewest lines that keep the reasoning.
+6. **Concern Separation (G1–G4)**: A file belongs to exactly one group and changes for exactly one reason.
+   - **G1 Engine — `src/infrastructure/`**: our strategy (budget, cache/supply policy, prefill, sampling, streams, text loop). Model-agnostic.
+   - **G2 GPU architecture — `src/platform/`**: how an op executes on a specific GPU (wave width, lane mapping, tile shape, intrinsics).
+   - **G3 Weight format — `src/backend/`**: how weights are stored and decoded.
+   - **G4 Model architecture — `src/architecture/`**: what the model computes (attention, Hyper-Connections, MLA, router, RoPE, tokenizer).
 
-   **Dependency direction** (verified from the `#include` graph): `G4 → G3/G2`, `G1 → G3/G2`; G2 and G3 depend on nothing above them. When adding or extending code, put it in the group whose *change reason* matches. **Cross a boundary only through a neutral seam** — an interface, or a scalar/shape parameter the caller supplies — never by pulling a lower group's model types upward. If a change would make `infrastructure/` include `architecture/`, or would put a model-specific name or constant into `platform/` or `backend/`, the design is wrong: introduce the seam instead. A move, a split or a rename is its own step with no behaviour change, and it must not carry a "while I'm here" edit.
+   Dependencies point one way: `G4 → G3/G2`, `G1 → G3/G2`; G2 and G3 depend on nothing above them. Put code where the *change reason* matches, and cross a boundary only through a neutral seam (an interface or a scalar/shape parameter the caller supplies) — never by pulling a lower group's model types upward. A move, split or rename is its own behaviour-preserving step, with no "while I'm here" edits.
 
 ### Development Process & Git Conventions
 
