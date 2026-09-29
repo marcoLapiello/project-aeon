@@ -135,9 +135,8 @@ struct AeonRuntimeConfig {
 
     // Demotion-queue capacity override. Zero (the default) derives it from
     // `enable_warm_refill` — the default capacity when refill is on, 0 when off.
-    // A positive value sets it directly, which is how the Step 5 A/B varies the
-    // number of evictions allowed in flight before the rest are dropped with
-    // `queue_pressure`.
+    // A positive value sets it directly, which is how the A/B varies the number of
+    // evictions allowed in flight before the rest are dropped with `queue_pressure`.
     uint64_t demotion_queue_capacity{0};
 
     // Phase 1 of the routing study: profile decode routing reuse distances. Off by
@@ -148,70 +147,65 @@ struct AeonRuntimeConfig {
     // Run the registry's full invariant audit after **every** expert reservation and
     // completion, not only at the phase boundaries. Off by default: the audit is a
     // whole-registry scan, so per-request it dominates a batch (measured 10.2 s of a
-    // 338-token swept prefill, ledger M43). On, it localises a bookkeeping defect to
-    // the individual operation that caused it. The boundaries and `invariants_hold()`
+    // 338-token swept prefill). On, it localises a bookkeeping defect to the
+    // individual operation that caused it. The boundaries and `invariants_hold()`
     // always audit regardless.
     bool validate_registry_each_request{false};
 
     // The body chunk `C` the layer-major prefill window runs with — the rows in
-    // flight per body invocation (Step 6 §6b). User-configurable; validated against
-    // the body's own row cap (`V4LayerBodyBatchScratch::kMaxTokens`) and against the
-    // window. It bounds the batch scratch (allocated at load) and the staging arena
+    // flight per body invocation. User-configurable; validated against the body's own
+    // row cap (`V4LayerBodyBatchScratch::kMaxTokens`) and against the window. It
+    // bounds the batch scratch (allocated at load) and the staging arena
     // (`min(6C, experts_per_layer)`). Larger = fewer body invocations; measured
     // nearly flat in throughput, so the default is on the wide side.
     uint32_t prefill_chunk{64};
 
-    // The layer-major prefill **window** `W` (Step 6 §6b): how many prompt tokens
-    // one layer-major pass carries in its residual, and therefore how many sweeps a
-    // prompt of `N` tokens pays (`⌈N/W⌉`). User-configurable. `0` means the whole
-    // prompt, bounded by the context — one pass, but a carry allocated for the whole
-    // context. The default matches the reference implementation's segment size
-    // (colibri `V4_PREFILL_SEGMENT = 4096`), which bounds the carry at ~393 MiB
-    // regardless of context and keeps a long prompt at `⌈N/4096⌉` passes.
+    // The layer-major prefill **window** `W`: how many prompt tokens one layer-major
+    // pass carries in its residual, and therefore how many sweeps a prompt of `N`
+    // tokens pays (`⌈N/W⌉`). User-configurable. `0` means the whole prompt, bounded by
+    // the context — one pass, but a carry allocated for the whole context. The
+    // default matches the reference implementation's segment size, which bounds the
+    // carry at ~393 MiB regardless of context and keeps a long prompt at `⌈N/4096⌉`
+    // passes.
     uint32_t prefill_window{4096};
 
-    // Step 6 D-b (policy A): freeze the Warm tier during prefill. A prefill touches
-    // every expert, so letting the sweep promote from Warm would **move** each
-    // Warm-resident expert into VRAM and empty the tier — destroying exactly the
-    // "natural selection" decode's Warm hits depend on. With this on, a prefill
-    // copies a Warm expert into VRAM **without** transferring ownership (a shadow
-    // residency) and evicts by **release** rather than demotion, so Warm's resident
-    // set is identical before and after the prefill. On by default, per D-b; a gate
-    // A/Bs it against `false`.
+    // Freeze the Warm tier during prefill. A prefill touches every expert, so letting
+    // the sweep promote from Warm would **move** each Warm-resident expert into VRAM
+    // and empty the tier — destroying exactly the "natural selection" decode's Warm
+    // hits depend on. With this on, a prefill copies a Warm expert into VRAM **without**
+    // transferring ownership (a shadow residency) and evicts by **release** rather than
+    // demotion, so Warm's resident set is identical before and after the prefill. On by
+    // default; a gate A/Bs it against `false`.
     bool freeze_warm_during_prefill{true};
 
-    // Step 6 item 6: drive the layer-major prefill window with the **expert sweep**
-    // instead of the per-token dispatch. The sweep frees only what it needs on
-    // entry, holds a sliding window of whole layer sets (`L, L+1, L+2, …` up to
-    // capacity), releases each layer's prefill-admitted set as it retires, and
-    // leaves the residents preserved at entry resident on exit — so Warm and its LRU
-    // ranking are untouched across the whole prefill and decode resumes on them. On
-    // by default; it is the prefill strategy the plan decided (D-a). Falls back to
-    // the per-token path when the Hot pool cannot hold a whole layer.
+    // Drive the layer-major prefill window with the **expert sweep** instead of the
+    // per-token dispatch. The sweep frees only what it needs on entry, holds a sliding
+    // window of whole layer sets (`L, L+1, L+2, …` up to capacity), releases each
+    // layer's prefill-admitted set as it retires, and leaves the residents preserved
+    // at entry resident on exit — so Warm and its LRU ranking are untouched across the
+    // whole prefill and decode resumes on them. On by default. Falls back to the
+    // per-token path when the Hot pool cannot hold a whole layer.
     bool prefill_sweep{true};
 
-    // The **prompt-length gate** for the sweep (Prefill Supply Strategy plan, Step
-    // 3). Below this window length the layer-major window runs the route-aware
-    // cached supply instead of the sweep: a whole-layer load over-reads a short
-    // prompt's small distinct set, so the sweep is the right strategy only for long
-    // ones. Zero (the default) derives the gate from the layer width (`3 E / 4`),
-    // placed at the measured crossover, so it is expressed in the model's own terms
-    // rather than as a constant tuned for one GPU. This is the **only** condition on
-    // the switch besides feasibility — a hidden threshold is exactly what the plan
-    // forbids.
+    // The **prompt-length gate** for the sweep. Below this window length the
+    // layer-major window runs the route-aware cached supply instead of the sweep: a
+    // whole-layer load over-reads a short prompt's small distinct set, so the sweep is
+    // the right strategy only for long ones. Zero (the default) derives the gate from
+    // the layer width (`3 E / 4`), placed at the measured crossover, so it is expressed
+    // in the model's own terms rather than as a constant tuned for one GPU. This is the
+    // **only** condition on the switch besides feasibility — a hidden threshold would
+    // be a policy nobody can see.
     uint32_t prefill_sweep_min_tokens{0};
 
     // The layer-sized staging **banks** the sweep's arena holds when `prefill_sweep`
     // is on, in units of one layer's payloads (`E`). **A memory budget, not a tuning
-    // figure**: the prefetch depth is *derived* from the arena (`blanks - 1` blocks of
+    // figure**: the prefetch depth is *derived* from the arena (`banks - 1` blocks of
     // free staging, bounded to one read wave at a time), so the count decides how much
     // pinned host memory the corridor spends and nothing else. Measured across `2E…
-    // 6E`: `29.83–30.39 s`, Gate A spread `1.009x`, `42/43` layer-bodies overlapped at
-    // every size (SUPPLY_CHAIN_HOT_PATH_ANALYSIS §17.4).
+    // 6E`: `29.83–30.39 s`, spread `1.009x`, `42/43` layer-bodies overlapped at every
+    // size.
     //
-    // This is why the knob is legitimate where an earlier revision removed it: the
-    // objection then was that depth selected the *algorithm* (Gate A failed at
-    // `1.38x`, `1E` ran a serial read/copy pipeline). It does not any more, so the
+    // The knob is legitimate because the depth no longer selects the *algorithm*: the
     // arena can be sized from the host's remaining RAM, which is exactly what a
     // portability knob should express.
     //

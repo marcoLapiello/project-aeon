@@ -22,12 +22,12 @@ namespace aeon::kernel {
 // Accumulate weighted expert output into token hidden state.
 //
 // **SUPERSEDED — do not select this in any new path.** Its accumulator is stored in
-// fp16 and re-rounded on every one of the six steps, which violates plan §2.10.3
-// ("accumulate in fp32"); measured against the fixed-order pair below it is 3.4x
-// less accurate on the model's own routing-weight shape. It is retained **only as a
-// gate control**: the deterministic fixtures use it to check that a run
-// reproducing the fp16 order still matches, so its reader is `tests/support/`.
-// The replacement is `aeon_moe_fused_w2_contrib_kernel` +
+// fp16 and re-rounded on every one of the six steps, which violates the fp32
+// accumulation rule the fixed-order pair below satisfies; measured against that
+// pair it is 3.4x less accurate on the model's own routing-weight shape. It is
+// retained **only as a gate control**: the deterministic fixtures use it to check
+// that a run reproducing the fp16 order still matches, so its reader is
+// `tests/support/`. The replacement is `aeon_moe_fused_w2_contrib_kernel` +
 // `moe_accumulate_fixed_order_kernel`, which is fp32 *and* has a fixed order.
 __global__ void moe_accumulate_expert_kernel(
     half* __restrict__ accum_out,
@@ -54,12 +54,11 @@ __global__ void moe_accumulate_expert_kernel(
 // It is the path that satisfies both requirements at once, which neither previous
 // path did:
 //
-//   * plan §2.10.3 requires **fp32 accumulation**. The fp16 read-modify-write
-//     above (`moe_accumulate_expert_kernel`) violates that: it stores its
-//     accumulator in fp16 and re-rounds on each of the six steps.
-//   * trap 38 requires a **fixed order**. `atomicAdd` cannot provide one, because
-//     the order in which the six expert blocks reach a given element is the
-//     scheduler's.
+//   * **fp32 accumulation**. The fp16 read-modify-write above
+//     (`moe_accumulate_expert_kernel`) violates that: it stores its accumulator in
+//     fp16 and re-rounds on each of the six steps.
+//   * **a fixed order**. `atomicAdd` cannot provide one, because the order in which
+//     the six expert blocks reach a given element is the scheduler's.
 //
 // Together those two constraints had left no correct option: gates that needed
 // reproducibility had to accept the less accurate path. Splitting the accumulation

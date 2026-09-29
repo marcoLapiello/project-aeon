@@ -38,8 +38,8 @@ struct V4LayerBodyTables {
         const float* sin;
     };
 
-    // Two bases, selected by layer class (plan 2.3): a Sliding layer rotates with
-    // the plain base, a compressed layer with the YaRN-on-compressed base.
+    // Two bases, selected by layer class: a Sliding layer rotates with the plain
+    // base, a compressed layer with the YaRN-on-compressed base.
     View for_layer(V4AttentionKind kind) const noexcept {
         return kind == V4AttentionKind::Sliding
             ? View{sliding_cos, sliding_sin}
@@ -85,15 +85,13 @@ struct V4LayerBodyOutput {
     std::vector<float> topk_weights;
 };
 
-// Indexer candidate selection (plan 2.4.3, layer part). Descending score, ties
-// broken to the **lower index** — the same rule as the router (trap 18) — and
-// the degenerate case `candidates <= index_topk` selects every candidate with no
-// padding.
+// Indexer candidate selection (layer part). Descending score, ties broken to the
+// **lower index** — the same rule as the router — and the degenerate case
+// `candidates <= index_topk` selects every candidate with no padding.
 //
-// Note this is the one host-side sync left in the body. The plan requires it to
-// become on-device for chunked batched prefill; that is item 19's second half and
-// is recorded here rather than hidden, because it does not change any result and
-// therefore cannot be seen by the equivalence gate.
+// This is the one host-side sync left in the body. It is a candidate for moving
+// on-device for chunked batched prefill, which would change no result and therefore
+// cannot be seen by the equivalence gate.
 inline void select_indexer_topk(const V4Layer& layer, const float* device_scores,
                                 int32_t* device_topk, size_t candidate_count,
                                 hipStream_t stream) {
@@ -212,10 +210,10 @@ struct V4LayerBodyRow {
 
     half* d_moe_accum{nullptr};
 
-    // ---- Where this token's rotated key (which is also its value, trap 6) is
-    // written. Decode leaves these null and gets the ring slot for its own
-    // position; a chunk points them at its own key buffer, because **a chunk must
-    // not write the ring as it goes** — see the proof in `v4_layer_body_batch.hpp`.
+    // ---- Where this token's rotated key (which is also its value) is written.
+    // Decode leaves these null and gets the ring slot for its own position; a chunk
+    // points them at its own key buffer, because **a chunk must not write the ring as
+    // it goes** — see the proof in `v4_layer_body_batch.hpp`.
     half* d_local_key_write{nullptr};
     half* d_local_value_write{nullptr};
     int64_t* d_local_position_write{nullptr};
@@ -231,8 +229,8 @@ struct V4LayerBodyRow {
 };
 
 // The single-token row over `V4ActivationScratch` plus the layer's own indexer
-// state buffers. Every pointer is exactly what the pre-refactor body used, so the
-// decode path is byte-for-byte the same computation.
+// state buffers. Every pointer is exactly what the decode path uses, so the decode
+// path is byte-for-byte the same computation.
 inline V4LayerBodyRow decode_layer_body_row(V4ActivationScratch& scratch,
                                             V4Layer& layer) {
     V4LayerBodyRow row;
@@ -261,9 +259,7 @@ inline V4LayerBodyRow decode_layer_body_row(V4ActivationScratch& scratch,
     row.d_compressor_kv = scratch.d_compressor_kv;
     row.d_compressor_score = scratch.d_compressor_score;
 
-    // The indexer query is RoPE'd in place into the layer's own buffer — the
-    // pre-refactor body copied the scratch buffer into it, which is a
-    // device-to-device copy of the value that is already there.
+    // The indexer query is RoPE'd in place into the layer's own buffer.
     row.d_indexer_query = layer.d_indexer_query;
     row.d_indexer_weights_half = scratch.d_indexer_weights;
     row.d_indexer_weights = layer.d_indexer_weights;

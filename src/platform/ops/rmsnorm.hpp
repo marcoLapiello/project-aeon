@@ -12,10 +12,9 @@
 // `__shfl_xor`. Both forms accumulate in fp32 and write fp16.
 //
 // The two forms exist because the graph uses both:
-//   - weighted (`rmsnorm_wave32_kernel`)      — Step 2.1 attention norm.
-//   - unit     (`rmsnorm_unit_wave32_kernel`) — weightless norm sites.
-// Which site uses which is a decision recorded in the plan (Step 2.1/2.2), not
-// something this header decides.
+//   - weighted (`rmsnorm_wave32_kernel`)      — the attention norm site.
+//   - unit     (`rmsnorm_unit_wave32_kernel`) — the weightless norm sites.
+// Which site uses which is a per-site decision, not something this header decides.
 //
 // Verification: the gate is `tests/test_v4_norm_oracle.cpp`, which compares these
 // kernels against `reference/dsv4_oracle.hpp` — an fp64 reference that shares no

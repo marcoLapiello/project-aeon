@@ -39,9 +39,9 @@ inline uint32_t ExpertRegistry::usable_host_capacity() const noexcept { return h
 
 // The Warm residents a boundary move surrendered to the corridor, in the order
 // they were released. The caller re-admits them at `prefill_end` so a window
-// leaves the Warm tier **as it found it** — which is the frozen-prefill guarantee
-// (Step 6 D-b), and the reason a move is a borrow rather than a loss. Cleared by
-// `clear_host_restore_set` once they have been restored.
+// leaves the Warm tier **as it found it** — the frozen-prefill guarantee, and the
+// reason a move is a borrow rather than a loss. Cleared by `clear_host_restore_set`
+// once they have been restored.
 inline const std::vector<uint32_t>& ExpertRegistry::host_restore_set() const noexcept { return host_restore_set_; }
 
 inline void ExpertRegistry::clear_host_restore_set() noexcept { host_restore_set_.clear(); }

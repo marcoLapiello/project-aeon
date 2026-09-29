@@ -115,18 +115,17 @@ struct ExpertTierState {
         const MemoryBudgetReport& budget = *params.budget;
         const uint32_t warm_slots = budget.warm_host_slots;
 
-        // 10 — the Hot VRAM pool, the staging arena and the direct reader. The arena
-        // and the reader are built for the *artifact's* format, not the backend's
-        // default, so a payload's staging slot is the artifact's own `payload_bytes`
-        // wide.
+        // The Hot VRAM pool, the staging arena and the direct reader. The arena and the
+        // reader are built for the *artifact's* format, not the backend's default, so a
+        // payload's staging slot is the artifact's own `payload_bytes` wide.
         //
         // The arena's slot count is the decode shape unless a prefill chunk is
-        // configured (Step 6 D4): a chunk issues up to `experts_per_token * C`
-        // deduplicated transfers as one set, and each distinct expert needs its own
-        // slot in transit. A chunk's deduplicated distinct set can never exceed the
-        // **layer's** expert count, so the term is capped by the layer here — and this
-        // is the same ceiling the graph's guard checks against, which is why a legal
-        // wide chunk is not refused.
+        // configured: a chunk issues up to `experts_per_token * C` deduplicated
+        // transfers as one set, and each distinct expert needs its own slot in
+        // transit. A chunk's deduplicated distinct set can never exceed the
+        // **layer's** expert count, so the term is capped by the layer here — the same
+        // ceiling the graph's guard checks against, which is why a legal wide chunk is
+        // not refused.
         payload_pool->allocate(budget.hot_vram_slots, format);
         const uint32_t dedup_ceiling = std::min<uint32_t>(
             params.experts_per_token * std::max<uint32_t>(1, runtime.prefill_chunk),

@@ -1,17 +1,17 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// The layer-major prefill working set (Step 6).
+// The layer-major prefill working set.
 //
 // Two buffers, and the distinction between them is the whole reason they are
-// separate (§6.4): the **chunk workspace** holds per-op temporaries for the rows
-// in flight and is recycled as layers advance, while the **carry** holds the
-// residual being transformed and must survive all 43 layers of a pass.
+// separate: the **chunk workspace** holds per-op temporaries for the rows in flight
+// and is recycled as layers advance, while the **carry** holds the residual being
+// transformed and must survive all 43 layers of a pass.
 //
-// This struct owns both, plus the configured window/chunk it was sized for. It
-// holds no reference to the host: `allocate` and `ensure_prefill_carry` take the
-// layer vector and the model config they size themselves from, so the workspace
-// can be read, allocated and freed without the assembly around it.
+// This struct owns both, plus the configured window/chunk it was sized for. It holds
+// no reference to the host: `allocate` and `ensure_prefill_carry` take the layer
+// vector and the model config they size themselves from, so the workspace can be
+// read, allocated and freed without the assembly around it.
 //
 // Of the two buffers, only the carry is engine-owned: it is the neutral
 // `infrastructure/core/prefill_carry.hpp` (`PrefillCarry`), sized by the model's
@@ -62,7 +62,7 @@ public:
     V4LayerBodyBatchScratch& batch_scratch() noexcept { return batch_scratch_; }
     const V4LayerBodyBatchScratch& batch_scratch() const noexcept { return batch_scratch_; }
 
-    // ---- Step 6 item 7: the prefill workspace, derived from the knobs ---------
+    // ---- the prefill workspace, derived from the knobs ----------------------
     //
     // The residual carry and the batch scratch are functions of the configured
     // window `W` and chunk `C`, so both are **derived and allocated once, at load**,
@@ -166,8 +166,7 @@ private:
     uint32_t batch_scratch_layer_{UINT32_MAX};
     uint32_t batch_scratch_count_{0};
     PrefillCarry carry_;
-    // Step 6 item 7: the configured knobs and whether the workspace was allocated at
-    // load for them.
+    // The configured knobs and whether the workspace was allocated at load for them.
     uint32_t prefill_window_tokens_{0};
     uint32_t prefill_chunk_tokens_{0};
     bool prefill_workspace_ready_{false};

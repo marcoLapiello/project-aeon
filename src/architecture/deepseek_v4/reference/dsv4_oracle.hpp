@@ -4,8 +4,7 @@
 // DeepSeek-V4 oracle: independent, host-only, double-precision references.
 //
 // These functions are the *specification written as arithmetic*. They exist so a
-// kernel can be compared against something that shares no code with it — see the
-// inference pipeline plan, Part V, "Anti-circularity rule".
+// kernel can be compared against something that shares no code with it.
 //
 // Binding rules for this header:
 //
@@ -20,10 +19,6 @@
 //   3. ACCUMULATE IN DOUBLE. The kernels accumulate in float; using double here
 //      makes the measured delta a statement about the kernel's rounding rather
 //      than about the reference's.
-//
-// Each reference states the plan step it implements. The plan is authoritative
-// for semantics; if this file and the plan disagree, the plan wins and this file
-// is the bug.
 // -----------------------------------------------------------------------------
 
 #include <algorithm>
@@ -140,17 +135,14 @@ inline bool within(const ErrorStats& s, double tol_abs, double tol_rel) {
 }
 
 // ---------------------------------------------------------------------------
-// RMSNorm — Step 2.1 (attention norm), 2.6 (FFN norm), 2.10 (pre-norm),
-//          Step 3 (final norm), and the Q/KV path norms in 2.2
+// RMSNorm — the attention norm, FFN norm, pre-norm, final norm, and the Q/KV
+// path norms
 // ---------------------------------------------------------------------------
 
 // out[i] = x[i] * rsqrt(mean(x^2) + eps) * weight[i], accumulated in double.
 //
-// The graph applies the weighted form at least to the attention RMSNorm (2.1),
-// whose spec is literally `x / sqrt(mean(x^2) + eps) * weight` over 4096 with
-// fp32 accumulate. `rmsnorm_unit` is the weightless form; whether a given site
-// carries a learned scale is a per-site decision recorded in the plan, not
-// something this header assumes.
+// `rmsnorm_unit` is the weightless form; whether a given site carries a learned
+// scale is a per-site decision, not something this header assumes.
 inline std::vector<double> rmsnorm(const std::vector<double>& x,
                                    const std::vector<double>& weight,
                                    double eps) {
@@ -177,11 +169,11 @@ inline std::vector<double> rmsnorm_unit(const std::vector<double>& x, double eps
 }
 
 // ---------------------------------------------------------------------------
-// RoPE — Step 2.3
+// RoPE
 //
 // Deliberately *not* parameterised by "which of the two upstream classes am I".
 // The only knob is the spec, and there are exactly two specs in the graph, so a
-// caller cannot silently invent a third. (trap 7)
+// caller cannot silently invent a third.
 // ---------------------------------------------------------------------------
 
 // The two RoPE classes the graph actually has, keyed on `compress_ratio`:
@@ -301,7 +293,7 @@ inline RopeTableRef rope_table(const RopeSpec& spec, uint32_t max_position) {
 
 // Rotates the tail `rotary_dim` of a single head row **in place**. The row is
 // `head_dim` wide; the leading `head_dim - rotary_dim` (= 448) entries are the
-// nope part and are never touched. (trap 27)
+// nope part and are never touched.
 //
 // GPT-J interleave: the pairs are adjacent, `(rotary + 2k, rotary + 2k + 1)`.
 //   forward: out[2k]   = x[2k]*cos - x[2k+1]*sin
@@ -350,7 +342,7 @@ inline double peak_abs(const std::vector<double>& v) {
 }
 
 // ---------------------------------------------------------------------------
-// Dense projections — Step 2.2 (MLA), and every other `y = W @ x` in the graph
+// Dense projections — the MLA path, and every other `y = W @ x` in the graph
 // ---------------------------------------------------------------------------
 
 // `y[o] = Σ_i W[o, i] · x[i]`, with `W` given as `[out_dim, in_dim]` **row
@@ -372,11 +364,10 @@ inline double peak_abs(const std::vector<double>& v) {
 // by exactly one iteration, and the accessor and `x` are only ever read. Every
 // `o` therefore executes the identical instruction sequence it did serially and
 // produces a **bit-identical** value — unlike a reassociated reduction, which
-// would change the result (see option 4 in the discussion of this in the plan).
-// The `if` clause keeps a parallel region from being opened for the handful of
-// tiny projections (a 64-wide gate) where the fork/join would cost more than the
-// work. Guarded by `_OPENMP`, so a target that was not opted in compiles the
-// serial loop verbatim.
+// would change the result. The `if` clause keeps a parallel region from being
+// opened for the handful of tiny projections (a 64-wide gate) where the
+// fork/join would cost more than the work. Guarded by `_OPENMP`, so a target
+// that was not opted in compiles the serial loop verbatim.
 template <class Accessor>
 std::vector<double> matvec(size_t out_dim, size_t in_dim,
                            const std::vector<double>& x,
@@ -394,26 +385,25 @@ std::vector<double> matvec(size_t out_dim, size_t in_dim,
 }
 
 // ---------------------------------------------------------------------------
-// MLA Q/KV paths — Step 2.2
+// MLA Q/KV paths
 //
 // Multi-head Latent Attention with a low-rank Q path and a single shared KV
 // head. Two things this encodes that a "collapse the matmuls" implementation
-// loses (trap 5), and one it must not invent (trap 6):
+// loses, and one it must not invent:
 //
 //   Q:  x -> wq_a [4096 -> 1024] -> q_norm (weighted, over 1024)
 //          -> wq_b [1024 -> 64*512] -> per-head norm (WEIGHTLESS, over 512)
 //   KV: x -> wkv  [4096 -> 512]  -> kv_norm (weighted, over 512)
 //
-// The per-head Q norm is weightless. Cited two ways: upstream's
+// The per-head Q norm is weightless. Upstream's
 // `fused_q_norm_rope(q_input, q_output, eps, freqs_cis, positions)` takes no
 // weight argument, and the checkpoint declares exactly
 // `attn.wq_a` / `attn.q_norm` / `attn.wq_b` / `attn.wkv` / `attn.kv_norm` —
-// there is no per-head norm tensor to load. The pipeline already uses the
-// weightless kernel, so kernel and contract agree.
+// there is no per-head norm tensor to load.
 //
 // There is no separate V: `kv` is a single 512-wide row used as both key and
-// value (trap 6). Nothing here produces a second tensor, and a gate should fail
-// if one appears.
+// value. Nothing here produces a second tensor, and a gate should fail if one
+// appears.
 // ---------------------------------------------------------------------------
 
 struct MlaQPath {
@@ -461,7 +451,7 @@ std::vector<double> mla_kv_path(const std::vector<double>& x_norm,
 }
 
 // ---------------------------------------------------------------------------
-// Hyper-Connections — Step 2.0 (pre-mix + Sinkhorn), 2.7 (post expansion)
+// Hyper-Connections — the attention pre-mix + Sinkhorn, and the post expansion
 //
 // Written directly from the upstream reference, which is the best arbiter here
 // because the comb's index convention is easy to get backwards and a transposed
@@ -470,8 +460,7 @@ std::vector<double> mla_kv_path(const std::vector<double>& x_norm,
 //   [V vllm/model_executor/kernels/mhc/torch.py:6-93  `mhc_pre_torch`]
 //   [V vllm/model_executor/kernels/mhc/torch.py:96-108 `mhc_post_torch`]
 //
-// THE COMB INDEX CONVENTION, stated once and unambiguously, because the plan's
-// own 2.0 prose gets it backwards (see the correction note in the plan):
+// THE COMB INDEX CONVENTION, stated once and unambiguously:
 //
 //   Let `C` be the 4x4 comb, flattened `C[i * hc_mult + j]`. Then
 //
@@ -643,7 +632,7 @@ inline std::vector<double> hc_post(const std::vector<double>& layer_out,
 }
 
 // ---------------------------------------------------------------------------
-// Step 3 — HC head reduction: the 4 residual streams collapse to one vector.
+// HC head reduction: the 4 residual streams collapse to one vector.
 //
 //   mixes  = hc_head_fn @ rmsnorm_without_weight(flatten(residual), rms_eps)  [hc_mult]
 //   pre[j] = sigmoid(mixes[j] · hc_head_scale + hc_head_base[j]) + hc_eps
@@ -651,10 +640,10 @@ inline std::vector<double> hc_post(const std::vector<double>& layer_out,
 //
 // `[V vllm/model_executor/kernels/mhc/triton.py  hc_head_reduce_triton_kernel]`
 //
-// It looks like Step 2.0's pre-mix and is deliberately not the same thing. Three
-// differences, each of which is a silent failure if got wrong:
+// It looks like the attention pre-mix and is deliberately not the same thing.
+// Three differences, each of which is a silent failure if got wrong:
 //
-//   * The RMSNorm has **no learned weight** — unlike 2.1's attention norm, and
+//   * The RMSNorm has **no learned weight** — unlike the attention norm, and
 //     unlike anything else in the model. There is no `hc_head` norm tensor to
 //     load, so an implementation that multiplies by a weight is reading something
 //     that does not exist. `weighted_norm` below exists only so a gate can show
@@ -749,7 +738,7 @@ inline HcHeadResult hc_head_reduce(const std::vector<double>& residual,
 
 
 // ---------------------------------------------------------------------------
-// Attention score + sink + softmax — Step 2.4.1
+// Attention score + sink + softmax
 //
 // `out[h][d] = Σ_j p_j · k[j][d] / l` with
 //
@@ -762,16 +751,14 @@ inline HcHeadResult hc_head_reduce(const std::vector<double>& residual,
 // absorbs probability mass and nothing else. Upstream describes it as *"a virtual
 // extra K with V=0"* `[V sglang .../dsv4/unified_kv_kernels/paged_prefill.py:194-203]`.
 //
-// There is no separate value tensor: the same `k` rows are used as values
-// (trap 6).
+// There is no separate value tensor: the same `k` rows are used as values.
 //
 // Note on the max. Including the sink in `m` is what keeps every exponent in
 // `exp(·) ≤ 0` when the sink dominates. It is a numerical-robustness property and
 // it is **not observable in the output**: in the regime where it matters (sink
 // far above every score) all mass sits on the sink and the output is zero whether
 // or not the sink was included in the max. A gate therefore cannot discriminate
-// on this by comparing outputs, and should not pretend to — see the note in the
-// attention gate.
+// on this by comparing outputs, and should not pretend to.
 // ---------------------------------------------------------------------------
 
 inline std::vector<double> attention_scores_sink(
@@ -812,10 +799,10 @@ inline std::vector<double> attention_scores_sink(
 }
 
 // The identical quantity written the other way: the sink is simply one more key
-// whose **value row is zero**. The plan states these two readings are numerically
-// identical; this function exists so a gate can confirm that rather than assume
-// it. (They are: the extra term contributes `p_sink · 0 = 0` to every numerator,
-// and `p_sink` to the denominator, under the same max.)
+// whose **value row is zero**. The two readings are numerically identical; this
+// function exists so a gate can confirm that rather than assume it. (They are:
+// the extra term contributes `p_sink · 0 = 0` to every numerator, and `p_sink` to
+// the denominator, under the same max.)
 inline std::vector<double> attention_sink_as_zero_value_key(
     const std::vector<double>& q, size_t num_heads, size_t head_dim,
     const std::vector<double>& k, size_t num_keys,
@@ -858,7 +845,7 @@ inline std::vector<double> attention_sink_as_zero_value_key(
 }
 
 // ---------------------------------------------------------------------------
-// Compressor — Step 2.4.2
+// Compressor
 //
 // Reference: `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py`
 // (`compress_norm_rope_store_triton` → the softmax + weighted sum, then RMSNorm)
@@ -883,8 +870,8 @@ inline std::vector<double> attention_sink_as_zero_value_key(
 //      the second half holds the newer `ratio` tokens: `coeff = 1 + overlap`,
 //      `segment = o / ratio`, offset `segment · head_dim + d`.
 //   4. THE ENTRY IS EMITTED ONLY WHEN `(pos + 1) % ratio == 0`, and its RoPE
-//      position is the window start `(pos / ratio)·ratio`, which equals the
-//      plan's `pos + 1 − ratio` exactly at those positions.
+//      position is the window start `(pos / ratio)·ratio`, which is exactly
+//      `pos + 1 − ratio` at those positions.
 // ---------------------------------------------------------------------------
 
 // Floor-mod, because Python's `%` (which the reference uses) and C++'s differ
@@ -969,15 +956,15 @@ inline std::vector<double> compressor_raw(const std::vector<std::vector<double>>
 
 // The compressed entry's RoPE position: the start of its own window. Upstream
 // writes this as `(positions // compress_ratio) * compress_ratio`
-// `[V compressor.py; V fused_compress_quant_cache.py]`; the plan writes the
-// equivalent `pos + 1 − ratio`. Provided once so a gate can assert they agree
-// rather than assume it.
+// `[V compressor.py; V fused_compress_quant_cache.py]`, which is the equivalent
+// of `pos + 1 − ratio`. Provided once so a gate can assert they agree rather than
+// assume it.
 inline int64_t compressor_rope_position(int64_t boundary_position, int64_t ratio) noexcept {
     return (boundary_position / ratio) * ratio;
 }
 
 // ---------------------------------------------------------------------------
-// Lightning indexer — Step 2.4.3
+// Lightning indexer
 //
 // Reference: `sglang/.../srt/layers/attention/dsv4/indexer.py`
 //   `fp8_paged_mqa_logits_torch` / the SM120 variant, lines 100-126 / 245-267.
@@ -994,8 +981,8 @@ inline int64_t compressor_rope_position(int64_t boundary_position, int64_t ratio
 //     score[c] = kv_scale[c] · Σ_h w[h] · relu( q[h] · k[c] )
 //
 // THE RELU IS ON THE PER-HEAD DOT, BEFORE THE WEIGHTING — not on the sum, and
-// not after the weight. This is trap 11, and it is easy to omit precisely
-// because the result still looks like a plausible attention score.
+// not after the weight. It is easy to omit precisely because the result still
+// looks like a plausible attention score.
 //
 // Scales, from `C4Indexer.__init__` `[V indexer.py:1034, 1075]`:
 //   softmax_scale = head_dim**-0.5        = 1/sqrt(128)   (the INDEX head)
@@ -1073,9 +1060,9 @@ inline std::vector<double> indexer_scores(const std::vector<double>& query,
     return scores;
 }
 
-// Top-k by descending score, ties broken to the **lower index** (trap 18). Ties
-// are broken by index rather than left to the sort, so the selection is
-// deterministic — the same rule the plan states for the router.
+// Top-k by descending score, ties broken to the **lower index**. Ties are broken
+// by index rather than left to the sort, so the selection is deterministic — the
+// same rule the router uses.
 inline std::vector<int32_t> topk_indices(const std::vector<double>& scores, size_t k) {
     std::vector<int32_t> order(scores.size());
     for (size_t i = 0; i < scores.size(); ++i) order[i] = static_cast<int32_t>(i);
@@ -1094,7 +1081,7 @@ inline std::vector<int32_t> topk_indices(const std::vector<double>& scores, size
 }
 
 // ---------------------------------------------------------------------------
-// Grouped low-rank output projection — Step 2.5
+// Grouped low-rank output projection
 //
 //     z[t, g, r] = Σ_d o[t, g, d] · wo_a[g, r, d]
 //
@@ -1153,7 +1140,7 @@ std::vector<double> grouped_wo_a(size_t tokens, size_t groups, size_t rank,
 }
 
 // ---------------------------------------------------------------------------
-// MoE router — Step 2.9
+// MoE router
 //
 //     scores[e] = sqrt(softplus(logits[e])),   softplus threshold 20
 //     selection[e] = scores[e] + bias[e]
@@ -1164,7 +1151,7 @@ std::vector<double> grouped_wo_a(size_t tokens, size_t groups, size_t rank,
 // `vllm/tests/kernels/moe/test_topk_softplus_sqrt.py::_torch_topk_softplus_sqrt`,
 // which is the arbiter for semantics and tie-break; the fused kernel and `ds4`
 // were used only as cross-checks. Three things this encodes that are easy to get
-// wrong and that the plan calls out explicitly:
+// wrong:
 //
 //  * the bias enters **after** softplus and sqrt, on the score — not on the
 //    logit. `ffn.gate.bias` is renamed `e_score_correction_bias` on load
@@ -1173,12 +1160,11 @@ std::vector<double> grouped_wo_a(size_t tokens, size_t groups, size_t rank,
 //  * selection is **flat** — a top-6 over all 256 experts. `n_group` and
 //    `topk_group` are absent from the config, so no group pre-filter exists;
 //  * the stored weight is the **unbiased** score, normalized by its own sum and
-//    only then scaled (trap 29).
+//    only then scaled.
 //
-// `bias_before_softplus` is the deliberately-wrong variant that trap names, in
-// the same spirit as `transpose_comb` and `apply_relu`: a gate computes the
-// wrong answer on purpose to show the difference is material. Nothing in the
-// graph passes `true`.
+// `bias_before_softplus` is the deliberately-wrong variant, in the same spirit as
+// `transpose_comb` and `apply_relu`: a gate computes the wrong answer on purpose
+// to show the difference is material. Nothing in the graph passes `true`.
 inline double softplus(double x) {
     // `F.softplus` with the default threshold: above 20 the identity is used,
     // because `log1p(exp(x))` has no precision left there.
@@ -1259,7 +1245,7 @@ inline RouterSelection router_hash(const std::vector<double>& logits,
 }
 
 // ===========================================================================
-// Swizzled W4A16 expert format — Steps 2.10.2 / 2.10.3
+// Swizzled W4A16 expert format
 // ===========================================================================
 //
 // The artifact stores each routed expert as W1, W2, W3 in a *swizzled* W4A16
@@ -1446,7 +1432,7 @@ struct SwizzledDecodeOptions {
 // and that is worth recording rather than leaving as an assumption**: this walk is
 // bounded by writing `rows * columns` doubles (200 MB per matrix, 600 MB per
 // expert), so it is memory-bound and the divisions were never the constraint. The
-// per-element form is kept below as `swizzled_decode_reference` and the P2 gate
+// per-element form is kept below as `swizzled_decode_reference` and the gate
 // asserts the two agree over real payloads — the change is a contraction, not a
 // reimplementation.
 //
@@ -1587,7 +1573,7 @@ inline void swizzled_encode(uint8_t* payload, SwizzledKind kind,
 }
 
 // ---------------------------------------------------------------------------
-// Clamped SwiGLU — Step 2.10.3
+// Clamped SwiGLU
 //
 //     hidden = silu(clamp(gate, max = limit)) * clamp(up, min = -limit, max = +limit)
 //
@@ -1638,7 +1624,7 @@ inline DecodedExpertWeights decode_expert_weights(const uint8_t* payload) {
 }
 
 // The whole routed expert body: `gate = W1·x`, `up = W3·x`, clamped SwiGLU, then
-// `out = W2·hidden` — Step 2.10.3 exactly, in double, given decoded weights.
+// `out = W2·hidden`, in double, given decoded weights.
 //
 // Note that the device writes `hidden` to fp16 between the two halves (the fused
 // kernel's output is a `half*`), so the gate must allow for that one rounding;
@@ -1685,8 +1671,8 @@ inline std::vector<double> expert_ffn_decoded(const std::vector<double>& w1,
 }
 
 // The payload entry point: decode, then the same arithmetic. One-shot callers
-// (and the Item-16 gate, on the artifact's real experts) use this; a gate that
-// drives many tokens over fixed payloads caches `decode_expert_weights` instead.
+// (and the gate, on the artifact's real experts) use this; a gate that drives
+// many tokens over fixed payloads caches `decode_expert_weights` instead.
 inline std::vector<double> expert_ffn(const uint8_t* payload,
                                       const std::vector<double>& activation,
                                       double limit = 10.0,
@@ -1720,11 +1706,12 @@ inline ExpertGateUp expert_gate_up(const uint8_t* payload,
 }
 
 // ---------------------------------------------------------------------------
-// Dense (unquantized) FFN — Step 2.10.4, the shared expert
+// Dense (unquantized) FFN — the shared expert
 // ---------------------------------------------------------------------------
 //
-// Structurally the same op as 2.10.3 and **deliberately a separate function**,
-// because the two differ in exactly the ways a shared helper would have hidden:
+// Structurally the same op as the routed expert and **deliberately a separate
+// function**, because the two differ in exactly the ways a shared helper would
+// have hidden:
 //
 //   * the weights are fp16 and stored row-major `[out, in]` with no
 //     quantization — this is not the swizzled W4A16 format;
@@ -1735,7 +1722,7 @@ inline ExpertGateUp expert_gate_up(const uint8_t* payload,
 //     both the routed and the shared path in the reference `[V model.py:1016-1021]`.
 //
 // So this uses `clamped_swiglu` rather than re-deriving it: the rule is shared on
-// purpose, and the gate for it lives with 2.10.3.
+// purpose.
 //
 // `w1`, `w3` are `[intermediate, hidden]` and `w2` is `[hidden, intermediate]`,
 // all row-major, as the checkpoint stores `nn.Linear.weight`.
@@ -1766,51 +1753,51 @@ inline std::vector<double> dense_ffn(size_t intermediate, size_t hidden,
 }
 
 // ===========================================================================
-// Tier 2 — the layer body (Steps 2.0 … 2.11), all three attention classes
+// The layer body, all three attention classes
 // ===========================================================================
 //
-// This is not a new primitive. It is the *composition* the Tier-2 gate exists to
-// certify: Tier 1 proved each piece, and the failure mode of a layer is the
-// wiring between them, not the pieces.
+// This is not a new primitive. It is the *composition* the layer-body gate
+// exists to certify: the primitives are proved individually, and the failure
+// mode of a layer is the wiring between them, not the pieces.
 //
 // One function, mirroring the device: `core/v4_layer_body.hpp` is a single body
 // with exactly one structural branch — the attention class. So is this.
 //
-//   2.0    HC attention pre-mix + Sinkhorn            -> x_pre        (all)
-//   2.1    attention RMSNorm                          -> x_norm       (all)
-//   2.2    MLA Q path (q_lora -> q_norm -> wq_b -> per-head norm), KV path
-//   2.3    RoPE forward on q and kv — *sliding* base (theta 10000, plain) for a
+//   HC attention pre-mix + Sinkhorn            -> x_pre        (all)
+//   attention RMSNorm                          -> x_norm       (all)
+//   MLA Q path (q_lora -> q_norm -> wq_b -> per-head norm), KV path
+//   RoPE forward on q and kv — *sliding* base (theta 10000, plain) for a
 //          ratio-0 layer, *compressed* base (theta 160000, YaRN-16) otherwise
-//   2.4.2  compressor: wkv/wgate projections, APE-add and the partial-state ring,
+//   compressor: wkv/wgate projections, APE-add and the partial-state ring,
 //          then the boundary materialization           (ratio != 0 only)
-//   2.4.3  indexer: query from q_lora_norm, weights, a second compressor, the
+//   indexer: query from q_lora_norm, weights, a second compressor, the
 //          score path and the top-k                       (CSA — ratio 4 — only)
-//   2.4.4  attention over the class's row-set + sink:
+//   attention over the class's row-set + sink:
 //            ratio 0   -> local rows only
 //            ratio 4   -> local rows + the indexer-selected compressed rows
 //            ratio 128 -> local rows + EVERY committed compressed row
-//   2.3    inverse RoPE on the attention-output tail
-//   2.5    grouped wo_a [8,1024,4096] then wo_b [4096,8192]
-//   2.6    HC attention post-mix                      -> res_mid      (all)
-//   2.7    HC FFN pre-mix + Sinkhorn                                  (all)
-//   2.8    FFN RMSNorm                                                (all)
-//   2.9    router (hash on layers < 3, biased flat top-6 otherwise)   (all)
-//   2.10   routed experts + shared expert, clamped SwiGLU             (all)
-//   2.10.5 combine: routed sum first, then `+= shared`                (all)
-//   2.11   HC FFN post-mix                            -> res_out      (all)
+//   inverse RoPE on the attention-output tail
+//   grouped wo_a [8,1024,4096] then wo_b [4096,8192]
+//   HC attention post-mix                      -> res_mid      (all)
+//   HC FFN pre-mix + Sinkhorn                                  (all)
+//   FFN RMSNorm                                                (all)
+//   router (hash on layers < 3, biased flat top-6 otherwise)   (all)
+//   routed experts + shared expert, clamped SwiGLU             (all)
+//   combine: routed sum first, then `+= shared`                (all)
+//   HC FFN post-mix                            -> res_out      (all)
 //
-// The branch is the plan's whole 2.4.4 and its trap 33: only CSA selects. HCA
-// compresses but does **not** index — it reads every committed compressed row,
-// and its `attn.indexer.*` tensors do not exist in the checkpoint at all. A
-// Sliding layer must never read the compressor or indexer tensors (trap 4).
+// The branch: only CSA selects. HCA compresses but does **not** index — it reads
+// every committed compressed row, and its `attn.indexer.*` tensors do not exist in
+// the checkpoint at all. A Sliding layer must never read the compressor or indexer
+// tensors.
 //
-// Ordering note, because it is the one place this composition is a *choice*.
-// Step 2.10.5 fixes the term set — `Σ_k w_k·down_k` plus the shared expert — but
-// the reference has two orderings of it: an unfused `final += shared` and a fused
-// form that passes the shared weights into the MoE kernel. Our engine mirrors the
-// fused form; this oracle writes the unfused `routed_sum + shared`. The term set
-// is identical and only the fp rounding order differs, so a gate comparing them
-// must allow the reassociation — it is not evidence of a defect.
+// Ordering note, because it is the one place this composition is a *choice*. The
+// term set is `Σ_k w_k·down_k` plus the shared expert, but the reference has two
+// orderings of it: an unfused `final += shared` and a fused form that passes the
+// shared weights into the MoE kernel. Our engine mirrors the fused form; this
+// oracle writes the unfused `routed_sum + shared`. The term set is identical and
+// only the fp rounding order differs, so a gate comparing them must allow the
+// reassociation — it is not evidence of a defect.
 
 struct LayerBodyShape {
     uint32_t hidden{4096};
@@ -1850,8 +1837,7 @@ struct LayerBodyShape {
     bool is_compressed() const noexcept { return compress_ratio != 0; }
     bool uses_indexer() const noexcept { return compress_ratio == 4; }
     // `coeff = 1 + overlap` with `overlap = (ratio == 4)`, so the ratio-4
-    // compressor row is twice as wide and the second half is the newer tokens
-    // (plan 2.4.2).
+    // compressor row is twice as wide and the second half is the newer tokens.
     uint32_t coefficient() const noexcept {
         return compress_ratio == 0 ? 0u : (compress_ratio == 4 ? 2u : 1u);
     }
@@ -1870,7 +1856,7 @@ struct LayerBodyShape {
 // The compressor and indexer pointers are null on a Sliding layer and are never
 // dereferenced for one. The indexer pointers are null on an HCA layer, which is
 // not an omission: the checkpoint has no `attn.indexer.*` tensors for a
-// ratio-128 layer at all (trap 33).
+// ratio-128 layer at all.
 struct LayerBodyWeights {
     // Hyper-Connections — fp32 in the checkpoint.
     const float* hc_attn_fn{nullptr};     // [hc_mult3, hc_dim]
@@ -1900,13 +1886,13 @@ struct LayerBodyWeights {
     const uint16_t* shared_w3{nullptr};     // [intermediate, hidden]
     const uint16_t* shared_w2{nullptr};     // [hidden, intermediate]
 
-    // Compressor — Steps 2.4.2/2.4.3. Present on every ratio != 0 layer.
+    // Compressor. Present on every ratio != 0 layer.
     const uint16_t* compressor_wkv{nullptr};    // [coeff*head_dim, hidden]
     const uint16_t* compressor_wgate{nullptr};  // [coeff*head_dim, hidden]
     const uint16_t* compressor_norm{nullptr};   // [head_dim]
     const float* compressor_ape{nullptr};       // [ratio, coeff*head_dim], fp32
 
-    // Indexer — Step 2.4.3. CSA only; an HCA layer must leave these null.
+    // Indexer. CSA only; an HCA layer must leave these null.
     const uint16_t* indexer_wq_b{nullptr};             // [index_n_heads*index_head_dim, q_lora_rank]
     const uint16_t* indexer_weights_proj{nullptr};     // [index_n_heads, hidden]
     const uint16_t* indexer_compressor_wkv{nullptr};   // [coeff*index_head_dim, hidden]
@@ -1919,14 +1905,13 @@ struct LayerBodyWeights {
 
     // Gate seam: the device's own selection, when a gate supplies it. The
     // selection is a **discrete** quantity, produced by a rule that is certified
-    // separately (Tier-1 gate 13, and the `routed ids and weights follow the rule`
-    // check in the Tier-2 gates). Driving the reference's combine with the
-    // device's own discrete output is what makes the numeric comparison an
-    // arithmetic comparison instead of a coincidence hunt, and it is the same
-    // principle trap 37 records for the indexer. It matters most in a serial loop:
-    // the device's MoE accumulation order is not reproducible, so its trajectory
-    // diverges from any fixed reference and a router near-tie can land on either
-    // side, which would make an unconditioned `moe_out` comparison flaky.
+    // separately (the `routed ids and weights follow the rule` check in the
+    // gate). Driving the reference's combine with the device's own discrete output
+    // is what makes the numeric comparison an arithmetic comparison instead of a
+    // coincidence hunt. It matters most in a serial loop: the device's MoE
+    // accumulation order is not reproducible, so its trajectory diverges from any
+    // fixed reference and a router near-tie can land on either side, which would
+    // make an unconditioned `moe_out` comparison flaky.
     //
     // When these are null — every caller except the serial-decode gate — the
     // selection is the oracle's own, and nothing below changes.
@@ -1937,15 +1922,14 @@ struct LayerBodyWeights {
     // tokens over fixed payloads sets these so the swizzle walk happens once
     // instead of per token — the multi-token compressed gates would otherwise
     // spend essentially all their time re-decoding 150M weights per token. The
-    // decode itself is certified by Tier-1 gate 13/15 and by Item 16 on the
-    // artifact's real experts, so leaving the payload path as the default keeps
-    // the fast path from being the only one exercised.
+    // decode itself is certified separately, so leaving the payload path as the
+    // default keeps the fast path from being the only one exercised.
     const DecodedExpertWeights* routed_decoded[8]{};
 };
 
-// The local ring. Key and value are the **same** row (trap 6), but the graph
-// keeps two caches, so the oracle does too: an implementation that only wrote one
-// of them would otherwise pass unnoticed.
+// The local ring. Key and value are the **same** row, but the graph keeps two
+// caches, so the oracle does too: an implementation that only wrote one of them
+// would otherwise pass unnoticed.
 struct SlidingKvRing {
     uint32_t capacity{0};
     uint32_t head_dim{0};
@@ -1999,9 +1983,9 @@ inline RopeTableRef rebase_rope_table(const RopeTableRef& table, uint32_t head_d
 
 // A compressor partial-state ring — `capacity` rows of `width` floats addressed
 // by `position % capacity`, exactly as `v4_save_compressor_state_kernel` writes
-// them. The APE is added to the **score** row only, indexed by `position % ratio`
-// (trap 26). `LayerKvState::X` uses two of these: the main compressor and, on
-// CSA only, the indexer's.
+// them. The APE is added to the **score** row only, indexed by `position % ratio`.
+// `LayerKvState::X` uses two of these: the main compressor and, on CSA only, the
+// indexer's.
 struct CompressorRing {
     uint32_t width{0};
     uint32_t capacity{0};
@@ -2068,13 +2052,13 @@ struct LayerKvState {
     }
 };
 
-// Step 2.4.2 — materialize one compressed entry out of a compressor ring.
+// Materialize one compressed entry out of a compressor ring.
 //
 // Mirrors `v4_materialize_compressed_entry_kernel`: per-dimension softmax over
 // the causal window, an RMSNorm over the whole head, then the tail RoPE taken at
-// the **window start** rather than at `position` (plan 2.3: `pos + 1 − ratio`).
-// The window is `coefficient * ratio` positions ending at the boundary, and the
-// segment of window offset `o` is `o / ratio` — the overlap layout.
+// the **window start** rather than at `position` (`pos + 1 − ratio`). The window is
+// `coefficient * ratio` positions ending at the boundary, and the segment of window
+// offset `o` is `o / ratio` — the overlap layout.
 inline std::vector<double> compressor_materialize(
     const CompressorRing& ring, uint32_t head_dim, uint32_t ratio,
     int64_t boundary_position, const std::vector<double>& norm_weight,
@@ -2199,7 +2183,7 @@ inline LayerBodyResult layer_body(
     const int64_t ratio = shape.compress_ratio;
 
     // -------------------------------------------------------------------
-    // 2.0 — HC attention pre-mix + Sinkhorn -> x_pre
+    // HC attention pre-mix + Sinkhorn -> x_pre
     // -------------------------------------------------------------------
     LayerBodyResult out;
     out.mixes_a = hc_mixes(
@@ -2222,12 +2206,12 @@ inline LayerBodyResult layer_body(
     out.x_pre = hc_pre_combine(residual, out.pre_a, hidden);
 
     // -------------------------------------------------------------------
-    // 2.1 — attention RMSNorm
+    // attention RMSNorm
     // -------------------------------------------------------------------
     out.x_norm = rmsnorm(out.x_pre, half_bits_to_doubles(w.attn_norm, hidden), shape.eps);
 
     // -------------------------------------------------------------------
-    // 2.2 — MLA Q and KV paths
+    // MLA Q and KV paths
     // -------------------------------------------------------------------
     {
         MlaQPath q = mla_q_path(
@@ -2250,9 +2234,9 @@ inline LayerBodyResult layer_body(
     }
 
     // -------------------------------------------------------------------
-    // 2.3 — RoPE forward on q (per head) and kv, with the *class's* base, then
-    //       the local ring write. The token's own key is in the cache before
-    //       attention runs.
+    // RoPE forward on q (per head) and kv, with the *class's* base, then
+    // the local ring write. The token's own key is in the cache before
+    // attention runs.
     // -------------------------------------------------------------------
     out.q_rot = out.q;
     for (size_t h = 0; h < num_heads; ++h) {
@@ -2268,10 +2252,10 @@ inline LayerBodyResult layer_body(
                       position64, out.kv_rot);
 
     // -------------------------------------------------------------------
-    // 2.4.2 / 2.4.3 — compressor, and on CSA the indexer.
+    // compressor, and on CSA the indexer.
     //
     // A Sliding layer skips all of this. Its compressor and indexer pointers are
-    // null and nothing below is reachable for it (trap 4).
+    // null and nothing below is reachable for it.
     // -------------------------------------------------------------------
     if (shape.is_compressed()) {
         if (w.compressor_wkv == nullptr || w.compressor_wgate == nullptr ||
@@ -2294,7 +2278,7 @@ inline LayerBodyResult layer_body(
 
         const RopeTableRef indexer_rope = rebase_rope_table(rope, shape.index_head_dim);
         if (shape.uses_indexer()) {
-            // Query comes from the *q_lora_norm* state, not from `q` (2.4.3).
+            // Query comes from the *q_lora_norm* state, not from `q`.
             out.indexer_query = matvec(
                 static_cast<size_t>(shape.index_n_heads) * shape.index_head_dim,
                 shape.q_lora_rank, out.q_lora_norm,
@@ -2353,7 +2337,7 @@ inline LayerBodyResult layer_body(
             out.compressed_index = entry;
         }
 
-        // 2.4.3 — indexer scoring and selection. CSA only; HCA has no indexer.
+        // indexer scoring and selection. CSA only; HCA has no indexer.
         if (shape.uses_indexer()) {
             const uint32_t candidates = static_cast<uint32_t>(std::min<int64_t>(
                 static_cast<int64_t>(state.compressed_keys.size()), (position64 + 1) / ratio));
@@ -2385,12 +2369,12 @@ inline LayerBodyResult layer_body(
     }
 
     // -------------------------------------------------------------------
-    // 2.4.4 — attention over the class's row-set, plus the sink.
+    // attention over the class's row-set, plus the sink.
     //
     // One merged key list under one softmax: the local rows, then the compressed
     // rows the class admits. The order is not load-bearing — a single max, not an
     // online accumulation — but the *set* is the whole distinction between the
-    // classes (trap 33).
+    // classes.
     // -------------------------------------------------------------------
     const std::vector<double> sink(w.attn_sink, w.attn_sink + num_heads);
     {
@@ -2417,7 +2401,7 @@ inline LayerBodyResult layer_body(
                 for (int32_t index : out.indexer_topk) append_compressed(index);
             } else {
                 // HCA: every committed compressed row, in entry order. There is
-                // no indexer and no top-k here (trap 33).
+                // no indexer and no top-k here.
                 for (uint32_t index = 0; index < committed; ++index) {
                     append_compressed(static_cast<int32_t>(index));
                 }
@@ -2430,7 +2414,7 @@ inline LayerBodyResult layer_body(
     }
 
     // -------------------------------------------------------------------
-    // 2.3 (inverse) — rotate the attention output tail back, before 2.5.
+    // inverse RoPE on the attention-output tail, before the output projection.
     // -------------------------------------------------------------------
     out.attn_inv = out.attn_out;
     for (size_t h = 0; h < num_heads; ++h) {
@@ -2441,7 +2425,7 @@ inline LayerBodyResult layer_body(
     }
 
     // -------------------------------------------------------------------
-    // 2.5 — grouped low-rank output projection, then wo_b
+    // grouped low-rank output projection, then wo_b
     // -------------------------------------------------------------------
     out.z = grouped_wo_a(
         1, shape.o_groups, shape.o_lora_rank, shape.group_dim(), out.attn_inv,
@@ -2452,12 +2436,12 @@ inline LayerBodyResult layer_body(
         [&](size_t o, size_t i) { return f16(w.wo_b, o * shape.total_o_lora() + i); });
 
     // -------------------------------------------------------------------
-    // 2.6 — HC attention post-mix -> res_mid
+    // HC attention post-mix -> res_mid
     // -------------------------------------------------------------------
     out.res_mid = hc_post(out.attn_proj, residual, out.post_a, out.comb_a, hidden);
 
     // -------------------------------------------------------------------
-    // 2.7 — HC FFN pre-mix + Sinkhorn
+    // HC FFN pre-mix + Sinkhorn
     // -------------------------------------------------------------------
     out.mixes_f = hc_mixes(
         out.res_mid, shape.hc_mult3(),
@@ -2478,13 +2462,13 @@ inline LayerBodyResult layer_body(
     out.ffn_pre = hc_pre_combine(out.res_mid, out.pre_f, hidden);
 
     // -------------------------------------------------------------------
-    // 2.8 — FFN RMSNorm
+    // FFN RMSNorm
     // -------------------------------------------------------------------
     out.ffn_norm = rmsnorm(out.ffn_pre, half_bits_to_doubles(w.ffn_norm, hidden), shape.eps);
 
     // -------------------------------------------------------------------
-    // 2.9 — router. Hash table on layers < 3 (no bias, no top-k); biased flat
-    //       top-6 otherwise.
+    // router. Hash table on layers < 3 (no bias, no top-k); biased flat
+    // top-6 otherwise.
     // -------------------------------------------------------------------
     out.router_logits = matvec(
         shape.num_experts, hidden, out.ffn_norm,
@@ -2509,7 +2493,7 @@ inline LayerBodyResult layer_body(
     }
 
     // -------------------------------------------------------------------
-    // 2.10 — routed experts, then the shared expert.
+    // routed experts, then the shared expert.
     //
     // A gate may substitute the *device's* own selection here (see
     // `routed_ids_override`); the term set and the arithmetic are unchanged, and
@@ -2557,25 +2541,24 @@ inline LayerBodyResult layer_body(
             static_cast<size_t>(hidden) * shape.intermediate),
         shape.swiglu_limit);
 
-    // 2.10.5 — the term set is `routed_sum + shared`. See the ordering note.
+    // The term set is `routed_sum + shared`. See the ordering note above.
     out.moe_out.assign(hidden, 0.0);
     for (size_t i = 0; i < hidden; ++i) {
         out.moe_out[i] = out.routed_sum[i] + out.shared_out[i];
     }
 
     // -------------------------------------------------------------------
-    // 2.11 — HC FFN post-mix -> res_out, which is the next layer's res_in.
+    // HC FFN post-mix -> res_out, which is the next layer's res_in.
     // -------------------------------------------------------------------
     out.res_out = hc_post(out.moe_out, out.res_mid, out.post_f, out.comb_f, hidden);
     return out;
 }
 
 // ===========================================================================
-// Model level — the composition (composition plan G9)
+// Model level — the composition
 // ===========================================================================
 //
-// `layer_body` above is one layer; this is the thing the composition plan's P2
-// gate needs and the tree has never had: **the whole forward pass in fp64** —
+// `layer_body` above is one layer; this is the whole forward pass in fp64 —
 // embed -> 43 x `layer_body` -> `hc_head` -> final RMSNorm -> LM head.
 //
 // It is deliberately thin. Every op it sequences is already certified, and it
@@ -2584,13 +2567,13 @@ inline LayerBodyResult layer_body(
 //
 //   * the embedding row is broadcast across the `hc_mult` streams, because the
 //     model's Hyper-Connections dimension enters as `hc_mult x hidden` with the
-//     identical row in every stream (Step 1);
+//     identical row in every stream;
 //   * the head is exactly `hc_head_reduce` -> `rmsnorm` -> `matvec`, which is the
 //     order `core/v4_graph.hpp::head_stage` dispatches its three kernels in.
 //
-// The oracle is written **before** the driver that is checked against it, which
-// is the plan's own rule: an oracle written after the implementation is written
-// to agree with it. Nothing here is derived from the device.
+// The oracle is written **before** the driver that is checked against it: an
+// oracle written after the implementation is written to agree with it. Nothing
+// here is derived from the device.
 //
 // Two things this deliberately does NOT do, named so a green comparison is not
 // read as more than it is:
@@ -2598,9 +2581,8 @@ inline LayerBodyResult layer_body(
 //   * it does not decide the routed selection. `LayerBodyWeights` carries the
 //     `routed_ids_override`/`routed_weights_override` seam, and a gate checking a
 //     loop must drive this with the **device's** own selection, exactly as the
-//     serial-decode gate does (trap 37). Left null, it uses its own rule.
-//   * it does not model the KV tiering, the sampler or the text front end. Those
-//     are P3/P4/P5.
+//     serial-decode gate does. Left null, it uses its own rule.
+//   * it does not model the KV tiering, the sampler or the text front end.
 
 struct ModelBodyShape {
     uint32_t hidden{4096};
@@ -2645,10 +2627,10 @@ struct ModelBodyResult {
     std::vector<double> logits;       // [vocab]
 };
 
-// Step 1 — the embedding lookup, expanded identically across the streams. The
-// broadcast is the model's own shape (plan Step 1), not a convenience: an
-// implementation that wrote one row and left the others stale is wrong at every
-// position after the first, and this is the closed form it has to match.
+// The embedding lookup, expanded identically across the streams. The broadcast is
+// the model's own shape, not a convenience: an implementation that wrote one row
+// and left the others stale is wrong at every position after the first, and this
+// is the closed form it has to match.
 inline std::vector<double> model_embed(const ModelBodyShape& shape,
                                        const ModelBodyWeights& weights,
                                        uint32_t token_id) {
@@ -2669,10 +2651,10 @@ inline std::vector<double> model_embed(const ModelBodyShape& shape,
     return residual;
 }
 
-// Steps 3–5 — `hc_head` -> final RMSNorm -> LM head, in the order the device
-// dispatches them. Takes the residual explicitly so a gate can feed it either the
-// oracle's own trajectory or the device's, which is what makes the head check
-// independent of where the residual came from.
+// `hc_head` -> final RMSNorm -> LM head, in the order the device dispatches them.
+// Takes the residual explicitly so a gate can feed it either the oracle's own
+// trajectory or the device's, which is what makes the head check independent of
+// where the residual came from.
 inline ModelBodyResult model_head(const ModelBodyShape& shape,
                                   const ModelBodyWeights& weights,
                                   const std::vector<double>& residual) {
@@ -2719,11 +2701,6 @@ inline ModelBodyResult model_head(const ModelBodyShape& shape,
 // tight) hands it the device's value; a caller that wants the model's own
 // trajectory passes `model_embed(...)`.
 //
-// `layer_ropes[l]` is the **class's** base for layer `l` (plain for Sliding,
-// YaRN-on-compressed otherwise), so the caller resolves the branch and the oracle
-// does not re-derive it. `state` is advanced in place: the caller owns one
-// `LayerKvState` per layer, which is what makes the model-level state a sequence
-// of tokens rather than a single step.
 inline ModelBodyResult model_body(const ModelBodyShape& model,
                                   const ModelBodyWeights& model_weights,
                                   const std::vector<LayerBodyShape>& layer_shapes,

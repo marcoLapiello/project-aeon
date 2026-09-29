@@ -2,18 +2,18 @@
 
 // DeepSeek-V4 prompt encoder — a port of the artifact's own encoder.
 //
-// Authority: `models/…-Aeon`'s sibling `encoding/encoding_dsv4.py` shipped inside the
-// checkpoint (760 lines). That copy, not vLLM's, is the reference for this artifact's
+// Authority: the `encoding/encoding_dsv4.py` shipped inside the checkpoint
+// (760 lines). That copy, not vLLM's, is the reference for this artifact's
 // template; the two are sibling revisions and differ.
 //
-// Step 0 of the inference pipeline plan is not deferrable: an almost-right template
-// silently changes every prefix and defeats prefix caching. This type exists so the
-// template is expressed once, with an oracle (`test_dsv4_prompt_encoding_oracle`)
-// that compares against the artifact's golden vectors byte-for-byte.
+// An almost-right template silently changes every prefix and defeats prefix
+// caching. This type exists so the template is expressed once, with an oracle
+// (`test_dsv4_prompt_encoding_oracle`) that compares against the artifact's golden
+// vectors byte-for-byte.
 //
 // Scope note: multi-turn *history* is not part of this type's job beyond rendering.
-// `context` (a separately encoded prefix) is intentionally not implemented; the plan
-// treats prefix reuse as a state-contract concern, not a formatting one.
+// A separately encoded `context` prefix is intentionally not implemented; prefix
+// reuse is a state-contract concern, not a formatting one.
 
 #include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
 
@@ -90,11 +90,11 @@ public:
     // Render the conversation to the model's prompt text.
     //
     // The pipeline mirrors the reference:
-    //   1. merge `tool` messages into user messages as tool-result blocks
-    //   2. order tool results by the preceding assistant's tool-call order
-    //   3. if any message declares tools, keep thinking (drop_thinking is forced off)
-    //   4. in thinking mode with drop_thinking, strip earlier reasoning
-    //   5. render each message, appending transition tokens
+    //   * merge `tool` messages into user messages as tool-result blocks;
+    //   * order tool results by the preceding assistant's tool-call order;
+    //   * if any message declares tools, keep thinking (drop_thinking is forced off);
+    //   * in thinking mode with drop_thinking, strip earlier reasoning;
+    //   * render each message, appending transition tokens.
     std::string encode(const std::vector<Dsv4PromptMessage>& messages,
                        const Dsv4PromptOptions& options) const;
 

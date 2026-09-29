@@ -56,18 +56,17 @@ struct PayloadTransfer {
     bool io_pending{false};
     // The reads have all landed in staging but the copy has not been enqueued.
     // Two reasons: the blocking path has not run yet, or the operation is
-    // staged-only and no VRAM slot was free (plan P2.6). Either way the bytes are
-    // safe in staging and the copy is retried later, which is what makes the read
-    // leg and the copy leg independently bounded.
+    // staged-only and no VRAM slot was free. Either way the bytes are safe in
+    // staging and the copy is retried later, which is what makes the read leg and
+    // the copy leg independently bounded.
     bool io_complete{false};
     uint64_t io_user_data{0};
     uint32_t io_request_count{0};
-    // A deferred Warm hand-off (plan P2.7): its bytes are already in host memory,
-    // so its staging slot is `IO_COMPLETE` from the outset and the copy runs later,
-    // when `attach_vram_destination` supplies a VRAM slot. `staging_ready` tells
-    // the copy path not to run the read-completion transition, and
-    // `warm_host_slot` (when pinned) is the upload source, so no payload is copied
-    // through the arena.
+    // A deferred Warm hand-off: its bytes are already in host memory, so its staging
+    // slot is `IO_COMPLETE` from the outset and the copy runs later, when
+    // `attach_vram_destination` supplies a VRAM slot. `staging_ready` tells the copy
+    // path not to run the read-completion transition, and `warm_host_slot` (when
+    // pinned) is the upload source, so no payload is copied through the arena.
     bool staging_ready{false};
     int32_t warm_host_slot{-1};
     // The tier that answered this request. Carried on the transfer so a

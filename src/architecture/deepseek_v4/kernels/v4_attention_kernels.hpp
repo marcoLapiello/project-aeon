@@ -14,7 +14,7 @@
 
 namespace aeon::kernel {
 
-// 4. Causal Sliding-Window Attention Kernel with Attention Sink (Wave32)
+// Causal sliding-window attention kernel with attention sink (Wave32).
 // Q: [num_tokens, 64, 512]
 // K: [num_tokens, 512] (Single KV head shared across all 64 Q heads)
 // Out: [num_tokens, 64, 512]
@@ -100,11 +100,7 @@ __global__ void __launch_bounds__(32) v4_sliding_window_attn_wave32_kernel(
     }
 }
 
-// 5. Grouped W_o_a Projection Kernel:
-// For each group g in 0..7: input is 8 heads x 512 = 4096 half elements.
-// Projected by W_o_a[g]: [1024, 4096] -> Z[g]: [1024]
-
-// 9. Autoregressive Sliding-Window Attention with persistent KV Cache
+// Autoregressive sliding-window attention with persistent KV cache.
 __global__ void __launch_bounds__(32) v4_cached_sliding_window_attn_wave32_kernel(
     const __half* __restrict__ q,          // [64, 512]
     const __half* __restrict__ key_cache,  // [window_size, 512]
@@ -182,7 +178,7 @@ __global__ void __launch_bounds__(32) v4_cached_sliding_window_attn_wave32_kerne
     }
 }
 
-// 10. Save one compressor or indexer partial row with its APE-adjusted score.
+// Save one compressor or indexer partial row with its APE-adjusted score.
 // The state is a position-addressed ring. The following materialization kernel
 // runs on the same stream, so no device-side barrier is required between them.
 __global__ void v4_save_compressor_state_kernel(
@@ -211,7 +207,7 @@ __global__ void v4_save_compressor_state_kernel(
     }
 }
 
-// 11. Materialize a completed C4/C128 compressed entry. The reduction is
+// Materialize a completed C4/C128 compressed entry. The reduction is
 // intentionally simple and float32: each output dimension independently
 // softmaxes the compressor scores over the causal window, then block 0
 // performs the small RMS reduction before the normalized row is stored.
@@ -319,16 +315,15 @@ __global__ void v4_materialize_compressed_entry_kernel(
     }
 }
 
-// 12. Float32 Lightning Indexer score path. One thread owns one compressed
+// Float32 lightning-indexer score path. One thread owns one compressed
 // candidate.
 //
 //   score[c] = Σ_h w[h] · relu( q[h] · k[c] ) · softmax_scale · head_scale
 //
-// THE RELU IS ON THE PER-HEAD DOT, BEFORE THE WEIGHTING — not on the sum, and
-// not after the weight. This is trap 11 and the kernel shipped without it: the
-// gate `tests/test_v4_indexer_oracle.cpp` caught `max_rel = 0.98` and 65 of 512
-// wrong top-k indices, because a missing ReLU still yields a plausible attention
-// score. Reference `[V sglang .../dsv4/indexer.py:119-124]`:
+// THE RELU IS ON THE PER-HEAD DOT, BEFORE THE WEIGHTING — not on the sum, and not
+// after the weight. A missing ReLU still yields a plausible attention score, so
+// `tests/test_v4_indexer_oracle.cpp` is what catches it (a missing ReLU gave 65 of
+// 512 wrong top-k indices). Reference `[V sglang .../dsv4/indexer.py:119-124]`:
 //   `score = bmm(kv, q.T); score = F.relu(score); score = score * weight;
 //    score = score.sum(dim=2)`
 __global__ void v4_indexer_scores_kernel(
@@ -354,13 +349,13 @@ __global__ void v4_indexer_scores_kernel(
             dot += __half2float(query[head_offset + static_cast<size_t>(dimension)]) *
                    __half2float(key[static_cast<size_t>(dimension)]);
         }
-        // ReLU here, per head, before the weight (trap 11).
+        // ReLU here, per head, before the weight.
         score += fmaxf(dot, 0.0f) * weights[head] * softmax_scale * head_scale;
     }
     scores[candidate] = score;
 }
 
-// 13. Serial local-plus-compressed attention for C4A and C128A. The bounded
+// Serial local-plus-compressed attention for C4A and C128A. The bounded
 // shared score array covers the 128-token local ring plus a 512-entry top-k.
 __global__ void __launch_bounds__(32) v4_cached_compressed_attention_wave32_kernel(
     const __half* __restrict__ q,

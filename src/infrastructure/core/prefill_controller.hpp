@@ -126,11 +126,10 @@ public:
         if (sweep_active_) {
             sweep_.begin();
         } else {
-            // The routed bank (Step 4): drain one layer's worth of the worst-LRU
-            // residents, keep the rest resident, and admit route-aware. The layer's
-            // union grows into the freed `E` slots and is leased until the layer
-            // retires, so it persists across the layer's chunks without a whole-layer
-            // pre-load.
+            // The routed bank: drain one layer's worth of the worst-LRU residents,
+            // keep the rest resident, and admit route-aware. The layer's union grows
+            // into the freed `E` slots and is leased until the layer retires, so it
+            // persists across the layer's chunks without a whole-layer pre-load.
             services_.registry->begin_prefill_stream(
                 services_.registry->experts_per_layer,
                 ExpertRegistry::PrefillAlloc::BoundedEvict);
@@ -151,10 +150,10 @@ public:
             return;
         }
         // The layer is dead the moment it retires, so its prefill-admitted set is
-        // released while the residents present at entry are spared (Step 1). Unlike
-        // the sweep — which loads a layer in one batch and settles it before the body
-        // — the routed path's **last chunk** may have left an upload in flight, and
-        // the release refuses a pending transfer, so settle and reap it first.
+        // released while the residents present at entry are spared. Unlike the sweep
+        // — which loads a layer in one batch and settles it before the body — the
+        // routed path's **last chunk** may have left an upload in flight, and the
+        // release refuses a pending transfer, so settle and reap it first.
         drain();
         services_.supply->reap_registry_transfers();
         services_.registry->release_layer(layer);
@@ -188,14 +187,12 @@ public:
                                        services_.registry->experts_per_layer,
                                        outstanding_leases());
             // Put the Warm residents the move surrendered **back**. Without this the
-            // borrow would cost Warm its cache, and the frozen-prefill guarantee
-            // (Step 6 D-b) — Warm identical before and after — would not hold across
-            // the move.
+            // borrow would cost Warm its cache, and the frozen-prefill guarantee —
+            // Warm identical before and after — would not hold across the move.
             if (services_.restore_warm) services_.restore_warm();
         }
         // Then the Hot residents the prefill drain freed, so decode resumes on the set
-        // the pool held before the pass (the plan's restore requirement). A no-op when
-        // no drain ran.
+        // the pool held before the pass. A no-op when no drain ran.
         if (services_.restore_residents) services_.restore_residents();
         // `prefill_active_`/`sweep_active_` deliberately stay set: they record the
         // strategy the window chose, for the gates that read the choice afterwards.
@@ -214,8 +211,8 @@ public:
         if (streams.demotion != nullptr) { CHECK_HIP(hipStreamSynchronize(streams.demotion)); }
     }
 
-    // The P2.3 hook: let the per-token pump drive the swept lookahead's copies. The
-    // sweep ignores the call when it is not driving a window.
+    // The mid-body pump hook: let the per-token pump drive the swept lookahead's
+    // copies. The sweep ignores the call when it is not driving a window.
     void pump() { (void)sweep_.pump(); }
 
     PrefillSweep& sweep() noexcept { return sweep_; }
@@ -231,9 +228,8 @@ public:
     // Layers whose reads were in flight when a body started (1 = the double buffer
     // is engaged; 0 = the pool is too small for two layers and loads are serial).
     uint32_t lookahead_depth() const noexcept { return sweep_.lookahead_depth(); }
-    // The lookahead length the **free blocks** allow at this instant (plan R5) — the
-    // smaller of the free VRAM blocks and the free staging blocks. Derived, not
-    // configured.
+    // The lookahead length the **free blocks** allow at this instant — the smaller of
+    // the free VRAM blocks and the free staging blocks. Derived, not configured.
     uint32_t derived_ahead_capacity() const noexcept { return sweep_.derived_lookahead_capacity(); }
     // Test instrument: cap the sweep's read lookahead (0 = staging-bounded only).
     void set_read_ahead_max(uint32_t max_depth) noexcept { sweep_.set_read_ahead_max(max_depth); }

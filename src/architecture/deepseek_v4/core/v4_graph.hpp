@@ -3,47 +3,32 @@
 // -----------------------------------------------------------------------------
 // The forward pass — the order, and only the order.
 //
-// This is the component the composition plan calls **G2**. It owns *when* each op
-// runs and which buffers it reads; it owns no weights, no state and no storage,
-// because `V4ModelHost` owns those. Nothing here is a kernel: every line is a
-// dispatch of something already written, already certified, and named in the
-// plan's Step list.
+// The graph owns *when* each op runs and which buffers it reads; it owns no weights,
+// no state and no storage, because `V4ModelHost` owns those. Nothing here is a
+// kernel: every line dispatches something already written and certified.
 //
-// P1 built the **head end** of the graph — the last three ops of the forward pass,
-// which turn the model's four residual streams into logits:
+// The head end turns the model's four residual streams into logits:
 //
-//    Step 1   token id -> embedding row, expanded across the `hc_mult` streams
-//    Step 3   `hc_head` — collapse the streams to one 4096-wide vector
-//    Step 4   final RMSNorm — the one with a learned weight
-//    Step 5   LM head — a separate [129280, 4096] matrix, not the embedding
+//    token id -> embedding row, expanded across the `hc_mult` streams
+//    `hc_head`  — collapse the streams to one 4096-wide vector
+//    final RMSNorm — the one with a learned weight
+//    LM head — a separate [129280, 4096] matrix, not the embedding
 //
-// P2 adds what sits between them: **the 43-layer loop**. `run_layer` is the loop
-// body — one call to `run_layer_body_decoding`, which chains the residual itself
-// (the body ends by writing `d_res_in` from its own `d_res_out`), which is why the
-// driver is three lines and why no layer is special-cased: the attention-class
-// branch lives inside the body, and the routed experts live behind the executor.
-// `forward_token` is that loop with the embedding in front and the head behind.
+// Between them sits the 43-layer loop. `run_layer` is the loop body — one call to
+// `run_layer_body_decoding`, which chains the residual itself (the body ends by
+// writing `d_res_in` from its own `d_res_out`), so no layer is special-cased: the
+// attention-class branch lives inside the body and the routed experts behind the
+// executor. `forward_token` is that loop with the embedding in front and the head
+// behind.
 //
-// Why `run_layer` is public rather than buried in the loop. The gate that
-// certifies this phase must observe each step's *inputs and outputs*, not only the
-// token it produces: a 43-layer fp64 reference that free-runs accumulates fp16
-// rounding drift against the device, and by the head that drift can flip a router
-// near-tie and make two trajectories diverge for reasons that are not defects.
-// The serial-decode gate settled this — feed the reference the **device's own**
-// per-step residual and routing. So the loop body is exposed, `forward_token`
-// calls it 43 times, and the gate can assert the two are the same computation.
+// `run_layer` is public so an fp64 reference can be fed the **device's own** per-step
+// residual and routing rather than free-running and accumulating fp16 drift — a
+// router near-tie flipped by drift would make two trajectories diverge for reasons
+// that are not defects.
 //
-// What P2 must not drag in. The head stage reads four tensors and the loop reads
-// the layers the host built; the sampler (P3), the text binding (P4) and the
-// observer that would trace a real forward pass (P5) are none of its business.
-// The observer seam exists and defaults to the null one, because the body requires
-// it, and populating it is a separate phase.
-//
-// Precision. `hc_head` and the final RMSNorm both store fp16, and the LM head
-// accumulates in fp32 and stores fp16 (plan Part I §1: the head is fp16, the
-// accumulate is fp32). The sampler (P3) widens to fp32 for its softmax and for the
-// logit-processor seam; widening here would be a second copy of the logits with no
-// consumer, which is why `logits()` is fp16 and says so.
+// Precision: `hc_head` and the final RMSNorm store fp16; the LM head accumulates in
+// fp32 and stores fp16. `logits()` is fp16 and says so; widening happens in the
+// sampler, where there is a consumer.
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/core/v4_layer_body_batch.hpp"
@@ -74,25 +59,24 @@ public:
     V4Graph(const V4Graph&) = delete;
     V4Graph& operator=(const V4Graph&) = delete;
 
-    // --- Step 1 — the embedding lookup and the Hyper-Connections expansion ----
+    // --- the embedding lookup and the Hyper-Connections expansion -----------
 
-    // The state entering the layer stack is `hc_mult × 4096` per token: the
-    // embedding row is **broadcast** across the streams, and that shape is held
-    // until `hc_head` collapses it (plan Step 1).
+    // The state entering the layer stack is `hc_mult × 4096` per token: the embedding
+    // row is **broadcast** across the streams, and that shape is held until `hc_head`
+    // collapses it.
     //
-    // This is a broadcast and not four related vectors, so the four copies carry
-    // the same `hidden` halves and differ in nothing. A gate can and should assert
-    // that byte-for-byte, because an implementation that wrote one row and left
-    // the other three stale would be numerically plausible at the very first
-    // position and wrong forever after.
+    // This is a broadcast, not four related vectors: the four copies carry the same
+    // `hidden` halves and differ in nothing. A gate asserts that byte-for-byte, because
+    // an implementation that wrote one row and left the other three stale would be
+    // plausible at the first position and wrong forever after.
     void embed_token(uint32_t token_id, hipStream_t stream) {
         const uint32_t hidden = static_cast<uint32_t>(kernel::DSV4_HIDDEN_SIZE);
         const uint32_t hc_mult = static_cast<uint32_t>(host_.config().hc_mult);
         const uint32_t vocab = static_cast<uint32_t>(host_.config().vocab_size);
 
-        // Refused rather than clamped: an out-of-range id indexes past the table,
-        // and a table overrun that happens to produce finite numbers is a defect
-        // no later comparison could attribute. (Same rule as trap 40.)
+        // Refused rather than clamped: an out-of-range id indexes past the table, and
+        // a table overrun that happens to produce finite numbers is a defect no later
+        // comparison could attribute.
         if (token_id >= vocab) {
             throw std::out_of_range(
                 "V4Graph::embed_token: token id " + std::to_string(token_id) +
@@ -119,7 +103,7 @@ public:
             scratch.d_res_in_half, scratch.d_res_in, total);
     }
 
-    // --- Steps 3–5 — the head end --------------------------------------------
+    // --- the head end --------------------------------------------------------
 
     // Consumes the residual the layer stack left in `d_res_in` and produces logits.
     // Returns the device logits (`[vocab_size]`, fp16), which the caller reads or
@@ -134,29 +118,27 @@ public:
         auto& scratch = host_.scratch();
         const auto& resources = host_.resources();
 
-        // Step 3 — `hc_head`. Not Step 2.0's pre-mix: the norm is **weightless**,
-        // the RMS is over the **flattened** 16384, `hc_head_scale` is a scalar, and
-        // there is no Sinkhorn and no comb, because with one output stream left
-        // there is nothing to mix. One block of 32 lanes, as the kernel is written.
+        // `hc_head`. Unlike the pre-mix, the norm is **weightless**, the RMS is over
+        // the **flattened** 16384, `hc_head_scale` is a scalar, and there is no
+        // Sinkhorn and no comb, because with one output stream left there is nothing to
+        // mix. One block of 32 lanes, as the kernel is written.
         hipLaunchKernelGGL(
             kernel::hc_head_wave32_kernel, dim3(1), dim3(32), 0, stream,
             scratch.d_res_in, resources.d_hc_head_fn, resources.d_hc_head_base,
             resources.d_hc_head_scale, scratch.d_hc_head_out,
             hidden, hc_mult, rms_eps, hc_eps);
 
-        // Step 4 — the final RMSNorm. This one *does* carry a learned weight
-        // (`norm.weight`), unlike the weightless head norm above and unlike the
-        // weightless per-head Q norm — the three are the model's only three, and
-        // which one has a tensor is a per-site fact, not a house rule.
+        // The final RMSNorm. This one carries a learned weight (`norm.weight`), unlike
+        // the weightless head norm above and the weightless per-head Q norm — which one
+        // has a tensor is a per-site fact, not a house rule.
         hipLaunchKernelGGL(
             kernel::rmsnorm_wave32_kernel, dim3(1), dim3(32), 0, stream,
             scratch.d_hc_head_out, resources.d_final_norm, scratch.d_head_norm,
             hidden, rms_eps);
 
-        // Step 5 — the LM head. A separate matrix: `tie_word_embeddings = False`,
-        // and both `embed.weight` and `head.weight` exist as distinct
-        // [129280, 4096] tensors in the artifact. One block per logit, fp32
-        // accumulate, fp16 store.
+        // The LM head. A separate matrix: `tie_word_embeddings = False`, and both
+        // `embed.weight` and `head.weight` exist as distinct [129280, 4096] tensors in
+        // the artifact. One block per logit, fp32 accumulate, fp16 store.
         hipLaunchKernelGGL(
             kernel::gemv_fp16_vec8_kernel, dim3(vocab), dim3(32), 0, stream,
             scratch.d_head_norm, resources.d_lm_head, scratch.d_logits, hidden);
@@ -164,27 +146,23 @@ public:
         return scratch.d_logits;
     }
 
-    // P1's unit of work: a token id in, logits out — the whole tail of the graph,
-    // and the first thing in the rewrite whose input is text-facing and whose
-    // output the sampler could consume.
+    // A token id in, logits out — the whole tail of the graph, whose input is
+    // text-facing and whose output the sampler could consume.
     const half* forward_head(uint32_t token_id, hipStream_t stream) {
         embed_token(token_id, stream);
         return head_stage(stream);
     }
 
-    // --- Step 2 — the 43-layer loop ------------------------------------------
+    // --- the 43-layer loop ---------------------------------------------------
 
-    // One layer, one token: the graph's unit of composition. It does three things
-    // and nothing else — hand the layer body its own layer, the model's RoPE
-    // tables and the host's expert executor, and hand back the body's return value
-    // (the routed selection, which the body already brings to the host).
+    // One layer, one token: the graph's unit of composition. It hands the layer body
+    // its layer, the model's RoPE tables and the host's expert executor, and returns
+    // the body's routed selection.
     //
-    // It does not advance the residual, write a position, or pick a branch. The
-    // body chains `d_res_in` from its own `d_res_out` at the end of the layer, so
-    // the next layer's `run_layer` reads exactly what this one produced; the body
-    // records the position itself; and the attention-class branch is one
-    // `attention_kind` read inside the body, in one place. A driver that repeated
-    // any of those would be a second body, which is what the plan forbids.
+    // It does not advance the residual, write a position, or pick a branch. The body
+    // chains `d_res_in` from its own `d_res_out`, records the position itself, and reads
+    // `attention_kind` in one place; a driver repeating any of that would be a second
+    // body.
     V4LayerBodyOutput run_layer(uint32_t layer_id, uint32_t token_id, uint32_t position,
                                 hipStream_t stream) {
         const V4LayerBodyTables tables = host_.tables();
@@ -211,26 +189,25 @@ public:
 
         const half* logits = head_stage(stream);
 
-        // The token boundary, and it is a precondition rather than an
-        // implementation detail (trap 41): a lease grants no ordering, so it has to
-        // be held for as long as compute reading that slot may be in flight.
-        // Sampling must read the logits back, so the caller has a compute-stream
-        // boundary here for free — that is what makes this release safe.
+        // The token boundary, and it is a precondition rather than an implementation
+        // detail: a lease grants no ordering, so it must be held for as long as compute
+        // reading that slot may be in flight. Sampling must read the logits back, so the
+        // caller has a compute-stream boundary here for free — which is what makes this
+        // release safe.
         host_.release_expert_leases();
 
         return logits;
     }
 
-    // --- Step 6 — the layer-major prefill window -----------------------------
+    // --- the layer-major prefill window --------------------------------------
 
     // Gathers `count` token rows into the carry, broadcast across the `hc_mult`
     // streams and widened to fp32 in one pass.
     //
-    // `embed.weight` is host-resident (Appendix A: read one row per token, and on
-    // the device it would cost ~74 Hot slots), so the rows are gathered on the
-    // host into one contiguous broadcast and uploaded with a **single** copy —
-    // the plan's "a gather over the chunk's ids, not 4 H2D copies per row". The
-    // broadcast is Step 1's shape unchanged: every stream carries the same halves.
+    // `embed.weight` is host-resident (on the device it would cost ~74 Hot slots), so
+    // the rows are gathered on the host into one contiguous broadcast and uploaded with
+    // a **single** copy — a gather over the chunk's ids, not 4 H2D copies per row. The
+    // broadcast is the embedding's shape unchanged: every stream carries the same halves.
     void embed_window(const uint32_t* token_ids, uint32_t count, hipStream_t stream) {
         const uint32_t hidden = static_cast<uint32_t>(host_.config().hidden_size);
         const uint32_t hc_mult = static_cast<uint32_t>(host_.config().hc_mult);
@@ -239,8 +216,8 @@ public:
 
         embed_staging_.resize(static_cast<size_t>(count) * hc_dim);
         for (uint32_t row = 0; row < count; ++row) {
-            // Refused rather than clamped (trap 40): an out-of-range id indexes past
-            // the table, and a finite number from the wrong row is unattributable.
+            // Refused rather than clamped: an out-of-range id indexes past the table,
+            // and a finite number from the wrong row is unattributable.
             const uint32_t token_id = token_ids[row];
             if (token_id >= vocab) {
                 throw std::out_of_range(
@@ -266,19 +243,18 @@ public:
             host_.prefill_carry_half(), host_.prefill_carry(), total);
     }
 
-    // Layer-major prefill over a **window** of `count` tokens (Step 6 D-a).
+    // Layer-major prefill over a **window** of `count` tokens.
     //
-    // The nested order is window -> layer -> chunk: for each layer, every chunk of
-    // the window runs before the next layer is entered, so a layer's routed-expert
-    // set is fetched once per window instead of once per chunk. The residual cannot
-    // live in the per-layer chunk workspace — that is recycled as layers advance
-    // (§6.4) — so it is carried in the host-owned buffer sized `count x hc_dim`.
+    // The nested order is window -> layer -> chunk: for each layer, every chunk of the
+    // window runs before the next layer is entered, so a layer's routed-expert set is
+    // fetched once per window instead of once per chunk. The residual cannot live in
+    // the per-layer chunk workspace — that is recycled as layers advance — so it is
+    // carried in the host-owned buffer sized `count x hc_dim`.
     //
-    // `chunk` is the body chunk `C`: the rows in flight per body invocation, which
-    // bounds the batch scratch and is at most `V4LayerBodyBatchScratch::kMaxTokens`.
-    // `count` is the window `W`. Neither is derived — `C` and `W` are the two knobs
-    // of Step 6 §6b — and `chunk == count` is the degenerate schedule with one body
-    // invocation per layer.
+    // `chunk` is the body chunk `C`: the rows in flight per body invocation, at most
+    // `V4LayerBodyBatchScratch::kMaxTokens`. `count` is the window `W`. Neither is
+    // derived, and `chunk == count` is the degenerate schedule with one body invocation
+    // per layer.
     const half* forward_window(const uint32_t* token_ids, uint32_t start_position,
                                uint32_t count, uint32_t chunk, hipStream_t stream) {
         if (count == 0) {
@@ -289,14 +265,12 @@ public:
                 "V4Graph::forward_window: the chunk must be in [1, " +
                 std::to_string(V4LayerBodyBatchScratch::kMaxTokens) + "]");
         }
-        // A chunk issues its `6C` routed requests as one deduplicated set (Step 6
-        // D1/D2), each distinct expert held in its own staging slot while in
-        // transit (D4). Dedup can only collapse onto the layer's own experts, so the
-        // real demand is `min(6C, experts_per_layer)`. Checked against the **chunked
-        // window's** capacity rather than the live arena, because the arena is cut to
-        // decode's smaller shape between windows and is only widened when a window
-        // begins — a caller that runs a wider chunk than it configured still fails
-        // here, before any work, rather than mid-window at the arena.
+        // A chunk issues its `6C` routed requests as one deduplicated set, each distinct
+        // expert held in its own staging slot while in transit. Dedup can only collapse
+        // onto the layer's own experts, so the real demand is `min(6C,
+        // experts_per_layer)`. Checked against the **chunked window's** capacity rather
+        // than the live arena, because the arena is cut to decode's smaller shape between
+        // windows and only widened when a window begins.
         const uint32_t staging_needed = std::min<uint32_t>(
             static_cast<uint32_t>(host_.config().num_experts_per_tok) * chunk,
             static_cast<uint32_t>(host_.config().n_routed_experts));
@@ -318,11 +292,10 @@ public:
         const V4LayerBodyTables tables = host_.tables();
         const uint32_t workspace_tokens = std::min(chunk, count);
 
-        // Step 6 item 6: the window is the swept prefill whenever the sweep is
-        // enabled and the Hot pool can hold a whole layer; below the prompt-length
-        // gate (Step 3) it is the route-aware cached supply instead. Both are the
-        // same layer-major window — only the expert supply differs. The window length
-        // `count` is what the gate reads.
+        // The window is the swept prefill whenever the sweep is enabled and the Hot pool
+        // can hold a whole layer; below the prompt-length gate it is the route-aware
+        // cached supply instead. Both are the same layer-major window — only the expert
+        // supply differs. The window length `count` is what the gate reads.
         host_.prefill_begin(count);
 
         for (uint32_t layer = 0; layer < layers; ++layer) {
@@ -343,10 +316,9 @@ public:
                 copy_workspace_to_carry(workspace, offset, span, hc_dim, stream);
             }
 
-            // The **layer boundary** (Step 0 D3), which the state forces rather than
-            // a policy choosing it: anything wider would lease the whole model. A
-            // lease grants no ordering, so handing it back needs a compute-stream
-            // boundary here; this drain is the per-layer cost D3 says to measure.
+            // The layer boundary, which the state forces rather than a policy choosing
+            // it: anything wider would lease the whole model. A lease grants no ordering,
+            // so handing it back needs a compute-stream boundary here.
             CHECK_HIP(hipStreamSynchronize(stream));
             host_.release_expert_leases();
             // The layer is dead the moment it retires — a window visits each layer
@@ -422,9 +394,9 @@ private:
                                  hipMemcpyDeviceToDevice, stream));
     }
 
-    // The body requires an observer; a real one that traces a forward pass is P5's
-    // (composition plan G4). The null observer copies nothing, so the hot path is
-    // the arithmetic and nothing else.
+    // The body requires an observer; a real one that traces a forward pass is not yet
+    // written. The null observer copies nothing, so the hot path is the arithmetic and
+    // nothing else.
     V4NullLayerBodyObserver observer_;
 };
 

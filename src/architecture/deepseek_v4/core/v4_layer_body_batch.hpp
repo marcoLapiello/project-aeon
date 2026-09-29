@@ -1,75 +1,42 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// Tier 3, item 19 — chunked batched prefill over the *same* layer body.
+// Chunked batched prefill over the *same* layer body.
 //
-// The plan's requirement is one sentence: "The layer body must be the same code as
-// decode, parameterised by chunk size. Two bodies is how the two paths drift."
-// No arithmetic is added here. What is added is a per-token workspace, the
-// ordering, and one thing that turns out to be unavoidable.
-//
-// ## The structural problem this file exists to solve
+// The layer body must be the same code as decode, parameterised by chunk size — two
+// bodies is how the two paths drift. No arithmetic is added here: what is added is a
+// per-token workspace, the ordering, and one thing that turns out to be unavoidable.
 //
 // The obvious chunking — run every token's pre-attention half, then every token's
-// attention half — is **not equivalent to serial, for any chunk length above
-// one**, and the reason is the local ring, not the compressed path.
+// attention half — is **not equivalent to serial for any chunk length above one**,
+// and the reason is the local ring, not the compressed path.
 //
-// Write every key first, then attend. The local ring has `C` slots and position
-// `p` lives in slot `p mod C`. Query `q` attends positions `[q − C + 1, q]`. In a
-// chunk spanning `[S, E]` with `E > S`, the write for position `p ∈ [S, E]` lands
-// in slot `p mod C`, which before the write held position `p − C`. Take `p = E`
-// (the chunk's last write) and `q = S` (its first query): `E − C ≥ S − C + 1`
-// whenever `E ≥ S + 1`, i.e. whenever the chunk has more than one token. So the
-// chunk's last write evicts a key — the *oldest* key of the window — that its
-// first query still needs. And it is not only the first query: every query below
-// `E` loses the keys in `[q − C + 1, E − C]`.
+// Write every key first, then attend. The ring has `C` slots, position `p` lives in
+// slot `p mod C`, and query `q` attends `[q − C + 1, q]`. For a chunk `[S, E]` with
+// `E > S`, the write for `E` lands in slot `E mod C`, which held position `E − C` —
+// and since `E − C >= S − C + 1`, that is a key the chunk's first query still needs.
+// Every query below `E` loses the keys in `[q − C + 1, E − C]`.
 //
-// This is trap 39, and it is why "as written, the equivalence gate cannot pass" in
-// Part III. A chunk of length 1 keeps equivalence, which is exactly what makes a
-// chunk-1 run the right reference: the property under test is that batching does
-// not change the answer, and at length 1 there is no batching.
-//
-// ## The fix, which is also the canonical design
-//
-// Do not write the chunk's keys into the ring while the chunk is being processed.
-// A token's key goes into a per-chunk key buffer (which the body's
-// `d_local_key_write` / `d_local_position_write` allow); each query then attends a
+// The fix: do not write the chunk's keys into the ring while the chunk is being
+// processed. A token's key goes into a per-chunk key buffer; each query attends a
 // **composed row-set** — the pre-chunk ring rows still inside its window plus the
-// chunk's own rows up to and including itself — and the chunk's keys are committed
-// to the ring once every query has run.
+// chunk's own rows up to and including itself — and the chunk's keys are committed to
+// the ring once every query has run. (The reference does the same: the current chunk's
+// freshly-computed K lives in a separate per-forward buffer not yet written to the
+// sliding-window ring.)
 //
-// This is the reference's own shape: "the current chunk's freshly-computed K lives
-// in a separate per-forward `kv [total_tokens, D]` not yet written to the SWA
-// ring", with the row-set assembled as `[compressed | swa positional]`
-// [plan 2.4.4].
+// The comparison can be bit-exact because the composed rows are assembled in
+// **ring-slot order** (`position mod C`) with the row count passed as the kernel's
+// "capacity". Slot order matters and position order would not: decode hands the
+// kernel the ring and lets it iterate slots `0 … C-1`, so for a wrapped window it sums
+// in a *rotation* of position order. Composing in the same rotation makes both paths
+// add identical `exp` terms over bit-identical keys, so a chunk and the same tokens
+// run one at a time differ by nothing at all.
 //
-// ## Why the comparison can be bit-exact
-//
-// The composed rows are assembled in **ring-slot order** (`position mod C`) and the
-// row count is passed to the attention kernel as its "capacity", so the kernel's own
-// window filter (`local_start <= key_position <= current_position`) is satisfied by
-// every row.
-//
-// Slot order matters and position order would not do. The decode path hands the
-// kernel the ring itself and lets it iterate slots `0 … C-1`, so the order it sums
-// the window in is slot order — and for a window that has wrapped, that is a
-// *rotation* of position order, not position order. Composing in the same rotation
-// makes both paths add the identical `exp` terms in the identical sequence over
-// bit-identical keys, so a chunk and the same tokens run one at a time differ by
-// nothing at all. The item-19 gate asserts that as equality rather than as a
-// tolerance, because with the orders matched there is no numerical reason for any
-// difference to exist. (Mutation M19-3 assembles descending slot order and is
-// killed.)
-//
-// The compressed path needs no special care, and that is a measured claim rather
-// than an obvious one. The compressor's partial ring is written once per token in
-// position order inside phase 1, and each boundary **materializes immediately**, so
-// a row is read by every boundary that needs it before any later token in the chunk
-// can reach its slot. The ring is therefore exactly as wide as it must be (one
-// window) and no wider, and a chunk of any length is safe — the compressed entries
-// themselves are appended to a growing array rather than to a ring. This was
-// previously guarded against, and the guard was wrong: item 19's gate now asserts
-// the opposite, that a chunk larger than both rings is bit-identical to serial.
+// The compressed path needs no special care: the compressor's partial ring is written
+// once per token in position order inside phase 1, and each boundary materializes
+// immediately, so a row is read by every boundary that needs it before any later
+// token in the chunk can reach its slot. A chunk of any length is therefore safe.
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
@@ -100,15 +67,14 @@ class V4LayerBodyBatchScratch {
 public:
     // The body's row cap. It is a **memory** decision and nothing else: the
     // composed row-set check in `compose_local_rows` is the only state bound, and it
-    // is sized from this, so raising it costs scratch and changes no contract.
+    // is sized from this.
     //
-    // The reference implementation clamps its equivalent at `128`
-    // (`V4_PREFILL_CHUNK`, `aeon-references/colibri/c/deepseek_v4.c` ~12073), but that
-    // clamp comes from *its* batch kernels' contract, not from the math — here the
-    // only bound is the composed row-set, which is derived from this constant. `256`
-    // is the layer's own expert count and therefore the widest chunk whose `6C`
-    // requests dedup to a whole layer, which makes it the natural ceiling. It is a
-    // *launch-count* knob: the sweep's byte cost does not depend on it.
+    // The reference implementation clamps its equivalent at `128` (`V4_PREFILL_CHUNK`),
+    // but that clamp comes from *its* batch kernels' contract, not from the math. Here
+    // the only bound is the composed row-set. `256` is the layer's own expert count and
+    // therefore the widest chunk whose `6C` requests dedup to a whole layer, which makes
+    // it the natural ceiling. It is a *launch-count* knob: the sweep's byte cost does
+    // not depend on it.
     static constexpr uint32_t kMaxTokens = 256;
     static constexpr uint32_t kMPad = 16;
 
@@ -128,11 +94,10 @@ public:
     }
 
     // The same allocation from **explicit** capacities rather than a layer. A
-    // layer-major window enters all 43 layers, and the scratch is one buffer, so it
-    // has to be sized for the worst case across them and allocated once — at load,
-    // from the configured chunk `C` (Step 6 item 7) — rather than re-allocated as
-    // each layer is entered. `allocate(layer, count)` is the per-layer form and is
-    // still what a single-layer caller wants.
+    // layer-major window enters all 43 layers and the scratch is one buffer, so it has
+    // to be sized for the worst case across them and allocated once at load from the
+    // configured chunk `C`, rather than re-allocated as each layer is entered.
+    // `allocate(layer, count)` is the per-layer form.
     void allocate_capacity(uint32_t compressed_capacity, uint32_t index_topk,
                            uint32_t local_capacity, uint32_t count) {
         free();
@@ -275,9 +240,9 @@ public:
 
     uint32_t token_count() const noexcept { return token_count_; }
 
-    // Exact VRAM this scratch holds. Reported at load, and checked against the
-    // budget's allowance there, so a configuration that would overrun the allowance
-    // fails with a named message instead of silently eating into the Hot pool.
+    // Exact VRAM this scratch holds, reported at load and checked against the budget's
+    // allowance there, so a configuration that would overrun fails with a named message
+    // instead of silently eating into the Hot pool.
     size_t bytes() const noexcept { return bytes_allocated_; }
 
     // The chunk's key row for local index `index` (0 = the chunk's first token),
@@ -289,7 +254,7 @@ public:
     int64_t* chunk_position(uint32_t index) const { return chunk_positions_ + index; }
 
     // The composed row-set the attention kernel reads. Key and value are the same
-    // rows (trap 6), so one buffer serves both of the kernel's arguments.
+    // rows, so one buffer serves both of the kernel's arguments.
     half* composed_keys() const { return composed_keys_; }
     int64_t* composed_positions() const { return composed_positions_; }
     size_t max_composed_rows() const { return max_composed_rows_; }
@@ -364,7 +329,7 @@ public:
         out.d_moe_accum = moe_accum_ + r * kMPad * H;
 
         // This token's key goes to the chunk buffer, not the ring. K and V are the
-        // same row, so both pointers name the same place (trap 6).
+        // same row, so both pointers name the same place.
         out.d_local_key_write = chunk_key(index);
         out.d_local_value_write = chunk_key(index);
         out.d_local_position_write = chunk_position(index);
@@ -372,8 +337,8 @@ public:
     }
 
 private:
-    // Non-static so the allocation can be accounted: `bytes()` is what the load-time
-    // check and the budget report read.
+    // Non-static so the allocation is accounted: `bytes()` is what the load-time check
+    // and the budget report read.
     template <typename T>
     T* alloc_array(size_t count) {
         T* pointer = nullptr;
@@ -463,14 +428,11 @@ private:
 // query's window, then the chunk's own rows up to and including the query.
 //
 // **The rows are ordered by ring slot (`position mod capacity`), not by position.**
-// That is not cosmetic. The decode path hands the attention kernel the ring itself
-// and lets it iterate slots `0 … capacity-1`, so the order it sums the window in is
-// slot order — which for a wrapped window is a rotation of the position order, not
-// position order. Composing the chunk's rows in the same slot order makes the two
-// paths add the same `exp` terms in the same sequence, which is what turns
-// `chunk ≡ serial` into an equality rather than a tolerance. (The kernel's own
-// window filter then passes every row: the window has exactly `rows` members and
-// `local_start = current_position - rows + 1` is its first position.)
+// That is not cosmetic: decode hands the attention kernel the ring and lets it iterate
+// slots `0 … capacity-1`, so the order it sums the window in is slot order — which for
+// a wrapped window is a rotation of position order. Composing the chunk's rows in the
+// same slot order makes the two paths add the same `exp` terms in the same sequence,
+// which turns `chunk ≡ serial` into an equality rather than a tolerance.
 //
 // `start_position` is the chunk's first position; `chunk_row` is the query's index
 // within the chunk, so the query's own row is included and no later one is.
@@ -542,7 +504,7 @@ inline V4LayerBodyPre run_chunk_pre_attention(
                                         stream, observer);
 }
 
-// Runs Steps 2.0 – 2.11 for **one layer and a chunk of tokens**.
+// Runs one layer and a **chunk of tokens**.
 //
 // The order of operations is the whole content of this function:
 //   1. phase 1 — every token's pre-attention half, in position order. Keys go to
@@ -555,10 +517,9 @@ inline V4LayerBodyPre run_chunk_pre_attention(
 //      once no query can need the rows they replace any more.
 //
 // Throws when the chunk does not fit the caller's workspace. It does **not** throw
-// for a chunk larger than either ring: the local ring is not written until the
-// commit phase and the compressor materializes each boundary as its token is
-// processed, so neither ring bounds the chunk. The measured proof is in item 19's
-// gate and in the comment on the guard below.
+// for a chunk larger than either ring: the local ring is not written until the commit
+// phase and the compressor materializes each boundary as its token is processed, so
+// neither ring bounds the chunk.
 inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     V4Layer& layer,
     V4LayerBodyBatchScratch& workspace,
@@ -579,25 +540,23 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     //
     // Both rings look like they bound the chunk size, and both were guarded against
     // until they were tested. Neither does. A chunk's keys go to the chunk buffer,
-    // not the ring (trap 39), so the local ring is untouched until the commit phase
-    // and a query whose window predates the chunk still reads it; and the compressor
+    // not the ring, so the local ring is untouched until the commit phase and a query
+    // whose window predates the chunk still reads it; and the compressor
     // **materializes each boundary immediately, in position order, inside phase 1**, so
     // a row is consumed by every boundary that needs it before any later token in the
     // chunk can reach its slot. For ratio 4 the last boundary that reads position `p`
-    // is at most `p + window - 1` (the r128 case:
-    // `p + ratio - 1 < p + window`), which is strictly before `p + window`, the first
+    // is at most `p + window - 1`, which is strictly before `p + window`, the first
     // write that could share `p`'s slot. The margin is exactly zero — the ring is as
     // narrow as it can be and still correct — which is why the false constraint was
     // easy to believe and why removing it needed proof rather than argument.
     //
-    // Measured (item 19's gate, `gfx1100`): a chunk of 16 tokens through the
-    // Sliding, CSA and HCA classes — larger than the local ring (10) *and* than the
-    // compressor ring (8) — is bit-identical to the same tokens run one at a time,
-    // across every token and the whole final state, with zero differing values. The
-    // real bounds are the workspace (`kMaxTokens`, `count <= workspace.token_count()`)
-    // and the composed row-set, which `compose_local_rows` checks against
-    // `max_composed_rows()`. Raising `kMaxTokens` is therefore a memory decision, not
-    // a state-contract one.
+    // Measured on `gfx1100`: a chunk of 16 tokens through the Sliding, CSA and HCA
+    // classes — larger than the local ring (10) *and* than the compressor ring (8) —
+    // is bit-identical to the same tokens run one at a time, across every token and
+    // the whole final state, with zero differing values. The real bounds are the
+    // workspace (`kMaxTokens`, `count <= workspace.token_count()`) and the composed
+    // row-set, which `compose_local_rows` checks against `max_composed_rows()`.
+    // Raising `kMaxTokens` is therefore a memory decision, not a state-contract one.
 
     // Phase 1. Every key the chunk owns is produced before any query runs, and
     // none of them touches the ring.
@@ -611,20 +570,19 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // token cannot express: **every** token's attention and normalization, then
     // every token's router, then one layer-wide dispatch, then every token's MoE.
     //
-    // The reason is the dispatch (Step 6 D1). A layer's `6C` requests can only be
-    // issued as one set — deduplicated, and overlapped — once all `C` selections
-    // are known, and the selection is produced *after* attention. So the router has
-    // to be lifted out of the per-token tail and run for the whole chunk first.
-    // This is the same decomposition colibri's `coli_v4_block_window_batch_ref`
-    // uses (attention for all, then a whole-chunk MoE union).
+    // The reason is the dispatch. A layer's `6C` requests can only be issued as one
+    // set — deduplicated, and overlapped — once all `C` selections are known, and the
+    // selection is produced *after* attention. So the router has to be lifted out of
+    // the per-token tail and run for the whole chunk first. This is the same
+    // decomposition the reference batch path uses (attention for all, then a
+    // whole-chunk MoE union).
     //
-    // All three land together (committed `2026-09-21`): the phase split, the
-    // layer-wide dispatch, and the depth-sized staging arena are one change, not
-    // three. The split alone, with the per-token dispatch, separates
-    // `on_routing_ready` from `on_routed_consumed` and lets the staging arena hand
-    // the same six slots to every token at a layer; the layer-wide dispatch alone,
-    // without the split, cannot know all `C` selections before the first token's
-    // MoE. `on_routing_ready_batch` is what makes the split correct.
+    // The phase split, the layer-wide dispatch, and the depth-sized staging arena are
+    // one change, not three. The split alone, with the per-token dispatch, separates
+    // `on_routing_ready` from `on_routed_consumed` and lets the staging arena hand the
+    // same six slots to every token at a layer; the layer-wide dispatch alone, without
+    // the split, cannot know all `C` selections before the first token's MoE.
+    // `on_routing_ready_batch` is what makes the split correct.
 
     // Phase 2a — attention through the FFN RMSNorm, for every token. Each token
     // composes its own row-set, because the row-set is a property of the query's
@@ -654,9 +612,9 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
         batch_weights[row] = outputs[row].topk_weights;
     }
 
-    // The one layer-wide dispatch: the chunk's `6C` requests as a deduplicated set
-    // (Step 6 item 4 / D1–D2). Leases are released at the layer boundary by the
-    // caller (`V4Graph::forward_window`), which is Step 0 D3.
+    // The one layer-wide dispatch: the chunk's `6C` requests as a deduplicated set.
+    // Leases are released at the layer boundary by the caller
+    // (`V4Graph::forward_window`).
     experts.on_routing_ready_batch(static_cast<uint32_t>(layer.layer_id), start_position,
                                    batch_ids, batch_weights);
 

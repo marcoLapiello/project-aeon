@@ -35,9 +35,9 @@ using TokenStep = std::function<uint32_t(uint32_t token_id, uint32_t position, b
 //
 // The per-token shape above and the windowed shape below are two mechanisms for
 // the same step — one `forward_token` per prompt token, or one layer-major
-// `forward_window` over the whole prompt (expert-streaming plan Step 6 D-a). The
-// loop therefore takes the *step* and not the mechanism, which is what keeps it
-// from growing a second decode loop for the swept path.
+// `forward_window` over the whole prompt. The loop therefore takes the *step* and
+// not the mechanism, which is what keeps it from growing a second decode loop for
+// the swept path.
 using PromptPrefill = std::function<uint32_t(const std::vector<uint32_t>& prompt)>;
 
 GenerationResult generate_token_ids(

@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// Step 6 item 6 — the prefill sweep driver.
+// The prefill sweep driver.
 //
 // Prefill and decode are two allocation strategies, not one strategy with a
 // parameter, so this is the component that owns the **switch** between them and the
@@ -10,13 +10,12 @@
 //
 // ## The model
 //
-// Prefill is layer-major within a window (Step 6 D-a): the window visits layers
-// 0…42 once. So at any instant the useful question is not "which expert is coldest"
-// — nothing is reused inside a window — but "which layer is next". The sweep answers
-// it directly:
+// Prefill is layer-major within a window: the window visits layers 0…42 once. So at
+// any instant the useful question is not "which expert is coldest" — nothing is
+// reused inside a window — but "which layer is next". The sweep answers it directly:
 //
 //   * `begin()` drains Hot outright. No decode resident survives into prefill,
-//     because not one of them is in the plan the sweep follows. Warm and its LRU
+//     because not one of them is in the order the sweep follows. Warm and its LRU
 //     ranking are untouched for the whole sweep;
 //   * `before_layer(L)` guarantees layer `L`'s whole set is resident. It is normally
 //     already there, because the lookahead loaded it one or more layers ago;
@@ -33,17 +32,13 @@
 //
 // ## The double buffer
 //
-// The slip above — "the lookahead loaded it one or more layers ago" — is the reason
-// this class exists rather than a loop in the driver, and it is worth being exact
-// about because it is where the speed is.
-//
 // A layer's reads are **issued before the previous layer's body runs**
 // (`before_layer(L)` dispatches `L + 1`, then the driver computes `L`). So while the
 // body spends ~1.4 s of compute, the drive is already reading the next layer's set;
 // `before_layer(L + 1)` then finds the transfer complete and its wait is near zero.
-// Measured before this split (ledger M42): a `512`-token swept prefill spent `34.6 s`
-// of `96.8 s` **blocked inside `materialize`**, at `4.2 GB/s` against a `6.33 GB/s`
-// drive — i.e. a third of the prefill waiting on a disk that was idle between layers.
+// Measured before this split: a `512`-token swept prefill spent `34.6 s` of `96.8 s`
+// **blocked inside `materialize`**, at `4.2 GB/s` against a `6.33 GB/s` drive — i.e.
+// a third of the prefill waiting on a disk that was idle between layers.
 //
 // The buffer is one layer deep, and that is enough: a layer set is ~0.55 s of drive
 // against ~1.4 s of compute, so one layer in flight already keeps the drive busy.
@@ -59,33 +54,29 @@
 // A layer's H2D copies are **not waited for on the host**, and their staging bank is
 // returned at `after_layer` rather than at the layer's own boundary. The copy therefore
 // overlaps the layer's attention and router — the work the layer body does before its
-// MoE — instead of fronting it: the sweep used to block ~0.12 s per layer on it.
-// Ordering is the **consumer's**, not the driver's: the body's MoE dispatch joins each
-// still-pending transfer and the executor waits on its per-expert event before the MoE
-// reads the weights, while a transfer the registry has already reaped is complete by
-// definition. Ordering the whole body here instead would recover nothing, because it
-// would put the copy back in front of the very work it hides behind.
+// MoE — instead of fronting it. Ordering is the **consumer's**, not the driver's: the
+// body's MoE dispatch joins each still-pending transfer and the executor waits on its
+// per-expert event before the MoE reads the weights.
 //
 // The bank cannot be reused before it is returned, which is why the arena must hold
 // **two** layer-sized banks when this is on: the bank in flight and the bank the
-// lookahead reads into. With one bank the sweep degrades to the blocking drain, exactly
-// as before.
+// lookahead reads into. With one bank the sweep degrades to the blocking drain.
 //
 // ## What this is not
 //
-// The lookahead loads a layer **whole**, not a routing prediction. It can: the
-// router lives inside the layer body, after attention, so layer `L+1`'s *selection*
-// is unknown while `L` computes — but its *set* is the whole layer, which is known,
-// which is exactly why the sweep is strong in prefill and candidate staging is weak
-// (§2). The loads are issued and materialized in layer order; overlapping the upload
-// with compute is the deferred drain above, bounded by the staging banks.
+// The lookahead loads a layer **whole**, not a routing prediction. It can: the router
+// lives inside the layer body, after attention, so layer `L+1`'s *selection* is unknown
+// while `L` computes — but its *set* is the whole layer, which is known, which is
+// exactly why the sweep is strong in prefill. The loads are issued and materialized in
+// layer order; overlapping the upload with compute is the deferred drain above, bounded
+// by the staging banks.
 //
 // ## Why not LRU here
 //
-// Eviction by recency ranks candidates that will be reused. Inside a window nothing
-// is reused — each layer is visited once and its set then dies all at once — so the
-// only correct release is the whole layer, and the only correct admission order is
-// layer order. LRU is not a slower way to do this; it is the wrong instrument.
+// Eviction by recency ranks candidates that will be reused. Inside a window nothing is
+// reused — each layer is visited once and its set then dies all at once — so the only
+// correct release is the whole layer, and the only correct admission order is layer
+// order. LRU is not a slower way to do this; it is the wrong instrument.
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/core/layer_batch_supply.hpp"
@@ -108,19 +99,19 @@ public:
     PrefillSweep(const PrefillSweep&) = delete;
     PrefillSweep& operator=(const PrefillSweep&) = delete;
 
-    // `staging_banks` is how many layer-sized banks the arena holds (`1` = the
-    // pre-Phase-1 shape, `2` = the deferred drain's headroom). It only decides which
-    // bank a layer's reads land in: layer `L` uses bank `L % staging_banks`, so with
-    // two banks the layer whose copies are still in flight and the layer being read
-    // ahead never share a slot. The bank count must match the arena the host built.
+    // `staging_banks` is how many layer-sized banks the arena holds (`1` = the serial
+    // shape, `2` = the deferred drain's headroom). It only decides which bank a layer's
+    // reads land in: layer `L` uses bank `L % staging_banks`, so with two banks the
+    // layer whose copies are still in flight and the layer being read ahead never share
+    // a slot. The bank count must match the arena the host built.
     void configure(LayerBatchSupply* supply, ExpertRegistry* registry,
                    uint32_t staging_banks = 1) {
         supply_ = supply;
         registry_ = registry;
         staging_banks_ = staging_banks == 0 ? 1u : staging_banks;
-        // Whether the drain can be deferred: it needs a second bank to read the
-        // lookahead into while this layer's uploads are still in flight. With one bank
-        // the sweep keeps the blocking drain — the pre-Phase-1 shape.
+        // the drain can be deferred: it needs a second bank to read the lookahead
+        // into while this layer's uploads are still in flight. With one bank the sweep
+        // keeps the blocking drain.
         deferred_drain_ = staging_banks_ > 1;
     }
     // True when a swept prefill is possible at all: a layer's whole set must fit in
@@ -133,9 +124,9 @@ public:
     // a whole-layer load; the measured cost of that rule was that it silently turned
     // the sweep off on the production path (a 103-token prompt swept, an 11-token one
     // did not) while a gate's window was moved down until it stopped being slow. A
-    // policy that is enabled by a threshold nobody can see, on the one path the plan
-    // exists to make fast, is the wrong shape. If the narrow-window case needs a
-    // different dispatch it belongs in the measurement, not in a hidden switch.
+    // policy that is enabled by a threshold nobody can see, on the path this is meant
+    // to make fast, is the wrong shape. If the narrow-window case needs a different
+    // dispatch it belongs in the measurement, not in a hidden switch.
     bool is_feasible() const noexcept {
         return supply_ != nullptr && registry_ != nullptr &&
                registry_->vram_capacity >= registry_->experts_per_layer;
@@ -208,12 +199,11 @@ public:
         record_occupancy(layer);
     }
 
-    // The mid-body pump (plan P2.3): enqueue each queued layer's copies as its own
-    // reads land, instead of in one block at the next boundary. Called from the
-    // executor's per-token hook — the only host activity inside a body — so the
-    // lookahead's VRAM blocks fill during this layer's body rather than after it.
-    // Non-blocking, and over **every** queued layer, so a deeper lookahead (P2.4) is
-    // pumped too.
+    // The mid-body pump: enqueue each queued layer's copies as its own reads land,
+    // instead of in one block at the next boundary. Called from the executor's
+    // per-token hook — the only host activity inside a body — so the lookahead's VRAM
+    // blocks fill during this layer's body rather than after it. Non-blocking, and
+    // over **every** queued layer, so a deeper lookahead is pumped too.
     size_t pump() {
         if (!active_) return 0;
         size_t pumped = 0;
@@ -221,8 +211,8 @@ public:
             pumped += supply_->pump_layer_prefetch(entry.state);
         }
         // A read wave has landed somewhere in what we just drained: issue the next one
-        // now, so the drive never idles between layers (plan R3's first link, bounded
-        // to one wave at a time by `dispatch_ahead`).
+        // now, so the drive never idles between layers, bounded to one wave at a time
+        // by `dispatch_ahead`.
         advance_reads();
         return pumped;
     }
@@ -231,10 +221,10 @@ public:
     // for; the lookahead is re-derived at the next `before_layer`.
     //
     // The staging bank is returned **here**, not at the layer's own `before_layer`.
-    // The driver synchronizes the compute stream at this boundary (Step 0 D3), so the
-    // layer's H2D copies have landed by now — the reclaim's event sync is instant, and
-    // the copy spent the layer's body in flight instead of fronting it. The extra
-    // `reap_registry_transfers` is what promotes the layer's completed uploads out of
+    // The driver synchronizes the compute stream at this boundary, so the layer's H2D
+    // copies have landed by now — the reclaim's event sync is instant, and the copy
+    // spent the layer's body in flight instead of fronting it. The extra
+    // `reap_registry_transfers` promotes the layer's completed uploads out of
     // `PROMOTION_PENDING` before `release_layer` refuses a live transfer.
     void after_layer(uint32_t layer) {
         if (!active_) return;
@@ -247,10 +237,10 @@ public:
                 " retired while layer " + std::to_string(resident_layer_) +
                 "'s staging bank is still resident");
         }
-        // **Reap first, reclaim second** (plan R3): the copies landed during the body,
-        // so the reaper releases their staging slots **by completion** and the block
-        // reclaim below then finds the bank already drained. The reclaim stays as the
-        // fallback for any slot whose event had not fired at this instant.
+        // **Reap first, reclaim second**: the copies landed during the body, so the
+        // reaper releases their staging slots **by completion** and the block reclaim
+        // below then finds the bank already drained. The reclaim stays as the fallback
+        // for any slot whose event had not fired at this instant.
         supply_->reap_registry_transfers();
         reclaim_resident_staging();
         registry_->release_layer(layer);
@@ -293,7 +283,7 @@ public:
         // all arrived, which is the "reserved-but-empty" figure.
         uint32_t vram_reserved_ahead{0};
         // The lookahead length the free blocks allowed at this sample — derived, not
-        // fixed (R5). Zero means a resource was exhausted.
+        // fixed. Zero means a resource was exhausted.
         uint32_t derived_capacity{0};
         // The components of `derived_capacity`, so the gate can show **what limits it**
         // and **what it is relative to**: the computing layer, or the staging queue.
@@ -512,8 +502,8 @@ private:
     bool active_{false};
     // The lookahead queue: layers whose reads have been dispatched and whose bytes are
     // on their way, in layer order. Its length is **derived from the free blocks** at
-    // each boundary (plan R5), so it deepens on a larger pool and empties when either
-    // VRAM or staging runs out — it is not a fixed depth.
+    // each boundary, so it deepens on a larger pool and empties when either VRAM or
+    // staging runs out — it is not a fixed depth.
     std::deque<LookaheadEntry> ahead_;
     // Test instrument: upper bound on the read lookahead (0 = staging only).
     uint32_t read_ahead_max_{0};
@@ -523,7 +513,7 @@ private:
     LayerBatchState resident_state_{};
     uint32_t resident_layer_{0};
     bool resident_valid_{false};
-    // Layer-sized staging banks the arena holds. `1` restores the pre-Phase-1 shape;
+    // Layer-sized staging banks the arena holds. `1` restores the serial shape;
     // `2` is the headroom the deferred drain reads into. Must match the host's arena.
     uint32_t staging_banks_{1};
     // `staging_banks_ > 1`: whether the drain is deferred to `after_layer`. Derived so

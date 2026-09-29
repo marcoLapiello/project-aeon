@@ -1,14 +1,13 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// The supply's transfer counters: the instrumentation the supply-chain hot-path
-// plan §1 landed, as one small owned unit rather than ten loose members.
+// The supply's transfer counters: the instrumentation for the streaming path, as
+// one small owned unit rather than ten loose members.
 //
-// These are the numbers the corridor's evidence rests on (ledger M42–M46), so
-// they stay exactly where they are measured — the mutation sites are inside
-// `dispatch`, `materialize` and `reap`, which the deferred Phase 3 items still
-// edit. Only their *storage* moves here, so the supply declares one member
-// instead of ten and the phase-slicing reset has a single obvious home.
+// These stay exactly where they are measured — the mutation sites are inside
+// `dispatch`, `materialize` and `reap`. Only their *storage* lives here, so the
+// supply declares one member instead of ten and the phase-slicing reset has a
+// single obvious home.
 //
 // Fields are public on purpose: a counter increment should read like arithmetic
 // at the site that measures it, not like an encapsulation ceremony.
@@ -38,9 +37,8 @@ struct SupplyTransferCounters {
     // `O(catalog)` scans, the transfer record-keeping).
     uint64_t dispatch_cpu_ns{0};
 
-    // Staging slots released by the completion path instead of at a boundary (P2.2),
-    // and copy enqueues issued by the non-blocking pump rather than `materialize`
-    // (P2.3).
+    // Staging slots released by the completion path instead of at a boundary, and
+    // copy enqueues issued by the non-blocking pump rather than `materialize`.
     uint64_t staging_released_on_completion{0};
     uint64_t copies_pumped{0};
 

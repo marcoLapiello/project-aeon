@@ -122,12 +122,11 @@ public:
         report.vram_attention_state_bytes = attention_memory.layer_state_bytes;
         report.vram_rope_bytes = attention_memory.rope_bytes;
         report.vram_kv_bytes = attention_memory.total_bytes();
-        // The prefill workspace is **derived from the configured knobs** (Step 6 item
-        // 7): the residual carry is a pure function of the window, and the batch
-        // scratch is an allowance the host checks its real allocation against at load.
-        // The `100 MiB` literal this replaces was wrong in both directions — it
-        // over-counted decode scratch several-fold and did not cover the batch scratch
-        // at all.
+        // The prefill workspace is **derived from the configured knobs**: the residual
+        // carry is a pure function of the window, and the batch scratch is an allowance
+        // the host checks its real allocation against at load. The `100 MiB` literal
+        // this replaces was wrong in both directions — it over-counted decode scratch
+        // several-fold and did not cover the batch scratch at all.
         const size_t carry_bytes = prefill_carry_bytes(runtime_cfg, geometry);
         report.vram_prefill_carry_bytes = runtime_cfg.prefill_sweep ? carry_bytes : 0;
         report.vram_batch_scratch_bytes = runtime_cfg.prefill_sweep
@@ -175,7 +174,7 @@ public:
             report.max_viable_context_size = static_cast<uint32_t>(low);
         }
 
-        // 6. Hard Feasibility Gate Evaluation
+        // Hard feasibility gate: reject before anything is uploaded.
         if (baseline_vram_needed > report.usable_vram_bytes) {
             report.is_feasible = false;
             std::ostringstream err_oss;
@@ -188,7 +187,7 @@ public:
             return report;
         }
 
-        // 7. Calculate Hot VRAM Expert Pool capacity
+        // Hot VRAM expert-pool capacity from what remains.
         size_t remaining_for_experts = report.usable_vram_bytes - (report.vram_dense_bytes +
                                                      report.vram_kv_bytes +
                                                      report.vram_scratch_bytes +

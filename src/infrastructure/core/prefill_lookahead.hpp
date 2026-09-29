@@ -9,10 +9,8 @@
 // that issue one read wave at a time as the previous lands; the class declares
 // them in `prefill_sweep.hpp`.
 //
-// The corridor requirements R1–R8 of the supply-chain plan §0.3 are carried
-// unchanged: the depth is derived from the staging arena alone, bounded to one
-// wave in flight, and re-derived at each boundary. This is a pure relocation of
-// the definitions — same bodies, same private access.
+// The depth is derived from the staging arena alone, bounded to one wave in
+// flight, and re-derived at each boundary.
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/core/prefill_sweep.hpp"
@@ -22,9 +20,9 @@
 
 namespace aeon::core {
 
-// The lookahead length the free blocks allow at this instant (plan R5/P2.6): the
-// biggest number of layers whose reads may be in flight. Derived from the runtime
-// free blocks, never a constant — see `read_lookahead_capacity`.
+// The lookahead length the free blocks allow at this instant: the biggest number
+// of layers whose reads may be in flight. Derived from the runtime free blocks,
+// never a constant — see `read_lookahead_capacity`.
 inline uint32_t PrefillSweep::derived_lookahead_capacity() const noexcept {
     return read_lookahead_capacity();
 }
@@ -39,9 +37,9 @@ inline uint32_t PrefillSweep::derived_lookahead_capacity() const noexcept {
 //
 // VRAM is deliberately absent: the staging arena and the VRAM pool are two
 // independent resources, and how many loaded magazines the rifle holds must not
-// decide how many are prepared in the box. A copy that finds no free VRAM well
-// waits in staging; it does not stop the reads after it. A host that wants a
-// deeper corridor pins more staging and the depth follows (plan R2/R5/R6).
+// decide how many are prepared in the box. A copy that finds no free VRAM waits in
+// staging; it does not stop the reads after it. A host that wants a deeper corridor
+// pins more staging and the depth follows.
 inline uint32_t PrefillSweep::read_lookahead_capacity() const noexcept {
         if (registry_ == nullptr || supply_ == nullptr) return 0;
         const uint32_t per_layer = registry_->experts_per_layer;

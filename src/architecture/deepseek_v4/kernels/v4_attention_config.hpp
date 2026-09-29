@@ -29,7 +29,6 @@ constexpr float DSV4_ROPE_THETA = 10000.0f;
 constexpr float DSV4_ATTN_SCALE = 0.04419417382415922f; // 1.0f / sqrtf(512.0f)
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // RoPE and YaRN configuration: see `v4_rope.hpp` (`RopeTable`).
 
 } // namespace aeon::kernel

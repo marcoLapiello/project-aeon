@@ -3,62 +3,55 @@
 // -----------------------------------------------------------------------------
 // The sampler — the logit-processor seam, and the decision that follows it.
 //
-// This is the composition plan's **G3** and its phase **P3**, the last op of the
-// token path (§2.1, step B6). It is deliberately *not* part of `V4Graph`: the
-// graph owns what happens in the model, and sampling is not a model operation.
-// The graph hands over fp16 logits; this decides a token.
+// Deliberately *not* part of `V4Graph`: the graph owns what happens in the model,
+// and sampling is not a model operation. The graph hands over fp16 logits; this
+// decides a token.
 //
-// Plan Step 5 puts three requirements on it, and only the first is ordinary:
+// Three requirements shape it:
 //
 //   1. temperature, top-k and top-p, with the softmax in fp32;
-//   2. a **logit-processor seam** — a hook that may mask or bias the logits
-//      *before* the decision. The plan calls this **not deferrable** (§6.4),
-//      because constrained/structured output — tool-call JSON — *is* a logit
+//   2. a **logit-processor seam** — a hook that may mask or bias the logits *before*
+//      the decision. Constrained/structured output (tool-call JSON) *is* a logit
 //      mask, and a closed argmax with no hook forces a pipeline change later;
 //   3. argmax first, which for the untruncated defaults is also the model's own
 //      decision.
 //
-// The seam mutates the logits in place rather than returning them, because that
-// is what a mask is, and because the sampled probability of an excluded token
-// must be **exactly zero** rather than small — a `-inf` logit is what makes that
-// true instead of approximately true.
+// The seam mutates the logits in place rather than returning them, because that is
+// what a mask is, and because the sampled probability of an excluded token must be
+// **exactly zero** rather than small — a `-inf` logit makes that true instead of
+// approximately true.
 //
 // Order: `processor -> temperature -> top-k -> top-p -> softmax -> decide`. The
 // seam is first so a mask can make a token impossible; temperature precedes the
 // truncations because the standard ordering is what a reference implementation's
-// numbers mean. The gate asserts the order rather than assuming it (a `+inf`
-// logit must survive `top_k = 1`).
+// numbers mean. The gate asserts the order rather than assuming it (a `+inf` logit
+// must survive `top_k = 1`).
 //
 // Determinism, and why the generator is written out rather than taken from
-// `<random>`. The gate's first clause is "seeded replay is bit-identical", and a
-// replay is only bit-identical *by construction* if both the bit stream and the
-// mapping to `[0, 1)` are specified here. `SplitMix64` is a handful of
-// documented lines, so the token sequence is a property of this file.
+// `<random>`: a seeded replay is only bit-identical *by construction* if both the
+// bit stream and the mapping to `[0, 1)` are specified here. `SplitMix64` is a
+// handful of documented lines, so the token sequence is a property of this file.
 //
 // Precision. The decision runs on **host fp32** logits: the fp32 softmax and the
 // seam both live here, so widening on the device would only add a second copy and
-// 259 KB more traffic per token. Two things follow:
+// 259 KB more traffic per token.
 //
 //   * the **greedy** path with no seam installed never widens at all. There is
 //     nothing for the host to do but pick the largest, and the certified device
-//     argmax pair does that with a 4-byte readback — which is the plan's
-//     "device + 4 B host" (§2.2) and the pre-rewrite graph's own design;
+//     argmax pair does that with a 4-byte readback;
 //   * widening fp16 -> fp32 is **exact**, so the device argmax and the host
 //     argmax are the same function on the same values. The gate asserts equality
-//     rather than agreement-within-a-tolerance, and that is why that assertion is
-//     strong rather than decorative.
+//     rather than agreement-within-a-tolerance.
 //
 // Two argmaxes, on purpose. The device pair is a parallel reduction over fp16;
 // `sampler_ops::argmax_of` is the scalar fp32 rule the sampler falls back to when
 // a seam is installed or the decision is sampled. They are two implementations of
-// one *rule* — ties to the lower index, which is exactly what the certified
-// kernel reduces with — and the gate asserts they agree. That agreement is the
-// point, not a redundancy.
+// one *rule* — ties to the lower index — and the gate asserts they agree.
 //
-// What is not here. The engine that binds the tokenizer, the prompt encoder and
-// the generation loop is P4 (`core/v4_engine.hpp`); the artifact's sampling
-// policy is a `config.json` fact the engine reads and passes in. This file knows
-// nothing about prompts, turns or stop conditions.
+// The engine that binds the tokenizer, the prompt encoder and the generation loop
+// is `core/v4_engine.hpp`; the artifact's sampling policy is a `config.json` fact
+// the engine reads and passes in. This file knows nothing about prompts, turns or
+// stop conditions.
 // -----------------------------------------------------------------------------
 
 #include "platform/ops/argmax.hpp"
@@ -93,11 +86,10 @@ using LogitProcessor = std::function<void(float* logits, uint32_t vocab)>;
 // -----------------------------------------------------------------------------
 
 struct SamplerConfig {
-    // `<= 0` is the greedy path — the `T -> 0` limit, and the plan's "argmax
-    // first" for the untruncated defaults. The artifact's own generation policy
-    // (`do_sample = true, temperature = 1, top_p = 1` — plan Step 5) is a *policy*
-    // the engine reads and passes in, not a property of this type, which is why
-    // the shipped default is the deterministic one.
+    // `<= 0` is the greedy path — the `T -> 0` limit, and "argmax first" for the
+    // untruncated defaults. The artifact's own generation policy (`do_sample = true,
+    // temperature = 1, top_p = 1`) is a *policy* the engine reads and passes in, not
+    // a property of this type, which is why the shipped default is deterministic.
     float temperature{0.0f};
 
     // `0` disables truncation; `>= vocab` is equivalent to disabled.
@@ -152,11 +144,11 @@ private:
 // The arithmetic — pure, host-only, and independently testable
 // -----------------------------------------------------------------------------
 
-// Each of these is one step of the plan's Step 5 and each is a total function on
-// a logit vector, so the gate can pin it against a hand-built vector with no
-// device and no model in the loop. They are in a `detail`-style namespace rather
-// than private members so that they can be tested on their own, which is what
-// makes a failing gate say *which* step is wrong.
+// Each of these is one stage of the decision and each is a total function on a
+// logit vector, so the gate can pin it against a hand-built vector with no device
+// and no model in the loop. They are in a `detail`-style namespace rather than
+// private members so that they can be tested on their own, which is what makes a
+// failing gate say *which* stage is wrong.
 namespace sampler_ops {
 
 // The rule the certified device kernel reduces with: strictly-greater wins, so a
@@ -219,8 +211,8 @@ inline void apply_top_k(float* logits, uint32_t n, uint32_t k) {
 // softmax renormalise gives the correct conditional distribution, but the cut
 // itself has to be chosen on the full set or the nucleus drifts.
 //
-// No-op at `top_p >= 1`, which is both the plan's default and the artifact's own
-// value: the untruncated path sorts nothing and allocates nothing.
+// No-op at `top_p >= 1`, which is both the default and the artifact's own value:
+// the untruncated path sorts nothing and allocates nothing.
 inline void apply_top_p(float* logits, uint32_t n, float top_p) {
     if (top_p >= 1.0f) return;
 
@@ -338,10 +330,9 @@ public:
 
     const SamplerConfig& config() const noexcept { return config_; }
 
-    // Validated, not clamped (trap 40's discipline applied to configuration): a
-    // negative, NaN or infinite temperature, or a `top_p` outside `(0, 1]`, is
-    // refused. The alternative — a silently different distribution — is a
-    // behaviour change no downstream comparison could attribute.
+    // Validated, not clamped: a negative, NaN or infinite temperature, or a `top_p`
+    // outside `(0, 1]`, is refused. The alternative — a silently different
+    // distribution — is a behaviour change no downstream comparison could attribute.
     void set_config(const SamplerConfig& config) {
         if (!std::isfinite(config.temperature) || config.temperature < 0.0f) {
             throw std::invalid_argument(
@@ -389,7 +380,7 @@ public:
 
     // The decision, on host fp32 logits, **in place**: seam, temperature, top-k,
     // top-p, then argmax or a draw. No device, no allocation, no widening — which
-    // is what lets the gate pin every step of plan Step 5 exactly.
+    // is what lets the gate pin every stage exactly.
     uint32_t decide(float* logits) {
         const uint32_t n = vocab_;
 

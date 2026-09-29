@@ -86,7 +86,7 @@ public:
         free();
     }
 
-    // Move-only semantics to prevent double-free
+    // Move-only: prevents accidental double-free.
     V4Layer(const V4Layer&) = delete;
     V4Layer& operator=(const V4Layer&) = delete;
 
@@ -211,13 +211,12 @@ public:
 
     // Puts a snapshot back, byte for byte, and restores the four counters.
     //
-    // This is the prefix-reuse primitive the plan's state contract requires (Part I
-    // §6.3 R1–R3): the state is a set of independent, position-addressed pieces, and
-    // a restore must be **byte-exact with respect to never having evicted**. A
-    // snapshot that is only ever captured is a latent type, so the gate that matters
-    // is not "does the copy round-trip" but "does a *restored* layer continue exactly
-    // like one that never stopped" — `tests/test_v4_state_restore.cpp` drives both and
-    // requires the tokens and the final state to be identical.
+    // The state is a set of independent, position-addressed pieces, and a restore must
+    // be **byte-exact with respect to never having evicted**. A snapshot that is only
+    // ever captured is a latent type, so the gate that matters is not "does the copy
+    // round-trip" but "does a *restored* layer continue exactly like one that never
+    // stopped" — `tests/test_v4_state_restore.cpp` drives both and requires the tokens
+    // and the final state to be identical.
     //
     // Every piece is written, including the ones a Sliding layer does not have: their
     // expected byte count is zero, so `write_state_bytes` is a no-op there rather than

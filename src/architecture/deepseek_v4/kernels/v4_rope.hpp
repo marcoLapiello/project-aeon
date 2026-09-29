@@ -1,27 +1,27 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// DeepSeek-V4 kept primitive: RoPE (Step 2.3).
+// DeepSeek-V4 kept primitive: RoPE.
 //
 // Gated on its own, like RMSNorm, and with exactly one definition:
 // `v4_attention.hpp` includes this header.
 //
-// The four properties this file must get right — each is a recorded trap:
+// The four properties this file must get right:
 //
-//   1. TAIL, NOT HEAD. Only the LAST `rope_dim` (64) of each 512-wide head
-//      rotates; the layout is `[nope (448) | rope (64)]`. The generic upstream
-//      parent class rotates the FIRST `rotary_dim`; the DSV4 subclass overrides
-//      it to rotate the last. Getting this wrong rotates the wrong dims and
-//      passes every "does it run" check. (trap 27)
+//   1. TAIL, NOT HEAD. Only the LAST `rope_dim` (64) of each 512-wide head rotates;
+//      the layout is `[nope (448) | rope (64)]`. The generic upstream parent class
+//      rotates the FIRST `rotary_dim`; the DSV4 subclass overrides it to rotate the
+//      last. Getting this wrong rotates the wrong dims and passes every "does it run"
+//      check.
 //   2. GPT-J INTERLEAVE, NOT NeoX. Adjacent pairs `(2k, 2k+1)` rotate together;
 //      `is_neox_style=False`.
 //   3. TWO BASES. `theta = compress_rope_theta (160000)` with YaRN when
 //      `compress_ratio > 1`, else `rope_theta (10000)` plain. Two `RopeTable`
-//      instances are built at model load, never one. (trap 7)
-//   4. NO AMPLITUDE SCALING. Upstream sets `mscale = 0`, so the effective
-//      magnitude factor is exactly 1.0. There is no `1 + 0.1*log(scale)` term.
+//      instances are built at model load, never one.
+//   4. NO AMPLITUDE SCALING. Upstream sets `mscale = 0`, so the effective magnitude
+//      factor is exactly 1.0. There is no `1 + 0.1*log(scale)` term.
 //
-// Gate: `tests/test_v4_rope_oracle.cpp`, against `reference/dsv4_oracle.hpp`.
+// Tested by `tests/test_v4_rope_oracle.cpp` against `reference/dsv4_oracle.hpp`.
 // -----------------------------------------------------------------------------
 
 #include <hip/hip_runtime.h>
@@ -194,7 +194,7 @@ __global__ void __launch_bounds__(32) v4_forward_rope_at_pos_wave32_kernel(
 }
 
 // Single-position inverse, for the attention-output tail before the grouped
-// projection (Step 2.5).
+// projection.
 __global__ void __launch_bounds__(32) v4_inverse_rope_at_pos_wave32_kernel(
     __half* __restrict__ vec,           // [num_heads, head_dim]
     const float* __restrict__ cos_cache,// [max_seq, half_rope]

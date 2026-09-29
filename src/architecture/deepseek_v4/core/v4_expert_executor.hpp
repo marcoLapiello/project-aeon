@@ -4,77 +4,47 @@
 // The production routed-expert executor.
 //
 // `V4RoutedExpertExecutor` (core/v4_layer_body.hpp) is the seam the layer body
-// calls. Inside a gate it is implemented against payloads supplied directly; in
-// the runtime it must be the whole tiered supply system — index lookup, Hot/Warm/
-// Cold promotion, prefetch, leases, staging — followed by the fused expert
-// kernels. This file is that implementation, and it is the only place the graph
-// touches storage.
+// calls. Inside a gate it is implemented against payloads supplied directly; in the
+// runtime it is the whole tiered supply system — index lookup, Hot/Warm/Cold
+// promotion, prefetch, leases, staging — followed by the fused expert kernels. This
+// is the only place the graph touches storage.
 //
-// Two things are deliberately *not* here:
+// Two things are deliberately *not* here: the router (the body computes the ids and
+// weights and hands them over through `on_routing_ready`) and the shared expert (the
+// body runs it into `moe_accum` before `accumulate_routed`, and this executor folds
+// that buffer in as the initial value of the fp32 accumulator rather than adding to
+// a completed sum).
 //
-//   * the router. The body computes the ids and the weights and hands them over
-//     through `on_routing_ready`; the executor never re-derives a selection.
-//   * the shared expert. The body runs it into `moe_accum` before calling
-//     `accumulate_routed`, and this executor folds that buffer in as the **initial
-//     value of the fp32 accumulator** rather than adding to a completed sum —
-//     which is the reference's own fused shape (plan 2.10.5).
-//
-// -----------------------------------------------------------------------------
-// The accumulation, and why it is this one
-//
-// Two dispatches, matching the plan's kernel inventory (items 19b):
+// The accumulation is two dispatches:
 //
 //   1. `aeon_moe_fused_w2_contrib_kernel` gives each of the six experts its own
-//      fp32 slice of the 4096-wide output. One writer per element, so the result
-//      is deterministic **by construction** rather than by observation.
-//   2. `moe_accumulate_fixed_order_kernel` sums those six slices in slot order
-//      in fp32 and rounds to fp16 **once**.
+//      fp32 slice of the 4096-wide output — one writer per element, so the result
+//      is deterministic by construction.
+//   2. `moe_accumulate_fixed_order_kernel` sums those six slices in slot order in
+//      fp32 and rounds to fp16 once.
 //
-// Neither of the two older paths had both required properties: the `atomicAdd`
-// path has an undefined reduction order (trap 38), and the fp16 read-modify-write
-// path re-rounds six times, which plan §2.10.3 forbids. Since a decode step that
-// is not bit-reproducible cannot support a byte-exact restore (item 22/R3), the
-// fixed-order pair is the only admissible choice here — it is not a preference.
+// Both are required for bit-reproducibility: an `atomicAdd` reduction has an
+// undefined order, and an fp16 read-modify-write re-rounds six times. A decode step
+// that is not bit-reproducible cannot support a byte-exact restore.
 //
-// -----------------------------------------------------------------------------
-// The lease policy, and the hazard it exists to close
+// The lease policy closes a real hazard. A lease only excludes a slot from being
+// *chosen as an eviction victim* — it grants no ordering — so a lease must be held
+// for as long as compute work that reads that slot may still be in flight. The
+// dangerous pair is not two readers but the incoming expert's H2D overwriting a
+// slot while the outgoing expert's kernel still reads it: the incoming upload is
+// ordered against the demotion but never against the compute stream, so an early
+// release lets a miss for layer L+1 land on a slot layer L's W2 kernel has not
+// finished reading. Holding a lease longer is only a capacity cost, so:
 //
-// A lease does exactly one thing (ExpertRegistry::reserve_vram_destination):
-// it excludes a slot from being *chosen as an eviction victim*. It grants no
-// ordering. So the safety property is a timing property of the caller:
-//
-//   **A lease must be held for as long as compute work that reads that slot may
-//   still be in flight.**
-//
-// Releasing earlier is silently wrong, and the failure mode is worth stating
-// precisely because it looks innocuous. The dangerous pair is *not* "the demotion
-// D2H reads the slot while a kernel reads it" — two readers cannot conflict. It is
-// **the incoming expert's H2D overwriting the slot while the outgoing expert's
-// kernel still reads it**. The incoming upload is ordered against the demotion
-// (`wait_for_demotion_dependency` → the SDMA stream) and against nothing else: it
-// never waits for the compute stream. So an early release lets a miss for layer
-// L+1 land an H2D on a slot that layer L's W2 kernel has not finished reading, and
-// the kernel then multiplies against a mixture of two different experts. The result
-// is a plausible number, produced from wrong weights, with nothing anywhere
-// recording that it became wrong.
-//
-// Holding a lease longer is only a capacity cost, so the policy here is the safe
-// side of that asymmetry, with the capacity handled explicitly rather than assumed:
-//
-//   * leases are held for the whole token — the token boundary is where the caller
-//     has a compute-stream boundary for free (sampling must read the logits back),
-//     so `release_leases()` there costs one host release per expert per token and
-//     no synchronization it did not already need;
+//   * leases are held for the whole token — the token boundary already has a
+//     compute-stream boundary (sampling reads the logits back), so releasing there
+//     costs no synchronization it did not already need;
 //   * before dispatching a layer, if the outstanding leases would leave fewer than
-//     a full layer's worth of reclaimable slots, the executor **drains the compute
-//     stream and releases**, which restores the "no reader in flight" precondition
-//     by construction.
+//     a full layer's worth of reclaimable slots, the executor drains the compute
+//     stream and releases, restoring the "no reader in flight" precondition.
 //
-// The second rule is what makes the first safe on a pool too small to hold
-// `6 × 43` leases. It is unreachable whenever the pool can, which is the normal
-// case; it exists so that a smaller pool degrades into extra synchronization
-// instead of into the registry's "no reclaimable Hot VRAM slot" throw, and it never
-// trades correctness for the schedule.
+// The second rule lets a pool too small to hold `6 × 43` leases degrade into extra
+// synchronization instead of the registry's "no reclaimable Hot VRAM slot" throw.
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/core/device_streams.hpp"
@@ -105,11 +75,9 @@
 
 namespace aeon::core {
 
-// Device scratch owned by the routed-expert path.
-//
-// It is separate from `V4ActivationScratch` on purpose: those buffers belong to
-// one token's activations, and these two belong to whichever supply tier is being
-// consumed. Keeping them apart is what lets the executor be handed to a gate with
+// Device scratch owned by the routed-expert path. Separate from `V4ActivationScratch`
+// because these buffers belong to whichever supply tier is being consumed, not to one
+// token's activations; keeping them apart lets the executor be handed to a gate with
 // nothing but this struct.
 struct V4RoutedExpertScratch {
     static constexpr int kExperts = 6;
@@ -137,9 +105,7 @@ struct V4RoutedExpertScratch {
         allocate_buffer(d_contrib, static_cast<size_t>(kExperts) * kHidden);
     }
 
-    // Exact VRAM this scratch holds. The budget reports it rather than a literal:
-    // the size is a property of the model's constants, not of any knob, but it is
-    // still a real allocation that the Hot pool is sized around.
+    // Exact VRAM this scratch holds; the budget reports it rather than a literal.
     size_t bytes() const noexcept { return bytes_allocated_; }
 
     void free() noexcept {
@@ -160,18 +126,13 @@ public:
 };
 
 // The four streams the executor interacts with live in
-// `infrastructure/core/device_streams.hpp`, owned by the host and borrowed here — one
-// definition, because this class's capacity fallback has to drain exactly the streams
-// that carry expert traffic and
-// a second definition of "the streams" is a way to hand it the wrong set.
-//
-// `compute` is where the expert kernels run and where the per-transfer staging
-// events are awaited. The other three carry the storage traffic (warm and cold
-// uploads, eviction downloads) and are needed by the capacity fallback: a slot is
-// only reclaimable once the copies *out of and into* it have completed, so a
-// fallback that drained only `compute` would release leases without freeing
-// anything, and the next dispatch would fail with the registry's own
-// "no reclaimable Hot VRAM slot" error.
+// `infrastructure/core/device_streams.hpp`, owned by the host and borrowed here: the
+// capacity fallback must drain exactly the streams that carry expert traffic, and a
+// second definition of "the streams" could hand it the wrong set. `compute` runs the
+// expert kernels and awaits the staging events; the other three carry storage traffic
+// (warm/cold uploads, eviction downloads). A slot is only reclaimable once the copies
+// out of and into it have completed, so draining only `compute` would release leases
+// without freeing anything.
 
 // The production executor. Borrows everything it needs; owns only its bookkeeping.
 class V4TieredExpertExecutor final : public V4RoutedExpertExecutor, public ExpertLeaseHolder {
@@ -239,12 +200,11 @@ public:
         observe_layer(layer_id);
     }
 
-    // The layer-wide dispatch (Step 6 item 4): a chunk's `6C` routed requests
-    // issued as **one deduplicated set**. Same seam, same invariants — the only
-    // difference is that the layer's union is staged once and reused by every
-    // token, instead of each token issuing its own six transfers. `C = 1`
-    // reproduces `on_routing_ready` exactly (the dedup of six distinct ids is the
-    // six ids), so the decode path is not a second code path.
+    // The layer-wide dispatch: a chunk's `6C` routed requests issued as **one
+    // deduplicated set**. Same seam, same invariants — the layer's union is staged
+    // once and reused by every token, instead of each token issuing its own six
+    // transfers. `C = 1` reproduces `on_routing_ready` exactly, so the decode path is
+    // not a second code path.
     void on_routing_ready_batch(uint32_t layer_id,
                                 uint32_t first_position,
                                 const std::vector<std::vector<int32_t>>& ids,
@@ -373,9 +333,9 @@ public:
     void on_routed_consumed(uint32_t layer_id, uint32_t position) override {
         (void)layer_id;
         (void)position;
-        // Mid-body supply pump (plan P2.3): the only host activity inside a body, so
-        // it is where the swept lookahead's copies are issued as their reads land. Set
-        // by the host; a no-op when the sweep is not driving the window.
+        // Mid-body supply pump: the only host activity inside a body, where the
+        // swept lookahead's copies are issued as their reads land. Set by the host;
+        // a no-op when the sweep is not driving the window.
         if (supply_pump_) supply_pump_();
         for (const uint32_t staging_idx : staging_in_use_) {
             staging_.release_after_gpu_transfer(staging_idx);

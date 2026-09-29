@@ -35,7 +35,7 @@ struct MemoryBudgetReport {
     size_t total_vram_bytes{0};
     size_t free_vram_bytes{0};
 
-    // What the plan is actually sized against: `min(free_vram, total_vram)`.
+    // What the budget is actually sized against: `min(free_vram, total_vram)`.
     // Planning against `total_vram` ignores VRAM another process already holds,
     // which on a card running a display server (or shared with another job) is
     // memory the engine cannot have.

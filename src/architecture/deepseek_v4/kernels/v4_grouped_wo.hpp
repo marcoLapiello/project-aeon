@@ -11,7 +11,7 @@
 
 namespace aeon::kernel {
 
-// 5. Grouped W_o_a Projection Kernel:
+// Grouped W_o_a projection (Wave32):
 // For each group g in 0..7: input is 8 heads x 512 = 4096 half elements.
 // Projected by W_o_a[g]: [1024, 4096] -> Z[g]: [1024]
 // Total output is [T, 8192]

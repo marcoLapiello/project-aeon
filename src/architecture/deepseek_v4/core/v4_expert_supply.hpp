@@ -19,25 +19,20 @@ namespace aeon::core {
 
 class V4ExpertSupplyCoordinator : public LayerBatchSupply {
 public:
-    // Six routed experts per token: the model's top-k. The supply's per-request
-    // vocabulary is the model's, so this constant lives with the model adapter, not
-    // in the neutral supply.
-    // One routed expert per token, the `k` of the top-k selection. An expert is
-    // selected at most once per token (the router's top-k is a set), so a token's
-    // six entries are distinct; only across tokens does an expert repeat.
+    // Six routed experts per token — the model's top-k. A token's six entries are
+    // distinct (the top-k is a set); an expert repeats only across tokens.
     static constexpr uint32_t ROUTED_EXPERTS = 6;
 
-    // The state of one dispatch. It is **the layer's deduplicated set**, not one
-    // token's six experts: the `C = 1` case (decode) deduplicates to exactly six,
-    // and a chunk of `C` tokens collapses its `6C` requests to the layer's union
-    // (Step 6 D2). The parallel per-expert arrays live in the neutral
-    // `LayerBatchState`; this adds the one model-shaped piece — `token_indices[t][k]`,
-    // the distinct index of token `t`'s `k`-th expert, so a slot is stage-once and
-    // read by every token that chose it without ever permuting the slot-sum order
-    // (step §7).
+    // The state of one dispatch: **the layer's deduplicated set**, not one token's six
+    // experts. Decode deduplicates to exactly six; a chunk of `C` tokens collapses its
+    // `6C` requests to the layer's union. The parallel per-expert arrays live in the
+    // neutral `LayerBatchState`; this adds the one model-shaped piece —
+    // `token_indices[t][k]`, the distinct index of token `t`'s `k`-th expert, so a slot
+    // is staged once and read by every token that chose it without ever permuting the
+    // slot-sum order.
     struct LayerPrefetchState : LayerBatchState {
-        // The batch shape. Decode leaves this as one token whose six indices are
-        // `0..5`; a chunk fills `token_indices` with one row per token.
+        // Decode leaves this as one token whose six indices are `0..5`; a chunk fills
+        // `token_indices` with one row per token.
         std::vector<std::array<uint32_t, ROUTED_EXPERTS>> token_indices;
     };
 
@@ -140,7 +135,7 @@ public:
     uint64_t h2d_drain_ns() const noexcept { return supply_.h2d_drain_ns(); }
     uint64_t h2d_drain_calls() const noexcept { return supply_.h2d_drain_calls(); }
     uint64_t dispatch_cpu_ns() const noexcept { return supply_.dispatch_cpu_ns(); }
-    // Staging slots freed by the completion path instead of a boundary block (P2.2).
+    // Staging slots freed by the completion path instead of a boundary block.
     uint64_t staging_released_on_completion() const noexcept {
         return supply_.staging_released_on_completion();
     }
@@ -189,16 +184,15 @@ public:
         return state;
     }
 
-    // The layer-wide dispatch (Step 6 item 4): a chunk's `6C` requests issued as
-    // **one set**. The requests are deduplicated to the layer's distinct experts,
-    // each distinct expert is staged **once** and read by every token that selected
-    // it, and the per-token index map is what lets the caller rebuild each token's
-    // six expert slots without disturbing the slot-sum order.
+    // The layer-wide dispatch: a chunk's `6C` requests issued as **one set**. The
+    // requests are deduplicated to the layer's distinct experts, each distinct expert
+    // is staged once and read by every token that selected it, and the per-token index
+    // map lets the caller rebuild each token's six expert slots without disturbing the
+    // slot-sum order.
     //
-    // Staging indices are the distinct-set positions `0..D-1`. `D <= 6C`, and the
-    // host sizes the arena to at least that (Step 6 D4), so no transfer waits for a
-    // slot; a caller that under-sizes the arena fails loudly here rather than
-    // silently colliding two experts on one slot.
+    // Staging indices are the distinct-set positions `0..D-1`. `D <= 6C`, and the host
+    // sizes the arena to at least that, so no transfer waits for a slot; an
+    // under-sized arena fails loudly here rather than silently colliding two experts.
     LayerPrefetchState dispatch_layer_prefetch_batch(
         uint32_t target_l,
         uint32_t first_position,
@@ -262,14 +256,13 @@ public:
         sync_state(state);
     }
 
-    // Streaming prefill (Step 6 item 6): load a whole layer's expert set. Unlike
-    // `dispatch_layer_prefetch_batch` this is not driven by a routing result — the
-    // layer is loaded whole, because a prefill chunk touches ~255 of 256 experts and
-    // the set is therefore **known rather than guessed** (plan §2). Staging indices
-    // are `staging_base + position` in `local_expert_ids`, so the caller sizes the
-    // arena to the layer and picks the bank: the sweep alternates banks by layer
-    // parity, which is what lets one layer's copies stay in flight through its body
-    // while the next layer's reads fill the other bank.
+    // Streaming prefill: load a whole layer's expert set. Unlike
+    // `dispatch_layer_prefetch_batch` this is not driven by a routing result — a prefill
+    // chunk touches ~255 of 256 experts, so the set is **known rather than guessed**.
+    // Staging indices are `staging_base + position` in `local_expert_ids`, so the
+    // caller sizes the arena to the layer and picks the bank: the sweep alternates
+    // banks by layer parity, which lets one layer's copies stay in flight through its
+    // body while the next layer's reads fill the other bank.
     LayerBatchState dispatch_layer_stream(
         uint32_t layer,
         const std::vector<uint32_t>& local_expert_ids,
@@ -319,8 +312,8 @@ public:
     }
 
     // The non-blocking half of `materialize_layer_prefetch` — enqueue a copy for each
-    // expert of `state` whose reads have all landed, and return without waiting (P2.3).
-    // The per-token pump calls this on the **lookahead** layer, so its VRAM block is
+    // expert of `state` whose reads have all landed, and return without waiting. The
+    // per-token pump calls this on the **lookahead** layer, so its VRAM block is
     // filled during the previous layer's body instead of at the next boundary.
     size_t pump_layer_prefetch(LayerBatchState& state) override {
         const size_t enqueued = supply_.materialize_available(state.supply_batch);
@@ -345,8 +338,8 @@ public:
 
     uint32_t staging_in_use_slots() const noexcept { return supply_.staging_in_use_slots(); }
 
-    // Free staging slots — the resource the sweep's lookahead depth is derived from
-    // (plan R5), alongside the registry's free VRAM slots.
+    // Free staging slots — the resource the sweep's lookahead depth is derived from,
+    // alongside the registry's free VRAM slots.
     uint32_t staging_free_slots() const override {
         return supply_.staging_state_counts().free;
     }

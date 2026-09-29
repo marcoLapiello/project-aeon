@@ -91,19 +91,19 @@ struct ExpertCatalogEntry {
     uint32_t lease_count{0};
     bool in_lru{false};
 
-    // Frozen prefill (Step 6 D-b): a Warm-owned expert can additionally hold a
-    // **shadow** VRAM residency — a copy taken without transferring ownership, so
-    // Warm's resident set survives a prefill. `warm_shadow` marks a copy in
-    // flight; `shadow_vram_slot` is the extra VRAM slot once it lands. Both are
-    // false/-1 outside frozen prefill, so decode's ownership model is untouched.
+    // Frozen prefill: a Warm-owned expert can additionally hold a **shadow** VRAM
+    // residency — a copy taken without transferring ownership, so Warm's resident
+    // set survives a prefill. `warm_shadow` marks a copy in flight;
+    // `shadow_vram_slot` is the extra VRAM slot once it lands. Both are false/-1
+    // outside frozen prefill, so decode's ownership model is untouched.
     int32_t shadow_vram_slot{-1};
     bool warm_shadow{false};
 
-    // Prefill restore (the plan's §3): set on every Hot resident when a prefill
-    // opens, cleared when that resident is drained (so a marked entry is exactly a
-    // **preserved** resident) or when the prefill ends. A marked resident is spared
-    // by the per-layer release, so only prefill-admitted residents are released and
-    // the pre-prefill set survives the pass. Only a Hot resident can carry it: a Warm
+    // Prefill restore: set on every Hot resident when a prefill opens, cleared when
+    // that resident is drained (so a marked entry is exactly a **preserved**
+    // resident) or when the prefill ends. A marked resident is spared by the
+    // per-layer release, so only prefill-admitted residents are released and the
+    // pre-prefill set survives the pass. Only a Hot resident can carry it: a Warm
     // shadow exists only during frozen prefill and every one is cleared at entry, so
     // there is no shadow side to mark.
     bool resident_at_prefill_begin{false};

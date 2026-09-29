@@ -89,9 +89,9 @@ public:
     uint32_t batch_staging_capacity() const noexcept { return staging_batch_slots_; }
 
     // Layer-sized staging banks the sweep's arena holds, derived from the arena's
-    // actual depth (`slots / experts_per_layer`). The default is `2` (R2); the
-    // derivation exists so a runtime resize moves the arena and the sweep's bank
-    // indexing together, with no second place for the two to disagree.
+    // actual depth (`slots / experts_per_layer`). The default is `2`; the derivation
+    // exists so a runtime resize moves the arena and the sweep's bank indexing
+    // together, with no second place for the two to disagree.
     uint32_t sweep_staging_banks() const noexcept { return sweep_staging_banks_; }
 
     // Sets the partition shape at load. `phase_cuts` is whether the sweep is on and
@@ -163,8 +163,8 @@ public:
 
         services_.staging->resize(slots);
         refresh_sweep_banks(experts_per_layer);
-        // The budget report is the plan's figure; keep it equal to the allocation so
-        // the two cannot drift after a resize.
+        // The budget report figure; keep it equal to the allocation so the two cannot
+        // drift after a resize.
         services_.budget->transient_staging_bytes =
             static_cast<size_t>(slots) * services_.staging->payload_bytes();
         return true;
@@ -234,7 +234,7 @@ private:
     // Layer-sized staging banks the sweep's arena holds, derived from the arena's
     // depth (`slots / experts_per_layer`). The default is `2` — two layer-blocks, one
     // the read destination and one the copy source — and it is deliberately **not** a
-    // config knob, because a settable depth lets a resource select the algorithm (R6).
+    // config knob, because a settable depth would let a resource select the algorithm.
     uint32_t sweep_staging_banks_{2};
 };
 

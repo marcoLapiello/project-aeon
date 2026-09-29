@@ -8,7 +8,7 @@
 
 namespace aeon::kernel {
 
-// 14. Hyper-Connections Head Reduction Kernel
+// Hyper-Connections head reduction kernel (Wave32).
 __global__ void __launch_bounds__(32) hc_head_wave32_kernel(
     const float* __restrict__ residual_in, // [4, 4096] = 16384 floats
     const float* __restrict__ hc_head_fn,  // [4, 16384] floats
@@ -23,7 +23,7 @@ __global__ void __launch_bounds__(32) hc_head_wave32_kernel(
     int total_hc_dim = hc_mult * hidden_dim; // 16384
     int lane = threadIdx.x; // 0..31
 
-    // Step 1: Mean square over total_hc_dim
+    // Mean square over total_hc_dim
     float sum_sq = 0.0f;
     for (int i = lane; i < total_hc_dim; i += 32) {
         float v = residual_in[i];
@@ -35,7 +35,7 @@ __global__ void __launch_bounds__(32) hc_head_wave32_kernel(
     }
     float rsqrt = rsqrtf((sum_sq / (float)total_hc_dim) + rms_eps);
 
-    // Step 2: Linear projection for each of the 4 streams
+    // Linear projection for each of the 4 streams
     __shared__ float s_pre[4];
     for (int s = 0; s < hc_mult; ++s) {
         float dot = 0.0f;
@@ -56,7 +56,7 @@ __global__ void __launch_bounds__(32) hc_head_wave32_kernel(
     }
     __syncthreads();
 
-    // Step 3: Combine streams into output [4096]
+    // Combine streams into output [4096]
     for (int h = lane; h < hidden_dim; h += 32) {
         float acc = 0.0f;
         for (int s = 0; s < hc_mult; ++s) {

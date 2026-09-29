@@ -249,8 +249,8 @@ public:
             };
         }
 
-        // Frozen prefill (Step 6 D-b). Warm's resident set must survive a prefill, so
-        // a Warm-resident expert is **copied** into VRAM rather than promoted: the
+        // Frozen prefill. Warm's resident set must survive a prefill, so a
+        // Warm-resident expert is **copied** into VRAM rather than promoted: the
         // catalog entry keeps `owner == WARM_HOST` and its host slot, and the VRAM
         // copy is recorded as a **shadow residency** on that same entry. Leaving the
         // mode — `end_prefill_stream()`, or `set_warm_frozen(false)` on the legacy
@@ -373,11 +373,11 @@ public:
     }
 
     // Give a staged-only operation its VRAM destination, at the moment its copy can
-    // actually run (plan P2.6). Returns the slot. Idempotent: an operation that
-    // already has a destination returns it unchanged, so a caller may attach and then
-    // copy without tracking whether an earlier call already did. The destination is
-    // reserved exactly as `reserve_request` would have done at reservation time, so
-    // the free-slot/demotion rules are unchanged — only **when** they run is.
+    // actually run. Returns the slot. Idempotent: an operation that already has a
+    // destination returns it unchanged, so a caller may attach and then copy without
+    // tracking whether an earlier call already did. The destination is reserved exactly
+    // as `reserve_request` would have done at reservation time, so the free-slot and
+    // demotion rules are unchanged — only **when** they run is.
     int32_t attach_vram_destination(uint64_t operation_id, uint64_t demotion_queue_capacity) {
         auto* incoming = find_incoming_operation(operation_id);
         if (incoming == nullptr) {
@@ -483,10 +483,10 @@ public:
             throw std::logic_error("ExpertRegistry: request completion lost its VRAM reservation");
         }
 
-        // Frozen prefill's non-destructive copy (Step 6 D-b): the VRAM slot becomes
-        // a shadow residency of a Warm-owned expert. Ownership stays Warm — the host
-        // slot is NOT freed and `owner`/`slot_idx` are untouched — so Warm's resident
-        // set is exactly what it was before the copy.
+        // Frozen prefill's non-destructive copy: the VRAM slot becomes a shadow
+        // residency of a Warm-owned expert. Ownership stays Warm — the host slot is
+        // NOT freed and `owner`/`slot_idx` are untouched — so Warm's resident set is
+        // exactly what it was before the copy.
         if (incoming->warm_shadow) {
             incoming->operation = ExpertOperation::NONE;
             incoming->operation_id = 0;
@@ -631,7 +631,7 @@ public:
         --catalog[gid].lease_count;
     }
 
-    // --- Prefill streaming (Step 6 item 6) ------------------------------------
+    // --- Prefill streaming ----------------------------------------------------
     //
     // Definitions live in `prefill_residency.hpp`; the streaming model they
     // implement (hard switch, preservation, per-layer release) is documented there.
@@ -709,7 +709,7 @@ public:
     // rescan of the catalog). It is `O(total_experts + slots)`, and it is called once
     // per reserved expert, so the cost is quadratic in the batch and linear in the
     // model: a layer-wide prefill dispatch is 256 reservations and a decode pass is
-    // 258, which measured **10.2 s of a 338-token swept prefill** (ledger M43).
+    // 258, which measured **10.2 s of a 338-token swept prefill**.
     //
     // So it is a debugging instrument, not a production cost. With it off the audit
     // still runs at every **boundary** — `init`, `begin_prefill_stream`,
@@ -1054,16 +1054,15 @@ private:
         }
     }
 
-    // Frozen-prefill shadow state (Step 6 D-b). `shadow_slot_of_expert_` mirrors
+    // Frozen-prefill shadow state. `shadow_slot_of_expert_` mirrors
     // `ExpertCatalogEntry::shadow_vram_slot` so a caller can resolve an expert's
     // VRAM copy without scanning the catalog.
     bool warm_frozen_{false};
     // See `set_validate_each_request`. Off unless a debug run or a gate turns it on.
     bool validate_each_request_{false};
-    // Step 6 item 6: the prefill sweep's streaming mode. Drains Hot on entry, holds
-    // a sliding window of whole layer sets in layer order, and leaves only the
-    // residents preserved at entry on exit. Implies `warm_frozen_`; decode never sees
-    // either flag set.
+    // The prefill sweep's streaming mode. Drains Hot on entry, holds a sliding window
+    // of whole layer sets in layer order, and leaves only the residents preserved at
+    // entry on exit. Implies `warm_frozen_`; decode never sees either flag set.
     bool prefill_stream_{false};
     // How a prefill load with no free slot is answered. See `PrefillAlloc`.
     PrefillAlloc prefill_alloc_{PrefillAlloc::FreeListOnly};

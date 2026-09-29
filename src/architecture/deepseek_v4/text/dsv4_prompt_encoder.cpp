@@ -120,7 +120,7 @@ int find_last_user_index(const std::vector<Dsv4PromptMessage>& messages) {
     return -1;
 }
 
-// Step 1: give `tool` messages a home. DeepSeek-V4 has no standalone tool role, so
+// Give `tool` messages a home. DeepSeek-V4 has no standalone tool role, so
 // their payloads become tool-result blocks inside a user message.
 std::vector<Dsv4PromptMessage> merge_tool_messages(const std::vector<Dsv4PromptMessage>& input) {
     std::vector<Dsv4PromptMessage> merged;
@@ -166,8 +166,8 @@ std::vector<Dsv4PromptMessage> merge_tool_messages(const std::vector<Dsv4PromptM
     return merged;
 }
 
-// Step 2: order tool results by the preceding assistant's tool-call order, so a
-// batch of results renders deterministically.
+// Order tool results by the preceding assistant's tool-call order, so a batch of
+// results renders deterministically.
 void sort_tool_results(const std::vector<Dsv4PromptMessage>& messages,
                        std::vector<Dsv4PromptMessage>& mutable_messages) {
     std::map<std::string, size_t> call_order;
@@ -210,9 +210,9 @@ void sort_tool_results(const std::vector<Dsv4PromptMessage>& messages,
     }
 }
 
-// Step 4: keep reasoning only from the last user turn onward; drop pre-last-user
-// developer messages entirely. Only reached when no message declares tools, since
-// a tool-bearing prompt forces thinking to be kept.
+// Keep reasoning only from the last user turn onward; drop pre-last-user developer
+// messages entirely. Only reached when no message declares tools, since a
+// tool-bearing prompt forces thinking to be kept.
 std::vector<Dsv4PromptMessage> drop_thinking_messages(
     const std::vector<Dsv4PromptMessage>& messages) {
     const int last_user_index = find_last_user_index(messages);

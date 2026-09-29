@@ -87,10 +87,9 @@ inline void ExpertRegistry::validate_invariants() const {
                     throw std::logic_error("ExpertRegistry: VRAM slot names an unknown expert");
                 }
                 // A VRAM slot has two admissible owners: an ordinary Hot expert, or
-                // a Warm expert's **shadow** copy taken during frozen prefill (Step 6
-                // D-b). The map is still bijective under that disjunction — it is the
-                // ownership model that is now explicit rather than the map that is
-                // loosened.
+                // a Warm expert's **shadow** copy taken during frozen prefill. The map
+                // is still bijective under that disjunction — it is the ownership model
+                // that is now explicit rather than the map that is loosened.
                 const auto& owner_entry = catalog[static_cast<size_t>(gid)];
                 const bool is_hot_owner =
                     owner_entry.owner == ExpertTier::HOT_VRAM &&

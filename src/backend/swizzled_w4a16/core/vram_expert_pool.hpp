@@ -13,13 +13,12 @@ namespace aeon::core {
 // Unified VRAM pool for S_hot routed INT4-W4A16 experts
 // Shared dynamically across all transformer layers
 //
-// Physical layout (Expert Review Step 2): one contiguous device allocation
-// holding num_slots back-to-back opaque expert regions, each described by the
-// selected ExpertFormatDescriptor and
-// byte-identical to the .aeon host/staging layout. A full expert therefore
-// uploads with a single hipMemcpyAsync instead of six per-sub-tensor copies:
-// fewer API submissions, one sequential SDMA burst, and hardware-friendly
-// prefetching on both the PCIe and NVMe paths.
+// Physical layout: one contiguous device allocation holding num_slots back-to-back
+// opaque expert regions, each described by the selected ExpertFormatDescriptor and
+// byte-identical to the .aeon host/staging layout. A full expert therefore uploads
+// with a single hipMemcpyAsync instead of six per-sub-tensor copies: fewer API
+// submissions, one sequential SDMA burst, and hardware-friendly prefetching on both
+// the PCIe and NVMe paths.
 class UnifiedVRAMExpertPool : public ExpertPayloadPool {
 public:
     // Sub-tensor byte sizes per single expert

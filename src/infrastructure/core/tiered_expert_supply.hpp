@@ -136,21 +136,20 @@ public:
     uint64_t h2d_drain_ns() const noexcept { return counters_.h2d_drain_ns; }
     uint64_t h2d_drain_calls() const noexcept { return counters_.h2d_drain_calls; }
     // CPU time in `dispatch`'s per-request loop: registry reservation, the two
-    // `O(catalog)` scans, and the transfer record-keeping. The region the analysis's
-    // §4 estimated and that no other counter covers.
+    // `O(catalog)` scans, and the transfer record-keeping, which no other counter
+    // covers.
     uint64_t dispatch_cpu_ns() const noexcept { return counters_.dispatch_cpu_ns; }
     // Staging slots released by the **completion** path rather than as a boundary
     // block: one per expert whose H2D copy's event fired and whose slot was therefore
-    // handed back immediately (plan P2.2 / R3). A numerator against
-    // `prefetch_staging_->slot_count()` it says how much of the arena drains
-    // incrementally instead of at a boundary.
+    // handed back immediately. A numerator against `prefetch_staging_->slot_count()`
+    // it says how much of the arena drains incrementally instead of at a boundary.
     uint64_t staging_released_on_completion() const noexcept {
         return counters_.staging_released_on_completion;
     }
 
-    // Copy enqueues issued by the **non-blocking pump** (P2.3) rather than by the
-    // blocking `materialize`. A numerator against the streamed expert count: it says
-    // how much of a layer's upload was moved off the boundary into the previous body.
+    // Copy enqueues issued by the **non-blocking pump** rather than by the blocking
+    // `materialize`. A numerator against the streamed expert count: it says how much
+    // of a layer's upload was moved off the boundary into the previous body.
     uint64_t copies_pumped() const noexcept { return counters_.copies_pumped; }
 
     // Zeroes every transfer counter above so a caller can slice one phase (prefill,
@@ -300,13 +299,12 @@ public:
                     state.io_request_count = static_cast<uint32_t>(request_count);
                     submitted_direct_io = true;
                 } else if (source_is_warm && request.vram_slot < 0) {
-                    // Staged-only Warm promotion (plan P2.7). The destination was
-                    // deferred by the registry, so nothing is uploaded here: the
-                    // payload waits in host memory (or in the arena, when the Warm slot
-                    // is not pinned) and `enqueue_expert_copy` takes the VRAM slot and
-                    // runs the copy when one is free. This is what keeps a Warm-heavy
-                    // swept prefill from committing a whole layer's VRAM at
-                    // reservation, which the staging-derived depth bound cannot see.
+                    // Staged-only Warm promotion. The destination was deferred by the
+                    // registry, so nothing is uploaded here: the payload waits in host
+                    // memory (or in the arena, when the Warm slot is not pinned) and
+                    // `enqueue_expert_copy` takes the VRAM slot and runs the copy when
+                    // one is free. This is what keeps a Warm-heavy swept prefill from
+                    // committing a whole layer's VRAM at reservation.
                     const bool pinned = host_pool_ != nullptr && source_slot >= 0 &&
                         host_pool_->is_slot_pinned(static_cast<uint32_t>(source_slot));
                     pipeline_.bind_staging(request.operation_id, payload_request.staging_idx);
@@ -695,13 +693,12 @@ public:
             }
 
             expert_registry_->complete_request(transfer.operation_id);
-            // Completion-driven release (plan P2.2 / R3): the copy's own event has
-            // fired, so its staging slot is spent — the data now lives in VRAM. Free
-            // it here rather than holding it to the layer boundary, so the arena
-            // drains incrementally instead of as a block. `release_if_copying` is
-            // safe on both paths: decode releases its own slots in
-            // `on_routed_consumed` (where the slot is already `AVAILABLE` by now) and
-            // simply reports `false`.
+            // Completion-driven release: the copy's own event has fired, so its
+            // staging slot is spent — the data now lives in VRAM. Free it here rather
+            // than holding it to the layer boundary, so the arena drains incrementally
+            // instead of as a block. `release_if_copying` is safe on both paths: decode
+            // releases its own slots in `on_routed_consumed` (where the slot is
+            // already `AVAILABLE` by now) and simply reports `false`.
             if (transfer.has_staging && prefetch_staging_ != nullptr &&
                 prefetch_staging_->release_if_copying(transfer.staging_idx)) {
                 ++counters_.staging_released_on_completion;

@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// The layer body's attention phases (plan Steps 2.0 – 2.4.3, and 2.4.4 – 2.8).
+// The layer body's attention phases.
 //
 // The first half of the body: everything through attention and the FFN RMSNorm.
 // `run_layer_body_pre_attention` stops deliberately short of attention, because a
@@ -25,8 +25,8 @@
 
 namespace aeon::core {
 
-// Runs Steps 2.0 – 2.4.3 for **one token**: everything up to, but not including,
-// attention.
+// Runs the pre-attention half for **one token**: everything up to, but not
+// including, attention.
 //
 // On entry the row's `d_res_in` (float, `hc_mult × hidden`) holds the four HC
 // residual streams. On return the token's rotated key is in the local ring, the
@@ -38,14 +38,12 @@ namespace aeon::core {
 // must interleave them, because **all** of the chunk's keys have to be in the
 // ring before **any** of its queries attends, or an early query cannot see a late
 // key. Splitting the body here is what lets `run_layer_body_chunk` do that while
-// still running the same code as decode; `run_layer_body_decoding` below simply
-// calls this and then the attention half, which is why there is one body and not
-// two.
+// still running the same code as decode; `run_layer_body_decoding` simply calls
+// this and then the attention half, which is why there is one body and not two.
 //
 // The layer class is read from `layer.spec().attention_kind`: a Sliding layer
-// takes the local-only path and never touches the compressor or indexer tensors
-// (traps 4 and 33); CSA and HCA take the compressed path with the indexer on CSA
-// only.
+// takes the local-only path and never touches the compressor or indexer tensors;
+// CSA and HCA take the compressed path with the indexer on CSA only.
 inline V4LayerBodyPre run_layer_body_pre_attention(
     V4Layer& layer,
     V4LayerBodyRow& scratch,
@@ -114,8 +112,8 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
         dim3(TOTAL_Q, 1), dim3(32), 0, stream,
         scratch.d_qa_norm, layer.d_wq_b, scratch.d_q, Q_LORA);
 
-    // The per-head norm is WEIGHTLESS (plan 2.2): the artifact has no tensor for
-    // it, and upstream's fused q-norm/rope takes no weight argument.
+    // The per-head norm is WEIGHTLESS: the artifact has no tensor for it, and
+    // upstream's fused q-norm/rope takes no weight argument.
     hipLaunchKernelGGL(
         kernel::rmsnorm_unit_wave32_kernel,
         dim3(NUM_HEADS), dim3(32), 0, stream,
@@ -215,7 +213,7 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
     // key of the window of every query in the chunk with a position below `p`.
     // Writing the chunk's keys into the ring first therefore evicts keys that
     // earlier queries in the same chunk still need, for any chunk length above
-    // one. `v4_layer_body_batch.hpp` carries the proof; trap 39 records it.
+    // one. `v4_layer_body_batch.hpp` carries the proof.
     const uint32_t local_slot = pos % layer.local_cache_capacity();
     if (scratch.d_local_key_write == nullptr) {
         const size_t local_offset = static_cast<size_t>(local_slot) * HEAD_DIM;
@@ -236,7 +234,7 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
         scratch.d_kv_norm_act, rope.cos, rope.sin, pos,
         1, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2);
 
-    // Key and value are the *same* row (trap 6). Both caches are written.
+    // Key and value are the *same* row. Both caches are written.
     CHECK_HIP(hipMemcpyAsync(scratch.d_local_value_write,
                              scratch.d_kv_norm_act, HEAD_DIM * sizeof(half),
                              hipMemcpyDeviceToDevice, stream));
@@ -284,8 +282,8 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
         const int partial_capacity =
             static_cast<int>(layer.state_layout().compressor_partial_capacity);
 
-        // Compressor partial state. The APE add lives inside the kernel
-        // (plan 2.4.2, trap 26) and applies to `score` only.
+        // Compressor partial state. The APE add lives inside the kernel and
+        // applies to `score` only.
         hipLaunchKernelGGL(
             kernel::v4_save_compressor_state_kernel,
             dim3(1), dim3(256), 0, stream,
@@ -354,7 +352,7 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
         }
 
         // The indexer runs on CSA only. HCA attends every committed compressed
-        // row and has no indexer tensors at all (trap 33).
+        // row and has no indexer tensors at all.
         if (layer.spec().attention_kind == V4AttentionKind::CSA) {
             if (committed != 0) {
                 hipLaunchKernelGGL(
@@ -429,20 +427,19 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
     return pre;
 }
 
-// Steps 2.4.4 – 2.11 for **one token**: attention over the class's row-set,
+// The attention half for **one token**: attention over the class's row-set,
 // followed by the output projection, the FFN and the residual.
 //
 // Splitting here is what lets a chunk write every key before any query runs. For
-// a single token the split is invisible: `run_layer_body_decoding` below calls
-// both halves back to back with nothing in between.
-// Phase 2a — attention through the FFN RMSNorm. Everything a token's selection
-// does **not** depend on, and everything the router **does** depend on.
+// a single token the split is invisible: `run_layer_body_decoding` calls both
+// halves back to back with nothing in between.
 //
-// The tail is split into phases here — not duplicated — so that a chunk can run
-// each phase over every one of its tokens before the next begins. That order is
-// what makes a chunk-wide expert dispatch possible: the router (#2b) of every
-// token must have run before the layer's union can be issued as one set, and the
-// MoE (#2c) of none of them may have run before it.
+// Everything in this half is what a token's selection does **not** depend on and
+// what the router **does** depend on. The tail is split into phases — not
+// duplicated — so a chunk can run each phase over every one of its tokens before
+// the next begins: the router of every token must have run before the layer's
+// union can be issued as one set, and the MoE of none of them may have run before
+// it.
 inline void run_layer_body_attention_and_norm(
     V4Layer& layer,
     V4LayerBodyRow& scratch,
@@ -514,8 +511,7 @@ inline void run_layer_body_attention_and_norm(
         trace_copy(observer, attention_trace->attention_output, scratch.d_attn_out, TOTAL_Q);
     }
 
-    // Inverse RoPE on the attention output tail, before the grouped projection
-    // (plan 2.3 / 2.5, trap 8).
+    // Inverse RoPE on the attention output tail, before the grouped projection.
     hipLaunchKernelGGL(
         kernel::v4_inverse_rope_at_pos_wave32_kernel,
         dim3(NUM_HEADS), dim3(32), 0, stream,
@@ -592,7 +588,7 @@ inline void run_layer_body_attention_and_norm(
     }
 
     // -----------------------------------------------------------------
-    // 2.8 — FFN RMSNorm
+    // FFN RMSNorm
     // -----------------------------------------------------------------
     hipLaunchKernelGGL(
         kernel::rmsnorm_wave32_kernel,

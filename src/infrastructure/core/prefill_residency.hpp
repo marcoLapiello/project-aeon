@@ -22,7 +22,7 @@
 
 namespace aeon::core {
 
-// --- Prefill streaming (Step 6 item 6) ------------------------------------
+// --- Prefill streaming ----------------------------------------------------
 //
 // Prefill and decode are two **different allocation strategies**, not one
 // strategy with a parameter. Decode keeps a persistent, LRU-ranked resident set
@@ -178,7 +178,7 @@ inline void ExpertRegistry::release_layer(uint32_t layer_id) {
             if (entry.lease_count != 0) {
                 throw std::logic_error(
                     "ExpertRegistry: release_layer with a live lease — the caller must "
-                    "release leases at the layer boundary first (Step 0 D3)");
+                    "release leases at the layer boundary first");
             }
             if (entry.operation != ExpertOperation::NONE) {
                 throw std::logic_error(

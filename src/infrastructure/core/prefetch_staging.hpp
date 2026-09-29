@@ -12,15 +12,15 @@
 #include <string>
 #include <vector>
 
-// The arena's slot count is a **construction parameter**, not a compile-time fact
-// (Step 6 / Step 0 D4). Decode's `C = 1` dispatch double-buffers one token —
-// `NUM_BUFFERS` banks of the model's `experts_per_token` selection — but a
-// layer-wide chunk dispatch issues up to `experts_per_token * C` transfers as one
-// set, and each distinct expert's transfer needs its own slot for as long as it is
-// in transit. Sizing that as the decode shape would silently collide the second
-// distinct expert with the first. The decode shape is therefore a **function of the
-// model** (`decode_slot_count`), supplied by the caller; this class bakes in no
-// expert count. `V4ModelHost` sizes it from the configured prefill chunk.
+// The arena's slot count is a **construction parameter**, not a compile-time fact.
+// Decode's `C = 1` dispatch double-buffers one token — `NUM_BUFFERS` banks of the
+// model's `experts_per_token` selection — but a layer-wide chunk dispatch issues up
+// to `experts_per_token * C` transfers as one set, and each distinct expert's
+// transfer needs its own slot for as long as it is in transit. Sizing that as the
+// decode shape would silently collide the second distinct expert with the first. The
+// decode shape is therefore a **function of the model** (`decode_slot_count`),
+// supplied by the caller; this class bakes in no expert count. `V4ModelHost` sizes it
+// from the configured prefill chunk.
 
 #include "infrastructure/hip_check.hpp"
 
@@ -295,9 +295,9 @@ public:
     }
 
     // Release a slot **iff** a copy is still draining through it, and report whether
-    // it did. This is the completion-driven form (plan R3): the reaper releases the
-    // slot when its copy's own event fires, and a caller that would also release it
-    // as a block (the sweep's boundary drain, the executor's `on_routed_consumed`)
+    // it did. This is the completion-driven form: the reaper releases the slot when
+    // its copy's own event fires, and a caller that would also release it as a block
+    // (the sweep's boundary drain, the executor's `on_routed_consumed`)
     // finds it already `AVAILABLE` and skips. `release_after_gpu_transfer` cannot be
     // used for that because it throws on an unexpected state.
     bool release_if_copying(uint32_t slot_idx) {

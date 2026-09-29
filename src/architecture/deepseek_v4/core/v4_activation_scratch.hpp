@@ -92,7 +92,7 @@ struct V4ActivationScratch {
         free();
     }
 
-    // Move-only semantics to prevent accidental double-free
+    // Move-only: prevents accidental double-free.
     V4ActivationScratch(const V4ActivationScratch&) = delete;
     V4ActivationScratch& operator=(const V4ActivationScratch&) = delete;
 
@@ -187,10 +187,7 @@ struct V4ActivationScratch {
         CHECK_HIP(hipMemset(d_x_norm, 0, M * H * sizeof(half)));
     }
 
-    // Exact VRAM these buffers hold. The budget reports this instead of a literal:
-    // the layout is a property of the model's kernel shapes rather than of a knob,
-    // but it is still a real allocation the Hot pool is sized around (the figure the
-    // old `100 MiB` constant was meant to stand for, measured).
+    // Exact VRAM these buffers hold; the budget reports this rather than a literal.
     size_t bytes() const noexcept { return bytes_allocated_; }
 
     void free() {
@@ -262,8 +259,7 @@ struct V4ActivationScratch {
     }
 
 private:
-    // Non-static so the allocation can be accounted; `bytes()` is what the budget
-    // report reads and what the load-time check compares against.
+    // Non-static so allocations are accounted; `bytes()` reports the total.
     template <typename T>
     void allocate_buffer(T*& pointer, size_t count) {
         CHECK_HIP(hipMalloc(&pointer, count * sizeof(T)));

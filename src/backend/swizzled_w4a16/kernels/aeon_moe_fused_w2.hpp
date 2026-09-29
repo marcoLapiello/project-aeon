@@ -98,11 +98,11 @@ void aeon_moe_fused_w2_accum_kernel(    const half* __restrict__ expert_hidden,
     if (expert < expert_count && row < N) {
         // `swizzled_w2_row_dot` already reduces across the `LPR` slices of this row
         // (its closing `__shfl_xor` loop), so the caller must **not** reduce again.
-        // It did, and the two reductions composed: the second one summed each slice's
-        // already-complete row total, multiplying the routed contribution by `LPR`
-        // (a silent 4x on the committed path). The kernel returned a plausible number
-        // at the wrong scale, which is why only an oracle comparison saw it — items
-        // 16/17/18 at `moe_out`, while any run-vs-run check agreed with itself.
+        // A second reduction would sum each slice's already-complete row total,
+        // multiplying the routed contribution by `LPR` (a silent 4x at `LPR = 4`).
+        // The kernel would return a plausible number at the wrong scale, which is
+        // why only an oracle comparison catches it — any run-vs-run check agrees
+        // with itself.
         accumulator = swizzled_w2_row_dot<RPW, LPR, ITERS>(
             weights.w2[expert],
             weights.s2[expert],
@@ -184,10 +184,9 @@ inline void dispatch_aeon_moe_fused_w2_accum(
 // This is the piece that removes the trade the previous two paths forced:
 //
 //   * `aeon_moe_fused_w2_accum_kernel` accumulates with `atomicAdd`, whose order
-//     across experts is the scheduler's and so is not reproducible (trap 38);
+//     across experts is the scheduler's and so is not reproducible;
 //   * the `moe_accumulate_expert_kernel` path is reproducible but keeps its
-//     accumulator in **fp16** and re-rounds on each of the six steps, which is what
-//     plan §2.10.3 forbids ("accumulate in fp32").
+//     accumulator in **fp16** and re-rounds on each of the six steps.
 //
 // Neither had both properties, so every gate that needed reproducibility had to
 // accept the less accurate one. Stage 2 (`moe_accumulate_fixed_order_kernel`)

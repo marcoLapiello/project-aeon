@@ -8,9 +8,8 @@
 //
 // It is deliberately *not* the policy: `TieredExpertSupply` decides what to
 // reserve and when to demote, and drives this pipeline; the pipeline does not
-// decide which expert moves. Each call site is named for the plan step it
-// implements (P2.2 completion-driven release, P2.3 the non-blocking pump, P2.6
-// the staged-only deferral).
+// decide which expert moves. The read leg and the copy leg are decoupled so reads
+// are bounded by staging and copies by VRAM.
 //
 // Collaborators are bound in one place, so the pipeline can be read without the
 // assembly around it.
@@ -96,12 +95,12 @@ public:
 
     void materialize(PayloadBatch& batch) {
         // Enqueue the copy for every expert whose reads have **already** landed but
-        // whose copy was deferred by the non-blocking pump (plan P2.6): a staged-only
-        // expert that found no free VRAM slot at the moment its read completed. This
-        // pass is what makes the blocking materialize a *join* of the two legs rather
-        // than a read-only loop: without it an expert sits `io_complete` and
-        // unsubmitted, and the layer body's MoE dispatch — which joins a transfer only
-        // after its copy was submitted — surfaces it as
+        // whose copy was deferred by the non-blocking pump: a staged-only expert that
+        // found no free VRAM slot at the moment its read completed. This pass makes
+        // the blocking materialize a *join* of the two legs rather than a read-only
+        // loop: without it an expert sits `io_complete` and unsubmitted, and the layer
+        // body's MoE dispatch — which joins a transfer only after its copy was
+        // submitted — surfaces it as
         // "duplicate request joined before its transfer was submitted".
         for (auto& state : batch.transfers) {
             if (state.io_complete && !enqueue_expert_copy(state, state.staging_idx)) {
@@ -207,13 +206,13 @@ public:
     // stream, its gate event, and the registry record are identical either way.
     //
     // Returns `false` **without enqueuing** when the operation is staged-only and no
-    // VRAM slot is free: the expert stays in staging and the caller retries later
-    // (plan P2.6 — this is the whole point of decoupling the read leg from the copy
-    // leg; reads are bounded by staging, copies by VRAM).
+    // VRAM slot is free: the expert stays in staging and the caller retries later —
+    // the decoupling of the read leg from the copy leg, since reads are bounded by
+    // staging and copies by VRAM.
     bool enqueue_expert_copy(PayloadTransfer& state, uint32_t staging_idx) {
         if (state.vram_slot < 0) {
             // No destination yet: take it now, when the copy can actually run. Covers
-            // both a staged-only cold read and a deferred Warm hand-off (P2.7).
+            // both a staged-only cold read and a deferred Warm hand-off.
             if (expert_registry_->free_vram_slot_count() == 0) {
                 return false;
             }
@@ -256,10 +255,10 @@ public:
         return true;
     }
 
-    // The **non-blocking** materialize (plan P2.3 / R3): move every completion the CQ
-    // already holds into the store, then enqueue the copy for each expert whose reads
-    // have *all* landed, and return how many were enqueued. Experts whose reads are
-    // still in flight are left for the next call; nothing is waited on.
+    // The **non-blocking** materialize: move every completion the CQ already holds
+    // into the store, then enqueue the copy for each expert whose reads have *all*
+    // landed, and return how many were enqueued. Experts whose reads are still in
+    // flight are left for the next call; nothing is waited on.
     //
     // This is what lets a layer's copies be issued as its reads land — during the
     // previous layer's body — instead of in one block at the boundary. It is called
@@ -326,7 +325,7 @@ public:
 
             // Phase 2: the copy. A staged-only expert whose VRAM is not free yet is
             // left `io_complete` and retried on a later call — the deferral that
-            // decouples the copy leg from the read leg (plan P2.6).
+            // decouples the copy leg from the read leg.
             if (state.io_complete && enqueue_expert_copy(state, state.staging_idx)) {
                 ++enqueued;
             }

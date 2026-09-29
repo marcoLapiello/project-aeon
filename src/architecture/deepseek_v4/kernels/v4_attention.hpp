@@ -17,8 +17,8 @@
 // header's callers; there is no second definition. The Wave32 RMSNorm and GEMV
 // moved to `platform/ops/` (they are model-agnostic).
 //
-// The system and HIP includes below are kept exactly as they were so a caller
-// that relied on including this header for them still compiles.
+// The system and HIP includes below are kept so a caller that relied on including
+// this umbrella for them still compiles.
 // -----------------------------------------------------------------------------
 
 #include <hip/hip_runtime.h>

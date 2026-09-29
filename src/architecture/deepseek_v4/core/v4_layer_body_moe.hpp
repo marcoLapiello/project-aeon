@@ -1,8 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// The layer body's MoE phases and the routed-expert supply seam
-// (plan Steps 2.9 – 2.11).
+// The layer body's MoE phases and the routed-expert supply seam.
 //
 // The second half's routing half: the router that writes the per-token top-k ids
 // and weights, the shared expert plus routed accumulate, and the HC FFN post. The
@@ -46,12 +45,11 @@ public:
         (void)weights;
     }
 
-    // A **layer-wide** dispatch: the `6C` requests of a chunk issued as one set
-    // (Step 6 D1). The default is the per-token sequence, so an executor with
-    // nothing to batch — a gate's synthetic one, for instance — needs no override,
-    // and `C = 1` reproduces `on_routing_ready` exactly. A real supply overrides it
-    // to deduplicate the layer's union and submit the transfers together, which is
-    // the whole point: one set of reads instead of `C` serialized ones.
+    // A **layer-wide** dispatch: the `6C` requests of a chunk issued as one set.
+    // The default is the per-token sequence, so an executor with nothing to batch —
+    // a gate's synthetic one, for instance — needs no override, and `C = 1`
+    // reproduces `on_routing_ready` exactly. A real supply overrides it to
+    // deduplicate the layer's union and submit the transfers together.
     virtual void on_routing_ready_batch(uint32_t layer_id,
                                         uint32_t first_position,
                                         const std::vector<std::vector<int32_t>>& ids,
@@ -85,9 +83,9 @@ public:
     }
 };
 
-// Phase 2b — the router (step H). Writes the per-token top-k ids and weights and
-// returns them, because a chunk-wide dispatch needs every token's selection on the
-// host before it can issue the layer's union as one set.
+// The router. Writes the per-token top-k ids and weights and returns them, because
+// a chunk-wide dispatch needs every token's selection on the host before it can
+// issue the layer's union as one set.
 inline V4LayerBodyOutput run_layer_body_router(
     V4Layer& layer,
     V4LayerBodyRow& scratch,
@@ -102,7 +100,7 @@ inline V4LayerBodyOutput run_layer_body_router(
     (void)M_PAD;
 
     // -----------------------------------------------------------------
-    // H. MoE router (2.9)
+    // MoE router
     // -----------------------------------------------------------------
     hipLaunchKernelGGL(
         kernel::gemv_fp16_vec8_kernel,
@@ -149,11 +147,12 @@ inline V4LayerBodyOutput run_layer_body_router(
     return output;
 }
 
-// Phase 2c — the shared expert, the routed accumulate, and the HC FFN post.
+// The shared expert, the routed accumulate, and the HC FFN post.
 //
 // The dispatch (`on_routing_ready`) is deliberately **not** here: a chunk issues
-// the layer's union once for all of its tokens, between 2b and 2c, so the caller
-// owns that call. Decode issues it per token, exactly where it always did.
+// the layer's union once for all of its tokens, between the router and this phase,
+// so the caller owns that call. Decode issues it per token, exactly where it always
+// did.
 inline void run_layer_body_moe_and_post(
     V4Layer& layer,
     V4LayerBodyRow& scratch,
@@ -170,7 +169,7 @@ inline void run_layer_body_moe_and_post(
     V4AttentionTraceRecord* attention_trace = pre.trace;
 
     // -----------------------------------------------------------------
-    // 2.10.4 — shared expert (always fires), accumulating into the cleared buffer
+    // Shared expert (always fires), accumulating into the cleared buffer
     // -----------------------------------------------------------------
     // Clear MoE accumulation buffer
     CHECK_HIP(hipMemsetAsync(scratch.d_moe_accum, 0, M_PAD * H * sizeof(half), stream));
@@ -204,7 +203,7 @@ inline void run_layer_body_moe_and_post(
     }
 
     // -----------------------------------------------------------------
-    // 2.10.3 — routed experts, supplied by the executor
+    // Routed experts, supplied by the executor
     // -----------------------------------------------------------------
     experts.accumulate_routed(static_cast<uint32_t>(layer.layer_id), pos,
                               scratch.d_ffn_norm_act, scratch.d_topk_weights,

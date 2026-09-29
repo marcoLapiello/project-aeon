@@ -3,14 +3,12 @@
 // -----------------------------------------------------------------------------
 // The model host — what is resident, in the order the assembly has to happen.
 //
-// This is the component the composition plan calls **G1**, and it is the largest
-// thing the graph rewrite was missing. It is deliberately *not* the forward pass:
-// the graph (`core/v4_graph.hpp`) owns the order of operations, and this owns the
-// objects they read and write. The split is what keeps the graph small enough to
-// read — nothing in this file knows what a token is, and nothing in the graph
-// knows how a tensor got into VRAM.
+// Deliberately *not* the forward pass: the graph (`core/v4_graph.hpp`) owns the order
+// of operations, and this owns the objects they read and write. The split is what
+// keeps the graph small enough to read — nothing in this file knows what a token is,
+// and nothing in the graph knows how a tensor got into VRAM.
 //
-// It builds all fifteen steps of the plan's assembly (composition plan §5.1):
+// It builds the whole assembly:
 //
 //    1. select the compute device and create the four shared streams
 //    2. open the `.aeon` container and resolve its weight backend
@@ -26,30 +24,22 @@
 //   12. preload the Hot slots, then the Warm pool, with batched `O_DIRECT` reads
 //   13. configure the tiered supply on the four streams
 //   14. construct the routed-expert scratch and the production executor
-//   15. (nothing left — the graph above this file drives it)
+//   15. allocate the prefill workspace
 //
-// The expert half is a **lift**, not a second design: `V4Pipeline::initialize`
-// performs the same sequence (composition plan §6.1, G1). The difference is that
-// the historical version built and ran its own graph inline, while this hands the
-// same objects to whichever graph the caller drives.
+// The **streaming system enters the graph only here**. `V4Graph` never learns which
+// tier answered a request: it calls the `V4RoutedExpertExecutor` the body declares,
+// and that executor is this object's. That is the whole reason the storage half can
+// be correct while the graph is numerics-only.
 //
-// The **streaming system enters the graph only here**. `V4Graph` never learns
-// which tier answered a request: it calls the `V4RoutedExpertExecutor` the body
-// declares, and that executor is this object's. That is the whole reason the
-// storage half can be correct while the graph is numerics-only.
+// Every object below already exists and is used as it stands: `AeonModelLoader`,
+// `DeepSeekV4Config`, `V4ModelSpec`, `V4ModelContract`, `MemoryBudgetEngine`,
+// `V4ModelResources`, `V4Layer`, `V4ActivationScratch`, `DeviceStreams`,
+// `V4LayerBodyTables`.
 //
-// What is *not* re-implemented here. Every object below already exists and is
-// used as it stands: `AeonModelLoader`, `DeepSeekV4Config`, `V4ModelSpec`,
-// `V4ModelContract`, `MemoryBudgetEngine`, `V4ModelResources`, `V4Layer`,
-// `V4ActivationScratch`, `DeviceStreams`, `V4LayerBodyTables`. This is that
-// assembly lifted into the rewrite rather than a second design of it.
-//
-// Verification note (plan Part V, second rule). A host is not an op, so there is
-// no arithmetic oracle for it. Its gate is that the assembly's own invariants
-// hold and that something above it produces oracle-checked numbers: the layers
-// and the head stage are read back and compared, and the budget's own accounting
-// is cross-checked against what was actually allocated. "It constructed without
-// throwing" is not the evidence.
+// A host is not an op, so there is no arithmetic oracle for it. Its gate is that the
+// assembly's own invariants hold and that something above it produces oracle-checked
+// numbers: the layers and the head stage are read back and compared, and the budget's
+// own accounting is cross-checked against what was actually allocated.
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/core/config.hpp"
@@ -107,11 +97,10 @@ public:
 
     // The whole assembly, in order, refusing at the first step that cannot hold.
     //
-    // The refusal at step 6 is load-bearing rather than informative: a
-    // configuration that does not fit is rejected before anything is uploaded,
-    // because the alternative — uploading a backbone that does not fit and
-    // discovering it as an allocation failure three layers in — is the failure
-    // mode the budget engine exists to prevent.
+    // The budget refusal is load-bearing rather than informative: a configuration that
+    // does not fit is rejected before anything is uploaded, because the alternative —
+    // uploading a backbone that does not fit and discovering it as an allocation
+    // failure three layers in — is the failure mode the budget engine exists to prevent.
     void initialize(const std::string& model_dir,
                     const AeonRuntimeConfig& runtime_cfg,
                     bool verbose = false) {
@@ -135,11 +124,10 @@ public:
 
         // The budget is sized against the bytes the graph actually **uploads**, not
         // the container's file size: `embed.weight` stays host-side and the unused
-        // `mtp.*` draft head is never read, and together those are 1.957 GiB the
-        // old file-size reservation over-counted. Reserving them cost 148 Hot
-        // expert slots (675 instead of 823 at context 256). The contract is the
-        // authority on the uploaded set — the same table that validates the
-        // artifact — so the budget cannot drift from what is placed on the device.
+        // `mtp.*` draft head is never read, together 1.957 GiB a file-size reservation
+        // would over-count, costing 148 Hot expert slots (675 instead of 823 at context
+        // 256). The contract is the authority on the uploaded set — the same table that
+        // validates the artifact — so the budget cannot drift from what reaches VRAM.
         budget_ = MemoryBudgetEngine::evaluate(
             runtime_cfg, make_v4_memory_geometry(config_),
             V4ModelContract::uploaded_dense_bytes(config_), expert_format);
@@ -157,8 +145,8 @@ public:
         // The RoPE tables and the model-level tensors are built for the declared
         // context, so `context_capacity_` is also every layer's `max_seq_len`.
         // Growing the context later means rebuilding both, which is why the layer
-        // state's own refusal (trap 40) is the thing a caller meets rather than a
-        // silently clamped position.
+        // state's own refusal is the thing a caller meets rather than a silently
+        // clamped position.
         resources_.initialize(loader_, context_capacity_, config_);
         scratch_.allocate();
 
@@ -267,12 +255,12 @@ public:
     V4ActivationScratch& scratch() noexcept { return scratch_; }
     const V4ActivationScratch& scratch() const noexcept { return scratch_; }
 
-    // --- the layer-major prefill working set (Step 6) ------------------------
+    // --- the layer-major prefill working set --------------------------------
     //
     // Two buffers, and the distinction between them is the whole reason they are
-    // separate (§6.4): the **chunk workspace** holds per-op temporaries for the
-    // rows in flight and is recycled as layers advance, while the **carry** holds
-    // the residual being transformed and must survive all 43 layers of a pass.
+    // separate: the **chunk workspace** holds per-op temporaries for the rows in
+    // flight and is recycled as layers advance, while the **carry** holds the
+    // residual being transformed and must survive all 43 layers of a pass.
 
     // The per-layer chunk workspace. `V4LayerBodyBatchScratch` sizes itself from a
     // layer's own capacities (the indexer's candidate scores and top-k), so left to
@@ -289,7 +277,7 @@ public:
         return prefill_workspace_.batch_scratch();
     }
 
-    // ---- Step 6 item 7: the prefill workspace, derived from the knobs ---------
+    // ---- the prefill workspace, derived from the knobs -----------------------
     //
     // The residual carry and the batch scratch are functions of the configured
     // window `W` and chunk `C`, so both are **derived and allocated once, at load**,
@@ -372,11 +360,11 @@ public:
     bool experts_ready() const noexcept { return executor_ != nullptr; }
 
     // The token boundary. The graph calls this once per token, after the head and
-    // before the caller reads the logits back — a lease grants no ordering, so it
-    // must be held for as long as compute reading that slot may be in flight
-    // (trap 41), and the logits readback is the compute-stream boundary that makes
-    // the release safe. Exposed here rather than on the seam because releasing is a
-    // property of the concrete tiered executor, not of the interface the body sees.
+    // before the caller reads the logits back — a lease grants no ordering, so it must
+    // be held for as long as compute reading that slot may be in flight, and the logits
+    // readback is the compute-stream boundary that makes the release safe. Exposed here
+    // rather than on the seam because releasing is a property of the concrete tiered
+    // executor, not of the interface the body sees.
     void release_expert_leases() {
         if (executor_) executor_->release_leases();
     }
@@ -389,9 +377,9 @@ public:
     }
 
     // Times the emergency drain in `ensure_pool_headroom` fired, from the supply
-    // telemetry. Zero whenever the pool can hold a token's `6 x 43` leases, which
-    // is the intended steady state; a non-zero value is how a gate says it ran the
-    // starved regime (Step 4).
+    // telemetry. Zero whenever the pool can hold a token's `6 x 43` leases, which is
+    // the intended steady state; a non-zero value is how a gate says it ran the
+    // starved regime.
     uint64_t forced_drains() const noexcept {
         return tier_.telemetry.forced_drains();
     }
@@ -437,9 +425,9 @@ public:
     }
 
     // Layer-sized staging banks the sweep's arena holds, derived from the arena's
-    // actual depth (`slots / experts_per_layer`). The default is `2` (R2); the
-    // derivation exists so a runtime resize moves the arena and the sweep's bank
-    // indexing together, with no second place for the two to disagree.
+    // actual depth (`slots / experts_per_layer`). The default is `2`; the derivation
+    // exists so a runtime resize moves the arena and the sweep's bank indexing
+    // together, with no second place for the two to disagree.
     uint32_t sweep_staging_banks() const noexcept {
         return tier_.host_partition.sweep_staging_banks();
     }
@@ -461,8 +449,7 @@ public:
     }
 
     // The demotion-queue capacity the supply was configured with, after the derived
-    // default and the `demotion_queue_capacity` override are resolved. Reported so a
-    // gate can name which arm of the Step 5 A/B it ran.
+    // default and the `demotion_queue_capacity` override are resolved.
     uint64_t demotion_queue_capacity() const noexcept { return tier_.demotion_queue_capacity; }
 
     // Diagnostics, for an assembly gate: the registry's residency claims and the
@@ -478,19 +465,18 @@ public:
     // advance is a prompt token (prefill) or a generated one (decode); this only
     // forwards that fact, it does not derive it. A no-op when the sink is off.
     //
-    // It also drives the frozen-Warm policy (Step 6 D-b) when
-    // `freeze_warm_during_prefill` is set: prefill enters the frozen mode, decode
-    // leaves it. Leaving settles any in-flight shadow copy first (`reap` is
-    // event-query only, no CPU synchronization) so the idle residencies are visible
-    // before they are released; a copy that is still genuinely in flight is
-    // reclaimed by eviction when it settles.
+    // It also drives the frozen-Warm policy when `freeze_warm_during_prefill` is set:
+    // prefill enters the frozen mode, decode leaves it. Leaving settles any in-flight
+    // shadow copy first (`reap` is event-query only, no CPU synchronization) so the idle
+    // residencies are visible before they are released; a copy that is still genuinely
+    // in flight is reclaimed by eviction when it settles.
     void set_supply_phase(bool prefill) {
         tier_.telemetry.set_phase(prefill ? RoutingPhase::Prefill : RoutingPhase::Decode);
         if (!freeze_warm_during_prefill_ || !experts_ready()) return;
         // Only the **transition** matters, and only on the way down does work have to
         // be done: leaving frozen must be total, because decode admits single
         // ownership and the invariant refuses a shadow left behind. So the boundary
-        // drains the expert streams (a legate boundary, not the request path) and
+        // drains the expert streams (a deliberate drain, not on the request path) and
         // reaps, which completes every in-flight copy before the idle shadows are
         // released. The swept prefill owns this flag while it is running.
         if (tier_.registry.prefill_streaming() || prefill == supply_phase_prefill_) return;
@@ -505,7 +491,7 @@ public:
     }
 
     // Frozen-prefill state, for a gate: whether the registry is in frozen mode and
-    // how many Warm-owned experts currently hold an extra VRAM copy (Step 6 D-b).
+    // how many Warm-owned experts currently hold an extra VRAM copy.
     bool warm_frozen() const noexcept { return tier_.registry.warm_frozen(); }
     uint32_t shadow_resident_count() const noexcept {
         return tier_.registry.shadow_resident_count();
@@ -513,8 +499,8 @@ public:
     int32_t shadow_slot_of(uint32_t gid) const { return tier_.registry.shadow_slot_of(gid); }
     uint64_t shadow_copies() const noexcept { return tier_.registry.shadow_copies; }
 
-    // Logical Warm bytes the supply served in a phase (Step 6 outcome 3). Requires
-    // the telemetry sink to have been enabled.
+    // Logical Warm bytes the supply served in a phase. Requires the telemetry sink to
+    // have been enabled.
     uint64_t supply_logical_bytes_from_warm(bool prefill) const noexcept {
         return tier_.telemetry.logical_bytes_from_warm(
             prefill ? SupplyTelemetryPhase::Prefill : SupplyTelemetryPhase::Decode);
@@ -570,8 +556,8 @@ public:
 
     // The two RoPE bases, in the shape the layer body consumes. Sliding layers use
     // the plain base (theta 10000) and compressed layers the YaRN-on-compressed one
-    // (theta 160000, factor 16) — plan 2.3, trap 7. Handed over as a plain struct
-    // so the body keeps no dependency on the resources object.
+    // (theta 160000, factor 16). Handed over as a plain struct so the body keeps no
+    // dependency on the resources object.
     V4LayerBodyTables tables() const noexcept {
         V4LayerBodyTables result;
         result.sliding_cos = resources_.d_cos_cache;
@@ -581,7 +567,7 @@ public:
         return result;
     }
 
-    // ---- Step 6 item 6: the prefill sweep / routed bank ----------------------
+    // ---- the prefill sweep / routed bank -------------------------------------
     //
     // `forward_window` drives the window lifecycle below; the strategy, the
     // prompt-length gate and the sweep itself live in `PrefillController`
@@ -663,9 +649,9 @@ public:
 
     // The corridor's **fill** per layer — staging slots reading, staging slots
     // copying, and the lookahead layer's reserved-but-not-yet-arrived VRAM experts.
-    // The pipeline model (supply-chain plan §0) says a healthy two-block corridor
-    // shows `reading` and `copying` both non-zero while a body runs; one pinned at `E`
-    // with the other at zero is the parking lot. Empty unless a sweep ran.
+    // A healthy two-block corridor shows `reading` and `copying` both non-zero while a
+    // body runs; one pinned at `E` with the other at zero is the parking lot. Empty
+    // unless a sweep ran.
     const std::vector<PrefillSweep::BlockOccupancy>& sweep_occupancy() const noexcept {
         return prefill_controller_.occupancy();
     }
@@ -700,11 +686,11 @@ public:
     // CPU time in `dispatch`'s per-request loop (the registry reservation and the two
     // `O(catalog)` scans). Reported for both phases, since the loop is shared.
     uint64_t supply_dispatch_cpu_ns() const noexcept { return supply_.dispatch_cpu_ns(); }
-    // Staging slots freed by the completion path instead of a boundary block (P2.2).
+    // Staging slots freed by the completion path instead of a boundary block.
     uint64_t supply_staging_released_on_completion() const noexcept {
         return supply_.staging_released_on_completion();
     }
-    // Copies the mid-body pump issued (P2.3).
+    // Copies the mid-body pump issued.
     uint64_t supply_copies_pumped() const noexcept { return supply_.copies_pumped(); }
     void reset_supply_transfer_counters() noexcept { supply_.reset_transfer_counters(); }
     // Layers whose reads were in flight when a body started (1 = the double buffer
@@ -712,9 +698,9 @@ public:
     uint32_t sweep_lookahead_depth() const noexcept {
         return prefill_controller_.lookahead_depth();
     }
-    // The lookahead length the **free blocks** allow at this instant (plan R5) — the
-    // smaller of the free VRAM blocks and the free staging blocks. Derived, not
-    // configured: it grows on a larger pool and shrinks to 0 when either runs out.
+    // The lookahead length the **free blocks** allow at this instant — the smaller of
+    // the free VRAM blocks and the free staging blocks. Derived, not configured: it
+    // grows on a larger pool and shrinks to 0 when either runs out.
     uint32_t sweep_derived_ahead_capacity() const noexcept {
         return prefill_controller_.derived_ahead_capacity();
     }
@@ -751,33 +737,23 @@ private:
         return count;
     }
 
-    // Steps 10–15 of §5.1 — the expert tier, in the order the loop needs it.
+    // The expert tier, in the order the loop needs it.
     //
-    // Skipped, not faked, when the budget left no Hot VRAM slot. The dense graph
-    // is still constructible (the head stage reads no expert), but the graph is
-    // not runnable, and `executor()` refuses rather than hand back an executor
-    // whose pool is empty and whose first dispatch would throw.
+    // Skipped, not faked, when the budget left no Hot VRAM slot. The dense graph is
+    // still constructible (the head stage reads no expert), but the graph is not
+    // runnable, and `executor()` refuses rather than hand back an executor whose pool
+    // is empty and whose first dispatch would throw.
     void initialize_experts(const AeonRuntimeConfig& runtime_cfg) {
         if (budget_.hot_vram_slots == 0) return;
 
         const auto& format = loader_.expert_format();
         const uint32_t warm_slots = budget_.warm_host_slots;
 
-        // 10 — the Hot VRAM pool, the staging arena, and the direct reader. The
-        // arena and the reader are built for the *artifact's* format, not the
-        // backend's default, so a payload's staging slot is the artifact's own
-        // `payload_bytes` wide.
-        //
-        // The arena's slot count is the decode shape unless a prefill chunk is
-        // configured (Step 6 D4): a chunk issues up to `6C` deduplicated transfers
-        // as one set, and each distinct expert needs its own slot in transit. Sized
-        // to the **ceiling** `6C` here, so no transfer ever waits for a slot; the
-        // Step 7 sweep picks the smaller concurrency depth.
-        // 10–12 — the neutral expert tier, built by `ExpertTierState::initialize`: the
-        // Hot pool, the pinned region and staging corridor, the Warm/staging partition,
-        // the residency registry, the direct reader, and the batched Hot/Warm preload.
-        // The concrete payload pool is the one backend-shaped piece, so it is built
-        // here (the composition root) and sized by the tier; everything else is engine.
+        // The neutral expert tier, built by `ExpertTierState::initialize`: the Hot
+        // pool, the pinned region and staging corridor, the Warm/staging partition, the
+        // residency registry, the direct reader, and the batched Hot/Warm preload. The
+        // concrete payload pool is the one backend-shaped piece, so it is built here
+        // (the composition root) and sized by the tier; everything else is engine.
         tier_.payload_pool = std::make_unique<UnifiedVRAMExpertPool>();
         tier_.initialize(ExpertTierState::Params{
             &format, &runtime_cfg, &budget_, &loader_,
@@ -786,7 +762,7 @@ private:
             static_cast<uint32_t>(config_.num_experts_per_tok),
             streams_.compute, &prefill_controller_.sweep(), &supply_});
 
-        // 13 — the tiered supply, on the four shared streams.
+        // The tiered supply, on the four shared streams.
         supply_.configure(
             &loader_,
             tier_.payload_pool.get(),
@@ -806,15 +782,15 @@ private:
         tier_.demotion_queue_capacity = supply_.demotion_queue_capacity();
         freeze_warm_during_prefill_ = runtime_cfg.freeze_warm_during_prefill;
 
-        // 14 — the routed-expert scratch and the production executor. The executor
-        // borrows the four streams the host owns, so its capacity fallback drains
-        // exactly the set that carries expert traffic.
+        // The routed-expert scratch and the production executor. The executor borrows
+        // the four streams the host owns, so its capacity fallback drains exactly the
+        // set that carries expert traffic.
         expert_scratch_.allocate();
 
-        // The decode workspace's real allocations against the budget's allowance
-        // (Step 6 item 7): `scratch_` is allocated far above in this function, so the
-        // two together are what the report's decode term stands for. Checked, not
-        // trusted, in the same way the batch scratch is.
+        // The decode workspace's real allocations against the budget's allowance:
+        // `scratch_` is allocated far above in this function, so the two together are
+        // what the report's decode term stands for. Checked, not trusted, in the same
+        // way the batch scratch is.
         const size_t decode_scratch_bytes = scratch_.bytes() + expert_scratch_.bytes();
         if (decode_scratch_bytes > decode_scratch_allowance_bytes()) {
             throw std::runtime_error(
@@ -836,18 +812,18 @@ private:
             tier_.telemetry, runtime_cfg.profile_routing_reuse ? &tier_.reuse_profiler : nullptr,
             config_.swiglu_limit);
 
-        // 15 — the prefill controller (Step 6 item 6): the sweep and the strategy
-        // switch. It borrows the same two components the executor does, and its
-        // sweep's bank count was bound by the partition where the arena was built;
-        // this resolves the switch and the prompt-length gate. The two host-side
-        // restore steps are injected, since both use the host's blocking-read path.
+        // The prefill controller: the sweep and the strategy switch. It borrows the
+        // same two components the executor does, and its sweep's bank count was bound by
+        // the partition where the arena was built; this resolves the switch and the
+        // prompt-length gate. The two host-side restore steps are injected, since both
+        // use the host's blocking-read path.
         //
-        // The prompt-length gate (Step 3) is resolved once from the layer width, and
-        // **placed at the measured crossover** rather than derived from theory: the
-        // A/B (`scripts/prefill_ab.sh`, ledger M44) puts the routed bank ahead of the
-        // sweep up to about `0.7 E` tokens and the sweep ahead from `0.75 E`, so the
-        // default is `3 E / 4`. It is a visible, overridable setting, and the round
-        // fraction keeps it expressed in the model's own terms.
+        // The prompt-length gate is resolved once from the layer width, and **placed at
+        // the measured crossover** rather than derived from theory: the A/B
+        // (`scripts/prefill_ab.sh`) puts the routed bank ahead of the sweep up to about
+        // `0.7 E` tokens and the sweep ahead from `0.75 E`, so the default is `3 E / 4`.
+        // It is a visible, overridable setting, and the round fraction keeps it
+        // expressed in the model's own terms.
         const uint32_t sweep_min_tokens = runtime_cfg.prefill_sweep_min_tokens > 0
             ? runtime_cfg.prefill_sweep_min_tokens
             : std::max<uint32_t>(
@@ -857,15 +833,14 @@ private:
             [this] { restore_prefill_warm(loader_.expert_format()); },
             [this] { tier_.bulk_loader.restore_residents(loader_.expert_format()); }});
         prefill_controller_.configure(runtime_cfg.prefill_sweep, sweep_min_tokens);
-        // P2.3: let the per-token hook pump the swept lookahead's copies. The executor
-        // does not know about the sweep, so it gets a callback; the sweep ignores the
-        // call when it is not driving a window.
+        // Let the per-token hook pump the swept lookahead's copies. The executor does
+        // not know about the sweep, so it gets a callback; the sweep ignores the call
+        // when it is not driving a window.
         executor_->set_supply_pump([this] { prefill_controller_.pump(); });
 
-        // 16 — the prefill workspace (Step 6 item 7), derived from the configured
-        // window and chunk and allocated **once, here**, so no window can fail
-        // mid-prompt on an allocation and the budget's carry term is realised rather
-        // than merely reserved.
+        // The prefill workspace, derived from the configured window and chunk and
+        // allocated **once, here**, so no window can fail mid-prompt on an allocation
+        // and the budget's carry term is realised rather than merely reserved.
         allocate_prefill_workspace(
             runtime_cfg.prefill_window == 0
                 ? runtime_cfg.context_size
@@ -892,9 +867,9 @@ private:
     V4ActivationScratch scratch_;
     std::vector<V4Layer> layers_;
 
-    // The layer-major prefill working set (Step 6): the residual carry and the
-    // worst-case batch scratch, allocated once at load. Owned by the workspace
-    // (see `v4_prefill_workspace.hpp`).
+    // The layer-major prefill working set: the residual carry and the worst-case
+    // batch scratch, allocated once at load. Owned by the workspace (see
+    // `v4_prefill_workspace.hpp`).
     V4PrefillWorkspace prefill_workspace_;
 
     // The engine-owned expert tier: the neutral state the tiered supply operates on,

@@ -122,12 +122,11 @@ public:
     }
 
     // Reloads the Hot residents a prefill drained, so the pool returns to the set it
-    // held before the pass (the plan's restore requirement). The gids come from the
-    // registry's `restore_set()`; each is admitted through the normal cold path —
-    // reserve a slot, read the payload, publish it — which is the same machinery
-    // decode uses, so nothing here is a second code path. It runs at a boundary (the
-    // prefill has already ended), so its blocking reads are off the hot path, and it
-    // is batched exactly like `preload_hot`.
+    // held before the pass. The gids come from the registry's `restore_set()`; each is
+    // admitted through the normal cold path — reserve a slot, read the payload, publish
+    // it — which is the same machinery decode uses, so nothing here is a second code
+    // path. It runs at a boundary (the prefill has already ended), so its blocking
+    // reads are off the hot path, and it is batched exactly like `preload_hot`.
     void restore_residents(const ExpertFormatDescriptor& format) {
         const std::vector<uint32_t> restore = services_.registry->restore_set();
         if (restore.empty()) return;
