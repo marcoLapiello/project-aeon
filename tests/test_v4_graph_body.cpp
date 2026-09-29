@@ -1,59 +1,58 @@
 // -----------------------------------------------------------------------------
-// P2 gate — the 43-layer driver: the graph produces a token, on real weights.
+// Gate — the 43-layer driver: the graph produces a token, on real weights.
 //
-// P1 certified the tail of the forward pass (embedding -> `hc_head` -> final
-// norm -> LM head) on the artifact's real tensors, and said in as many words what
-// it did **not** certify: "the residual the head consumes is an embedding, not a
-// 43-layer trajectory". This gate is that trajectory.
+// The head-stage gate certified the tail of the forward pass (embedding ->
+// `hc_head` -> final norm -> LM head) on the artifact's real tensors, and said in
+// as many words what it did **not** certify: "the residual the head consumes is an
+// embedding, not a 43-layer trajectory". This gate is that trajectory.
 //
 // It certifies two things, and they are different defects:
 //
-//   1. THE COMPOSITION IS ARITHMETICALLY RIGHT. The graph's `run_layer` chain,
-//      over the real 43 layers with real routed experts delivered through the
-//      tiered supply, agrees with an independently written fp64 reference
+//   1. THE COMPOSITION IS ARITHMETICALLY RIGHT. The graph's `run_layer` chain, over
+//      the real 43 layers with real routed experts delivered through the tiered
+//      supply, agrees with an independently written fp64 reference
 //      (`reference::model_body`) at every layer and at the head.
 //   2. THE DRIVER IS THE LOOP IT CLAIMS TO BE. `forward_token` produces the same
-//      logits, fp16-bit for fp16-bit, as the gate's own 43 calls to `run_layer`
-//      plus the head. A driver that skipped a layer, repeated one, ordered them
-//      wrongly or dropped the embedding cannot pass both.
+//      logits, fp16-bit for fp16-bit, as the gate's own 43 calls to `run_layer` plus
+//      the head. A driver that skipped a layer, repeated one, ordered them wrongly or
+//      dropped the embedding cannot pass both.
 //
 // THE INSTRUMENT, and why it is this one. A 43-layer fp64 reference that free-runs
 // against the device accumulates the device's fp16 rounding at every step, and by
 // the head that drift can flip a router near-tie — after which the two trajectories
 // differ for a reason that is not a defect. The serial-decode gate settled the
-// method for exactly this: hand the reference the **device's own** per-step
-// residual, and drive its MoE combine with the **device's own** selection
+// method for exactly this: hand the reference the **device's own** per-step residual,
+// and drive its MoE combine with the **device's own** selection
 // (`LayerBodyWeights::routed_ids_override` / `routed_weights_override`), so the
-// comparison measures one layer's composition rather than accumulated drift. That
-// is why `V4Graph::run_layer` is public: the gate has to observe each step's input
-// and its output.
+// comparison measures one layer's composition rather than accumulated drift. That is
+// why `V4Graph::run_layer` is public: the gate has to observe each step's input and
+// its output.
 //
 // The selection is therefore *not* left unchecked. Its rule — softplus, add bias,
 // flat top-6, ties to the lower index, the hash table on layers 0–2 — is asserted
 // separately against the **device's own router logits** (read out of
-// `V4ActivationScratch::d_router_logits` after the layer), which is trap 37's
-// rule: a discrete quantity produced by a rule is checked against the rule applied
-// to the device's own inputs, never elementwise against the reference's.
+// `V4ActivationScratch::d_router_logits` after the layer): a discrete quantity
+// produced by a rule is checked against the rule applied to the device's own inputs,
+// never elementwise against the reference's.
 //
-// WHAT IS REAL HERE. All 43 layers' dense weights, the real embedding table, the
-// real head, the real RoPE tables, the real 512-wide `index_topk`, and **real
-// routed experts read from the 145 GB container through the production
-// `V4TieredExpertExecutor`** — Hot/Warm/Cold, leases, staging, `O_DIRECT`. The
-// expert arithmetic is Tier-1/items 14–19; what is new here is that it is reached
+// WHAT IS REAL HERE. All 43 layers' dense weights, the real embedding table, the real
+// head, the real RoPE tables, the real 512-wide `index_topk`, and **real routed
+// experts read from the 145 GB container through the production
+// `V4TieredExpertExecutor`** — Hot/Warm/Cold, leases, staging, `O_DIRECT`. The expert
+// arithmetic is certified by the per-op gates; what is new here is that it is reached
 // through the assembled host rather than a fixture.
 //
 // WHAT IS DELIBERATELY NOT COVERED, named so a green line is not read as more:
 //
-//   * **The local ring wrap.** It needs more than `sliding_window = 128` tokens
-//     (the ring is `min(context, 128)`, and a position is bounded by the context),
-//     which at 43 layers would be tens of thousands of expert fetches. The ring at
-//     its real capacity is the real-scale state gate's subject; the wrap at small
-//     capacity is the serial-decode gate's.
+//   * **The local ring wrap.** It needs more than `sliding_window = 128` tokens (the
+//     ring is `min(context, 128)`, and a position is bounded by the context), which
+//     at 43 layers would be tens of thousands of expert fetches. The ring at its real
+//     capacity is the real-scale state gate's subject; the wrap at small capacity is
+//     the serial-decode gate's.
 //   * **HCA compression.** A ratio-128 layer commits its first compressed entry at
 //     position 127; four tokens never reach it. Compressed attention is certified
-//     by items 17/18/20. CSA *is* exercised: it commits at position 3.
+//     elsewhere. CSA *is* exercised: it commits at position 3.
 //   * **The sampler, the text binding, the observer, and tiering under load.**
-//     P3/P4/P5.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -106,15 +105,15 @@ using aeon::testgate::report;
 constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
 
 // The context bounds the position, so it also bounds every ring. 256 is the same
-// value the P1 gate uses: large enough that the compressor's partial ring and the
-// committed-entry counters are exercised for real, small enough that the 43
+// value the head-stage gate uses: large enough that the compressor's partial ring
+// and the committed-entry counters are exercised for real, small enough that the 43
 // layers' attention state stays a fraction of VRAM.
 constexpr uint32_t kMaxSeq = 256;
 
 // Real token ids from `profiling-prompts/first-prompt.jsonl` — the same source the
-// P1 gate's probes come from. Four tokens is the plan's floor and it is enough to
-// matter: RoPE runs at four distinct positions (trap 36 forbids a position-0-only
-// gate) and a CSA layer commits its first compressed entry at position 3.
+// head-stage gate's probes come from. Four tokens is enough to matter: RoPE runs at
+// four distinct positions (a position-0-only gate would be blind) and a CSA layer
+// commits its first compressed entry at position 3.
 constexpr uint32_t kTokenIds[] = {65106, 295, 4654, 3999};
 constexpr uint32_t kTokens = sizeof(kTokenIds) / sizeof(kTokenIds[0]);
 
@@ -224,8 +223,8 @@ LayerBodyShape make_shape(const V4LayerSpec& spec, const V4Layer& device) {
 }
 
 // The RoPE base the layer's *class* selects: the plain base for Sliding, the
-// YaRN-on-compressed base otherwise (plan 2.3, trap 7). The layer body makes this
-// choice internally from `attention_kind`; the oracle is handed the answer.
+// YaRN-on-compressed base otherwise. The layer body makes this choice internally
+// from `attention_kind`; the oracle is handed the answer.
 RopeTableRef rope_for(const V4LayerSpec& spec, uint32_t max_position) {
     return aeon::reference::rope_table(
         aeon::reference::rope_spec_for(
@@ -264,11 +263,10 @@ ModelBodyWeights load_model_body_weights(const AeonModelLoader& loader) {
 //
 // The reference's combine is *driven* by the device's ids and weights, so the
 // selection itself has to be checked somewhere or the gate would accept any
-// selection at all. It is checked here, against the device's own router logits
-// (trap 37): score them the way the reference scores them — softplus, plus the
-// bias on a biased layer, nothing on a hash layer — rank with the model's own tie
-// rule (descending, ties to the lower index), and require the top-6 to be the ids
-// the device reported.
+// selection at all. It is checked here, against the device's own router logits:
+// score them the way the reference scores them — softplus, plus the bias on a biased
+// layer, nothing on a hash layer — rank with the model's own tie rule (descending,
+// ties to the lower index), and require the top-6 to be the ids the device reported.
 //
 // It also measures how close the 6th and 7th candidates came, because "a router
 // near-tie is reachable" is a claim, not an assumption, and the smallest gap over
@@ -292,8 +290,8 @@ void audit_router_rule(uint32_t layer_id, uint32_t token_id,
 
     const int64_t* hash_row = hash_row_for_token(*g_loader, layer_id, token_id);
     // On a hash layer the selection comes from `tid2eid` and the ranking is used
-    // only for its scores, so there is no rule to compare there; the table's own
-    // row is certified by Tier-1 gate 13.
+    // only for its scores, so there is no rule to compare there; the table's own row
+    // is certified separately.
     if (hash_row != nullptr) return;
 
     const float* device_bias = g_loader->get_data_ptr<float>(
@@ -326,14 +324,14 @@ void audit_router_rule(uint32_t layer_id, uint32_t token_id,
 
 int main() {
     std::printf("================================================================================\n");
-    std::printf("  P2 — the 43-layer driver: embedding -> 43 x run_layer -> head\n");
+    std::printf("  the 43-layer driver: embedding -> 43 x run_layer -> head\n");
     std::printf("================================================================================\n");
     aeon::core::select_compute_device(true);
 
     const auto gate_start = Clock::now();
 
     // -------------------------------------------------------------------------
-    // A. The assembly (composition plan G1's gate line)
+    // A. The assembly
     // -------------------------------------------------------------------------
     std::printf("\n[A] The host assembly\n");
 
@@ -508,7 +506,7 @@ int main() {
                         shapes[0].local_capacity == host.layer(0).local_cache_capacity() &&
                             shapes[2].local_capacity == host.layer(2).local_cache_capacity(),
                         std::to_string(shapes[0].local_capacity) + " rows");
-    harness.assert_that("A: CSA has the indexer and HCA does not (trap 33)",
+    harness.assert_that("A: CSA has the indexer and HCA does not",
                         shapes[2].uses_indexer() && !shapes[3].uses_indexer() &&
                             weights[2].indexer_wq_b != nullptr &&
                             weights[3].indexer_wq_b == nullptr,
@@ -557,9 +555,9 @@ int main() {
 
             const std::vector<double> device_res = read_float(stream, graph.residual(), hc_dim);
 
-            // The device's own discrete selection drives the reference's combine
-            // (item 18's method): the term set must be identical for the
-            // comparison to be arithmetic rather than a coincidence hunt.
+            // The device's own discrete selection drives the reference's combine:
+            // the term set must be identical for the comparison to be arithmetic
+            // rather than a coincidence hunt.
             weights[layer].routed_ids_override = out.topk_indices.data();
             weights[layer].routed_weights_override = out.topk_weights.data();
             for (size_t k = 0; k < out.topk_indices.size(); ++k) {
@@ -710,7 +708,7 @@ int main() {
 
     const bool ok = harness.failures == 0;
     std::printf("--------------------------------------------------------------------------------\n");
-    std::printf("[P2 — graph body] %s — %u checks, %u failed\n", ok ? "PASS" : "FAIL",
+    std::printf("[graph body] %s — %u checks, %u failed\n", ok ? "PASS" : "FAIL",
                 harness.checks, harness.failures);
     return ok ? 0 : 1;
 }

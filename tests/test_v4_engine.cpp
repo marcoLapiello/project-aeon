@@ -1,12 +1,11 @@
 // -----------------------------------------------------------------------------
-// P4 gate — the text binding: one conversation in, text out.
+// Gate — the text binding: one conversation in, text out.
 //
-// This is the composition plan's phase P4 and, in its own words, the plan's
-// **acceptance criterion**: "one command takes a conversation and returns text"
-// (§1). Everything it binds already ran — the tokenizer, the canonical prompt
-// encoder and `text::generate_token_ids` were certified by Tiers 0–3; the host,
-// the graph and the sampler by P1–P3. What never existed was the binding, and that
-// is the only thing this gate is about.
+// The acceptance criterion is "one command takes a conversation and returns text".
+// Everything it binds already ran — the tokenizer, the canonical prompt encoder and
+// `text::generate_token_ids` were certified earlier; the host, the graph and the
+// sampler too. What never existed was the binding, and that is the only thing this
+// gate is about.
 //
 // WHAT THE GATE IS ENTITLED TO ASSERT, and what it is not. Coherence — "the reply
 // is a reply to *that* prompt" — is the criterion's first clause and it is **not
@@ -17,24 +16,23 @@
 //      a loop written **here**, in the test, that drives `graph.forward_token` and
 //      `sampler.select` directly and computes the positions itself. A binding that
 //      skipped the state reset, mis-positioned a token, fed the wrong prompt or
-//      reseeded wrongly cannot pass it. This is P2's "the driver is the loop it
-//      claims to be", moved one layer up.
+//      reseeded wrongly cannot pass it.
 //   B. THE REPLY IS TEXT. Non-empty, valid UTF-8, decoded by the artifact's own
 //      tokenizer — the pipeline's *last* step, which nothing else checks.
 //   C. IT IS DETERMINISTIC. Two calls with the same arguments produce the same
 //      ids and the same text, because the engine resets state and reseeds before
 //      each one. (The graph itself is bit-reproducible — the rewrite has one
-//      accumulation, the fixed-order fp32 reduce — which P2 measured as 0
-//      differing of 517 120 fp16 logits.)
+//      accumulation, the fixed-order fp32 reduce — which measured as 0 differing
+//      of 517 120 fp16 logits.)
 //   D. THE HISTORY IS IN THE CONTEXT. The same user turn, asked after a prior
 //      exchange, produces a **different** first token than it does alone: the
 //      conversation is genuinely rendered and fed, not merely accepted. This is
 //      the closest machine-checkable stand-in for the criterion's second clause.
 //   E. EVERY STOP REASON IS REACHABLE, and the bound is refused rather than
 //      clamped: `max_new_tokens` is honoured; a prompt that fills the context is
-//      refused; and a position at capacity throws (trap 40, through the graph).
+//      refused; and a position at capacity throws, through the graph.
 //   F. THE ARTIFACT'S POLICY IS READ, not assumed: `generation_config.json`
-//      converts to a sampler config the way the plan says it does.
+//      converts to a sampler config.
 //   G. THE THINKING STRIP IS A PURE FUNCTION of the decoded string, tested on
 //      hand-built text so it needs no model and cannot be carried by the
 //      acceptance run.
@@ -262,7 +260,7 @@ std::vector<double> prompt_logits(V4Engine& engine, const std::vector<uint32_t>&
 
 int main() {
     std::printf("================================================================================\n");
-    std::printf("  P4 — the text binding: conversation in, text out\n");
+    std::printf("  the text binding: conversation in, text out\n");
     std::printf("================================================================================\n");
     aeon::core::select_compute_device(true);
 
@@ -305,7 +303,7 @@ int main() {
                       policy.do_sample ? "true" : "false",
                       static_cast<double>(policy.temperature),
                       static_cast<double>(policy.top_p));
-        harness.assert_that("F: it says what the plan records (sampling, T=1, top_p=1)",
+        harness.assert_that("F: the artifact's policy is read (sampling, T=1, top_p=1)",
                             policy.do_sample && policy.temperature == 1.0f &&
                                 policy.top_p == 1.0f,
                             detail);
@@ -628,8 +626,8 @@ int main() {
                                            std::string::npos,
                             refused ? message.substr(0, 46) : "no refusal");
 
-        // And the position bound is a refusal rather than a wrap (trap 40), seen
-        // through the graph this time rather than through the layer.
+        // And the position bound is a refusal rather than a wrap, seen through the
+        // graph this time rather than through the layer.
         bool position_refused = false;
         try {
             (void)engine.graph().forward_token(
@@ -687,7 +685,7 @@ int main() {
     }
 
     // =========================================================================
-    // H. The swept prefill through the engine (Step 6 items 6–7)
+    // H. The swept prefill through the engine
     // =========================================================================
     //
     // The engine's prompt is one layer-major window, and the sweep is a **config**
@@ -705,10 +703,9 @@ int main() {
     // one constructed.
     //
     // What is *not* re-asserted here: byte-equality of the swept path. That is
-    // `test_v4_prefill_sweep`'s subject (ledger M40) at the graph level, and the speed
-    // of both prefill strategies is `bench_prefill_ab` (ledger M42). This section
-    // asserts only the thing the engine adds: that it *takes* the configured strategy
-    // and switches cleanly.
+    // `test_v4_prefill_sweep`'s subject at the graph level, and the speed of both
+    // prefill strategies is `bench_prefill_ab`. This section asserts only the thing the
+    // engine adds: that it *takes* the configured strategy and switches cleanly.
     std::printf("\n[H] The swept prefill through the engine\n");
     {
         // Direction 1 — this gate's engine has the sweep off, so nothing was drained
@@ -792,7 +789,7 @@ int main() {
 
     stage("the whole gate", gate_start);
     std::printf("\n--------------------------------------------------------------------------------\n");
-    std::printf("  P4: %u checks, %u failures\n", harness.checks, harness.failures);
+    std::printf("  text binding: %u checks, %u failures\n", harness.checks, harness.failures);
     std::printf("--------------------------------------------------------------------------------\n");
     return harness.failures == 0 ? 0 : 1;
 }

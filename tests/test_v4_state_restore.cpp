@@ -1,10 +1,9 @@
 // -----------------------------------------------------------------------------
-// Tier-4, item 22 — the state contract: snapshot / restore, and R3.
+// Gate — the state contract: snapshot / restore, byte-exactness.
 //
-// The plan's gate for the prefix cache manager is one sentence: "restore is
-// **byte-exact** with respect to never having evicted, and a candidate boundary
-// outside the local window is detected rather than served stale." This gate covers
-// the first half (R3) and the layout it rests on (R1/R2).
+// The property: "restore is **byte-exact** with respect to never having evicted,
+// and a candidate boundary outside the local window is detected rather than served
+// stale." This gate covers the first half and the layout it rests on.
 //
 // ## Why a restore gate is not the same as a copy round-trip
 //
@@ -15,7 +14,7 @@
 // wrong, which is exactly the failure a prefix cache produces in the field: a
 // reused prefix whose next token is subtly not what the unreused run would give.
 //
-// So the instrument here is the plan's own — a run that never stopped:
+// So the instrument here is a run that never stopped:
 //
 //   reference   tokens 0 … N+K−1, one layer, never interrupted
 //   restored    tokens 0 … N−1, **snapshot**, reset, **restore**, tokens N … N+K−1
@@ -28,19 +27,19 @@
 //
 // ## Anti-circularity, and how it is avoided here
 //
-// The comparison is not against an fp64 oracle — Tier 1 and items 16–18 own the
+// The comparison is not against an fp64 oracle — the per-op gates own the
 // arithmetic — it is against **the same certified body driven without the
-// interruption**. `run_layer_body_decoding` is the Tier-2 certified path, and both
-// sides go through it; the only difference between them is the snapshot/restore in
-// the middle. That is what makes this a test of the state contract rather than of
-// the graph. It is the same shape as item 19's C2, from the other direction.
+// interruption**. `run_layer_body_decoding` is the certified path, and both sides go
+// through it; the only difference between them is the snapshot/restore in the
+// middle. That is what makes this a test of the state contract rather than of the
+// graph.
 //
 // ## What is asserted
 //
 //   A. ROUND TRIP — snapshot, reset, restore, snapshot again is byte-identical, and
 //      the state was non-empty to begin with (so A is not "nothing round-trips to
 //      nothing").
-//   B. R3 — a restored layer continues exactly like one that never stopped, at a
+//   B. A restored layer continues exactly like one that never stopped, at a
 //      mid-ratio-window boundary and at a boundary, for Sliding / CSA / HCA.
 //   C. LOAD-BEARING — the comparison in B can fail. A cleared snapshot, a zeroed
 //      local ring, and a zeroed compressor-partial *position* each break the
@@ -48,13 +47,13 @@
 //      would have agreed anyway.
 //
 // Deliberately NOT covered, and named so it is not mistaken for coverage:
-//   * R4 — detecting a candidate boundary *outside* the local window and rebuilding
-//     the ring rather than serving a stale one. That is the prefix *matcher*'s half
-//     of item 22 and needs the cache key / block table, which do not exist yet.
-//   * tier placement (R5): the pieces are moved VRAM→VRAM here, not to warm/cold.
-//   * the cache key's non-token inputs (thinking mode, active tool set) — trap 23.
-//   * the routed-expert arithmetic and the real 128-token window (shrunk here, as in
-//     items 16–19); the compressed paths run for real, since HCA commits an entry.
+//   * detecting a candidate boundary *outside* the local window and rebuilding the
+//     ring rather than serving a stale one. That is the prefix *matcher*'s half and
+//     needs the cache key / block table, which do not exist yet.
+//   * tier placement: the pieces are moved VRAM→VRAM here, not to warm/cold.
+//   * the cache key's non-token inputs (thinking mode, active tool set).
+//   * the routed-expert arithmetic and the real 128-token window (shrunk here); the
+//     compressed paths run for real, since HCA commits an entry.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -207,8 +206,8 @@ size_t compare_snapshot(const std::string& label, const V4LayerStateSnapshot& wa
 
 // Runs `count` tokens from logical position `start`, recording every one. The input
 // residual for each token is the (read-only) seed row — a single layer's input is the
-// embedding broadcast over the four HC streams, as in item 19's gate, so the tokens
-// are comparable across runs regardless of what the layer wrote back.
+// embedding broadcast over the four HC streams, so the tokens are comparable across
+// runs regardless of what the layer wrote back.
 std::vector<TokenRecord> run_tokens(
     StackLayer& layer,
     aeon::core::V4ActivationScratch& scratch,
@@ -262,7 +261,7 @@ bool same_continuation(const std::string& label, const std::vector<TokenRecord>&
 } // namespace
 
 int main() {
-    std::cout << "[Gate] Tier-4 item 22: state restore is byte-exact (R3)\n";
+    std::cout << "[Gate] state restore is byte-exact\n";
     aeon::core::select_compute_device(true);
     bool ok = true;
 
@@ -355,9 +354,9 @@ int main() {
     GateExpertExecutor executor;
     executor.scratch = &scratch;
     executor.stream = 0;
-    // Trap 38: the atomic accumulation's order is the scheduler's, so a byte-exact
-    // comparison between two runs would be meaningless without a fixed order. This
-    // gate requires the deterministic path and states so here.
+    // The atomic accumulation's order is the scheduler's, so a byte-exact comparison
+    // between two runs would be meaningless without a fixed order. This gate requires
+    // the deterministic path and states so here.
     executor.deterministic = true;
     for (uint32_t k = 0; k < kRoutedExperts; ++k) {
         executor.synthetic[k] = payloads[k].data();
@@ -403,7 +402,7 @@ int main() {
     }
 
     // -------------------------------------------------------------------
-    // B. R3 — a restored layer continues like one that never stopped
+    // B. A restored layer continues like one that never stopped
     // -------------------------------------------------------------------
     std::cout << "\n--- B. restore is byte-exact w.r.t. never having evicted ---\n";
     struct Case {
@@ -540,7 +539,7 @@ int main() {
 
     std::printf("\n[Gate] total differing values: %zu\n", total_differences);
     ok &= (total_differences == 0);
-    std::printf("\n[Tier-4 item 22 restore] %s\n", ok ? "PASS" : "FAIL");
+    std::printf("\n[state restore] %s\n", ok ? "PASS" : "FAIL");
     for (uint32_t k = 0; k < kRoutedExperts; ++k) CHECK_HIP(hipFree(executor.d_payload[k]));
     CHECK_HIP(hipFree(d_seeds));
     CHECK_HIP(hipFree(d_cos));

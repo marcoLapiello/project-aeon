@@ -1,29 +1,26 @@
 // -----------------------------------------------------------------------------
-// P3 gate — the sampler and its logit-processor seam.
+// Gate — the sampler and its logit-processor seam.
 //
-// P2 left the graph producing **logits** and named the next thing plainly:
-// "until P3's gate is green the graph ends at logits". The plan's Step 5 puts
-// three requirements on the op that follows, and only the first is ordinary:
-// temperature / top-k / top-p with an fp32 softmax; a **logit-processor seam**
-// that may mask or bias the logits *before* the decision (the plan's
-// **not-deferrable** item, because tool-call JSON and structured output are logit
-// masks — §6.4); and argmax first.
+// The op that follows the graph's logits has three requirements, and only the first
+// is ordinary: temperature / top-k / top-p with an fp32 softmax; a
+// **logit-processor seam** that may mask or bias the logits *before* the decision
+// (not deferrable, because tool-call JSON and structured output are logit masks);
+// and argmax first.
 //
-// The gate clause, verbatim (§7 P3): "seeded replay is bit-identical; a mask that
-// sets one logit to `-inf` removes that token from the support; `T->0` converges
-// to the argmax path; the untruncated defaults reproduce the argmax token. **The
-// seam is asserted to exist, not merely to be present.**"
+// The clauses: "seeded replay is bit-identical; a mask that sets one logit to
+// `-inf` removes that token from the support; `T->0` converges to the argmax path;
+// the untruncated defaults reproduce the argmax token. **The seam is asserted to
+// exist, not merely to be present.**"
 //
-// HOW "THE UNTRUNCATED DEFAULTS REPRODUCE THE ARGMAX TOKEN" IS READ, stated so
-// the reading can be argued with rather than assumed. The artifact's own
-// generation policy is `do_sample = true, temperature = 1, top_p = 1` (plan
-// Step 5), and sampling from an untruncated softmax does **not** generally return
-// the argmax — so the clause cannot mean "the T=1 draw is the argmax". It is read
-// as the plan's own words elsewhere in the same sentence: "argmax at `T=1,
-// top_p=1` *first*", i.e. the shipped default configuration is the deterministic
-// one, and at the untruncated defaults the sampler's decision is the argmax of
-// the logits the graph produced. Three separate statements are then measured, and
-// none is a tautology:
+// HOW "THE UNTRUNCATED DEFAULTS REPRODUCE THE ARGMAX TOKEN" IS READ, stated so the
+// reading can be argued with rather than assumed. The artifact's own generation
+// policy is `do_sample = true, temperature = 1, top_p = 1`, and sampling from an
+// untruncated softmax does **not** generally return the argmax — so the clause
+// cannot mean "the T=1 draw is the argmax". It is read as "argmax at `T=1,
+// top_p=1` *first*": the shipped default configuration is the deterministic one,
+// and at the untruncated defaults the sampler's decision is the argmax of the
+// logits the graph produced. Three separate statements are then measured, and none
+// is a tautology:
 //
 //   1. the default configuration resolves to the argmax, and that token is the
 //      **certified device argmax** on the same logits (D4, E2, F2) — two
@@ -36,12 +33,12 @@
 //
 // WHAT IS REAL HERE. The pure section runs on hand-built vectors with an
 // independently written fp64 reference for the softmax and the nucleus, so every
-// step of Step 5 is pinned exactly and the gate needs no model for it. The device
-// section drives the **certified argmax pair** on uploaded fp16 vectors. Section
-// F closes the seam on the artifact's own logits: `V4Graph::forward_token` for a
-// real token, then the sampler on exactly what the graph left — which is the only
-// statement that the sampler's input contract (`const half* [vocab]`) is the
-// graph's output contract rather than an assumption.
+// stage is pinned exactly and the gate needs no model for it. The device section
+// drives the **certified argmax pair** on uploaded fp16 vectors. Section F closes
+// the seam on the artifact's own logits: `V4Graph::forward_token` for a real token,
+// then the sampler on exactly what the graph left — the only statement that the
+// sampler's input contract (`const half* [vocab]`) is the graph's output contract
+// rather than an assumption.
 //
 // WHY WIDENING MAKES AN EXACT ASSERTION POSSIBLE. fp16 -> fp32 is exact, so the
 // device argmax over the fp16 logits and the host argmax over their widenings are
@@ -50,16 +47,14 @@
 //
 // WHAT IS DELIBERATELY NOT COVERED, named so a green line is not read as more:
 //
-//   * **The text binding** (tokenizer, prompt encoder, detokenizer, the
-//     generation loop) — P4, `core/v4_engine.hpp`. This gate never encodes or
-//     decodes a token.
+//   * **The text binding** (tokenizer, prompt encoder, detokenizer, the generation
+//     loop) — `core/v4_engine.hpp`. This gate never encodes or decodes a token.
 //   * **The artifact's sampling policy**, which is a `config.json` fact the engine
-//     reads and passes in; this file's default is the deterministic one on
-//     purpose and the gate asserts it is.
-//   * **Throughput.** A host-side fp32 softmax over 129280 logits is the plan's
-//     accepted first implementation ("host-side is acceptable"); what is asserted
-//     here is that the *untruncated* and *greedy* paths allocate nothing and
-//     read back four bytes.
+//     reads and passes in; this file's default is the deterministic one on purpose
+//     and the gate asserts it is.
+//   * **Throughput.** A host-side fp32 softmax over 129280 logits is the accepted
+//     first implementation; what is asserted here is that the *untruncated* and
+//     *greedy* paths allocate nothing and read back four bytes.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -96,7 +91,7 @@ using aeon::core::SplitMix64;
 namespace ops = aeon::core::sampler_ops;
 
 constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
-constexpr uint32_t kToken = 65106;   // the P1/P2 gates' first probe token
+constexpr uint32_t kToken = 65106;   // the earlier gates' first probe token
 
 constexpr float kInf = std::numeric_limits<float>::infinity();
 
@@ -240,7 +235,7 @@ constexpr uint32_t kVocab = 129280;
 
 int main() {
     std::printf("================================================================================\n");
-    std::printf("  P3 — the sampler and its logit-processor seam\n");
+    std::printf("  the sampler and its logit-processor seam\n");
     std::printf("================================================================================\n");
     aeon::core::select_compute_device(true);
 
@@ -314,7 +309,7 @@ int main() {
     }
 
     // =========================================================================
-    // B. The arithmetic — every step of Step 5, pinned exactly
+    // The arithmetic — every stage, pinned exactly
     // =========================================================================
     std::printf("\n[B] Temperature, top-k, top-p, softmax, argmax\n");
     {
@@ -950,7 +945,7 @@ int main() {
 
     stage("the whole gate", gate_start);
     std::printf("\n--------------------------------------------------------------------------------\n");
-    std::printf("  P3: %u checks, %u failures\n", harness.checks, harness.failures);
+    std::printf("  sampler: %u checks, %u failures\n", harness.checks, harness.failures);
     std::printf("--------------------------------------------------------------------------------\n");
     return harness.failures == 0 ? 0 : 1;
 }

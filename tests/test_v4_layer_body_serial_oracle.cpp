@@ -1,13 +1,12 @@
 // -----------------------------------------------------------------------------
-// Tier-2 gate, item 18 — serial multi-token decode across compressor boundaries,
-// with the residual carried by the device itself.
+// Gate — serial multi-token decode across compressor boundaries, with the residual
+// carried by the device itself.
 //
-// Items 16 and 17 each certify *one layer's composition* for one token at a time.
-// Both of them make a deliberate simplification that this gate removes: after
-// every step they overwrite the device's residual with `to_half(oracle.res_out)`,
-// so the device's own output never feeds back into its own state. That is the
-// right instrument for measuring a layer's arithmetic, and it is blind to the
-// thing a *loop* does.
+// The single-token composition gates make a deliberate simplification this gate
+// removes: after every step they overwrite the device's residual with
+// `to_half(oracle.res_out)`, so the device's own output never feeds back into its
+// own state. That is the right instrument for measuring a layer's arithmetic, and
+// it is blind to the thing a *loop* does.
 //
 // This gate therefore runs a three-layer stack — Sliding (layer 0), CSA (layer 2),
 // HCA (layer 3) — for 136 tokens and removes that simplification:
@@ -17,31 +16,28 @@
 //     layer L+1's input, and the last layer's output is the next token's input.
 //   * the oracle is still the reference, but it is driven by the *device's*
 //     residual trajectory: the input it is handed at each step is read out of the
-//     device's own buffers. This is trap 37's principle applied to state — a
-//     reference must be driven by the device's actual inputs, or the comparison
-//     measures input divergence and calls it a defect. Compared this way, every
-//     per-step tolerance stays tight while the device's *state* — the local ring,
-//     the compressor partial ring, the committed compressed entries and their
-//     positions — accumulates its own error across 408 layer-steps, 34 CSA
-//     boundaries and one HCA boundary.
+//     device's own buffers. A reference must be driven by the device's actual
+//     inputs, or the comparison measures input divergence and calls it a defect.
+//     Compared this way, every per-step tolerance stays tight while the device's
+//     *state* — the local ring, the compressor partial ring, the committed
+//     compressed entries and their positions — accumulates its own error across
+//     408 layer-steps, 34 CSA boundaries and one HCA boundary.
 //   * the reference's MoE *combine* is driven by the device's own discrete
-//     selection (ids and weights), for the same reason and by the same principle.
-//     The selection is not thereby unchecked: the rule that produces it — bias
-//     after softplus, flat top-6, ties to the lower index, hash table order — is
-//     asserted against the device's **own logits**, and the logits themselves are
-//     compared on the peak-relative basis. See the finding below for why an
-//     elementwise selection comparison is the wrong instrument here.
+//     selection (ids and weights), for the same reason. The selection is not thereby
+//     unchecked: the rule that produces it — bias after softplus, flat top-6, ties
+//     to the lower index, hash table order — is asserted against the device's **own
+//     logits**, and the logits themselves are compared on the peak-relative basis.
 //
-// FINDING (item 18): the device's serial decode is **not bit-reproducible**. The
-// default routed-expert path accumulates with `atomicAdd`, whose order across the
-// six experts is undefined, so `moe_out` differs between two runs of the same
-// binary by ~1e-7. Over a 408-step loop that drift compounds, and any router step
-// whose 6th and 7th candidates sit inside the drift lands on either side — this
-// gate measured 0–2 such steps per run, with a worst selection-value gap of
-// 8.6e-5, varying between runs, and a resulting `moe_out` difference up to
-// 7e-3 of peak (above the 4e-3 tolerance; it is what motivated the seam above).
-// Items 16 and 17 could not have seen this: both re-seed the residual from the
-// oracle, so their trajectory never accumulates.
+// FINDING: the device's serial decode is **not bit-reproducible**. The default
+// routed-expert path accumulates with `atomicAdd`, whose order across the six
+// experts is undefined, so `moe_out` differs between two runs of the same binary by
+// ~1e-7. Over a 408-step loop that drift compounds, and any router step whose 6th
+// and 7th candidates sit inside the drift lands on either side — this gate measured
+// 0–2 such steps per run, with a worst selection-value gap of 8.6e-5, varying
+// between runs, and a resulting `moe_out` difference up to 7e-3 of peak (above the
+// 4e-3 tolerance; it is what motivated the seam above). The single-token gates
+// could not have seen this: both re-seed the residual from the oracle, so their
+// trajectory never accumulates.
 //
 // **Consequence taken, and why it is a decision rather than a workaround.** Driving
 // the atomic path made this gate fail roughly one run in ten, and not on the
@@ -49,29 +45,25 @@
 // oracle's *state* — the ring keys written in earlier steps — is no longer the
 // device's state, so a later `attn_proj` disagreement is a consequence of the
 // divergence rather than of a defect. A gate that is red one run in ten is not a
-// usable signal, and trap 38 says in as many words that every loop gate must state
-// which accumulation it requires. **This gate therefore requires the deterministic
-// accumulation** (`executor.deterministic = true`), the same choice item 19 made,
-// and reports the nondeterminism as a measurement — `near_tie`,
-// `selection_mismatch_steps`, `worst_selection_gap`, `drift` — instead of
-// inferring it from an intermittently red line. The deterministic accumulation
-// removes the amplification at its source.
-// Item 18's *finding* is unchanged and is why the seam and the counters exist.
+// usable signal. **This gate therefore requires the deterministic accumulation**
+// (`executor.deterministic = true`) and reports the nondeterminism as a measurement
+// — `near_tie`, `selection_mismatch_steps`, `worst_selection_gap`, `drift` —
+// instead of inferring it from an intermittently red line.
 //
 // 136 tokens is not a round number: HCA (ratio 128) commits its first compressed
 // entry at position 127, so a run that crosses an HCA boundary cannot be shorter
-// than 129 tokens, and eight more are needed before the boundary is behind the
-// loop rather than at its end.
+// than 129 tokens, and eight more are needed before the boundary is behind the loop
+// rather than at its end.
 //
 // **Why the stack is {0, 2, 3} and not layer 1.** It is one layer per branch the
 // body can *take*, not a sample of the model. The artifact's classes are
-// `compress_ratios = [0, 0, 4, 128, 4, 128, …]` with `num_hash_layers = 3`, so
-// layer 0 is Sliding+hash, layer 2 is CSA+hash and layer 3 is HCA+biased. Layer 1
-// is the *second* Sliding layer — same attention class as layer 0 and also a hash
-// layer — so it adds no branch on either axis: same code, different weights. The
-// pair 2/3 is chosen because it straddles both boundaries at once (2 = last hash
-// and first CSA; 3 = first biased and first HCA), which is what lets three layers
-// cover three classes and both router branches.
+// `compress_ratios = [0, 0, 4, 128, 4, 128, …]` with `num_hash_layers = 3`, so layer
+// 0 is Sliding+hash, layer 2 is CSA+hash and layer 3 is HCA+biased. Layer 1 is the
+// *second* Sliding layer — same attention class as layer 0 and also a hash layer —
+// so it adds no branch on either axis: same code, different weights. The pair 2/3 is
+// chosen because it straddles both boundaries at once (2 = last hash and first CSA;
+// 3 = first biased and first HCA), which lets three layers cover three classes and
+// both router branches.
 //
 // What is asserted:
 //
@@ -87,17 +79,16 @@
 //      end (every local ring slot, every committed compressed row, every position)
 //      against the oracle's; closed forms for the ring positions that need no
 //      oracle at all; the entry materialized at the HCA boundary shown to be
-//      still there, bit-identical, hundreds of steps later and load-bearing in the
 //      final attention row-set; the drift between the device's residual and the
-//      oracle's measured to be non-zero — a positive measurement that the
-//      device's chain is its own and not the item-17 shortcut; and the number of
-//      router steps where the two selections disagreed, which is the measurement
-//      behind the finding below.
+//      oracle's measured to be non-zero — a positive measurement that the device's
+//      chain is its own and not the re-seeded shortcut; and the number of router
+//      steps where the two selections disagreed, which is the measurement behind
+//      the finding above.
 //
 // Deliberately NOT covered here, and named so it is not mistaken for coverage:
-//   * the routed-expert arithmetic — Tier-1 gates 13/15 and item 16 own it, so the
-//     experts here are six synthetic payloads encoded with the oracle's own
-//     encoder (as in item 17). The 408-step run would otherwise be a multi-minute
+//   * the routed-expert arithmetic — the per-op gates own it, so the experts here
+//     are six synthetic payloads encoded with the oracle's own encoder. The
+//     408-step run would otherwise be a multi-minute
 //     page-in over a 145 GB container for a path already certified;
 //   * the 128-token sliding window and the real `index_topk = 512` — the window is
 //     shrunk to 4 and the top-k to 3 so the ring wraps and CSA's selection is
@@ -345,24 +336,23 @@ int main() {
     executor.loader = nullptr;   // synthetic payloads
     executor.scratch = &scratch;
     executor.stream = 0;
-    // **Which accumulation this gate requires, stated explicitly (trap 38).** The
-    // finding this gate produced is that the *default* routed-expert path is not
-    // bit-reproducible: `atomicAdd`'s order across the six experts is the
-    // scheduler's, so `moe_out` differs between runs of the same binary and a
-    // router near-tie eventually flips. The measurements are below and in the
-    // header (`0–2` such steps per run, `moe_out` up to `7.0e-3` of peak).
+    // **Which accumulation this gate requires, stated explicitly.** The finding this
+    // gate produced is that the *default* routed-expert path is not bit-reproducible:
+    // `atomicAdd`'s order across the six experts is the scheduler's, so `moe_out`
+    // differs between runs of the same binary and a router near-tie eventually flips.
+    // The measurements are below and in the header (`0–2` such steps per run,
+    // `moe_out` up to `7.0e-3` of peak).
     //
     // That nondeterminism cannot be *both* the finding and an assertion this gate
     // makes. Driving the atomic path here made the gate fail roughly one run in ten
-    // — not on the near-tie step itself, but later: once the device's trajectory
-    // and the oracle's diverge, the oracle's *state* (the ring keys written in past
+    // — not on the near-tie step itself, but later: once the device's trajectory and
+    // the oracle's diverge, the oracle's *state* (the ring keys written in past
     // steps) no longer belongs to the device, and the next step's `attn_proj`
     // disagreement is a consequence of the divergence, not of a defect. A gate that
     // is red one run in ten is not a usable signal. So the gate now **requires the
-    // deterministic accumulation** — the same decision item 19 made, and the one
-    // trap 38 says every loop gate must take — and the nondeterminism is reported
-    // as a measurement (`near_tie`, `selection_mismatch`, `drift`) rather than
-    // inferred from a flaky red line.
+    // deterministic accumulation** and the nondeterminism is reported as a
+    // measurement (`near_tie`, `selection_mismatch`, `drift`) rather than inferred
+    // from a flaky red line.
     executor.deterministic = true;
     for (uint32_t k = 0; k < kRoutedExperts; ++k) {
         executor.synthetic[k] = payloads[k].data();
@@ -370,8 +360,8 @@ int main() {
     }
 
     // Seed both sides from the same fp16-rounded embedding row, broadcast to the
-    // four HC streams (plan Step 1). This is the only value the loop is ever
-    // handed from outside; everything after it is the device's own.
+    // four HC streams. This is the only value the loop is ever handed from outside;
+    // everything after it is the device's own.
     {
         std::vector<double> seed(kHcDim, 0.0);
         const __half* embed = loader.get_data_ptr<__half>("embed.weight");
@@ -470,14 +460,14 @@ int main() {
                          upload_and_read(0, scratch.d_attn_proj, kHidden), kTol);
 
             // The router: the logits on the peak-relative basis, and the *rule*
-            // checked against the device's own logits (trap 37). The rule is the
-            // pass criterion for the selection — not an elementwise comparison of
-            // the two selections — because the device's serial loop is not
-            // bit-reproducible: the default MoE path accumulates with `atomicAdd`,
-            // whose order across the six experts is undefined, so the device's
-            // trajectory drifts from any fixed reference and a router step whose
-            // 6th and 7th candidates sit inside that drift lands on either side.
-            // The rule check cannot be moved by that; an elementwise one can, and
+            // checked against the device's own logits. The rule is the pass criterion
+            // for the selection — not an elementwise comparison of the two selections
+            // — because the device's serial loop is not bit-reproducible: the default
+            // MoE path accumulates with `atomicAdd`, whose order across the six
+            // experts is undefined, so the device's trajectory drifts from any fixed
+            // reference and a router step whose 6th and 7th candidates sit inside
+            // that drift lands on either side. The rule check cannot be moved by that;
+            // an elementwise one can, and
             // did, once in the runs that established this gate.
             ok &= report("      router logits", want.router_logits,
                          read_float(0, scratch.d_router_logits, 256), kTol);

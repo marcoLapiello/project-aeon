@@ -1,14 +1,14 @@
 // -----------------------------------------------------------------------------
-// Tier-3 gate, item 19 — chunked batched prefill, `chunk ≡ serial`.
+// Gate: chunked batched prefill, `chunk ≡ serial`.
 //
-// The plan's gate is one sentence: "prefill(chunk) must produce byte-equivalent
-// state, logits, and token id to running the same tokens serially". This gate
-// asserts exactly that, for the three attention classes, and it asserts it as
-// **equality** rather than as a tolerance, because with the composition this
-// repository now uses there is no numerical reason for a difference to exist.
+// The property: "prefill(chunk) must produce byte-equivalent state, logits, and
+// token id to running the same tokens serially". This gate asserts exactly that,
+// for the three attention classes, and it asserts it as **equality** rather than as
+// a tolerance, because with the composition this repository uses there is no
+// numerical reason for a difference to exist.
 //
 // There is no fp64 oracle in this file, deliberately. `chunk ≡ serial` is not a
-// claim about the graph's arithmetic — Tier 1 and Tier 2 own that — it is a claim
+// claim about the graph's arithmetic — the per-op gates own that — it is a claim
 // about *batching*: that processing `N` tokens together gives what the same `N`
 // tokens give one at a time. So the reference is the same path driven with
 // `count = 1`, which is serial by definition, and the gate asks whether batching
@@ -20,26 +20,25 @@
 //   C2  chunk {1,…}   == run_layer_body_decoding     the reference is the graph
 //
 // C2 is what keeps C from being circular: it ties the one-at-a-time chunk run to
-// the Tier-2 certified decode body, so the equality in C is between the batch path
-// and the certified path rather than between two copies of the same new code.
+// the certified decode body, so the equality in C is between the batch path and
+// the certified path rather than between two copies of the same new code.
 //
 // ## The structural property, and the false version of it
 //
 // The obvious chunking — write every key of the chunk into the local ring, then run
 // every query — is **not equivalent to serial at any chunk length above one**, and
 // the gate asserts that the implementation does not do it. The proof is in the
-// header of `core/v4_layer_body_batch.hpp` and is recorded as trap 39: for a ring
-// of `C` slots the write for position `p` lands in slot `p mod C`, which held
-// position `p − C`, and `p − C` is the *oldest* key of the window of the chunk's
-// own first query. The chunk's last write therefore evicts a key its first query
-// needs.
+// header of `core/v4_layer_body_batch.hpp`: for a ring of `C` slots the write for
+// position `p` lands in slot `p mod C`, which held position `p − C`, and `p − C` is
+// the *oldest* key of the window of the chunk's own first query. The chunk's last
+// write therefore evicts a key its first query needs.
 //
 // The implementation keeps the chunk's keys in a per-chunk buffer, gives each query
 // a *composed row-set* (pre-chunk ring rows in its window + the chunk's own rows up
 // to itself), and commits the keys to the ring afterwards. The gate checks that
 // ordering directly: **after every token's pre-attention half the ring has not
-// moved** and the chunk's keys are in the chunk buffer. Mutation M19-2 (write the
-// ring as the chunk goes) is the false version and fails section B.
+// moved** and the chunk's keys are in the chunk buffer. The false version is
+// "write the ring as the chunk goes", and it fails section B.
 //
 // ## Why equality rather than a tolerance
 //
@@ -64,16 +63,15 @@
 //      differing values it saw rather than only a pass bit.
 //
 // Deliberately NOT covered here, and named so it is not mistaken for coverage:
-//   * throughput. The plan says structural equivalence and speed are two different
-//     gates. The composition is currently a per-row loop of device-to-device copies:
-//     correct, and not fast. Turning it into one gather kernel is a separate step
-//     with its own measurement.
-//   * the indexer's per-token host round-trip in `select_indexer_topk`, which the
-//     plan requires to become on-device for prefill. It changes no value, so this
-//     gate cannot see it — recorded in the plan's open list instead.
-//   * the routed-expert arithmetic and any tiering (synthetic payloads, as in items
-//     17/18), and the real 128-token window with `index_topk = 512` (shrunk, as in
-//     items 16–18). The *compressed* paths are exercised for real: the prompt is
+//   * throughput. Structural equivalence and speed are two different gates. The
+//     composition is currently a per-row loop of device-to-device copies: correct,
+//     and not fast. Turning it into one gather kernel is a separate step with its own
+//     measurement.
+//   * the indexer's per-token host round-trip in `select_indexer_topk`, which could
+//     become on-device for prefill. It changes no value, so this gate cannot see it.
+//   * the routed-expert arithmetic and any tiering (synthetic payloads), and the real
+//     128-token window with `index_topk = 512` (shrunk here). The *compressed* paths
+//     are exercised for real: the prompt is
 //     long enough for HCA to commit an entry and for CSA to commit many.
 // -----------------------------------------------------------------------------
 
@@ -320,7 +318,7 @@ std::vector<TokenRecord> run_layer_schedule(
 } // namespace
 
 int main() {
-    std::cout << "[Gate] Tier-3 item 19: chunked batched prefill, chunk == serial\n";
+    std::cout << "[Gate] chunked batched prefill, chunk == serial\n";
     aeon::core::select_compute_device(true);
     bool ok = true;
 
@@ -418,10 +416,9 @@ int main() {
     GateExpertExecutor executor;
     executor.scratch = &scratch;
     executor.stream = 0;
-    // Trap 38: the atomic accumulation's order is the scheduler's, so an equality
-    // between two runs of the same schedule would be meaningless without a fixed
-    // order. The plan requires a gate to state which accumulation it needs; this
-    // one requires the deterministic path, and says so here.
+    // The atomic accumulation's order is the scheduler's, so an equality between
+    // two runs of the same schedule would be meaningless without a fixed order. This
+    // gate therefore requires the deterministic path, and says so here.
     executor.deterministic = true;
     for (uint32_t k = 0; k < kRoutedExperts; ++k) {
         executor.synthetic[k] = payloads[k].data();
@@ -644,12 +641,11 @@ int main() {
     // This is the anchor for section C. Without it, section C only ever compares
     // the chunk path against itself at a different chunk length, so a mistake
     // applied to *both* sides — a wrong ring position at commit, say — would be
-    // invisible. That is not hypothetical: mutation M19-4 (commit the position one
-    // below the token's) survived the whole of section C, because the reference run
-    // went through the same commit loop. The comparison below is therefore both the
-    // tokens *and* the final state against `run_layer_body_decoding`, which is the
-    // Tier-2 certified path and does not share the chunk driver at all.
-    std::cout << "\n--- C2. the serial reference is the Tier-2 decode body ---\n";
+    // invisible: the reference run went through the same commit loop. The comparison
+    // below is therefore both the tokens *and* the final state against
+    // `run_layer_body_decoding`, which is the certified path and does not share the
+    // chunk driver at all.
+    std::cout << "\n--- C2. the serial reference is the decode body ---\n";
     for (size_t li = 0; li < stack.size(); ++li) {
         const std::vector<uint32_t> serial(kTokens, 1);
         std::vector<std::vector<TokenRecord>> results(2);

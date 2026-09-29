@@ -1,97 +1,93 @@
 // -----------------------------------------------------------------------------
-// Tier-3 gate, item 20 — long-context lifecycle: ring reuse and boundary
-// compression past context capacity.
+// Gate — long-context lifecycle: ring reuse and boundary compression past context
+// capacity.
 //
-// Items 16–19 all certify the *arithmetic* of the layer body on real weights and
-// all of them shrink the local window (to 6, 10 and 4) and the index top-k (to 3)
-// so that a wrap and a non-degenerate selection fit inside a short run. Each of
-// them names that shrinkage as uncovered. This gate spends its budget on the one
+// The arithmetic gates of the layer body all shrink the local window and the index
+// top-k so that a wrap and a non-degenerate selection fit inside a short run, and
+// each names that shrinkage as uncovered. This gate spends its budget on the one
 // thing they could not measure: **the real window, over a context long enough to
-// reuse the ring more than twice**, and on the question the plan left open — what
-// the state containers do once the context stops fitting.
+// reuse the ring more than twice**, and on what the state containers do once the
+// context stops fitting.
 //
-// It is deliberately, structurally, a *different instrument* from items 16–19.
-// It uses no fp64 oracle and compares no checkpoint against a reference: the
-// arithmetic is already certified, and re-deriving it in fp64 is what made those
-// gates expensive. What is asserted here are **closed forms and invariants** —
-// the ring's contents are *predicted* from the token count before they are read,
-// and the two independently-addressed stores are required to be bit-identical
-// under each other's writes.
+// It is deliberately, structurally, a *different instrument*: no fp64 oracle and no
+// checkpoint compared against a reference. The arithmetic is already certified, and
+// re-deriving it in fp64 is what made those gates expensive. What is asserted here
+// are **closed forms and invariants** — the ring's contents are *predicted* from the
+// token count before they are read, and the two independently-addressed stores are
+// required to be bit-identical under each other's writes.
 //
-// Specification: plan §7.1. The four cached pieces (local ring, compressed store,
-// compressor partial ring, indexer state) are rings, but their lifecycle has two
-// regimes that must not be confused:
+// The four cached pieces (local ring, compressed store, compressor partial ring,
+// indexer state) are rings, but their lifecycle has two regimes that must not be
+// confused:
 //
-//   * the **local ring** reuses continuously and correctly — that *is* the
-//     sliding window — and every query's row-set is `[max(0, pos−C+1), pos]` [V
-//     cache_utils.py:892-894];
+//   * the **local ring** reuses continuously and correctly — that *is* the sliding
+//     window — and every query's row-set is `[max(0, pos−C+1), pos]`
+//     [V cache_utils.py:892-894];
 //   * the **compressed store** must never reuse, and its capacity is derived so
 //     that it cannot: `K = ceil(max_seq/ratio)` is exactly what the declared
 //     context produces. If it ever wrapped, the row-set would silently become a
 //     sliding window over compressed entries — the newest `K` instead of every
 //     committed entry — and **no position guard could tell**, because every
-//     populated slot records a position `≤ pos` (trap 40). `V4Layer::
-//     record_position` refusing a position at or beyond capacity is therefore the
-//     only mechanism that keeps HCA's "all committed rows" from quietly becoming
-//     "the newest K", and section E measures the divergence that makes the
-//     refusal load-bearing rather than decorative.
+//     populated slot records a position `≤ pos`. `V4Layer::record_position`
+//     refusing a position at or beyond capacity is therefore the only mechanism
+//     that keeps HCA's "all committed rows" from quietly becoming "the newest K",
+//     and section E measures the divergence that makes the refusal load-bearing
+//     rather than decorative.
 //
 // The run is one three-layer stack — Sliding (layer 0), CSA (layer 2), HCA
 // (layer 3) — for 260 tokens, which is the shortest run that reuses the 128-slot
-// ring twice (slots are `pos mod 128`, so slot 0 is written at 0 and again at
-// 256) and still crosses two HCA boundaries (ratio 128 commits at 127 and 255).
+// ring twice (slots are `pos mod 128`, so slot 0 is written at 0 and again at 256)
+// and still crosses two HCA boundaries (ratio 128 commits at 127 and 255).
 //
-// **Why those three layers, and not layer 1.** The stack is one layer per branch
-// the body can *take*, not a sample of the model. The artifact's classes are
-// `compress_ratios = [0, 0, 4, 128, 4, 128, …]` with `num_hash_layers = 3`, so
-// layer 0 is Sliding+hash, layer 2 is CSA+hash and layer 3 is HCA+biased. Layer 1
-// is the *second* Sliding layer: same attention class as layer 0 and also a hash
-// layer, so it adds no branch on either axis — same code, different weights. The
-// pair 2/3 is chosen because it straddles both boundaries at once (2 = last hash
-// and first CSA; 3 = first biased and first HCA), which is what lets three layers
-// cover three classes and both router branches.
+// **Why those three layers, and not layer 1.** The stack is one layer per branch the
+// body can *take*, not a sample of the model. The artifact's classes are
+// `compress_ratios = [0, 0, 4, 128, 4, 128, …]` with `num_hash_layers = 3`, so layer
+// 0 is Sliding+hash, layer 2 is CSA+hash and layer 3 is HCA+biased. Layer 1 is the
+// *second* Sliding layer: same attention class as layer 0 and also a hash layer, so
+// it adds no branch on either axis — same code, different weights. The pair 2/3 is
+// chosen because it straddles both boundaries at once (2 = last hash and first CSA;
+// 3 = first biased and first HCA), which lets three layers cover three classes and
+// both router branches.
 //
 // What is asserted:
 //
-//   A. CLOSED FORMS BEFORE ANY DEVICE WORK — the ring's slot/position mapping,
-//      the entry position `(i+1)·ratio − 1`, and the fact that the capacity is
-//      exactly what the declared context produces (so the count clamp is a no-op
-//      in range, and "the ring never wraps" is a property of the *layout*, not an
-//      assumption).
+//   A. CLOSED FORMS BEFORE ANY DEVICE WORK — the ring's slot/position mapping, the
+//      entry position `(i+1)·ratio − 1`, and the fact that the capacity is exactly
+//      what the declared context produces (so the count clamp is a no-op in range,
+//      and "the ring never wraps" is a property of the *layout*, not an assumption).
 //   B. THE REAL WINDOW — after 260 tokens, slot `s` holds the largest position
 //      `p ≤ 259` with `p ≡ s (mod 128)`, predicted before it is read; and the
-//      kernel's own exact-boundary behaviour is measured on captured real state:
-//      a partial ring's unfilled slots contribute **exactly zero** (perturbing
-//      them does not move `attn_out` by one ulp), while an in-window row moves it
-//      by a large fraction of peak.
+//      kernel's own exact-boundary behaviour is measured on captured real state: a
+//      partial ring's unfilled slots contribute **exactly zero** (perturbing them
+//      does not move `attn_out` by one ulp), while an in-window row moves it by a
+//      large fraction of peak.
 //   C. THE TWO STORES ARE INDEPENDENT AND THEIR POSITIONS ARE CLOSED FORMS — the
-//      entry materialized at the first boundary (CSA position 3, HCA position
-//      127) is byte-identical 256 steps later; every committed entry's recorded
-//      position is `(i+1)·ratio − 1`; the compressor partial ring's slots are
+//      entry materialized at the first boundary (CSA position 3, HCA position 127)
+//      is byte-identical 256 steps later; every committed entry's recorded position
+//      is `(i+1)·ratio − 1`; the compressor partial ring's slots are
 //      `pos mod capacity`; and the ring as it stood at the first boundary is the
 //      closed form, i.e. materializing an entry did not disturb it.
 //   D. THE ROW-SET PAST THE WINDOW IS THE CLASS RULE — HCA reads every committed
 //      entry (dropping the oldest moves the output), CSA reads the indexer's
 //      selection (dropping one selected entry moves it), and the counts are
 //      `min(K, (pos+1)/ratio)` with a full local window.
-//   E. CAPACITY IS EXACT AND THE REFUSAL IS LOAD-BEARING (trap 40) — the layer
-//      refuses a position at `max_seq_len` and accepts `max_seq_len − 1`; the
-//      capacity equals `ceil(max_seq/ratio)` exactly; and, the discriminating
-//      part, a hand-built **wrapped** store is shown to pass the kernel's own
+//   E. CAPACITY IS EXACT AND THE REFUSAL IS LOAD-BEARING — the layer refuses a
+//      position at `max_seq_len` and accepts `max_seq_len − 1`; the capacity equals
+//      `ceil(max_seq/ratio)` exactly; and, the discriminating part, a hand-built
+//      **wrapped** store is shown to pass the kernel's own
 //      `compressed_positions[i] ≤ current_pos` guard in full while its row-set is
 //      the newest `K` entries rather than the oldest — so a wrapped ring is
 //      undetectable from the entries and would silently change what HCA attends.
 //
 // Deliberately NOT covered here, named so it is not mistaken for coverage:
-//   * the routed-expert arithmetic and every other checkpoint's precision —
-//     Tier-1 and items 16–18 own those; the experts here are six synthetic
-//     payloads and no checkpoint is compared against a reference at all;
-//   * the real `index_topk = 512`: 260 tokens commit only 65 CSA entries, so a
-//     real top-k would select all of them and the selection would degenerate.
-//     The top-k is shrunk to 8 so CSA's row-set is a real selection, exactly as
-//     in items 17/18, and the *window* — which is what this item is about — is
-//     left at the model's own 128;
-//   * tiering, and any prefix-reuse restore (Tier 4 item 22).
+//   * the routed-expert arithmetic and every other checkpoint's precision — the
+//     per-op gates own those; the experts here are six synthetic payloads and no
+//     checkpoint is compared against a reference at all;
+//   * the real `index_topk = 512`: 260 tokens commit only 65 CSA entries, so a real
+//     top-k would select all of them and the selection would degenerate. The top-k
+//     is shrunk to 8 so CSA's row-set is a real selection, and the *window* — which
+//     is what this gate is about — is left at the model's own 128;
+//   * tiering, and any prefix-reuse restore.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -369,7 +365,7 @@ bool entries_equal(const std::vector<__half>& a, const std::vector<__half>& b,
 } // namespace
 
 int main() {
-    std::cout << "[Gate] Tier-3 item 20: long-context lifecycle (ring reuse, capacity)\n";
+    std::cout << "[Gate] long-context lifecycle (ring reuse, capacity)\n";
     aeon::core::select_compute_device(true);
     bool ok = true;
     uint32_t checks = 0;
@@ -415,7 +411,7 @@ int main() {
         // and the capacity is `ceil(max_seq/ratio)`, which for a ratio dividing
         // the context are the same number. That is why the store cannot wrap
         // inside the declared context — and why the clamp in the count is a
-        // no-op there rather than a silently binding limit (trap 40).
+        // no-op there rather than a silently binding limit.
         for (uint32_t ratio : ratios) {
             const uint32_t capacity = (kMaxSeq + ratio - 1u) / ratio;
             const uint32_t last_count = (kMaxSeq - 1u + 1u) / ratio;
@@ -524,7 +520,7 @@ int main() {
 
     // Six synthetic experts, encoded once. No checkpoint is compared against a
     // reference in this gate, so the experts only need to make the MoE non-trivial
-    // — its arithmetic belongs to Tier 1 and items 16–18.
+    // — its arithmetic belongs to the per-op gates.
     std::array<std::vector<uint8_t>, kRoutedExperts> payloads;
     for (uint32_t k = 0; k < kRoutedExperts; ++k) {
         payloads[k] = aeon::testgate::make_synthetic_payload(k + 1);
@@ -844,7 +840,7 @@ int main() {
 
         if (!uses_indexer) {
             // HCA attends *every* committed entry, so its row-set width is the
-            // committed count itself — no top-k, no indexer (trap 33).
+            // committed count itself — no top-k, no indexer.
             assert_that("D: HCA's compressed row-set is every committed entry",
                         committed == kTokens / 128u,
                         "count=" + std::to_string(committed));
@@ -937,7 +933,7 @@ int main() {
     }
 
     // -------------------------------------------------------------------
-    // E. Capacity is exact, and the refusal is load-bearing (trap 40)
+    // E. Capacity is exact, and the refusal is load-bearing
     // -------------------------------------------------------------------
     std::cout << "\n--- E. capacity, and why the refusal is not decorative ---\n";
     {
@@ -1091,7 +1087,7 @@ int main() {
                     "index 0 holds position " + std::to_string(newest_positions[0]) +
                         " where the closed form requires " +
                         std::to_string(ratio - 1) +
-                        "; both pass the guard (trap 40)");
+                        "; both pass the guard");
 
         const std::vector<__half> suppressed_keys(static_cast<size_t>(128) * kHeadDim,
                                                   __float2half(0.0f));
@@ -1151,7 +1147,7 @@ int main() {
     // -------------------------------------------------------------------
     // Summary
     // -------------------------------------------------------------------
-    std::printf("\n[Tier-3 item 20 lifecycle] %s — %u checks, %u failed\n",
+    std::printf("\n[long-context lifecycle] %s — %u checks, %u failed\n",
                 ok ? "PASS" : "FAIL", checks, failures);
     std::printf("  run: %u tokens x %u layers at the model's own window (128); "
                 "compressed top-k shrunk to %u\n",
