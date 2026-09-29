@@ -17,35 +17,41 @@ mean that it is part of the production runtime.
 
 ## Current engine path
 
-The current integration point is the rewrite: `src/architecture/deepseek_v4/core/v4_engine.hpp`
-binds the text front end to the graph, `core/v4_graph.hpp` runs the ordered forward
-(embed → 43 × layer → head → LM head), and `core/v4_model_host.hpp` owns everything resident
+The current integration point is the rewrite: `src/architecture/deepseek_v4/runtime/v4_engine.hpp`
+binds the text front end to the graph, `runtime/v4_graph.hpp` runs the ordered forward
+(embed → 43 × layer → head → LM head), and `runtime/v4_model_host.hpp` owns everything resident
 (loader, config, spec, contract, budget, resources, scratch, streams, 43 layers, expert pools,
 registry, staging, supply, executor). Model-level GPU allocations are owned by
 `v4_model_resources.hpp`; architecture-neutral Hot/Warm/Cold transfer state, prefetch,
 direct-I/O materialization, and supply telemetry are owned by
-`infrastructure/core/tiered_expert_supply.hpp`, with `v4_expert_supply.hpp` retaining the V4
+`infrastructure/core/tiered_expert_supply.hpp`, with `moe/v4_expert_supply.hpp` retaining the V4
 request adapter.
+
+The model tree is grouped by sub-concern: `spec/` (the checkpoint's description — config,
+spec, contract, memory geometry, dense binding), `layer/` (one layer's compute — the body
+phases, state, scratch), `moe/` (routed-expert execution and its supply adapter), `runtime/`
+(assembly and driving — host, resources, graph, engine, prefill workspace), alongside
+`kernels/`, `text/` and `reference/`.
 
 The production-facing implementation is:
 
-- `src/architecture/deepseek_v4/core/config.hpp` - DeepSeek-V4 model configuration.
+- `src/architecture/deepseek_v4/spec/config.hpp` - DeepSeek-V4 model configuration.
 - `src/platform/rdna3/device.hpp` - RDNA3/HIP device selection and GPU utilities.
-- `src/architecture/deepseek_v4/core/v4_engine.hpp` - the text binding: tokenizer + prompt encoder + generation loop + graph.
-- `src/architecture/deepseek_v4/core/v4_graph.hpp` - the ordered forward pass (embed, 43 layers, head, LM head).
-- `src/architecture/deepseek_v4/core/v4_model_host.hpp` - what is resident: the whole assembly. It now delegates the layer-major prefill working set to `v4_prefill_workspace.hpp` (`V4PrefillWorkspace`; its residual carry is the neutral `infrastructure/core/prefill_carry.hpp`), the direct expert I/O to `infrastructure/core/expert_direct_io.hpp` (`ExpertDirectIO`), the tier's bulk load and restore to `infrastructure/core/expert_tier_loader.hpp` (`ExpertTierLoader`), the Warm/staging boundary to `infrastructure/core/host_partition.hpp` (`HostPartition`), and the prefill lifecycle and sweep to `infrastructure/core/prefill_controller.hpp` (`PrefillController`), keeping its own API unchanged.
+- `src/architecture/deepseek_v4/runtime/v4_engine.hpp` - the text binding: tokenizer + prompt encoder + generation loop + graph.
+- `src/architecture/deepseek_v4/runtime/v4_graph.hpp` - the ordered forward pass (embed, 43 layers, head, LM head).
+- `src/architecture/deepseek_v4/runtime/v4_model_host.hpp` - what is resident: the whole assembly. It now delegates the layer-major prefill working set to `v4_prefill_workspace.hpp` (`V4PrefillWorkspace`; its residual carry is the neutral `infrastructure/core/prefill_carry.hpp`), the direct expert I/O to `infrastructure/core/expert_direct_io.hpp` (`ExpertDirectIO`), the tier's bulk load and restore to `infrastructure/core/expert_tier_loader.hpp` (`ExpertTierLoader`), the Warm/staging boundary to `infrastructure/core/host_partition.hpp` (`HostPartition`), and the prefill lifecycle and sweep to `infrastructure/core/prefill_controller.hpp` (`PrefillController`), keeping its own API unchanged.
 - `src/infrastructure/core/prefill_carry.hpp` - the layer-major prefill residual carry (model-agnostic): the fp16/fp32 residual pair, sized by a scalar residual width and grown only. The V4 prefill workspace supplies the width and owns the model's chunk scratch.
 - `src/infrastructure/core/prefill_sweep.hpp` - the swept-prefill driver and the switch between the prefill and decode allocation strategies (model-agnostic; drives the `LayerBatchSupply` port). Its read-ahead policy and wave issuance (`derived_lookahead_capacity`, `read_lookahead_capacity`, `set_read_ahead_max`, `update_frontier`, `dispatch_ahead`, `advance_reads`, `reads_in_flight`) live in `prefill_lookahead.hpp`.
 - `src/infrastructure/core/sampler.hpp` - the logit-processor seam and the sampler (model-agnostic; uses only `platform/ops/argmax.hpp`).
-- `src/architecture/deepseek_v4/core/v4_layer_body.hpp` - the single layer body (decode and chunk share it): the orchestrator for the per-token attention tail and the decode body. Its types live in `v4_layer_body_types.hpp`, its attention phases in `v4_layer_body_attention.hpp`, and its MoE phases (with the `V4RoutedExpertExecutor` seam) in `v4_layer_body_moe.hpp`.
-- `src/architecture/deepseek_v4/core/v4_model_resources.hpp` - RoPE caches and model-level resident weights.
-- `src/architecture/deepseek_v4/core/v4_expert_supply.hpp` - six-expert V4 request adapter and Aeon payload-source mapping.
+- `src/architecture/deepseek_v4/layer/v4_layer_body.hpp` - the single layer body (decode and chunk share it): the orchestrator for the per-token attention tail and the decode body. Its types live in `v4_layer_body_types.hpp`, its attention phases in `v4_layer_body_attention.hpp`, and its MoE phases (with the `V4RoutedExpertExecutor` seam) in `v4_layer_body_moe.hpp`.
+- `src/architecture/deepseek_v4/runtime/v4_model_resources.hpp` - RoPE caches and model-level resident weights.
+- `src/architecture/deepseek_v4/moe/v4_expert_supply.hpp` - six-expert V4 request adapter and Aeon payload-source mapping.
 - `src/infrastructure/core/tiered_expert_supply.hpp` - architecture-neutral tiered payload movement and transfer lifecycle: the policy that reserves, demotes and reaps. Its payload vocabulary is in `tiered_expert_supply_types.hpp`, its derived telemetry records in `supply_telemetry_recorder.hpp`, its counters in `supply_transfer_counters.hpp`, its in-flight transfer table in `pending_transfer_registry.hpp`, and its read/copy mechanisms in `expert_transfer_pipeline.hpp`. The layer-batch port a swept prefill drives (`LayerBatchState`, `LayerBatchSupply`) is in `layer_batch_supply.hpp`; the V4 adapter is `v4_expert_supply.hpp`.
 - `src/infrastructure/core/aeon_loader.hpp` - native `.aeon` dense and expert container access.
 - `src/infrastructure/core/expert_direct_io.hpp` - the direct (`O_DIRECT`) expert-fragment I/O (model-agnostic): the `io_uring` reader, the in-flight completion map the supply fills, the request-id counter, and the batched blocking expert read. Split out of `v4_model_host.hpp`; the host owns one and shares its reader/completion/id pointers with the supply.
 - `src/infrastructure/core/expert_tier_loader.hpp` - the expert tier's bulk load and restore (model-agnostic): Hot preload, Warm preload, and the drained-resident restore, over the registry's slots and the pools. Split out of `v4_model_host.hpp`; a second architecture reuses it.
 - `src/infrastructure/core/expert_tier_state.hpp` - the engine-owned expert tier (model-agnostic): the residency registry, the hot payload pool, Warm pool, staging arena, pinned host region, Warm/staging partition, telemetry, routing-reuse profiler, direct I/O and bulk loader, as one bundle (`ExpertTierState`). Its `initialize` builds steps 10–12 of the assembly from a few model scalars (`num_layers`/`experts_per_layer`/`experts_per_token`), the format, the budget and the artifact source — so a model gets a whole expert tier from one call. The hot pool is held through the neutral `ExpertPayloadPool`; the concrete, format-specific pool (`UnifiedVRAMExpertPool`) is constructed by the host and sized here, so this header includes no backend.
-- `src/infrastructure/core/memory_budget.hpp` - umbrella over the memory budget (model-agnostic): `runtime_config.hpp` (the knobs, safety margins, scratch allowances, staging slot counts), `model_memory_geometry.hpp` (the architecture-supplied input the engine reads), `memory_budget_report.hpp` (`MemoryBudgetReport` and its derived terms), and `memory_budget_engine.hpp` (the device/host query and feasibility evaluation). V4 supplies its geometry via `src/architecture/deepseek_v4/core/v4_memory_geometry.hpp`.
+- `src/infrastructure/core/memory_budget.hpp` - umbrella over the memory budget (model-agnostic): `runtime_config.hpp` (the knobs, safety margins, scratch allowances, staging slot counts), `model_memory_geometry.hpp` (the architecture-supplied input the engine reads), `memory_budget_report.hpp` (`MemoryBudgetReport` and its derived terms), and `memory_budget_engine.hpp` (the device/host query and feasibility evaluation). V4 supplies its geometry via `src/architecture/deepseek_v4/spec/v4_memory_geometry.hpp`.
 - `src/backend/swizzled_w4a16/core/vram_expert_pool.hpp` - current backend's Tier 1 hot expert pool.
 - `src/infrastructure/core/host_expert_pool.hpp` - shared Tier 2 warm expert pool.
 - `src/infrastructure/core/expert_registry.hpp` - shared expert residency and usage tracking: the class declaration and the reservation / completion / demotion policy. Its data vocabulary is in `expert_registry_types.hpp`; the out-of-line definitions of the Warm/staging partition are in `warm_partition.hpp`, of the prefill streaming mode and frozen-prefill shadows in `prefill_residency.hpp`, and of the invariant audit in `expert_registry_validation.hpp`.

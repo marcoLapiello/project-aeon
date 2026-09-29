@@ -163,10 +163,10 @@ sampled correctly.
 ## 6. References
 
 - `src/infrastructure/core/aeon_loader.hpp` — `release_dense_pages_except`, `drop_residency`
-- `src/architecture/deepseek_v4/core/memory_budget.hpp` — `release_dense_pages_after_upload`,
+- `src/infrastructure/core/runtime_config.hpp` — `release_dense_pages_after_upload`,
   `HOST_RAM_RESERVED_BYTES`
-- `src/architecture/deepseek_v4/core/v4_model_host.hpp` — the release call site, `preload_warm_experts`,
+- `src/architecture/deepseek_v4/runtime/v4_model_host.hpp` — the release call site, `preload_warm_experts`,
   `read_experts_direct_blocking`, `preload_hot_experts`
 - `src/infrastructure/core/host_expert_pool.hpp` — the pinned Warm allocation
-- `src/architecture/deepseek_v4/core/v4_model_contract.hpp` — `uploaded_dense_bytes`
+- `src/architecture/deepseek_v4/spec/v4_model_contract.hpp` — `uploaded_dense_bytes`
 - [PERFORMANCE_LEDGER](../../status/PERFORMANCE_LEDGER.md) **M28**

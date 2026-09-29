@@ -14,7 +14,7 @@ This study must not change normal inference behavior, the default expert placeme
 
 ## 2. Measurement boundary
 
-The profiler must observe the routing result once the six selected expert IDs are known on the host. The graph exposes this seam as `V4RoutedExpertExecutor::on_routing_ready(layer_id, position, ids, weights)` in `src/architecture/deepseek_v4/core/v4_expert_executor.hpp`, which runs after the routed ids are known and before any device work for the MoE; the profiler counts those IDs rather than adding a second router path or collecting router logits.
+The profiler must observe the routing result once the six selected expert IDs are known on the host. The graph exposes this seam as `V4RoutedExpertExecutor::on_routing_ready(layer_id, position, ids, weights)` in `src/architecture/deepseek_v4/moe/v4_expert_executor.hpp`, which runs after the routed ids are known and before any device work for the MoE; the profiler counts those IDs rather than adding a second router path or collecting router logits.
 
 The smallest record needed for aggregation is:
 
