@@ -1,6 +1,6 @@
 # Project Aeon — Project Status
 
-**Audited: 2026-09-27, on branch `main`.**
+**Audited: 2026-09-29, on branch `main`.**
 
 This is the **single progress-tracking document**. It owns what is done, what is in flight, what is open, and what is deliberately future. Read it with [AGENTS.md](../../AGENTS.md), which owns the stable context — purpose, external references, and engineering rules.
 
@@ -34,6 +34,8 @@ The documents that matter for a milestone are linked from its row in §3. This s
 
 **Historical documents are marked, not deleted.** A replaced plan moves to `superseded/`, an analysis to `historical/`, annotated with what replaced it. Such a document may name targets and files that no longer exist — correct for a record, but **not** for instructions. The codebase map is authoritative for what actually builds.
 
+The **four concern groups (G1–G4)** and the **comment-writing rule** are stable context, owned by [AGENTS.md](../../AGENTS.md) §3. They are stated there once and not restated here.
+
 ---
 
 ## 3. Progress
@@ -46,11 +48,11 @@ Oldest to newest. As the list grows, the two oldest rows fuse into one, so the t
 
 | Milestone | State | Detail |
 | :--- | :--- | :--- |
-| Foundations (oldest rows, fused): build and hardware baseline, the three-tier storage stack, and the native text path | complete | [Phase 0](../execution/completed/PHASE_0_EXECUTION_PLAN.md), [Phase 1](../execution/completed/PHASE_1_EXECUTION_PLAN.md), [Phase 2](../execution/completed/PHASE_2_EXECUTION_PLAN.md), [Warm-tier repair](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md), [native text path](../execution/completed/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md) |
-| DeepSeek-V4 specification and oracle harness: Step 0 prompt encoding and the implementation order Tiers 0–4, through the layer body, the three attention classes, chunked prefill, the long-context lifecycle, streaming and tiering, and state restore | verified | [DSV4 Inference Pipeline Plan](../execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md) — one plan; its every `[V]` claim cites readable reference code |
+| Foundations (oldest rows, fused): build and hardware baseline, the three-tier storage stack, the native text path, and the DeepSeek-V4 specification and oracle harness (implementation order Tiers 0–4, through the layer body, the three attention classes, chunked prefill, the long-context lifecycle, streaming and tiering, and state restore) | complete / verified | [Phase 0](../execution/completed/PHASE_0_EXECUTION_PLAN.md), [Phase 1](../execution/completed/PHASE_1_EXECUTION_PLAN.md), [Phase 2](../execution/completed/PHASE_2_EXECUTION_PLAN.md), [Warm-tier repair](../execution/completed/WARM_TIER_REPAIR_AND_SUPPLY_TELEMETRY_PLAN.md), [native text path](../execution/completed/TEXT_IN_TEXT_OUT_IMPLEMENTATION_PLAN.md), [DSV4 Inference Pipeline Plan](../execution/completed/DSV4_INFERENCE_PIPELINE_PLAN.md) — every `[V]` claim cites readable reference code |
 | Graph rewrite: composition P0–P4, the 43-layer text-in/text-out path | acceptance criterion met | [DSV4 Graph Composition Plan](../execution/completed/DSV4_GRAPH_COMPOSITION_PLAN.md) §7; ledger M28 |
 | Prefill supply strategy: prompt-length gate, bounded Hot drain, routed bank, Hot-set restore | complete | [PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md](../execution/completed/PREFILL_SUPPLY_STRATEGY_EXECUTION_PLAN.md); ledger M44/M44b |
 | Supply-chain hot path: the corridor as a demand-driven pipeline | complete | [SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md](../execution/completed/SUPPLY_CHAIN_HOT_PATH_EXECUTION_PLAN.md); ledger M42–M46; evidence §8–§19 of [the analysis](../analysis/historical/SUPPLY_CHAIN_HOT_PATH_ANALYSIS.md) |
+| Structural consolidation: monolith module split, concern relocation into **G1–G4**, and the plan-reference comment pass across the tree | complete | [Module Split Plan](../execution/completed/MONOLITH_MODULE_SPLIT_EXECUTION_PLAN.md), [Relocation Execution Plan](../execution/completed/RELOCATION_EXECUTION_PLAN.md); grouping rationale in [the analysis](../analysis/historical/CONCERN_GROUPING_AND_RELOCATION_ANALYSIS.md). No measurement and no behaviour change; the four groups are now a standing rule ([AGENTS.md](../../AGENTS.md) §3 rule 6) |
 
 ### Present
 

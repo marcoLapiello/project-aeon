@@ -1,10 +1,10 @@
 # Concern Grouping and Relocation Analysis
 
 **Date:** 2026-09-28
-**Status:** Analysis / proposal. Not an execution plan, not started.
+**Status:** Historical. A pre-execution analysis: it proposed the four groups below and where each file belonged, and it framed the destinations as proposals rather than decisions. Superseded by the executed result — the [Relocation Execution Plan](../../execution/completed/RELOCATION_EXECUTION_PLAN.md) (complete 2026-09-29) moved the files, and its §7 records what actually landed. Kept for the reasoning that produced the grouping; **not** an instruction, and its target paths may not match the tree.
 **Scope:** Classify every file under `src/` into one of four concerns, and propose where it belongs so the engine can grow to other models and other AMD GPUs without cascades. Kernel files are covered in depth in §5.
 
-**Provenance.** This document follows the [Monolith Module Split Execution Plan](../../execution/active/MONOLITH_MODULE_SPLIT_EXECUTION_PLAN.md) (tiers A–C complete). That split made the concerns *visible*; this analysis decides what the visible pieces actually are, so a later relocation can be mechanical.
+**Provenance.** This document follows the [Monolith Module Split Execution Plan](../../execution/completed/MONOLITH_MODULE_SPLIT_EXECUTION_PLAN.md) (tiers A–C complete). That split made the concerns *visible*; this analysis decides what the visible pieces actually are, so a later relocation can be mechanical.
 
 **What this document is not.** It does not change behaviour, does not reorder work, and does not commit to any destination path. Every "Action" cell is a proposal for a decision, not a decision. Nothing moves until the destinations in §6 are agreed.
 

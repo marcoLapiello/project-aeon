@@ -1,5 +1,7 @@
 # Monolith Module Split — Execution Plan
 
+**Status:** Complete (2026-09-29). Tiers A–C are done and each Tier-D item is either explicitly deferred on-edit or re-assessed by the later [Relocation Execution Plan](RELOCATION_EXECUTION_PLAN.md). This split made the concerns *visible*; the relocation that followed is what assigned each file to its group.
+
 *Created 2026-09-27. Owner: this document — it is the action list. Evidence for the measurements below is the file inventory and churn count taken at creation (see §1). Scope: **structural split only**. No behaviour change, no performance claim, no new abstraction.*
 
 **Goal:** break the files that accreted during the last implementations into focused modules, per [AGENTS.md](../../../AGENTS.md) §3 *Code Architecture & Runtime* rule 7 (modular, no monolithic mixed-concern files) and the [codebase map](../../status/CODEBASE_MAP.md) cleanup rule.

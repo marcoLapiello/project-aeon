@@ -9,7 +9,7 @@
 > "current engine path" below is the **rebuilt** graph; the storage, streaming, artifact-format
 > and kernel sections were always current. See [PROJECT_STATUS.md](PROJECT_STATUS.md).
 
-*Status: current runtime map, audited 2026-09-12.*
+*Status: current runtime map, audited 2026-09-29.*
 
 This document distinguishes the current inference engine from validation programs,
 hardware spikes, and offline tooling. A file being built by CMake does not by itself
@@ -66,7 +66,7 @@ access remains available inside the loader for native `.aeon` ownership and
 validation. The bounded Hot/Warm/Cold path is implemented. See
 [PHASE_2_EXECUTION_PLAN.md](../execution/completed/PHASE_2_EXECUTION_PLAN.md) for the storage and kernel work.
 
-## Active validation (default `ctest` — 44 tests)
+## Active validation (default `ctest` — 50 tests)
 
 These targets are built and run on every branch. They validate the artifact format,
 the storage tiers, the W4A16 kernels, the text front end, the kept model-side

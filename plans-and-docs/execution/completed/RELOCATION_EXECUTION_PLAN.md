@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-28
 **Status:** Complete (2026-09-29). All stages done; every §6 row resolved (moved, or re-assessed as genuinely model-specific and kept).
-**Scope:** Execute the file movements described by the [Concern Grouping and Relocation Analysis](../../analysis/current/CONCERN_GROUPING_AND_RELOCATION_ANALYSIS.md), one small commit per step, with no behaviour change. This plan covers only the steps that are ready or nearly ready now; the genuinely mixed files were deferred to their own steps (§6) and have since been resolved.
+**Scope:** Execute the file movements described by the [Concern Grouping and Relocation Analysis](../../analysis/historical/CONCERN_GROUPING_AND_RELOCATION_ANALYSIS.md), one small commit per step, with no behaviour change. This plan covers only the steps that were ready or nearly ready now; the genuinely mixed files were deferred to their own steps (§6) and have since been resolved.
 
 **Companion document.** The analysis owns *what the four groups are and where each file belongs*. This plan owns *the order and the verification*. Where they disagree, the analysis wins on classification and this plan wins on sequence.
 
