@@ -59,6 +59,9 @@ if(AEON_BUILD_TESTS)
     # Wave32 RMSNorm and clamped SwiGLU.
     aeon_add_test(test_swiglu_clamp SOURCES tests/test_swiglu_clamp.cpp)
 
+    # RDNA3 Wave32 WMMA primitive and its operand lane map (silicon).
+    aeon_add_test(test_rdna3_wmma_oracle SOURCES tests/test_rdna3_wmma_oracle.cpp)
+
     # Parallel W4A16 swizzle layout contract (host-side).
     aeon_add_test(test_w4a16_swizzle SOURCES tests/test_w4a16_swizzle.cpp)
 
@@ -175,6 +178,14 @@ if(AEON_BUILD_TESTS)
     # permutation), the clamp rule, and the composed FFN against an fp64 oracle,
     # then re-checks W1 and the whole FFN on a real artifact payload.
     aeon_add_test(test_v4_expert_oracle SOURCES tests/test_v4_expert_oracle.cpp)
+
+    # The multi-token replacement for those GEMVs: the same format and clamp,
+    # driven by a token->expert permutation, with the swizzled weights staged
+    # into LDS and consumed as WMMA B fragments. Certifies the permutation, the
+    # LDS transposition and the partial-M-tile padding against the same fp64
+    # reference. OPENMP is only for the reference's fp64 matvecs.
+    aeon_add_test(test_v4_grouped_wmma_oracle
+        SOURCES tests/test_v4_grouped_wmma_oracle.cpp TIMEOUT 600 OPENMP)
 
     # Step 2.10.4 — shared expert: dense fp16 FFN, no routing, same clamp. The
     # clamp rule itself is certified at item 14; this certifies the structure,
