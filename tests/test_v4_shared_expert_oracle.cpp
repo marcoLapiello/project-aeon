@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Tier-1 gate: shared expert (Step 2.10.4) — versus an independent fp64 oracle.
+// Tier-1 gate: shared expert — versus an independent fp64 oracle.
 //
 // The shared expert is the simplest op in the graph, and that is exactly why the
 // gate is short. It is structurally the same activation as the routed expert, so
@@ -17,7 +17,7 @@
 //                    once**. Measured on the device, because "once" is the kind of
 //                    property that is right by accident until it is not.
 //
-// The clamped-SwiGLU *rule* itself is certified by item 14's gate, against the
+// The clamped-SwiGLU *rule* itself is certified by the clamp gate, against the
 // asymmetric/symmetric/no-clamp fork. This gate reuses `clamped_swiglu` rather
 // than re-deriving it: duplicating the rule here would let the two copies drift,
 // and re-proving it would add no information.
@@ -475,7 +475,7 @@ int main() {
                 } else {
                     std::printf("  %-54s %-22s %s\n",
                                 "asymmetric edge not reached even at 8x",
-                                "n/a (item 14 covers it)",
+                                "n/a (covered by the clamp gate)",
                                 (std::to_string(gate_below) + " gate below -10").c_str());
                 }
             }

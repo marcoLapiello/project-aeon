@@ -2,13 +2,12 @@
 // Tier-1 gate: Wave32 RMSNorm versus an independent fp64 reference.
 //
 // This is the first certified graph primitive of the rewrite, and it fixes the
-// pattern the rest of Tier 1 follows:
+// pattern the rest of the per-op gates follow:
 //
 //   1. THE REFERENCE IS INDEPENDENT. It lives in `reference/dsv4_oracle.hpp` and
-//      shares no code with the kernel under test. The plan's anti-circularity
-//      rule is explicit: an oracle derived from the kernel proves only
-//      self-consistency, and that defect is why the previous implementation's
-//      tests passed on wrong logic.
+//      shares no code with the kernel under test. An oracle derived from the
+//      kernel proves only self-consistency, and that defect is why the previous
+//      implementation's tests passed on wrong logic.
 //   2. THE KERNEL IS THE KEPT ONE. `platform/ops/rmsnorm.hpp`, not a local copy.
 //   3. THE GATE ASSERTS A NUMBER. "It produced output" is not a gate; a stated
 //      tolerance is.
@@ -140,7 +139,7 @@ int main() {
 
     std::vector<__half> h_y(kCount);
 
-    // --- Weighted form (Step 2.1 attention RMSNorm) ---------------------------
+    // --- Weighted form (attention RMSNorm) -----------------------------------
     CHECK_HIP(hipMemset(d_y, 0, kCount * sizeof(__half)));
     aeon::kernel::rmsnorm_wave32_kernel<<<kRows, 32>>>(d_x, d_w, d_y, kDim, kEps);
     CHECK_HIP(hipGetLastError());

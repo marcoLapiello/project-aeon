@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Tier-1 gate: grouped output projection (Step 2.5) — versus an independent
+// Tier-1 gate: grouped output projection — versus an independent
 // fp64 reference.
 //
 // The graph is

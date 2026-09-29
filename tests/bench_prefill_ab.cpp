@@ -3,8 +3,8 @@
 //
 // ## Why this exists
 //
-// Step 6's outcome 5 is a *speed* claim, and a speed claim without its baseline is
-// not a measurement. An earlier version of this work reported "2.1 tok/s" for the
+// Any throughput claim needs its baseline. An earlier version of this work
+// reported "2.1 tok/s" for the
 // batched window with nothing beside it — which, against the ~3 tok/s serial
 // prefill we already had, reads as a regression. It was worse than that: the run
 // was at a 103-token prompt, and the two arms do not scale the same way.
@@ -20,11 +20,11 @@
 //     serial_bytes(N)  ~  N x 6 draws x 43 layers      (grows with N)
 //     sweep_bytes      ~  43 x experts_per_layer       (constant in N)
 //
-// The **routed bank** (Prefill Supply Strategy plan, Step 4) sits between them: it
+// The **routed bank** sits between them: it
 // reads each layer's union once and holds it to the layer boundary, so its cost is
 // `sum_layer |union(N)|`, which grows with N but stays below the sweep's whole-layer
 // load until the union saturates near `E`. Which supply wins is a question of N, and
-// the gate (Step 3) is the switch between them.
+// the prompt-length gate is the switch between them.
 //
 // So this program measures **one arm at a time**, each in its own process with a
 // pristine host, and a driver script tabulates the matrix. That isolation matters:
@@ -48,7 +48,7 @@
 //
 // It does not assert. It prints, because the numbers are the deliverable and a
 // threshold would turn a measurement into a test that passes. Correctness under the
-// sweep is `test_v4_prefill_sweep`'s subject (byte-identical to serial, ledger M40),
+// sweep is `test_v4_prefill_sweep`'s subject (byte-identical to serial),
 // and under the bank `test_v4_routed_prefill`'s; this file never re-checks it. It is
 // also **prefill-only** — it samples nothing, so the greedy/sampling distinction does
 // not apply here.
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
     runtime.prefill_window = kWindow;
     runtime.warm_host_bytes = warm_gib * 1024ULL * 1024ULL * 1024ULL;
     // Force the strategy so both supplies can be measured at the same N. The gate is
-    // what the window reads (Step 3); a gate of one token always sweeps, a gate above
+    // what the window reads; a gate of one token always sweeps, a gate above
     // any prompt always routes. The production default is the derived `3 E / 4`.
     if (arm == "swept") {
         runtime.prefill_sweep_min_tokens = 1;

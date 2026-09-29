@@ -1,13 +1,12 @@
 // -----------------------------------------------------------------------------
-// Tier-2 gate, item 16 — one full Sliding-class layer body, versus an
-// independent fp64 oracle.
+// Gate — one full Sliding-class layer body, versus an independent fp64 oracle.
 //
-// Tier 1 certified eleven primitives one at a time. This gate certifies the
-// *composition*: `core/v4_layer_body.hpp::run_layer_body_decoding`, which is the
-// single piece of code the rewrite's decode and chunked-batch prefill are both
-// meant to drive. Tier 1's own lesson is that a layer fails in the wiring between
-// correct primitives, so the gate has to compare the whole layer — `res_out` and
-// the intermediate checkpoints the plan names — against a reference that is
+// The per-op gates certified eleven primitives one at a time. This gate certifies
+// the *composition*: `core/v4_layer_body.hpp::run_layer_body_decoding`, which is the
+// single piece of code the decode and chunked-batch prefill paths are both
+// meant to drive. The lesson from the per-op gates is that a layer fails in the
+// wiring between correct primitives, so the gate has to compare the whole layer —
+// `res_out` and the intermediate checkpoints — against a reference that is
 // written independently of that code.
 //
 // What is asserted, and why each line earns its place:
@@ -26,11 +25,10 @@
 //                            a wiring that is wrong in the same way in both.
 //   D. PER-STEP LOCKING    — the residual between steps is written from the
 //                            oracle, so the gate measures ONE LAYER rather than
-//                            the accumulation of rounding across a loop. Serial
-//                            multi-token state evolution is item 18's gate.
+//                            the accumulation of rounding across a loop.
 //
 // Deliberately NOT covered here, and named so it is not mistaken for coverage:
-//   * the compressed classes (CSA/HCA) — items 17;
+//   * the compressed classes (CSA/HCA);
 //   * the local-window rollover at the real 128-token window — the ring is
 //     shrunk to make the wrap reachable in a few tokens;
 //   * any tiering: this gate supplies experts directly.
@@ -272,7 +270,7 @@ int main() {
     std::cout << "\n--- B. full layer body, real weights ---\n";
 
     // Start both from the same fp16-rounded residual: the embedding row of the
-    // first token, broadcast to the four HC streams (plan Step 1).
+    // first token, broadcast to the four HC streams.
     std::vector<double> residual(kHcDim, 0.0);
     {
         const __half* embed = loader.get_data_ptr<__half>("embed.weight");
@@ -434,8 +432,8 @@ int main() {
                         "max|delta|=" + std::to_string(attn_delta));
         }
 
-        // (iii) The shared expert is present exactly once (item 15's property,
-        //       re-observed at layer scale).
+        // (iii) The shared expert is present exactly once (the shared-expert
+        //       rule, re-observed at layer scale).
         double shared_delta = 0.0;
         for (size_t i = 0; i < kHidden; ++i)
             shared_delta = std::fmax(shared_delta,

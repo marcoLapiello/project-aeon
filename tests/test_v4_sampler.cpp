@@ -23,13 +23,13 @@
 // is a tautology:
 //
 //   1. the default configuration resolves to the argmax, and that token is the
-//      **certified device argmax** on the same logits (D4, E2, F2) — two
+//      **certified device argmax** on the same logits — two
 //      implementations of one rule agreeing;
 //   2. `T -> 0` in *sampling* mode converges to the same token, so the greedy
-//      switch is not a special case bolted on beside the sampler (D3);
+//      switch is not a special case bolted on beside the sampler;
 //   3. at `T=1, top_p=1, top_k=0` the **support is the whole vocabulary** — every
 //      token has non-zero probability — which is what "untruncated" means and is
-//      the property that makes the first two statements interesting (B8, E4).
+//      the property that makes the first two statements interesting.
 //
 // WHAT IS REAL HERE. The pure section runs on hand-built vectors with an
 // independently written fp64 reference for the softmax and the nucleus, so every
@@ -649,7 +649,7 @@ int main() {
     {
         const std::vector<float> probe = distinct_probe();
 
-        // D1/D2 — the gate's first clause.
+        // The gate's first clause: same seed replays, different seed diverges.
         {
             const auto draw_sequence = [&](uint64_t seed_value, uint32_t count) {
                 Sampler sampler(probe_size);
@@ -697,7 +697,7 @@ int main() {
                                 varies, varies ? "varies" : "constant");
         }
 
-        // D3 — T -> 0 converges to the argmax path.
+        // T -> 0 converges to the argmax path.
         {
             const uint32_t expected = ops::argmax_of(probe.data(), probe_size);
             Sampler sampler(probe_size);
@@ -716,7 +716,7 @@ int main() {
                                                   std::to_string(expected));
         }
 
-        // D4 — the shipped default: greedy at top-k=0, top-p=1.
+        // The shipped default: greedy at top-k=0, top-p=1.
         {
             Sampler sampler(probe_size);
             harness.assert_that("D: the shipped default is the deterministic one",
@@ -742,7 +742,7 @@ int main() {
                                     std::to_string(logits.size()));
         }
 
-        // D5 — invalid configurations are refused, not clamped.
+        // Invalid configurations are refused, not clamped.
         {
             Sampler sampler(probe_size);
             const auto refuses = [&](const SamplerConfig& config) {

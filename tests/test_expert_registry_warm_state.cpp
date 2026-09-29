@@ -31,7 +31,7 @@ int main() {
     ExpertRegistry registry(1, 8, 2, 2);
     // This gate's subject *is* the registry's bookkeeping, so the full audit runs
     // after every operation here — the fine-grained assertion is the point, and it is
-    // what the production path leaves off for speed (ledger M43).
+    // what the production path leaves off for speed.
     registry.set_validate_each_request(true);
     assert(registry.invariants_hold());
 

@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Tier-1 gate: attention score + sink + softmax (Step 2.4.1) — versus an
+// Tier-1 gate: attention score + sink + softmax — versus an
 // independent fp64 reference.
 //
 // The kernel under test is `v4_sliding_window_attn_wave32_kernel`, which is the
@@ -19,7 +19,7 @@
 //   * V = K: there is no value tensor to pass, and the output is a convex
 //     combination of the in-window key rows.
 //
-// HONEST LIMITATION. The plan says the sink must be included in the max. That is
+// HONEST LIMITATION. The sink must be included in the max. That is
 // a numerical-robustness property and it is **not observable in the output**:
 // when the sink dominates, all mass sits on the sink and the output is zero
 // whether or not the sink was in the max. This gate therefore does *not* claim
@@ -63,7 +63,7 @@ constexpr size_t kTokens    = 150;      // > window, so a full-window position e
 constexpr double kScale     = 0.04419417382415922; // 1 / sqrt(512), the full head
 constexpr double kTol       = 2e-3;     // fraction of peak; output is fp16
 
-// Positions chosen to cover the plan's three regimes.
+// Positions chosen to cover the three regimes.
 constexpr size_t kPosZero     = 0;      // 1 key
 constexpr size_t kPosShort    = 5;      // 6 keys, < window
 constexpr size_t kPosAtWindow = 127;    // exactly 128 keys — first full window
@@ -205,7 +205,7 @@ int main() {
     };
 
     // =======================================================================
-    // Stage 1 — the three regimes the plan names
+    // Stage 1 — the three regimes
     // =======================================================================
     const std::vector<double> out = run(h_k, h_sink);
 
@@ -390,8 +390,8 @@ int main() {
         const std::vector<double> k_win = slice_rows(k_d, start, count, kHeadDim);
 
         // A: the two readings of the sink — "a term in the denominator" vs "one
-        //    more key whose value row is zero" — must agree, because the plan
-        //    asserts they are numerically identical.
+        //    more key whose value row is zero" — must agree, since they are
+        //    numerically identical.
         {
             const std::vector<double> a = aeon::reference::attention_scores_sink(
                 q_t, kHeads, kHeadDim, k_win, count, sink_d, kScale);

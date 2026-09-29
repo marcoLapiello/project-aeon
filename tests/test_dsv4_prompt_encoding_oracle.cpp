@@ -1,4 +1,4 @@
-// Step 0 prompt-encoding oracle (checkpoint plan Stage B).
+// Prompt-encoding oracle.
 //
 // The DeepSeek-V4 artifact ships its own prompt encoder and four golden
 // input/output vectors. This test renders each vector through our encoder and
@@ -141,7 +141,7 @@ std::string first_difference(const std::string& actual, const std::string& expec
 int main() {
     try {
         const fs::path vectors_dir = find_vectors_dir();
-        std::cout << "[Test] DSV4 prompt-encoding oracle (Step 0)\n"
+        std::cout << "[Test] DSV4 prompt-encoding oracle\n"
                   << "  vectors: " << vectors_dir.string() << "\n" << std::endl;
 
         aeon::text::Dsv4Tokenizer tokenizer;

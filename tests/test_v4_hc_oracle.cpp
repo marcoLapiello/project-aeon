@@ -383,7 +383,7 @@ int main() {
         // The same offset shows up in the doubly-stochastic check above: the
         // fixed point has row and column sums of `1 - eps`, so the comb is never
         // *exactly* doubly stochastic. `hc_sinkhorn_eps` is the floor on that
-        // deviation, and the plan's "within 1e-4" gate is really "within eps".
+        // deviation, and the "within 1e-4" gate is really "within eps".
         std::vector<double> flat(kHcMult3, 0.0);
         const std::vector<double> zero_scale{0.0, 0.0, 0.0};
         const std::vector<double> zero_base(kHcMult3, 0.0);

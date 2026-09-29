@@ -1,8 +1,8 @@
 // -----------------------------------------------------------------------------
-// Tier-1 gate: the MoE router (Step 2.9) — versus an independent fp64 oracle.
+// Tier-1 gate: the MoE router — versus an independent fp64 oracle.
 //
-// The router has two mutually exclusive branches and four things the plan flags
-// as easy to get wrong. This gate measures each of them rather than asserting
+// The router has two mutually exclusive branches and four things that are
+// easy to get wrong. This gate measures each of them rather than asserting
 // the output, because every one of the four produces a plausible-looking result:
 //
 //   1. the bias is added to the **post-softplus score**, not the logit. A loader
@@ -20,7 +20,7 @@
 //
 // The hash branch is then replayed against the **artifact's own** `tid2eid`
 // table for real token ids, and the table's shape, dtype, and hash/biased layer
-// split are verified on disk — the plan's requirement that `tid2eid` be checked
+// split are verified on disk — `tid2eid` must be checked
 // against our artifact and not against a synthetic table.
 //
 // The existing `test_moe_router` is not a substitute and is not relied on here:
@@ -587,7 +587,7 @@ int main() {
         ok &= check("scoring_func == sqrtsoftplus",
                     config.scoring_func == "sqrtsoftplus", config.scoring_func);
 
-        // The plan's structural claim is that `n_group`/`topk_group` are *absent*
+        // `n_group`/`topk_group` must be *absent*
         // from the config, which is what makes this a flat top-6 rather than the
         // DeepSeek-V3 `noaux_tc` grouped variant. A typed parser cannot show
         // absence, so read the file itself.

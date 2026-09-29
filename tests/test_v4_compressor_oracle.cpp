@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Tier-1 gate: compressor + APE (Step 2.4.2) — versus an independent fp64
+// Tier-1 gate: compressor + APE — versus an independent fp64
 // reference.
 //
 // The compressor is the second op the audit found missing entirely (the APE
@@ -22,7 +22,7 @@
 //     segments are populated from the right offsets by feeding the two segments
 //     distinguishable data and checking the result uses both.
 //   * THE BOUNDARY IS `(pos + 1) % ratio == 0`, and the RoPE position is the
-//     window start `(pos / ratio)·ratio` — checked equal to the plan's
+//     window start `(pos / ratio)·ratio` — checked against
 //     `pos + 1 − ratio` at every boundary.
 //   * K = V: the kernel writes the same value to `compressed_key` and
 //     `compressed_value`.
@@ -378,17 +378,17 @@ int main() {
                         "pos+1 would differ by " + std::to_string(d));
         }
 
-        // --- Boundary alignment: the plan's `pos + 1 - ratio` == our formula.
+        // --- Boundary alignment: `pos + 1 - ratio` == our formula. -----------------
         {
             bool all_equal = true;
             for (int64_t b = spec.ratio - 1; b <= 4 * spec.ratio; b += spec.ratio) {
-                const int64_t plan_form = b + 1 - spec.ratio;
+                const int64_t closed_form = b + 1 - spec.ratio;
                 const int64_t ours = aeon::reference::compressor_rope_position(b, spec.ratio);
-                if (plan_form != ours) all_equal = false;
+                if (closed_form != ours) all_equal = false;
                 // And the boundary condition itself holds at `b`.
                 if ((b + 1) % spec.ratio != 0) all_equal = false;
             }
-            ok &= check("rope pos == plan's pos+1-ratio at boundaries", all_equal,
+            ok &= check("rope pos == pos+1-ratio at boundaries", all_equal,
                         "checked 5 consecutive boundaries");
         }
 

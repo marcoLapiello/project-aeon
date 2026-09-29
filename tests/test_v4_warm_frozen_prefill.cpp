@@ -1,9 +1,9 @@
 // -----------------------------------------------------------------------------
-// Step 6 outcome 3 — the Warm tier survives a prefill intact (D-b, policy A).
+// Gate — the Warm tier survives a prefill intact.
 //
-// The plan's D-b freezes Warm during prefill: the sweep must not **promote** from
+// Prefill freezes Warm: the sweep must not **promote** from
 // Warm (a promotion is a *move*, so each Warm-resident expert it touches would
-// leave the tier) and must not **demote** into it. The decision's whole point is
+// leave the tier) and must not **demote** into it. The whole point is
 // that decode's "natural selection" in Warm is still there when the prompt is
 // done, so the first generated tokens start warm instead of cold.
 //
@@ -24,7 +24,7 @@
 //
 // The reference for A is the registry's own residency map, which is the thing the
 // policy is defined over; the tier answer itself (which tier served a request) is
-// not re-derived here — that is Step 3's tier-invariance gate.
+// not re-derived here.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -94,7 +94,7 @@ size_t set_difference_size(const std::set<uint32_t>& a, const std::set<uint32_t>
 
 int main() {
     std::printf("================================================================================\n");
-    std::printf("  Step 6 outcome 3 — Warm is preserved across a prefill (D-b)\n");
+    std::printf("  Warm is preserved across a prefill\n");
     std::printf("================================================================================\n");
     aeon::core::select_compute_device(true);
 

@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Step 4 — the routed bank: route-aware, cached prefill below the sweep's gate.
+// Gate — the routed bank: route-aware, cached prefill below the sweep's gate.
 //
 // A window shorter than the gate runs the same layer-major loop as the sweep, but
 // the expert supply is the **routed bank** instead of a blind whole-layer load:
@@ -9,7 +9,7 @@
 //      a prefill supply is active.
 //   B. BOUNDED DRAIN, SHARED RESTORE. It frees one layer's worth (`E`) of the
 //      worst-LRU residents and preserves the rest, then restores the freed set on
-//      exit, exactly as the sweep does (the shared registry machinery of Steps 1–2).
+//      exit, exactly as the sweep does (the shared registry machinery).
 //   C. THE BANK'S CEILING. Each layer reads at most one layer's set from NVMe — the
 //      union is fetched once and held to the layer boundary — and, below the gate,
 //      strictly less than a whole layer, which is what makes the routed strategy the
@@ -109,7 +109,7 @@ size_t differing_bytes(const std::vector<uint8_t>& a, const std::vector<uint8_t>
 
 int main(int argc, char** argv) {
     std::printf("================================================================================\n");
-    std::printf("  Step 4 — the routed bank: cached prefill below the sweep's gate\n");
+    std::printf("  the routed bank: cached prefill below the sweep's gate\n");
     std::printf("================================================================================\n");
     aeon::core::select_compute_device(true);
 

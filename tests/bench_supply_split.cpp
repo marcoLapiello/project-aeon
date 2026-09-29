@@ -215,9 +215,8 @@ int main(int argc, char** argv) {
     runtime.prefill_window = kWindow;
     runtime.warm_host_bytes = warm_gib * 1024ULL * 1024ULL * 1024ULL;
     // The sweep's arena is `2E` (two layer-blocks) by default. The A/B arm resizes it
-    // to **one** layer-block at runtime — the pre-Phase-2 shape — through the depth
-    // API rather than a config flag, because the depth must not be a behaviour switch
-    // (plan R6).
+    // to **one** layer-block at runtime through the depth
+    // API rather than a config flag, because the depth must not be a behaviour switch.
     const uint32_t sweep_banks_env = [] {
         const char* env = std::getenv("AEON_SWEEP_BANKS");
         return env != nullptr ? static_cast<uint32_t>(std::atoi(env)) : 0u;
@@ -264,7 +263,7 @@ int main(int argc, char** argv) {
         static_cast<double>(layers) * per_layer * 14'155'776.0 / 1073741824.0;
     const uint32_t gate = host.prefill_sweep_min_tokens();
 
-    // P1.2 requirement: the pinned staging figure a gate reads is the figure
+    // The pinned staging figure a gate reads is the figure
     // allocated. The budget report and the arena share `staging_slot_count`, so this
     // is the cross-check that they have not drifted.
     const size_t staging_slot_bytes = host.staging_slot_count() *

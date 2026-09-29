@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Step 6 item 6 — the prefill sweep: bounded drain, layer-ordered streaming, restore.
+// Gate — the prefill sweep: bounded drain, layer-ordered streaming, restore.
 //
 // Prefill and decode are two allocation strategies, not one with a parameter, so
 // the switch between them is asserted as a switch. Through the real host (43
@@ -47,8 +47,8 @@ using aeon::core::V4ModelHost;
 
 constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
 constexpr uint32_t kContext = 256;
-// The window `W` and the body chunk `C`. `C` is the body's own row cap (raised to
-// `64` in Step 6 item 7; colibri's equivalent is 128) and is a batch size *inside* a
+// The window `W` and the body chunk `C`. `C` is the body's own row cap (colibri's
+// equivalent is 128) and is a batch size *inside* a
 // layer, not a partition of the window. `W` is a real layer-major window rather than
 // the chunk-major degenerate `W = C`: this gate ran at `W = 16` for a while, which is
 // exactly chunk-major and therefore certified nothing about the layer-major order.
@@ -56,8 +56,8 @@ constexpr uint32_t kWindow = 96;
 constexpr uint32_t kChunk = 16;
 // A **realistic** Warm pool, not a token one. At `1 GiB` only ~`1.6` experts per layer
 // are Warm-resident, so the frozen-prefill shadow path — the one a Warm-heavy sweep
-// exercises — was effectively untested and a real defect hid behind it (analysis §18.3:
-// a Warm promotion reserved its VRAM at reservation rather than at copy time, and the
+// exercises — was effectively untested and a real defect hid behind it (a Warm
+// promotion reserved its VRAM at reservation rather than at copy time, and the
 // pool over-committed). `16 GiB` puts ~`10%` of every layer on that path while staying
 // well inside this box's memory, and the gate's own Warm-preservation checks below are
 // computed from the pool rather than written down, so they follow it.
@@ -126,7 +126,7 @@ size_t differing_bytes(const std::vector<uint8_t>& a, const std::vector<uint8_t>
 
 int main() {
     std::printf("================================================================================\n");
-    std::printf("  Step 6 item 6 — the prefill sweep: bounded drain, layer order, restore\n");
+    std::printf("  the prefill sweep: bounded drain, layer order, restore\n");
     std::printf("================================================================================\n");
     aeon::core::select_compute_device(true);
 
@@ -286,7 +286,7 @@ int main() {
     assert_that("C: registry invariants hold", host.registry().invariants_hold(),
                 "invariants_hold()");
 
-    // ---- the prompt-length gate (Step 3) -------------------------------------
+    // ---- the prompt-length gate ----------------------------------------------
     //
     // **Forced open here** (`prefill_sweep_min_tokens = 1`) so this gate is about the
     // sweep at any window length; the *default* gate and the routed path below it are

@@ -697,7 +697,7 @@ int main() {
     std::cout << "\n--- E. accumulation order (measurement, not certification) ---\n";
     {
         // The W2 path accumulates with `atomicAdd`, so the summation order is a
-        // property of the scheduler, not of the source. Gate 14 asks whether that
+        // property of the scheduler, not of the source. This measurement asks whether that
         // order is stable and how much it moves the result. Repeat identical work
         // and compare.
         constexpr int kExperts = 6;
@@ -771,7 +771,7 @@ int main() {
 
         // Whatever the answer, the total must still equal the weight-weighted sum
         // of the per-expert outputs to within the fp32 accumulation bound. That is
-        // the property Gate 14 actually cares about.
+        // the property this gate actually cares about.
         {
             std::vector<double> reference(kW2Rows, 0.0);
             for (int e = 0; e < kExperts; ++e) {

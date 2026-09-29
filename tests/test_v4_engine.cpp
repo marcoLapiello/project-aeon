@@ -89,7 +89,7 @@ using aeon::text::StopReason;
 
 constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
 
-// The context the whole gate runs at. 256 is the P1/P2 gates' value: the model's
+// The context the whole gate runs at. 256 is the graph gate's value: the model's
 // real window (128) and its real indexer width (512) are exercised for real, and
 // the expert tier fits comfortably, which is what keeps the assembly honest
 // without making the gate a memory test.

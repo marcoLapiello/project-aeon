@@ -563,7 +563,7 @@ int main() {
             for (size_t k = 0; k < out.topk_indices.size(); ++k) {
                 const int32_t id = out.topk_indices[k];
                 if (id < 0) {
-                    throw std::logic_error("P2 gate: a routed expert id is negative");
+                    throw std::logic_error("graph-body gate: a routed expert id is negative");
                 }
                 weights[layer].routed_payloads[k] =
                     host.loader().get_expert_data(layer, static_cast<uint32_t>(id));

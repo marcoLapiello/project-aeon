@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// Shared fixture for the Tier-2 layer-body gates (items 16, 17 and 18).
+// Shared fixture for the layer-body gates.
 //
 // All three gates drive `core/v4_layer_body.hpp` on real device state and compare
 // every checkpoint against `reference/dsv4_oracle.hpp`. What they share is the
@@ -12,15 +12,14 @@
 // The routed-expert seam has two modes on purpose:
 //
 //   * ARTIFACT — payloads are read from the 145 GB expert container, which is
-//     what item 16 does; that is the real thing and it costs ~3 s per token in
+//     the real thing and it costs ~3 s per token in
 //     page-in.
 //   * SYNTHETIC — payloads are encoded locally with the oracle's own
-//     `swizzled_encode` and uploaded once. Items 17 and 18 need runs long enough
+//     `swizzled_encode` and uploaded once. Compressed-class gates need runs long enough
 //     to cross compressor boundaries (128 tokens for one HCA entry; 136 for a
 //     readable one), which the artifact store would make a multi-minute test;
-//     the routed-expert arithmetic itself is already certified by Tier-1 gates
-//     13/15 and by item 16, so those gates spend their budget on the serial
-//     state and the compressed path.
+//     the routed-expert arithmetic itself is already certified, so those gates
+//     spend their budget on the serial state and the compressed path.
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/core/v4_layer_body.hpp"
@@ -80,7 +79,7 @@ inline std::vector<__half> to_half(const std::vector<double>& v) {
 // `abs_floor` is for a quantity that can *collapse* toward zero: when a tensor's
 // own peak is at the noise floor, a peak-relative bound is the wrong instrument
 // and rejects a correct implementation. A difference below `abs_floor` passes
-// regardless of the peak. This is the same lesson Tier 1 recorded twice (the
+// regardless of the peak. This is the same lesson recorded twice (the
 // RoPE `cos` zero crossing and the dominated sink), now factored into the
 // comparison itself.
 inline bool report(const char* label, const std::vector<double>& want,
@@ -244,12 +243,12 @@ public:
     // When true, the six experts are summed in a **fixed** order — one dispatch
     // per expert, accumulated in slot order — instead of through the fused
     // `atomicAdd` path. The fused path's order across experts is the scheduler's,
-    // so `moe_out` differs between two runs of the same binary by ~1e-7; that is
-    // the property trap 38 records. Item 18 deliberately drives the atomic path to
-    // surface it, and item 19's `chunk ≡ serial` gate needs the deterministic one
-    // or a byte-exact comparison between two runs of the *same* schedule would be
-    // meaningless. **Which accumulation a gate requires is a decision, not a
-    // default** — this flag is how a gate states it.
+    // so `moe_out` differs between two runs of the same binary by ~1e-7. A gate
+    // deliberately drives the atomic path to
+    // surface it, whereas a byte-exact comparison between two runs of the *same*
+    // schedule needs the deterministic one
+    // or it would be meaningless. **Which accumulation a gate requires is a
+    // decision, not a default** — this flag is how a gate states it.
     bool deterministic{false};
 
     void on_routing_ready(uint32_t layer_id, uint32_t position,
