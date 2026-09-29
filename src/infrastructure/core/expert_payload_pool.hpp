@@ -28,7 +28,11 @@ public:
         allocate(slots, format);
     }
 
-    ~ExpertPayloadPool() {
+    // Virtual so the tier can own the pool through the neutral interface while the
+    // concrete pool (a format's byte view of a slot) is what a backend builds. The
+    // engine never deletes through a base pointer anywhere else, but this is the one
+    // place a owning handle crosses the format boundary.
+    virtual ~ExpertPayloadPool() {
         free();
     }
 

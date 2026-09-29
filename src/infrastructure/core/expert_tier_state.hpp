@@ -25,6 +25,7 @@
 
 #include "infrastructure/core/expert_direct_io.hpp"
 #include "infrastructure/core/expert_host_region.hpp"
+#include "infrastructure/core/expert_payload_pool.hpp"
 #include "infrastructure/core/expert_registry.hpp"
 #include "infrastructure/core/expert_tier_loader.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
@@ -38,6 +39,13 @@
 namespace aeon::core {
 
 struct ExpertTierState {
+    // The Hot VRAM pool. Held through the neutral `ExpertPayloadPool`, because the
+    // hot pool is an engine concept — it owns the slot allocation and every neutral
+    // consumer takes this interface. The concrete pool a backend builds
+    // (`UnifiedVRAMExpertPool`) only adds that format's *view* of a slot's bytes, so
+    // it is constructed by whoever composes the tier and moved in here; naming it in
+    // this header would make `infrastructure/` include a backend header.
+    std::unique_ptr<ExpertPayloadPool> payload_pool;
     ExpertRegistry registry;
     HostExpertPool host_pool;
     std::unique_ptr<PrefetchStagingArena> staging;

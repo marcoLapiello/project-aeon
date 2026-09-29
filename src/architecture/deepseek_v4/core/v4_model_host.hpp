@@ -234,7 +234,7 @@ public:
         executor_.reset();
         supply_.clear();
         expert_scratch_.free();
-        vram_pool_.free();
+        tier_.payload_pool.reset();
         tier_.host_pool.free();
         tier_.staging.reset();
         // The partition's bound staging pointer is now stale; clear it so nothing
@@ -474,7 +474,9 @@ public:
     // Diagnostics, for an assembly gate: the registry's residency claims and the
     // pool it made them against. Not used by the graph.
     const ExpertRegistry& registry() const noexcept { return tier_.registry; }
-    UnifiedVRAMExpertPool& vram_pool() noexcept { return vram_pool_; }
+    UnifiedVRAMExpertPool& vram_pool() noexcept {
+        return static_cast<UnifiedVRAMExpertPool&>(*tier_.payload_pool);
+    }
     const SupplyTelemetry& telemetry() const noexcept { return tier_.telemetry; }
 
     // Tell the telemetry which phase the next dispatch belongs to. The caller is
@@ -777,7 +779,8 @@ private:
         // as one set, and each distinct expert needs its own slot in transit. Sized
         // to the **ceiling** `6C` here, so no transfer ever waits for a slot; the
         // Step 7 sweep picks the smaller concurrency depth.
-        vram_pool_.allocate(budget_.hot_vram_slots, format);
+        tier_.payload_pool = std::make_unique<UnifiedVRAMExpertPool>();
+        tier_.payload_pool->allocate(budget_.hot_vram_slots, format);
         // A chunk's deduplicated distinct set can never exceed the **layer's** expert
         // count: dedup collapses `6C` requests onto at most `n_routed_experts`
         // experts. Sizing to `6C` alone asks for 384 slots at `C = 64` (5.1 GiB
@@ -879,7 +882,7 @@ private:
         // runs at a window boundary, reading the demotion capacity through the pointer
         // (the supply sets it a few lines down).
         tier_.bulk_loader.bind(ExpertTierLoader::Services{
-            &tier_.registry, &vram_pool_, &tier_.host_pool, &tier_.direct_io, &loader_, &budget_,
+            &tier_.registry, tier_.payload_pool.get(), &tier_.host_pool, &tier_.direct_io, &loader_, &budget_,
             streams_.compute, &demotion_queue_capacity_});
 
         // 12 — Hot, then Warm, filled by batched `O_DIRECT` reads. This is the
@@ -904,7 +907,7 @@ private:
         // 13 — the tiered supply, on the four shared streams.
         supply_.configure(
             &loader_,
-            &vram_pool_,
+            tier_.payload_pool.get(),
             warm_slots > 0 ? &tier_.host_pool : nullptr,
             &tier_.registry,
             tier_.staging.get(),
@@ -947,7 +950,7 @@ private:
             tier_.reuse_profiler.reset(tier_.registry.total_experts);
         }
         executor_ = std::make_unique<V4TieredExpertExecutor>(
-            supply_, vram_pool_, *tier_.staging, tier_.registry, expert_scratch_, streams_,
+            supply_, vram_pool(), *tier_.staging, tier_.registry, expert_scratch_, streams_,
             tier_.telemetry, runtime_cfg.profile_routing_reuse ? &tier_.reuse_profiler : nullptr,
             config_.swiglu_limit);
 
@@ -1013,12 +1016,9 @@ private:
     // (see `v4_prefill_workspace.hpp`).
     V4PrefillWorkspace prefill_workspace_;
 
-    // The backend's payload pool: how a payload lies in a VRAM slot is the weight
-    // format's business, so the concrete pool stays here while the neutral tier
-    // state (registry, Warm pool, staging, partition, telemetry, readers) is the
-    // engine-owned `ExpertTierState`. See `expert_tier_state.hpp`.
-    UnifiedVRAMExpertPool vram_pool_;
-    // The engine-owned expert tier: the neutral state the tiered supply operates on.
+    // The engine-owned expert tier: the neutral state the tiered supply operates on,
+    // including the Hot payload pool (the concrete, format-specific pool is
+    // constructed here and moved in). See `expert_tier_state.hpp`.
     ExpertTierState tier_;
     V4ExpertSupplyCoordinator supply_;
     V4RoutedExpertScratch expert_scratch_;
