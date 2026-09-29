@@ -181,7 +181,7 @@ public:
         PrefetchStagingArena& staging,
         ExpertRegistry& registry,
         V4RoutedExpertScratch& scratch,
-        const V4DeviceStreams& streams,
+        const DeviceStreams& streams,
         SupplyTelemetry& telemetry,
         RoutingReuseProfiler* reuse_profiler,
         float swiglu_limit
@@ -460,7 +460,7 @@ private:
     PrefetchStagingArena& staging_;
     ExpertRegistry& registry_;
     V4RoutedExpertScratch& scratch_;
-    V4DeviceStreams streams_;
+    DeviceStreams streams_;
     SupplyTelemetry& telemetry_;
     // Null unless the routing study asked for reuse profiling. Kept as a pointer so
     // its absence is the off switch: nothing is recorded when it is null.

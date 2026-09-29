@@ -6,7 +6,7 @@
 // This is the composition plan's **G5** and its phase **P4**, and it is the last
 // thing between the rewrite and the plan's **acceptance criterion**: one command
 // takes a conversation and returns text (§1). Everything below it already runs —
-// the host (`V4ModelHost`), the graph (`V4Graph`), the sampler (`V4Sampler`) —
+// the host (`V4ModelHost`), the graph (`V4Graph`), the sampler (`Sampler`) —
 // and everything it binds to text already runs — the tokenizer, the canonical
 // prompt encoder, and the generation loop. What did not exist was the **binding**,
 // and that is the whole of this file.
@@ -17,7 +17,7 @@
 //
 //     V4Graph::forward_window(prompt, 0, N, C, compute)     // prefill -> logits
 //     V4Graph::forward_token(token_id, position, compute)   // decode  -> logits
-//     V4Sampler::select(logits, compute)                    // -> token
+//     Sampler::select(logits, compute)                    // -> token
 //
 // One line each, because every other decision was made by the component that owns
 // it. The gate asserts this identity rather than assuming it (§A of the gate), which
@@ -131,8 +131,8 @@ struct V4GenerationPolicy {
     // path — `temperature <= 0` is the sampler's own `T -> 0` limit, not a second
     // mode — so the two conventions meet here, in one place, rather than in the
     // sampler learning about `do_sample`.
-    V4SamplerConfig to_sampler_config(uint64_t seed) const {
-        V4SamplerConfig config;
+    SamplerConfig to_sampler_config(uint64_t seed) const {
+        SamplerConfig config;
         config.temperature = do_sample ? temperature : 0.0f;
         config.top_p = top_p;
         config.top_k = 0;  // the artifact declares no top_k; the nucleus is its truncation
@@ -247,7 +247,7 @@ public:
                 std::to_string(tokenizer_.vocab_size()) +
                 ") is not the model's (" + std::to_string(vocab) + ")");
         }
-        sampler_ = std::make_unique<V4Sampler>(vocab);
+        sampler_ = std::make_unique<Sampler>(vocab);
 
         // The artifact's own policy, if it ships one. Absent is not an error — a
         // checkpoint without `generation_config.json` gets the deterministic
@@ -279,8 +279,8 @@ public:
     const V4ModelHost& host() const noexcept { return host_; }
     V4Graph& graph() { return *graph_; }
     const V4Graph& graph() const { return *graph_; }
-    V4Sampler& sampler() { return *sampler_; }
-    const V4Sampler& sampler() const { return *sampler_; }
+    Sampler& sampler() { return *sampler_; }
+    const Sampler& sampler() const { return *sampler_; }
     const text::Dsv4Tokenizer& tokenizer() const noexcept { return tokenizer_; }
     const text::Dsv4PromptEncoder& encoder() const noexcept { return *encoder_; }
 
@@ -346,7 +346,7 @@ public:
     V4Reply chat(const std::vector<text::Dsv4PromptMessage>& messages,
                  const text::Dsv4PromptOptions& prompt_options,
                  const text::GenerationOptions& generation,
-                 const V4SamplerConfig& sampling) {
+                 const SamplerConfig& sampling) {
         if (!ready()) {
             throw std::logic_error("V4Engine::chat: the engine was not initialized");
         }
@@ -511,7 +511,7 @@ private:
     std::vector<half> logits_host_{};
     text::Dsv4Tokenizer tokenizer_{};
     std::unique_ptr<text::Dsv4PromptEncoder> encoder_{};
-    std::unique_ptr<V4Sampler> sampler_{};
+    std::unique_ptr<Sampler> sampler_{};
 };
 
 }  // namespace aeon::core

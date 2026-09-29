@@ -87,11 +87,11 @@
 namespace {
 
 using aeon::core::V4Graph;
-using aeon::core::V4LogitProcessor;
+using aeon::core::LogitProcessor;
 using aeon::core::V4ModelHost;
-using aeon::core::V4Sampler;
-using aeon::core::V4SamplerConfig;
-using aeon::core::V4SplitMix64;
+using aeon::core::Sampler;
+using aeon::core::SamplerConfig;
+using aeon::core::SplitMix64;
 
 namespace ops = aeon::core::sampler_ops;
 
@@ -253,7 +253,7 @@ int main() {
     {
         // A second, deliberately literal transcription of the published
         // recurrence. It shares no line with the header, so a changed constant or
-        // shift in `V4SplitMix64` shows up as a difference over a thousand draws
+        // shift in `SplitMix64` shows up as a difference over a thousand draws
         // rather than as a slightly different but self-consistent token stream.
         const auto literal_splitmix = [](uint64_t& state) {
             state += 0x9E3779B97F4A7C15ull;
@@ -265,7 +265,7 @@ int main() {
 
         uint32_t mismatches = 0;
         for (uint64_t seed_value : {0ull, 1ull, 0xDEADBEEFull, 0xFFFFFFFFFFFFFFFFull}) {
-            V4SplitMix64 rng(seed_value);
+            SplitMix64 rng(seed_value);
             uint64_t state = seed_value;
             for (int draw = 0; draw < 1000; ++draw) {
                 if (rng.next_u64() != literal_splitmix(state)) ++mismatches;
@@ -276,7 +276,7 @@ int main() {
 
         // Same seed, same stream; different seed, different stream. This is the
         // gate's "seeded replay is bit-identical" at its source.
-        V4SplitMix64 a(12345), b(12345), c(12346);
+        SplitMix64 a(12345), b(12345), c(12346);
         uint32_t same = 0, differing = 0;
         for (int draw = 0; draw < 256; ++draw) {
             const uint64_t av = a.next_u64();
@@ -291,7 +291,7 @@ int main() {
         // `[0, 1)` and never 1: a categorical walk with `u == 1` would fall off
         // the end of the vector, so this is a termination property and not
         // decoration. The mean is the one statistical check worth making.
-        V4SplitMix64 rng(7);
+        SplitMix64 rng(7);
         double minimum = 1.0, maximum = 0.0, total = 0.0;
         constexpr int kDraws = 100000;
         for (int draw = 0; draw < kDraws; ++draw) {
@@ -308,9 +308,9 @@ int main() {
         harness.assert_that("A: the mean is 1/2 to within 0.01",
                             std::fabs(mean - 0.5) < 0.01, "mean=" + sci(mean));
         std::printf("  [note] first u64 for seeds 0, 1 and 2: 0x%016llx 0x%016llx 0x%016llx\n",
-                    static_cast<unsigned long long>(V4SplitMix64(0).next_u64()),
-                    static_cast<unsigned long long>(V4SplitMix64(1).next_u64()),
-                    static_cast<unsigned long long>(V4SplitMix64(2).next_u64()));
+                    static_cast<unsigned long long>(SplitMix64(0).next_u64()),
+                    static_cast<unsigned long long>(SplitMix64(1).next_u64()),
+                    static_cast<unsigned long long>(SplitMix64(2).next_u64()));
     }
 
     // =========================================================================
@@ -455,7 +455,7 @@ int main() {
             one_hot[5] = 1.0f;
             uint32_t wrong = 0;
             for (uint64_t seed_value = 0; seed_value < 512; ++seed_value) {
-                V4SplitMix64 rng(seed_value);
+                SplitMix64 rng(seed_value);
                 if (ops::sample_from_probs(one_hot.data(), 8, rng) != 5) ++wrong;
             }
             harness.assert_that("B: a one-hot vector always draws its hot index",
@@ -476,7 +476,7 @@ int main() {
 
         // C1 — the hook is invoked, exactly once, with the logits and the width.
         {
-            V4Sampler sampler(probe_size);
+            Sampler sampler(probe_size);
             uint32_t calls = 0;
             uint32_t seen_vocab = 0;
             float* seen_pointer = nullptr;
@@ -497,8 +497,8 @@ int main() {
         // C2 — a mask of one token removes it from the support: probability
         // exactly zero, and never drawn.
         {
-            V4Sampler sampler(probe_size);
-            V4SamplerConfig config;
+            Sampler sampler(probe_size);
+            SamplerConfig config;
             config.temperature = 1.0f;
             config.seed = 99;
             sampler.set_config(config);
@@ -537,8 +537,8 @@ int main() {
             constexpr uint32_t kSurvivor = 3;
             uint32_t wrong = 0;
             for (uint64_t seed_value = 0; seed_value < 64; ++seed_value) {
-                V4Sampler sampler(probe_size);
-                V4SamplerConfig config;
+                Sampler sampler(probe_size);
+                SamplerConfig config;
                 config.temperature = 1.0f;
                 config.seed = seed_value;
                 sampler.set_config(config);
@@ -557,7 +557,7 @@ int main() {
         // C4 — a mask that excludes everything is refused, not answered with
         // index 0.
         {
-            V4Sampler sampler(probe_size);
+            Sampler sampler(probe_size);
             sampler.set_logit_processor([](float* logits, uint32_t n) {
                 for (uint32_t i = 0; i < n; ++i) logits[i] = -std::numeric_limits<float>::infinity();
             });
@@ -597,8 +597,8 @@ int main() {
         // `T = 0.5` installed, a first-running seam still sees all eight finite
         // logits at their raw values; a last-running seam sees three, scaled.
         {
-            V4Sampler sampler(probe_size);
-            V4SamplerConfig config;
+            Sampler sampler(probe_size);
+            SamplerConfig config;
             config.temperature = 0.5f;
             config.top_k = 3;
             sampler.set_config(config);
@@ -627,7 +627,7 @@ int main() {
             // ...and the consequence of that order: a mask of the argmax combined
             // with `top_k = 1` decides the runner-up. A last-running seam would
             // mask the survivor instead and leave nothing decidable at all.
-            V4Sampler ordered(probe_size);
+            Sampler ordered(probe_size);
             ordered.set_config(config);
             ordered.set_logit_processor([](float* logits, uint32_t) {
                 logits[kMasked] = -std::numeric_limits<float>::infinity();
@@ -657,8 +657,8 @@ int main() {
         // D1/D2 — the gate's first clause.
         {
             const auto draw_sequence = [&](uint64_t seed_value, uint32_t count) {
-                V4Sampler sampler(probe_size);
-                V4SamplerConfig config;
+                Sampler sampler(probe_size);
+                SamplerConfig config;
                 config.temperature = 1.0f;
                 config.seed = seed_value;
                 sampler.set_config(config);
@@ -679,8 +679,8 @@ int main() {
                                 first != other, first != other ? "differs" : "coincides");
 
             // The replay must survive a fresh object, not merely a repeated call.
-            V4Sampler sampler(probe_size);
-            V4SamplerConfig config;
+            Sampler sampler(probe_size);
+            SamplerConfig config;
             config.temperature = 1.0f;
             config.seed = 4242;
             sampler.set_config(config);
@@ -705,8 +705,8 @@ int main() {
         // D3 — T -> 0 converges to the argmax path.
         {
             const uint32_t expected = ops::argmax_of(probe.data(), probe_size);
-            V4Sampler sampler(probe_size);
-            V4SamplerConfig config;
+            Sampler sampler(probe_size);
+            SamplerConfig config;
             config.temperature = 1e-6f;
             config.seed = 5;
             sampler.set_config(config);
@@ -723,7 +723,7 @@ int main() {
 
         // D4 — the shipped default: greedy at top-k=0, top-p=1.
         {
-            V4Sampler sampler(probe_size);
+            Sampler sampler(probe_size);
             harness.assert_that("D: the shipped default is the deterministic one",
                                 sampler.config().temperature <= 0.0f &&
                                     sampler.config().top_k == 0 && sampler.config().top_p == 1.0f,
@@ -749,8 +749,8 @@ int main() {
 
         // D5 — invalid configurations are refused, not clamped.
         {
-            V4Sampler sampler(probe_size);
-            const auto refuses = [&](const V4SamplerConfig& config) {
+            Sampler sampler(probe_size);
+            const auto refuses = [&](const SamplerConfig& config) {
                 try {
                     sampler.set_config(config);
                 } catch (const std::invalid_argument&) {
@@ -758,13 +758,13 @@ int main() {
                 }
                 return false;
             };
-            V4SamplerConfig negative;
+            SamplerConfig negative;
             negative.temperature = -1.0f;
-            V4SamplerConfig zero_p;
+            SamplerConfig zero_p;
             zero_p.top_p = 0.0f;
-            V4SamplerConfig above_one_p;
+            SamplerConfig above_one_p;
             above_one_p.top_p = 1.5f;
-            V4SamplerConfig nan_temperature;
+            SamplerConfig nan_temperature;
             nan_temperature.temperature = std::numeric_limits<float>::quiet_NaN();
 
             harness.assert_that("D: a negative temperature is refused", refuses(negative),
@@ -799,7 +799,7 @@ int main() {
             uint32_t disagreements = 0;
             std::string detail;
             for (const auto& values : probes) {
-                V4Sampler sampler(static_cast<uint32_t>(values.size()));
+                Sampler sampler(static_cast<uint32_t>(values.size()));
                 __half* device = upload_fp16(stream, values);
                 const uint32_t from_device = sampler.device_argmax(device, stream);
 
@@ -826,7 +826,7 @@ int main() {
         // per token with no other symptom.
         {
             const std::vector<float> values = distinct_probe();
-            V4Sampler sampler(static_cast<uint32_t>(values.size()));
+            Sampler sampler(static_cast<uint32_t>(values.size()));
             __half* device = upload_fp16(stream, values);
 
             const uint32_t fast = sampler.select(device, stream);
@@ -860,7 +860,7 @@ int main() {
             logits[100000] = 6.0f;  // the argmax, at a non-trivial index
             logits[7] = 5.0f;
 
-            V4Sampler sampler(kVocab);
+            Sampler sampler(kVocab);
             harness.assert_that("E: the argmax block count is the model's own 505",
                                 sampler.argmax_blocks() == 505,
                                 std::to_string(sampler.argmax_blocks()));
@@ -870,7 +870,7 @@ int main() {
             harness.assert_that("E: the untruncated default picks the planted argmax",
                                 token == 100000, std::to_string(token) + " == 100000");
 
-            sampler.set_config(V4SamplerConfig{1.0f, 0, 1.0f, 31337});
+            sampler.set_config(SamplerConfig{1.0f, 0, 1.0f, 31337});
             sampler.set_logit_processor([&](float* values, uint32_t n) {
                 values[100000] = -std::numeric_limits<float>::infinity();
             });
@@ -916,7 +916,7 @@ int main() {
         host.initialize(kModelDir, runtime, /*verbose=*/false);
 
         const uint32_t vocab = static_cast<uint32_t>(host.config().vocab_size);
-        V4Sampler sampler(vocab);
+        Sampler sampler(vocab);
         harness.assert_that("F: the sampler's width is the model's vocabulary",
                             vocab == kVocab, std::to_string(vocab));
 

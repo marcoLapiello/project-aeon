@@ -101,12 +101,12 @@
 
 namespace aeon::core {
 
-class V4PrefillSweep {
+class PrefillSweep {
 public:
-    V4PrefillSweep() = default;
+    PrefillSweep() = default;
 
-    V4PrefillSweep(const V4PrefillSweep&) = delete;
-    V4PrefillSweep& operator=(const V4PrefillSweep&) = delete;
+    PrefillSweep(const PrefillSweep&) = delete;
+    PrefillSweep& operator=(const PrefillSweep&) = delete;
 
     // `staging_banks` is how many layer-sized banks the arena holds (`1` = the
     // pre-Phase-1 shape, `2` = the deferred drain's headroom). It only decides which
@@ -159,7 +159,7 @@ public:
         if (active_) return;
         if (!is_feasible()) {
             throw std::logic_error(
-                "V4PrefillSweep: the Hot pool holds " +
+                "PrefillSweep: the Hot pool holds " +
                 std::to_string(registry_ ? registry_->vram_capacity : 0) +
                 " slots, fewer than one layer's " +
                 std::to_string(registry_ ? registry_->experts_per_layer : 0) +
@@ -243,7 +243,7 @@ public:
         // is refused rather than silently reclaiming the wrong bank.
         if (resident_valid_ && resident_layer_ != layer) {
             throw std::logic_error(
-                "V4PrefillSweep: layer " + std::to_string(layer) +
+                "PrefillSweep: layer " + std::to_string(layer) +
                 " retired while layer " + std::to_string(resident_layer_) +
                 "'s staging bank is still resident");
         }
@@ -354,7 +354,7 @@ private:
         if (missing == 0) return;
         if (registry_->free_vram_slot_count() < missing) {
             throw std::runtime_error(
-                "V4PrefillSweep: layer " + std::to_string(layer) + " needs " +
+                "PrefillSweep: layer " + std::to_string(layer) + " needs " +
                 std::to_string(missing) + " more slots but only " +
                 std::to_string(registry_->free_vram_slot_count()) +
                 " are free — the lookahead must not outrun the release order");
@@ -550,7 +550,7 @@ private:
 } // namespace aeon::core
 
 // The out-of-line read-ahead policy definitions. Included after the class so the
-// header sees a complete `V4PrefillSweep`; it includes this file, so it is also
+// header sees a complete `PrefillSweep`; it includes this file, so it is also
 // includable on its own.
 #include "infrastructure/core/prefill_lookahead.hpp"
 

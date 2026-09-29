@@ -104,7 +104,7 @@ inline V4LayerBodyOutput run_layer_body_router(
     // H. MoE router (2.9)
     // -----------------------------------------------------------------
     hipLaunchKernelGGL(
-        kernel::v4_gemv_fp16_vec8_kernel,
+        kernel::gemv_fp16_vec8_kernel,
         dim3(256, 1), dim3(32), 0, stream,
         scratch.d_ffn_norm_act, layer.d_gate_weight, scratch.d_router_logits_half, H);
 
@@ -175,11 +175,11 @@ inline void run_layer_body_moe_and_post(
     CHECK_HIP(hipMemsetAsync(scratch.d_moe_accum, 0, M_PAD * H * sizeof(half), stream));
 
     hipLaunchKernelGGL(
-        kernel::v4_gemv_fp16_vec8_kernel,
+        kernel::gemv_fp16_vec8_kernel,
         dim3(INTER_DIM, 1), dim3(32), 0, stream,
         scratch.d_ffn_norm_act, layer.d_shared_w1, scratch.d_shared_gate, H);
     hipLaunchKernelGGL(
-        kernel::v4_gemv_fp16_vec8_kernel,
+        kernel::gemv_fp16_vec8_kernel,
         dim3(INTER_DIM, 1), dim3(32), 0, stream,
         scratch.d_ffn_norm_act, layer.d_shared_w3, scratch.d_shared_up, H);
 
@@ -194,7 +194,7 @@ inline void run_layer_body_moe_and_post(
     }
 
     hipLaunchKernelGGL(
-        kernel::v4_gemv_fp16_vec8_kernel,
+        kernel::gemv_fp16_vec8_kernel,
         dim3(H, 1), dim3(32), 0, stream,
         scratch.d_shared_swiglu, layer.d_shared_w2, scratch.d_moe_accum, INTER_DIM);
 

@@ -23,12 +23,15 @@
 
 ## 2. House rules
 
-There are two step kinds, each with one rule.
+There are three step kinds, each with one rule.
 
 > **MOVE step:** the only permitted diff is `#include` paths and file location. Every code line is identical before and after.
 > **SPLIT step:** code may move between files and a seam may appear, but behaviour is unchanged and the seam is the only new thing.
+> **RENAME step:** a mechanical symbol rename across all call sites (`src`, `tests`, `tools`), word-boundary and exact. No definition, signature, or behaviour changes; the diff is the same token on a different spelling.
 
-Both are verified by the same recipe (§5). A move must never carry a rename, a refactor, or a "while I'm here" fix; if it needs one, that is a separate step.
+Both MOVE and SPLIT are verified by the same recipe (§5). A move must never carry a rename, a refactor, or a "while I'm here" fix; if it needs one, that is a separate step.
+
+**Naming consistency (the case the original rule missed).** A file that moves out of the model tree must not keep the model's name — neither in its file name (handled by the MOVE) nor in the symbols it *defines*. A generic type defined in a moved file (`V4Sampler`, `V4DeviceStreams`, `V4PrefillSweep`, `v4_gemv_fp16_kernel`, …) is renamed to its neutral spelling in a dedicated RENAME step. Because a symbol has call sites everywhere — **including inside model files** — the rename necessarily touches `v4_` files, but only as *usages*: no model-specific symbol is ever renamed. The audit for a RENAME is that the diff contains only the renamed tokens (word-boundary), and that every changed line in a model file is a call site of the renamed generic symbol, never a model-specific definition.
 
 ---
 
@@ -116,7 +119,20 @@ These are the model-coupled G1 files and the genuinely mixed files. Each needs a
 
 Once the seams exist, each deferred file moves by the ordinary MOVE recipe into the same destinations (`infrastructure/core/` for G1; the backend GPU halves to `platform/` per decision 3).
 
-**Naming follow-up:** the sweep class is still named `V4PrefillSweep` while it now lives in `infrastructure/core/` — the file name lost its prefix but the class name did not (a move step renames files only). Renaming the class to `PrefillSweep` is a separate, mechanical step to take when convenient.
+**Naming follow-up:** ~~the sweep class is still named `V4PrefillSweep`~~ ✅ **Done** — the RENAME step below neutralised the symbols defined in the moved files.
+
+### RENAME step — neutralised symbols in moved files — ✅ complete
+
+| Symbol (old → new) | Defined in | Kind |
+| :--- | :--- | :--- |
+| `V4Sampler` → `Sampler`, `V4SamplerConfig` → `SamplerConfig`, `V4SplitMix64` → `SplitMix64`, `V4LogitProcessor` → `LogitProcessor` | `infrastructure/core/sampler.hpp` | types |
+| `V4DeviceStreams` → `DeviceStreams` | `infrastructure/core/device_streams.hpp` | type |
+| `V4PrefillSweep` → `PrefillSweep` | `infrastructure/core/prefill_sweep.hpp` | type |
+| `v4_gemv_fp16_kernel` → `gemv_fp16_kernel`, `v4_gemv_fp16_vec8_kernel` → `gemv_fp16_vec8_kernel` | `platform/ops/gemv.hpp` | kernels |
+| `v4_rmsnorm_wave32_kernel` → `rmsnorm_wave32_kernel`, `v4_rmsnorm_unit_wave32_kernel` → `rmsnorm_unit_wave32_kernel` | `platform/ops/rmsnorm.hpp` | kernels |
+| `v4_argmax_fp16_partial_kernel` → `argmax_fp16_partial_kernel`, `v4_argmax_partial_reduce_kernel` → `argmax_partial_reduce_kernel` | `platform/ops/argmax.hpp` | kernels |
+
+26 files touched, all as usages. Audited: no model-specific symbol (`V4ModelHost`, `V4Graph`, `V4Layer*`, `V4Attention*`, …) was renamed; the only such tokens in the diff are unchanged context on comment lines that also carried a renamed generic symbol. Builds; the seven gates pass.
 
 ---
 

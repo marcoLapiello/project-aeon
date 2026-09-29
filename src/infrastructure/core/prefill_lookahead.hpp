@@ -4,7 +4,7 @@
 // The prefill sweep's read-ahead policy: how deep the frontier may go and how the
 // read waves are issued.
 //
-// This header holds the out-of-line definitions of the `V4PrefillSweep` members
+// This header holds the out-of-line definitions of the `PrefillSweep` members
 // that decide the lookahead depth from the **free blocks** (never a constant) and
 // that issue one read wave at a time as the previous lands; the class declares
 // them in `prefill_sweep.hpp`.
@@ -25,7 +25,7 @@ namespace aeon::core {
 // The lookahead length the free blocks allow at this instant (plan R5/P2.6): the
 // biggest number of layers whose reads may be in flight. Derived from the runtime
 // free blocks, never a constant — see `read_lookahead_capacity`.
-inline uint32_t V4PrefillSweep::derived_lookahead_capacity() const noexcept {
+inline uint32_t PrefillSweep::derived_lookahead_capacity() const noexcept {
     return read_lookahead_capacity();
 }
 
@@ -42,7 +42,7 @@ inline uint32_t V4PrefillSweep::derived_lookahead_capacity() const noexcept {
 // decide how many are prepared in the box. A copy that finds no free VRAM well
 // waits in staging; it does not stop the reads after it. A host that wants a
 // deeper corridor pins more staging and the depth follows (plan R2/R5/R6).
-inline uint32_t V4PrefillSweep::read_lookahead_capacity() const noexcept {
+inline uint32_t PrefillSweep::read_lookahead_capacity() const noexcept {
         if (registry_ == nullptr || supply_ == nullptr) return 0;
         const uint32_t per_layer = registry_->experts_per_layer;
         if (per_layer == 0) return 0;
@@ -71,7 +71,7 @@ inline uint32_t V4PrefillSweep::read_lookahead_capacity() const noexcept {
 // Cap the read lookahead (0 = only the staging arena bounds it). A **test
 // instrument**: it lets a gate separate "how deep the reads run" from "what the
 // pump costs", which are otherwise confounded.
-inline void V4PrefillSweep::set_read_ahead_max(uint32_t max_depth) noexcept { read_ahead_max_ = max_depth; }
+inline void PrefillSweep::set_read_ahead_max(uint32_t max_depth) noexcept { read_ahead_max_ = max_depth; }
 
 // Queue the next layers' reads, as many as the **derived** capacity allows. The
 // capacity is recomputed each call rather than held as a constant, so the queue
@@ -80,7 +80,7 @@ inline void V4PrefillSweep::set_read_ahead_max(uint32_t max_depth) noexcept { re
 // `from` is where the caller believes the lookahead should start; the queue may
 // already hold layers beyond it, in which case dispatching resumes after the
 // queue's tail so nothing is dispatched twice.
-inline void V4PrefillSweep::dispatch_ahead(uint32_t from) {
+inline void PrefillSweep::dispatch_ahead(uint32_t from) {
         if (registry_ == nullptr || supply_ == nullptr) return;
         if (from >= registry_->num_layers) return;
         // **One read wave in flight at a time.** A second layer's reads must not
@@ -131,7 +131,7 @@ inline void V4PrefillSweep::dispatch_ahead(uint32_t from) {
 // per-token hook, which is the only host activity inside a body, so the corridor
 // keeps advancing while the layer computes instead of waiting for the next
 // boundary. A no-op while a wave is still in flight, or when the queue is full.
-inline void V4PrefillSweep::advance_reads() {
+inline void PrefillSweep::advance_reads() {
         if (!active_) return;
         const uint32_t from = ahead_.empty() ? active_layer_ + 1 : ahead_.back().layer + 1;
         dispatch_ahead(from);
@@ -140,7 +140,7 @@ inline void V4PrefillSweep::advance_reads() {
 // Whether any queued layer still has reads in the drive. `io_pending` is cleared
 // by the supply as each expert's read lands (the pump's `materialize_available`),
 // so this is fresh within one token of the layer body.
-inline bool V4PrefillSweep::reads_in_flight() const noexcept {
+inline bool PrefillSweep::reads_in_flight() const noexcept {
         for (const auto& entry : ahead_) {
             for (const uint8_t pending : entry.state.io_pending) {
                 if (pending != 0) return true;
@@ -149,7 +149,7 @@ inline bool V4PrefillSweep::reads_in_flight() const noexcept {
         return false;
     }
 
-inline void V4PrefillSweep::update_frontier() {
+inline void PrefillSweep::update_frontier() {
         const uint32_t layers = registry_->num_layers;
         uint32_t resident_layers = 0;
         for (uint32_t layer = 0; layer < layers; ++layer) {

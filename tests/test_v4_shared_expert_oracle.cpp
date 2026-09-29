@@ -133,11 +133,11 @@ int main() {
         std::vector<__half> gate, up, hidden, out;
     };
     auto run_shared = [&]() {
-        hipLaunchKernelGGL(aeon::kernel::v4_gemv_fp16_vec8_kernel,
+        hipLaunchKernelGGL(aeon::kernel::gemv_fp16_vec8_kernel,
                            dim3(kIntermediate), dim3(32), 0, 0,
                            d_x, d_w1, d_gate, kHidden);
         CHECK_HIP(hipGetLastError());
-        hipLaunchKernelGGL(aeon::kernel::v4_gemv_fp16_vec8_kernel,
+        hipLaunchKernelGGL(aeon::kernel::gemv_fp16_vec8_kernel,
                            dim3(kIntermediate), dim3(32), 0, 0,
                            d_x, d_w3, d_up, kHidden);
         CHECK_HIP(hipGetLastError());
@@ -146,7 +146,7 @@ int main() {
                            d_gate, d_up, d_hidden, kIntermediate,
                            static_cast<float>(kLimit));
         CHECK_HIP(hipGetLastError());
-        hipLaunchKernelGGL(aeon::kernel::v4_gemv_fp16_vec8_kernel,
+        hipLaunchKernelGGL(aeon::kernel::gemv_fp16_vec8_kernel,
                            dim3(kHidden), dim3(32), 0, 0,
                            d_hidden, d_w2, d_out, kIntermediate);
         CHECK_HIP(hipGetLastError());

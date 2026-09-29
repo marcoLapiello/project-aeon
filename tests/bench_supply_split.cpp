@@ -93,8 +93,8 @@ namespace {
 using aeon::core::V4Graph;
 using aeon::core::V4LayerBodyBatchScratch;
 using aeon::core::V4ModelHost;
-using aeon::core::V4Sampler;
-using aeon::core::V4SamplerConfig;
+using aeon::core::Sampler;
+using aeon::core::SamplerConfig;
 using Clock = std::chrono::steady_clock;
 
 constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
@@ -255,8 +255,8 @@ int main(int argc, char** argv) {
             " tokens, fewer than the requested " + std::to_string(max_len));
     }
 
-    V4Sampler sampler(static_cast<uint32_t>(host.config().vocab_size));
-    sampler.set_config(V4SamplerConfig{});  // defaults: temperature 0 => greedy
+    Sampler sampler(static_cast<uint32_t>(host.config().vocab_size));
+    sampler.set_config(SamplerConfig{});  // defaults: temperature 0 => greedy
 
     const uint32_t layers = host.num_layers();
     const uint32_t per_layer = host.registry().experts_per_layer;

@@ -142,7 +142,7 @@ int main() {
 
     // --- Weighted form (Step 2.1 attention RMSNorm) ---------------------------
     CHECK_HIP(hipMemset(d_y, 0, kCount * sizeof(__half)));
-    aeon::kernel::v4_rmsnorm_wave32_kernel<<<kRows, 32>>>(d_x, d_w, d_y, kDim, kEps);
+    aeon::kernel::rmsnorm_wave32_kernel<<<kRows, 32>>>(d_x, d_w, d_y, kDim, kEps);
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
     CHECK_HIP(hipMemcpy(h_y.data(), d_y, kCount * sizeof(__half), hipMemcpyDeviceToHost));
@@ -158,7 +158,7 @@ int main() {
 
     // --- Unit form ------------------------------------------------------------
     CHECK_HIP(hipMemset(d_y, 0, kCount * sizeof(__half)));
-    aeon::kernel::v4_rmsnorm_unit_wave32_kernel<<<kRows, 32>>>(d_x, d_y, kDim, kEps);
+    aeon::kernel::rmsnorm_unit_wave32_kernel<<<kRows, 32>>>(d_x, d_y, kDim, kEps);
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
     CHECK_HIP(hipMemcpy(h_y.data(), d_y, kCount * sizeof(__half), hipMemcpyDeviceToHost));
@@ -193,7 +193,7 @@ int main() {
         CHECK_HIP(hipMemcpy(d_x, h_small.data(), kCount * sizeof(__half),
                             hipMemcpyHostToDevice));
         CHECK_HIP(hipMemset(d_y, 0, kCount * sizeof(__half)));
-        aeon::kernel::v4_rmsnorm_wave32_kernel<<<kRows, 32>>>(d_x, d_w, d_y, kDim, kEps);
+        aeon::kernel::rmsnorm_wave32_kernel<<<kRows, 32>>>(d_x, d_w, d_y, kDim, kEps);
         CHECK_HIP(hipGetLastError());
         CHECK_HIP(hipDeviceSynchronize());
         CHECK_HIP(hipMemcpy(h_y.data(), d_y, kCount * sizeof(__half),

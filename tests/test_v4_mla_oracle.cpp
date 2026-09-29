@@ -183,7 +183,7 @@ int main() {
     // =======================================================================
     // Stage 1 — Q_a = wq_a @ x_norm  [4096 -> 1024]
     // =======================================================================
-    aeon::kernel::v4_gemv_fp16_kernel<<<dim3(kQLoraRank, 1), 32>>>(
+    aeon::kernel::gemv_fp16_kernel<<<dim3(kQLoraRank, 1), 32>>>(
         d_x, d_wq_a, d_qa, static_cast<int>(kHidden));
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
@@ -196,7 +196,7 @@ int main() {
     // =======================================================================
     // Stage 2 — Q_a norm (weighted, over q_lora_rank = 1024)
     // =======================================================================
-    aeon::kernel::v4_rmsnorm_wave32_kernel<<<dim3(1), 32>>>(
+    aeon::kernel::rmsnorm_wave32_kernel<<<dim3(1), 32>>>(
         d_qa, d_q_norm_w, d_qa_norm, static_cast<int>(kQLoraRank),
         static_cast<float>(kEps));
     CHECK_HIP(hipGetLastError());
@@ -224,7 +224,7 @@ int main() {
     // =======================================================================
     // Stage 3 — Q = wq_b @ q_a_norm  [1024 -> 64 * 512]
     // =======================================================================
-    aeon::kernel::v4_gemv_fp16_kernel<<<dim3(kQWidth, 1), 32>>>(
+    aeon::kernel::gemv_fp16_kernel<<<dim3(kQWidth, 1), 32>>>(
         d_qa_norm, d_wq_b, d_q, static_cast<int>(kQLoraRank));
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
@@ -238,7 +238,7 @@ int main() {
     // Stage 4 — per-head WEIGHTLESS norm, one 512-row per head.
     //           Launched exactly as the pipeline does: one block per head.
     // =======================================================================
-    aeon::kernel::v4_rmsnorm_unit_wave32_kernel<<<dim3(kHeads), 32>>>(
+    aeon::kernel::rmsnorm_unit_wave32_kernel<<<dim3(kHeads), 32>>>(
         d_q, d_q, static_cast<int>(kHeadDim), static_cast<float>(kEps));
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
@@ -275,7 +275,7 @@ int main() {
     // =======================================================================
     // Stage 5 — KV = wkv @ x_norm  [4096 -> 512]
     // =======================================================================
-    aeon::kernel::v4_gemv_fp16_kernel<<<dim3(kHeadDim, 1), 32>>>(
+    aeon::kernel::gemv_fp16_kernel<<<dim3(kHeadDim, 1), 32>>>(
         d_x, d_wkv, d_kv, static_cast<int>(kHidden));
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
@@ -284,7 +284,7 @@ int main() {
     // =======================================================================
     // Stage 6 — KV norm (weighted, over head_dim = 512)
     // =======================================================================
-    aeon::kernel::v4_rmsnorm_wave32_kernel<<<dim3(1), 32>>>(
+    aeon::kernel::rmsnorm_wave32_kernel<<<dim3(1), 32>>>(
         d_kv, d_kv_norm_w, d_kv, static_cast<int>(kHeadDim), static_cast<float>(kEps));
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());

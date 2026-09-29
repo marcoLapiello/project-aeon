@@ -29,7 +29,7 @@
 
 namespace aeon::core {
 
-struct V4DeviceStreams {
+struct DeviceStreams {
     hipStream_t compute{nullptr};
     hipStream_t sdma{nullptr};
     hipStream_t sdma_cold{nullptr};
@@ -38,8 +38,8 @@ struct V4DeviceStreams {
     // Non-blocking, so a copy on one stream never serialises another. All four or
     // none: a partially created set is destroyed before the throw, so a caller
     // that catches this cannot leak the streams that did succeed.
-    static V4DeviceStreams create() {
-        V4DeviceStreams streams;
+    static DeviceStreams create() {
+        DeviceStreams streams;
         try {
             streams.compute = create_one("compute");
             streams.sdma = create_one("sdma");
@@ -66,7 +66,7 @@ private:
         hipStream_t stream = nullptr;
         const hipError_t error = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
         if (error != hipSuccess) {
-            throw std::runtime_error(std::string("V4DeviceStreams: hipStreamCreateWithFlags(") +
+            throw std::runtime_error(std::string("DeviceStreams: hipStreamCreateWithFlags(") +
                                      identity + "): " + hipGetErrorString(error));
         }
         return stream;

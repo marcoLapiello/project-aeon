@@ -45,7 +45,7 @@ public:
     // The executor is nullable (a budget with no Hot slot leaves the graph
     // unbuildable but constructible, and the lifecycle still runs).
     struct Services {
-        const V4DeviceStreams* streams{nullptr};
+        const DeviceStreams* streams{nullptr};
         V4ExpertSupplyCoordinator* supply{nullptr};
         V4TieredExpertExecutor* executor{nullptr};
         ExpertRegistry* registry{nullptr};
@@ -207,7 +207,7 @@ public:
     // transition (frozen-Warm leave), since entering a sweep frees the whole Hot pool
     // and no upload or demotion may still be reading or writing a slot.
     void drain() const {
-        const V4DeviceStreams& streams = *services_.streams;
+        const DeviceStreams& streams = *services_.streams;
         CHECK_HIP(hipStreamSynchronize(streams.compute));
         if (streams.sdma != nullptr) { CHECK_HIP(hipStreamSynchronize(streams.sdma)); }
         if (streams.sdma_cold != nullptr) { CHECK_HIP(hipStreamSynchronize(streams.sdma_cold)); }
@@ -218,12 +218,12 @@ public:
     // sweep ignores the call when it is not driving a window.
     void pump() { (void)sweep_.pump(); }
 
-    V4PrefillSweep& sweep() noexcept { return sweep_; }
-    const V4PrefillSweep& sweep() const noexcept { return sweep_; }
+    PrefillSweep& sweep() noexcept { return sweep_; }
+    const PrefillSweep& sweep() const noexcept { return sweep_; }
 
     // The corridor's **fill** per layer — staging slots reading, staging slots
     // copying, and the lookahead layer's reserved-but-not-yet-arrived VRAM experts.
-    const std::vector<V4PrefillSweep::BlockOccupancy>& occupancy() const noexcept {
+    const std::vector<PrefillSweep::BlockOccupancy>& occupancy() const noexcept {
         return sweep_.occupancy_samples();
     }
     uint64_t load_ns() const noexcept { return sweep_.load_ns(); }
@@ -244,7 +244,7 @@ private:
     }
 
     Services services_{};
-    V4PrefillSweep sweep_;
+    PrefillSweep sweep_;
     bool sweep_requested_{false};
     uint32_t min_tokens_{0};
     // Whether the layer-major prefill supply is active at all this window (either

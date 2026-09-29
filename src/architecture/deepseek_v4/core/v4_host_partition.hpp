@@ -66,7 +66,7 @@ public:
         HostExpertPool* host_pool{nullptr};
         PrefetchStagingArena* staging{nullptr};
         ExpertHostRegion* region{nullptr};
-        V4PrefillSweep* sweep{nullptr};
+        PrefillSweep* sweep{nullptr};
         V4ExpertSupplyCoordinator* supply{nullptr};
         MemoryBudgetReport* budget{nullptr};
     };

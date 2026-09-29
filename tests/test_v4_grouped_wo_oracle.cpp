@@ -172,7 +172,7 @@ int main() {
             dim3(32)>>>(d_o, d_w, d_z, static_cast<int>(kTokens));
         CHECK_HIP(hipGetLastError());
 
-        aeon::kernel::v4_gemv_fp16_kernel<<<
+        aeon::kernel::gemv_fp16_kernel<<<
             dim3(static_cast<unsigned>(kHidden), static_cast<unsigned>(kTokens)),
             dim3(32)>>>(d_z, d_b, d_y, static_cast<int>(kZ));
         CHECK_HIP(hipGetLastError());

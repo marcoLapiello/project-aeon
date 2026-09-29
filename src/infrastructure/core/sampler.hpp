@@ -32,7 +32,7 @@
 // Determinism, and why the generator is written out rather than taken from
 // `<random>`. The gate's first clause is "seeded replay is bit-identical", and a
 // replay is only bit-identical *by construction* if both the bit stream and the
-// mapping to `[0, 1)` are specified here. `V4SplitMix64` is a handful of
+// mapping to `[0, 1)` are specified here. `SplitMix64` is a handful of
 // documented lines, so the token sequence is a property of this file.
 //
 // Precision. The decision runs on **host fp32** logits: the fp32 softmax and the
@@ -86,13 +86,13 @@ namespace aeon::core {
 // The logit-processor hook: it receives the **host fp32 logits** and the
 // vocabulary width and mutates them in place. A mask writes `-INFINITY`, a bias
 // adds, a grammar does both.
-using V4LogitProcessor = std::function<void(float* logits, uint32_t vocab)>;
+using LogitProcessor = std::function<void(float* logits, uint32_t vocab)>;
 
 // -----------------------------------------------------------------------------
 // The configuration
 // -----------------------------------------------------------------------------
 
-struct V4SamplerConfig {
+struct SamplerConfig {
     // `<= 0` is the greedy path — the `T -> 0` limit, and the plan's "argmax
     // first" for the untruncated defaults. The artifact's own generation policy
     // (`do_sample = true, temperature = 1, top_p = 1` — plan Step 5) is a *policy*
@@ -108,7 +108,7 @@ struct V4SamplerConfig {
     float top_p{1.0f};
 
     // The generator's seed. The same seed and the same logits give the same
-    // tokens, bit for bit, by construction (see `V4SplitMix64`).
+    // tokens, bit for bit, by construction (see `SplitMix64`).
     uint64_t seed{0};
 };
 
@@ -123,9 +123,9 @@ struct V4SamplerConfig {
 // library happens to do this decade. This is the whole generator: no state to get
 // wrong and no distribution object whose algorithm may differ between
 // implementations.
-class V4SplitMix64 {
+class SplitMix64 {
 public:
-    explicit V4SplitMix64(uint64_t seed = 0) noexcept : state_(seed) {}
+    explicit SplitMix64(uint64_t seed = 0) noexcept : state_(seed) {}
 
     void seed(uint64_t value) noexcept { state_ = value; }
     uint64_t seed() const noexcept { return state_; }
@@ -283,7 +283,7 @@ inline void softmax_in_place(float* logits, uint32_t n) {
 // probabilities may sum to a hair below 1, so the last index with positive
 // probability is returned as the fallback: a `u` just under 1 must not fall off
 // the end of the vector.
-inline uint32_t sample_from_probs(const float* probs, uint32_t n, V4SplitMix64& rng) noexcept {
+inline uint32_t sample_from_probs(const float* probs, uint32_t n, SplitMix64& rng) noexcept {
     const double u = rng.next_unit();
     double accumulated = 0.0;
     uint32_t last_positive = 0;
@@ -304,11 +304,11 @@ inline uint32_t sample_from_probs(const float* probs, uint32_t n, V4SplitMix64& 
 // Owns the seam, the configuration, the generator, and the device workspace for
 // the certified argmax pair. Sized from the vocabulary and nothing else, so it
 // needs no host and no model to construct — which is what keeps the gate cheap.
-class V4Sampler {
+class Sampler {
 public:
-    explicit V4Sampler(uint32_t vocab) : vocab_(vocab) {
+    explicit Sampler(uint32_t vocab) : vocab_(vocab) {
         if (vocab_ == 0) {
-            throw std::invalid_argument("V4Sampler: the vocabulary must be non-empty");
+            throw std::invalid_argument("Sampler: the vocabulary must be non-empty");
         }
         // One partial per block of 256 lanes, and 505 of those is exactly the
         // model's 129280 logits — but the count is computed, so a different
@@ -324,33 +324,33 @@ public:
         rng_.seed(config_.seed);
     }
 
-    ~V4Sampler() {
+    ~Sampler() {
         free();
     }
 
-    V4Sampler(const V4Sampler&) = delete;
-    V4Sampler& operator=(const V4Sampler&) = delete;
-    V4Sampler(V4Sampler&&) = delete;
-    V4Sampler& operator=(V4Sampler&&) = delete;
+    Sampler(const Sampler&) = delete;
+    Sampler& operator=(const Sampler&) = delete;
+    Sampler(Sampler&&) = delete;
+    Sampler& operator=(Sampler&&) = delete;
 
     uint32_t vocab() const noexcept { return vocab_; }
     uint32_t argmax_blocks() const noexcept { return argmax_blocks_; }
 
-    const V4SamplerConfig& config() const noexcept { return config_; }
+    const SamplerConfig& config() const noexcept { return config_; }
 
     // Validated, not clamped (trap 40's discipline applied to configuration): a
     // negative, NaN or infinite temperature, or a `top_p` outside `(0, 1]`, is
     // refused. The alternative — a silently different distribution — is a
     // behaviour change no downstream comparison could attribute.
-    void set_config(const V4SamplerConfig& config) {
+    void set_config(const SamplerConfig& config) {
         if (!std::isfinite(config.temperature) || config.temperature < 0.0f) {
             throw std::invalid_argument(
-                "V4Sampler: temperature must be finite and non-negative, got " +
+                "Sampler: temperature must be finite and non-negative, got " +
                 std::to_string(config.temperature));
         }
         if (!(config.top_p > 0.0f) || config.top_p > 1.0f) {
             throw std::invalid_argument(
-                "V4Sampler: top_p must lie in (0, 1], got " + std::to_string(config.top_p));
+                "Sampler: top_p must lie in (0, 1], got " + std::to_string(config.top_p));
         }
         config_ = config;
         rng_.seed(config_.seed);
@@ -366,7 +366,7 @@ public:
     // Installing a processor forces the host path: the device argmax cannot see a
     // mask, so a constrained decision costs the widening. That is the cost of a
     // constraint, not a defect.
-    void set_logit_processor(V4LogitProcessor processor) { processor_ = std::move(processor); }
+    void set_logit_processor(LogitProcessor processor) { processor_ = std::move(processor); }
     void clear_logit_processor() { processor_ = nullptr; }
     bool has_logit_processor() const noexcept { return static_cast<bool>(processor_); }
 
@@ -375,9 +375,9 @@ public:
     // The certified device argmax, on its own: the two-phase reduction, then a
     // 4-byte readback and a stream sync at the token boundary.
     uint32_t device_argmax(const half* d_logits, hipStream_t stream) const {
-        kernel::v4_argmax_fp16_partial_kernel<<<argmax_blocks_, 256, 0, stream>>>(
+        kernel::argmax_fp16_partial_kernel<<<argmax_blocks_, 256, 0, stream>>>(
             d_logits, static_cast<int>(vocab_), d_partial_vals_, d_partial_idx_);
-        kernel::v4_argmax_partial_reduce_kernel<<<1, 256, 0, stream>>>(
+        kernel::argmax_partial_reduce_kernel<<<1, 256, 0, stream>>>(
             d_partial_vals_, d_partial_idx_, static_cast<int>(argmax_blocks_), d_argmax_result_);
 
         int32_t host_id = 0;
@@ -406,7 +406,7 @@ public:
         // turn into a silent uniform draw.
         if (!sampler_ops::has_finite_logit(logits, n)) {
             throw std::runtime_error(
-                "V4Sampler: the logit processor left no finite logit — there is no "
+                "Sampler: the logit processor left no finite logit — there is no "
                 "distribution to decide from (a promotion must be a finite bias)");
         }
 
@@ -465,9 +465,9 @@ private:
     uint32_t vocab_{0};
     uint32_t argmax_blocks_{0};
 
-    V4SamplerConfig config_{};
-    V4SplitMix64 rng_{};
-    V4LogitProcessor processor_{};
+    SamplerConfig config_{};
+    SplitMix64 rng_{};
+    LogitProcessor processor_{};
 
     // Device workspace for the certified argmax pair only. The logits themselves
     // are never copied whole to the device: the host path widens on the way back.

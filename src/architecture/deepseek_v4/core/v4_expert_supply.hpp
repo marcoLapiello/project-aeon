@@ -307,7 +307,7 @@ public:
     // Hands the staging slots a streamed batch borrowed back to the arena. The
     // executor releases its own in `on_routed_consumed`; the sweep has no such hook.
     //
-    // The sweep defers this past the layer body (see `V4PrefillSweep`): the copy is
+    // The sweep defers this past the layer body (see `PrefillSweep`): the copy is
     // left in flight with no host wait, the body's MoE dispatch joins the pending
     // transfer and the executor orders the weights behind it per expert, and this runs
     // at the layer boundary — where the driver has synchronized the compute stream, so

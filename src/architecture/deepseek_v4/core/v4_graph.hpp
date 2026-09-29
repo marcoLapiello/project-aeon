@@ -149,7 +149,7 @@ public:
         // weightless per-head Q norm — the three are the model's only three, and
         // which one has a tensor is a per-site fact, not a house rule.
         hipLaunchKernelGGL(
-            kernel::v4_rmsnorm_wave32_kernel, dim3(1), dim3(32), 0, stream,
+            kernel::rmsnorm_wave32_kernel, dim3(1), dim3(32), 0, stream,
             scratch.d_hc_head_out, resources.d_final_norm, scratch.d_head_norm,
             hidden, rms_eps);
 
@@ -158,7 +158,7 @@ public:
         // [129280, 4096] tensors in the artifact. One block per logit, fp32
         // accumulate, fp16 store.
         hipLaunchKernelGGL(
-            kernel::v4_gemv_fp16_vec8_kernel, dim3(vocab), dim3(32), 0, stream,
+            kernel::gemv_fp16_vec8_kernel, dim3(vocab), dim3(32), 0, stream,
             scratch.d_head_norm, resources.d_lm_head, scratch.d_logits, hidden);
 
         return scratch.d_logits;

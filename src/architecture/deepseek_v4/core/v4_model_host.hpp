@@ -41,7 +41,7 @@
 // What is *not* re-implemented here. Every object below already exists and is
 // used as it stands: `AeonModelLoader`, `DeepSeekV4Config`, `V4ModelSpec`,
 // `V4ModelContract`, `MemoryBudgetEngine`, `V4ModelResources`, `V4Layer`,
-// `V4ActivationScratch`, `V4DeviceStreams`, `V4LayerBodyTables`. This is that
+// `V4ActivationScratch`, `DeviceStreams`, `V4LayerBodyTables`. This is that
 // assembly lifted into the rewrite rather than a second design of it.
 //
 // Verification note (plan Part V, second rule). A host is not an op, so there is
@@ -119,7 +119,7 @@ public:
         verbose_ = verbose;
 
         select_compute_device(verbose_);
-        streams_ = V4DeviceStreams::create();
+        streams_ = DeviceStreams::create();
 
         loader_.open_model(model_dir);
         const auto& expert_format = loader_.expert_format();
@@ -356,7 +356,7 @@ public:
         return prefill_workspace_.prefill_carry_tokens();
     }
 
-    const V4DeviceStreams& streams() const noexcept { return streams_; }
+    const DeviceStreams& streams() const noexcept { return streams_; }
 
     V4Layer& layer(uint32_t layer_id) { return layers_.at(layer_id); }
     const V4Layer& layer(uint32_t layer_id) const { return layers_.at(layer_id); }
@@ -665,14 +665,14 @@ public:
 
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
     // streamed, and the deepest frontier the lookahead reached.
-    const V4PrefillSweep& prefill_sweep() const noexcept { return prefill_controller_.sweep(); }
+    const PrefillSweep& prefill_sweep() const noexcept { return prefill_controller_.sweep(); }
 
     // The corridor's **fill** per layer — staging slots reading, staging slots
     // copying, and the lookahead layer's reserved-but-not-yet-arrived VRAM experts.
     // The pipeline model (supply-chain plan §0) says a healthy two-block corridor
     // shows `reading` and `copying` both non-zero while a body runs; one pinned at `E`
     // with the other at zero is the parking lot. Empty unless a sweep ran.
-    const std::vector<V4PrefillSweep::BlockOccupancy>& sweep_occupancy() const noexcept {
+    const std::vector<PrefillSweep::BlockOccupancy>& sweep_occupancy() const noexcept {
         return prefill_controller_.occupancy();
     }
 
@@ -1189,7 +1189,7 @@ private:
     bool freeze_warm_during_prefill_{false};
     bool supply_phase_prefill_{false};
 
-    V4DeviceStreams streams_;
+    DeviceStreams streams_;
     V4ModelResources resources_;
     V4ActivationScratch scratch_;
     std::vector<V4Layer> layers_;

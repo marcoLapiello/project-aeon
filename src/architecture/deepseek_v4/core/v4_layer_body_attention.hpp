@@ -92,7 +92,7 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
     // B. Attention RMSNorm
     // -----------------------------------------------------------------
     hipLaunchKernelGGL(
-        kernel::v4_rmsnorm_wave32_kernel,
+        kernel::rmsnorm_wave32_kernel,
         dim3(1), dim3(32), 0, stream,
         scratch.d_x_pre, layer.d_attn_norm, scratch.d_x_norm, H, 1e-6f);
 
@@ -100,34 +100,34 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
     // C. MLA projections — q_lora -> q_norm -> wq_b -> per-head norm; wkv -> kv_norm
     // -----------------------------------------------------------------
     hipLaunchKernelGGL(
-        kernel::v4_gemv_fp16_kernel,
+        kernel::gemv_fp16_kernel,
         dim3(Q_LORA, 1), dim3(32), 0, stream,
         scratch.d_x_norm, layer.d_wq_a, scratch.d_qa, H);
 
     hipLaunchKernelGGL(
-        kernel::v4_rmsnorm_wave32_kernel,
+        kernel::rmsnorm_wave32_kernel,
         dim3(1), dim3(32), 0, stream,
         scratch.d_qa, layer.d_q_norm, scratch.d_qa_norm, Q_LORA, 1e-6f);
 
     hipLaunchKernelGGL(
-        kernel::v4_gemv_fp16_kernel,
+        kernel::gemv_fp16_kernel,
         dim3(TOTAL_Q, 1), dim3(32), 0, stream,
         scratch.d_qa_norm, layer.d_wq_b, scratch.d_q, Q_LORA);
 
     // The per-head norm is WEIGHTLESS (plan 2.2): the artifact has no tensor for
     // it, and upstream's fused q-norm/rope takes no weight argument.
     hipLaunchKernelGGL(
-        kernel::v4_rmsnorm_unit_wave32_kernel,
+        kernel::rmsnorm_unit_wave32_kernel,
         dim3(NUM_HEADS), dim3(32), 0, stream,
         scratch.d_q, scratch.d_q, HEAD_DIM, 1e-6f);
 
     hipLaunchKernelGGL(
-        kernel::v4_gemv_fp16_kernel,
+        kernel::gemv_fp16_kernel,
         dim3(HEAD_DIM, 1), dim3(32), 0, stream,
         scratch.d_x_norm, layer.d_wkv, scratch.d_kv, H);
 
     hipLaunchKernelGGL(
-        kernel::v4_rmsnorm_wave32_kernel,
+        kernel::rmsnorm_wave32_kernel,
         dim3(1), dim3(32), 0, stream,
         scratch.d_kv, layer.d_kv_norm, scratch.d_kv_norm_act, HEAD_DIM, 1e-6f);
 
@@ -137,31 +137,31 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
         const int compressor_width = coefficient * HEAD_DIM;
 
         hipLaunchKernelGGL(
-            kernel::v4_gemv_fp16_kernel,
+            kernel::gemv_fp16_kernel,
             dim3(compressor_width, 1), dim3(32), 0, stream,
             scratch.d_x_norm, layer.d_compressor_wkv, scratch.d_compressor_kv, H);
         hipLaunchKernelGGL(
-            kernel::v4_gemv_fp16_kernel,
+            kernel::gemv_fp16_kernel,
             dim3(compressor_width, 1), dim3(32), 0, stream,
             scratch.d_x_norm, layer.d_compressor_wgate, scratch.d_compressor_score, H);
 
         if (layer.spec().attention_kind == V4AttentionKind::CSA) {
             hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
+                kernel::gemv_fp16_kernel,
                 dim3(INDEXER_Q, 1), dim3(32), 0, stream,
                 scratch.d_qa_norm, layer.d_indexer_wq_b, scratch.d_indexer_query, Q_LORA);
             hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
+                kernel::gemv_fp16_kernel,
                 dim3(kernel::DSV4_INDEX_N_HEADS, 1), dim3(32), 0, stream,
                 scratch.d_x_norm, layer.d_indexer_weights_proj,
                 scratch.d_indexer_weights_half, H);
             hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
+                kernel::gemv_fp16_kernel,
                 dim3(coefficient * kernel::DSV4_INDEX_HEAD_DIM, 1), dim3(32), 0, stream,
                 scratch.d_x_norm, layer.d_indexer_compressor_wkv,
                 scratch.d_indexer_compressor_kv, H);
             hipLaunchKernelGGL(
-                kernel::v4_gemv_fp16_kernel,
+                kernel::gemv_fp16_kernel,
                 dim3(coefficient * kernel::DSV4_INDEX_HEAD_DIM, 1), dim3(32), 0, stream,
                 scratch.d_x_norm, layer.d_indexer_compressor_wgate,
                 scratch.d_indexer_compressor_score, H);
@@ -533,7 +533,7 @@ inline void run_layer_body_attention_and_norm(
         scratch.d_attn_out, layer.d_wo_a, scratch.d_z_lora, 1);
 
     hipLaunchKernelGGL(
-        kernel::v4_gemv_fp16_kernel,
+        kernel::gemv_fp16_kernel,
         dim3(H, 1), dim3(32), 0, stream,
         scratch.d_z_lora, layer.d_wo_b, scratch.d_attn_proj, TOT_LORA);
 
@@ -595,7 +595,7 @@ inline void run_layer_body_attention_and_norm(
     // 2.8 — FFN RMSNorm
     // -----------------------------------------------------------------
     hipLaunchKernelGGL(
-        kernel::v4_rmsnorm_wave32_kernel,
+        kernel::rmsnorm_wave32_kernel,
         dim3(1), dim3(32), 0, stream,
         scratch.d_ffn_pre, layer.d_ffn_norm, scratch.d_ffn_norm_act, H, 1e-6f);
 

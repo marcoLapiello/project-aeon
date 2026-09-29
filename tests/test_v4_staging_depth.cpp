@@ -52,9 +52,9 @@ namespace {
 
 using aeon::core::V4Graph;
 using aeon::core::V4ModelHost;
-using aeon::core::V4PrefillSweep;
-using aeon::core::V4Sampler;
-using aeon::core::V4SamplerConfig;
+using aeon::core::PrefillSweep;
+using aeon::core::Sampler;
+using aeon::core::SamplerConfig;
 using Clock = std::chrono::steady_clock;
 
 constexpr const char* kModelDir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";
@@ -139,7 +139,7 @@ struct Row {
     uint32_t hot_preserved{0};
     uint32_t sample_layer{0};
     // The full per-layer sample set, kept for the optional corridor trace.
-    std::vector<V4PrefillSweep::BlockOccupancy> samples;
+    std::vector<PrefillSweep::BlockOccupancy> samples;
 };
 
 } // namespace
@@ -206,8 +206,8 @@ int main(int argc, char** argv) {
         ids[i] = (i * 7u + 1u) % 1000u;
     }
 
-    V4Sampler sampler(static_cast<uint32_t>(host.config().vocab_size));
-    sampler.set_config(V4SamplerConfig{});  // defaults: temperature 0 => greedy
+    Sampler sampler(static_cast<uint32_t>(host.config().vocab_size));
+    sampler.set_config(SamplerConfig{});  // defaults: temperature 0 => greedy
 
     std::printf(
         "[staging-depth] layers=%u E=%u window=%u chunk=%u floor=%u slots "

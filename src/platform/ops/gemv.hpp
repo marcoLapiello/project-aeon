@@ -10,9 +10,9 @@
 // `platform/ops/rmsnorm.hpp` and `v4_rope.hpp`.
 //
 // Two forms:
-//   `v4_gemv_fp16_kernel`      — one half per lane per step. Used for the MLA
+//   `gemv_fp16_kernel`      — one half per lane per step. Used for the MLA
 //                                projections and the compressor/indexer gates.
-//   `v4_gemv_fp16_vec8_kernel` — eight halves per lane per step via `uint4`.
+//   `gemv_fp16_vec8_kernel` — eight halves per lane per step via `uint4`.
 //                                Used for the shared expert and LM head.
 //                                Requires `in_dim % 8 == 0`.
 //
@@ -31,7 +31,7 @@ namespace aeon::kernel {
 
 // One lane per output column, striding the input dimension by the wave width.
 // `y[token * gridDim.x + out_col] = dot(x_row, w_row)`.
-__global__ void v4_gemv_fp16_kernel(
+__global__ void gemv_fp16_kernel(
     const __half* __restrict__ x,       // [T, in_dim]
     const __half* __restrict__ w,       // [out_dim, in_dim]
     __half*       __restrict__ y,       // [T, out_dim]
@@ -61,7 +61,7 @@ __global__ void v4_gemv_fp16_kernel(
 
 // Vectorized FP16 GEMV: each lane streams 8 halves per iteration via uint4 — 8x
 // fewer global transactions and FP32 FMA accumulation.
-__global__ void __launch_bounds__(32) v4_gemv_fp16_vec8_kernel(
+__global__ void __launch_bounds__(32) gemv_fp16_vec8_kernel(
     const __half* __restrict__ x,       // [T, in_dim]
     const __half* __restrict__ w,       // [out_dim, in_dim]
     __half*       __restrict__ y,       // [T, out_dim]

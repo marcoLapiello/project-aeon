@@ -388,7 +388,7 @@ int main(int argc, char** argv) {
             : aeon::text::Dsv4ThinkingMode::Chat;
 
         // The artifact's own policy unless the caller overrode a field of it.
-        aeon::core::V4SamplerConfig sampling =
+        aeon::core::SamplerConfig sampling =
             engine.policy().to_sampler_config(options.seed);
         if (options.greedy) {
             sampling.temperature = 0.0f;

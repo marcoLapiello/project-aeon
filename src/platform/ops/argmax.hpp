@@ -17,7 +17,7 @@ namespace aeon::kernel {
 // GPU argmax over the [129280] FP16 logit head (Expert Review Step 5).
 // Phase 1 and Phase 2 are separate launches because HIP has no implicit
 // grid-wide barrier between blocks in one ordinary kernel launch.
-__global__ void __launch_bounds__(256) v4_argmax_fp16_partial_kernel(
+__global__ void __launch_bounds__(256) argmax_fp16_partial_kernel(
     const __half* __restrict__ logits,
     int n,
     float* __restrict__ partial_vals,   // [argmax_blocks]
@@ -60,7 +60,7 @@ __global__ void __launch_bounds__(256) v4_argmax_fp16_partial_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256) v4_argmax_partial_reduce_kernel(
+__global__ void __launch_bounds__(256) argmax_partial_reduce_kernel(
     const float* __restrict__ partial_vals,
     const int32_t* __restrict__ partial_idx,
     int partial_count,

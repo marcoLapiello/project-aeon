@@ -125,7 +125,7 @@ using aeon::core::HostExpertPool;
 using aeon::core::PrefetchStagingArena;
 using aeon::core::SupplyTelemetry;
 using aeon::core::UnifiedVRAMExpertPool;
-using aeon::core::V4DeviceStreams;
+using aeon::core::DeviceStreams;
 using aeon::core::V4ExpertSupplyCoordinator;
 using aeon::core::V4Layer;
 using aeon::core::V4LayerBodyOutput;
@@ -187,8 +187,8 @@ struct Harness {
     hipStream_t sdma_cold{nullptr};
     hipStream_t demotion{nullptr};
 
-    V4DeviceStreams streams() const {
-        return V4DeviceStreams{compute, sdma, sdma_cold, demotion};
+    DeviceStreams streams() const {
+        return DeviceStreams{compute, sdma, sdma_cold, demotion};
     }
 
     // One (token, layer) checkpoint pair.

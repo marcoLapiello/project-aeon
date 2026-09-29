@@ -80,8 +80,8 @@ using aeon::core::V4GenerationPolicy;
 using aeon::core::V4Graph;
 using aeon::core::V4ModelHost;
 using aeon::core::V4Reply;
-using aeon::core::V4Sampler;
-using aeon::core::V4SamplerConfig;
+using aeon::core::Sampler;
+using aeon::core::SamplerConfig;
 using aeon::text::Dsv4PromptMessage;
 using aeon::text::Dsv4PromptOptions;
 using aeon::text::Dsv4Role;
@@ -202,10 +202,10 @@ Dsv4PromptMessage assistant_message(const std::string& text) {
 // It mirrors `text::generate_token_ids`'s positions exactly — prompt token `i` at
 // position `i`, then generated token `g` at `prompt.size() + g - 1` — because that
 // is the contract the engine is required to satisfy, not a re-derivation of it.
-std::vector<uint32_t> independent_replay(V4ModelHost& host, V4Graph& graph, V4Sampler& sampler,
+std::vector<uint32_t> independent_replay(V4ModelHost& host, V4Graph& graph, Sampler& sampler,
                                          const std::vector<uint32_t>& prompt,
                                          uint32_t new_tokens,
-                                         const V4SamplerConfig& sampling) {
+                                         const SamplerConfig& sampling) {
     host.reset_generation_state();
     sampler.set_config(sampling);
     sampler.reseed(sampling.seed);
@@ -286,7 +286,7 @@ int main() {
     stage("A: the engine assembly", build_start);
 
     // The policy is used by every generation below, so it is fixed once.
-    const V4SamplerConfig sampling = engine.policy().to_sampler_config(engine.options().seed);
+    const SamplerConfig sampling = engine.policy().to_sampler_config(engine.options().seed);
 
     Dsv4PromptOptions prompt_options;
     prompt_options.thinking_mode = Dsv4ThinkingMode::Chat;
@@ -452,13 +452,13 @@ int main() {
         // four tokens — measured, not assumed — so the divergence is forced where
         // it is guaranteed: a flattened distribution (`T=5`), where the seed is the
         // only thing deciding.
-        V4SamplerConfig flat = sampling;
+        SamplerConfig flat = sampling;
         flat.temperature = 5.0f;
         const V4Reply flat_reference =
             engine.chat(conversation, prompt_options, generation_options(kNewTokens), flat);
         bool differed = false;
         for (uint64_t offset = 1; offset <= 4 && !differed; ++offset) {
-            V4SamplerConfig other_seed = flat;
+            SamplerConfig other_seed = flat;
             other_seed.seed = engine.options().seed + offset;
             const V4Reply other = engine.chat(conversation, prompt_options,
                                               generation_options(kNewTokens), other_seed);
@@ -470,7 +470,7 @@ int main() {
         // The negative control: the greedy path never consults the generator, so
         // the seed is *irrelevant* there. This is what makes the check above a
         // statement about sampling rather than about the RNG being called.
-        V4SamplerConfig greedy = sampling;
+        SamplerConfig greedy = sampling;
         greedy.temperature = 0.0f;
         greedy.seed = 1;
         const V4Reply greedy_first =

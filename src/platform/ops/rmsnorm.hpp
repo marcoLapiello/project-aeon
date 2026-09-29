@@ -12,8 +12,8 @@
 // `__shfl_xor`. Both forms accumulate in fp32 and write fp16.
 //
 // The two forms exist because the graph uses both:
-//   - weighted (`v4_rmsnorm_wave32_kernel`)      — Step 2.1 attention norm.
-//   - unit     (`v4_rmsnorm_unit_wave32_kernel`) — weightless norm sites.
+//   - weighted (`rmsnorm_wave32_kernel`)      — Step 2.1 attention norm.
+//   - unit     (`rmsnorm_unit_wave32_kernel`) — weightless norm sites.
 // Which site uses which is a decision recorded in the plan (Step 2.1/2.2), not
 // something this header decides.
 //
@@ -28,7 +28,7 @@
 namespace aeon::kernel {
 
 // Weighted RMSNorm: out = x * rsqrt(mean(x^2) + eps) * weight.
-__global__ void __launch_bounds__(32) v4_rmsnorm_wave32_kernel(
+__global__ void __launch_bounds__(32) rmsnorm_wave32_kernel(
     const __half* __restrict__ input,
     const __half* __restrict__ weight,
     __half* __restrict__ output,
@@ -62,7 +62,7 @@ __global__ void __launch_bounds__(32) v4_rmsnorm_wave32_kernel(
 }
 
 // Weightless RMSNorm: out = x * rsqrt(mean(x^2) + eps).
-__global__ void __launch_bounds__(32) v4_rmsnorm_unit_wave32_kernel(
+__global__ void __launch_bounds__(32) rmsnorm_unit_wave32_kernel(
     const __half* __restrict__ input,
     __half* __restrict__ output,
     int dim,
