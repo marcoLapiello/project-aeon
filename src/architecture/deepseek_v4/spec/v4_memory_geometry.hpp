@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------------
 // The DeepSeek-V4 memory geometry: the architecture's half of the budget seam.
 //
-// The budget engine (`infrastructure/core/memory_budget_engine.hpp`) owns the
+// The budget engine (`infrastructure/memory/memory_budget_engine.hpp`) owns the
 // policy and reads a neutral `ModelMemoryGeometry`. This header builds that struct
 // from the V4 config: the four counts, the residual carry per token, and — the one
 // thing only the architecture can supply — the attention-state cost as a function
@@ -16,7 +16,7 @@
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer_state.hpp"
 #include "architecture/deepseek_v4/spec/v4_model_spec.hpp"
-#include "infrastructure/core/model_memory_geometry.hpp"
+#include "infrastructure/memory/model_memory_geometry.hpp"
 
 #include <cstddef>
 #include <cstdint>

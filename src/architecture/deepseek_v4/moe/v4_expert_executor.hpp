@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------------
 // The production routed-expert executor.
 //
-// `V4RoutedExpertExecutor` (core/v4_layer_body.hpp) is the seam the layer body
+// `V4RoutedExpertExecutor` (layer/v4_layer_body.hpp) is the seam the layer body
 // calls. Inside a gate it is implemented against payloads supplied directly; in the
 // runtime it is the whole tiered supply system — index lookup, Hot/Warm/Cold
 // promotion, prefetch, leases, staging — followed by the fused expert kernels. This
@@ -47,18 +47,18 @@
 // synchronization instead of the registry's "no reclaimable Hot VRAM slot" throw.
 // -----------------------------------------------------------------------------
 
-#include "infrastructure/core/device_streams.hpp"
-#include "infrastructure/core/expert_lease_holder.hpp"
+#include "infrastructure/device_streams.hpp"
+#include "infrastructure/expert/expert_lease_holder.hpp"
 #include "architecture/deepseek_v4/moe/v4_expert_supply.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
 #include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
-#include "infrastructure/core/expert_registry.hpp"
-#include "infrastructure/core/host_expert_pool.hpp"
-#include "infrastructure/core/prefetch_staging.hpp"
-#include "infrastructure/core/routing_reuse.hpp"
+#include "infrastructure/expert/residency/expert_registry.hpp"
+#include "infrastructure/expert/storage/host_expert_pool.hpp"
+#include "infrastructure/expert/transport/prefetch_staging.hpp"
+#include "infrastructure/routing/routing_reuse.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -126,7 +126,7 @@ public:
 };
 
 // The four streams the executor interacts with live in
-// `infrastructure/core/device_streams.hpp`, owned by the host and borrowed here: the
+// `infrastructure/device_streams.hpp`, owned by the host and borrowed here: the
 // capacity fallback must drain exactly the streams that carry expert traffic, and a
 // second definition of "the streams" could hand it the wrong set. `compute` runs the
 // expert kernels and awaits the staging events; the other three carry storage traffic

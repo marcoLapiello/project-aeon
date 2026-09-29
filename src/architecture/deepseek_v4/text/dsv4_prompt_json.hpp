@@ -4,7 +4,7 @@
 //
 // The encoder must reproduce the reference `json.dumps(value, ensure_ascii=False)`
 // byte-for-byte, because tool schemas are embedded in the prompt text. That needs
-// two properties `infrastructure/core/json.hpp` does not have:
+// two properties `infrastructure/json.hpp` does not have:
 //
 //   1. **Insertion order.** Its object type is `std::map`, which sorts keys.
 //      Python dicts preserve insertion order, and a tool schema like
@@ -14,7 +14,7 @@
 //      for the second.
 //
 // So this is a separate, small codec used only for prompt text. It is deliberately
-// not a general-purpose JSON facility and does not replace `core/json.hpp`.
+// not a general-purpose JSON facility and does not replace `infrastructure/json.hpp`.
 //
 // Representation note: an object keeps its keys and values in two parallel
 // vectors rather than `vector<pair<string, PromptJson>>`. A `std::pair` needs its

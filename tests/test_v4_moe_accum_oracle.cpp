@@ -54,7 +54,7 @@
 #include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
-#include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "support/v4_layer_body_gate.hpp"
 

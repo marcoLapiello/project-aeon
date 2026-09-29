@@ -89,8 +89,8 @@
 #include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/spec/v4_model_spec.hpp"
 #include "architecture/deepseek_v4/kernels/v4_rope.hpp"
-#include "infrastructure/core/aeon_loader.hpp"
-#include "infrastructure/core/supply_telemetry.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
+#include "infrastructure/expert/transport/supply_telemetry.hpp"
 #include "infrastructure/io/direct_io_reader.hpp"
 
 #include <hip/hip_fp16.h>

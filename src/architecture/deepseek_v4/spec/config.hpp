@@ -1,6 +1,6 @@
 #pragma once
 
-#include "infrastructure/core/json.hpp"
+#include "infrastructure/json.hpp"
 
 #include <cmath>
 #include <cstdint>

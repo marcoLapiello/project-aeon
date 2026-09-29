@@ -34,7 +34,7 @@
 #include "architecture/deepseek_v4/kernels/moe_router.hpp"
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
-#include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

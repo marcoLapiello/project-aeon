@@ -1,9 +1,9 @@
-#include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/spec/v4_memory_geometry.hpp"
 #include "platform/rdna3/device.hpp"
-#include "infrastructure/core/expert_registry.hpp"
-#include "infrastructure/core/memory_budget.hpp"
+#include "infrastructure/expert/residency/expert_registry.hpp"
+#include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/spec/v4_model_contract.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 

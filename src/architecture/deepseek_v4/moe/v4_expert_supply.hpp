@@ -1,9 +1,9 @@
 #pragma once
 
-#include "infrastructure/core/aeon_loader.hpp"
-#include "infrastructure/core/expert_payload_pool.hpp"
-#include "infrastructure/core/layer_batch_supply.hpp"
-#include "infrastructure/core/tiered_expert_supply.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
+#include "infrastructure/expert/storage/expert_payload_pool.hpp"
+#include "infrastructure/expert/layer_batch_supply.hpp"
+#include "infrastructure/expert/transport/tiered_expert_supply.hpp"
 
 #include <hip/hip_runtime.h>
 

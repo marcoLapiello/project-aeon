@@ -1,7 +1,7 @@
 #pragma once
 
 #include "architecture/deepseek_v4/spec/v4_model_spec.hpp"
-#include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>

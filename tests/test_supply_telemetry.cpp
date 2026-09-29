@@ -1,5 +1,5 @@
-#include "infrastructure/core/supply_telemetry.hpp"
-#include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/expert/transport/supply_telemetry.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
 
 #include <cassert>
 #include <fstream>

@@ -98,7 +98,7 @@
 #include "architecture/deepseek_v4/spec/v4_model_spec.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
-#include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
 #include "support/v4_layer_body_gate.hpp"
 
 #include <algorithm>

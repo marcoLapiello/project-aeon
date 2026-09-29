@@ -82,7 +82,7 @@
 #include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer_body_batch.hpp"
 #include "architecture/deepseek_v4/spec/v4_model_spec.hpp"
-#include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
 #include "support/v4_layer_body_gate.hpp"
 
 #include <algorithm>

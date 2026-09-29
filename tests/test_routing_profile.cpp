@@ -1,4 +1,4 @@
-#include "infrastructure/core/routing_profile.hpp"
+#include "infrastructure/routing/routing_profile.hpp"
 
 #include <cassert>
 #include <filesystem>

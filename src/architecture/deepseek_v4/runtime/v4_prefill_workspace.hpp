@@ -14,14 +14,14 @@
 // read, allocated and freed without the assembly around it.
 //
 // Of the two buffers, only the carry is engine-owned: it is the neutral
-// `infrastructure/core/prefill_carry.hpp` (`PrefillCarry`), sized by the model's
+// `infrastructure/prefill/prefill_carry.hpp` (`PrefillCarry`), sized by the model's
 // residual width. The chunk workspace is the model's own `V4LayerBodyBatchScratch`
 // — its layout is written in the model's dimensions and its worst case is taken
 // across the model's layers, so it stays here.
 // -----------------------------------------------------------------------------
 
-#include "infrastructure/core/prefill_carry.hpp"
-#include "infrastructure/core/runtime_config.hpp"
+#include "infrastructure/prefill/prefill_carry.hpp"
+#include "infrastructure/memory/runtime_config.hpp"
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer_body_batch.hpp"

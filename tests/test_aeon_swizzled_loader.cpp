@@ -1,4 +1,4 @@
-#include "infrastructure/core/aeon_loader.hpp"
+#include "infrastructure/artifact/aeon_loader.hpp"
 
 #include <cassert>
 #include <cstdint>

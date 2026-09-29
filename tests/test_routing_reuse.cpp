@@ -1,4 +1,4 @@
-#include "infrastructure/core/routing_reuse.hpp"
+#include "infrastructure/routing/routing_reuse.hpp"
 
 #include <cassert>
 #include <iostream>

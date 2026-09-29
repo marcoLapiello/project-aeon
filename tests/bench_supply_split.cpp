@@ -67,10 +67,10 @@
 
 #include "platform/rdna3/device.hpp"
 
-#include "infrastructure/core/memory_budget.hpp"
+#include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
 #include "architecture/deepseek_v4/runtime/v4_model_host.hpp"
-#include "infrastructure/core/sampler.hpp"
+#include "infrastructure/sampler.hpp"
 #include "architecture/deepseek_v4/text/dsv4_prompt_encoder.hpp"
 #include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
 #include "infrastructure/hip_check.hpp"

@@ -55,7 +55,7 @@
 #include "architecture/deepseek_v4/runtime/v4_engine.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
 #include "architecture/deepseek_v4/runtime/v4_model_host.hpp"
-#include "infrastructure/core/sampler.hpp"
+#include "infrastructure/sampler.hpp"
 #include "infrastructure/hip_check.hpp"
 #include "infrastructure/text/text_generation.hpp"
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "infrastructure/core/expert_format.hpp"
+#include "infrastructure/expert/storage/expert_format.hpp"
 
 #include <cstddef>
 
