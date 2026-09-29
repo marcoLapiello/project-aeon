@@ -73,6 +73,7 @@
 #include "infrastructure/core/aeon_loader.hpp"
 #include "infrastructure/core/expert_direct_io.hpp"
 #include "infrastructure/core/expert_registry.hpp"
+#include "infrastructure/core/expert_tier_state.hpp"
 #include "infrastructure/core/expert_tier_loader.hpp"
 #include "infrastructure/core/host_expert_pool.hpp"
 #include "infrastructure/core/expert_host_region.hpp"
@@ -197,7 +198,7 @@ public:
         // from a clean slate and capture everything after it" rather than "start
         // clean and hope nothing has happened yet".)
         if (!runtime_cfg.supply_telemetry_path.empty()) {
-            telemetry_.enable_jsonl(runtime_cfg.supply_telemetry_path, runtime_cfg.run_id);
+            tier_.telemetry.enable_jsonl(runtime_cfg.supply_telemetry_path, runtime_cfg.run_id);
             if (verbose_) {
                 std::printf("[Host] Supply telemetry -> %s (run_id=%s)\n",
                             runtime_cfg.supply_telemetry_path.c_str(),
@@ -223,7 +224,7 @@ public:
         // Flush the telemetry sink first, while the pools it observes still exist,
         // so the final summary captures the peak occupancy of the run being torn
         // down rather than a post-free zero.
-        telemetry_.disable();
+        tier_.telemetry.disable();
 
         // Teardown is the construction order reversed, and the two references that
         // matter are dropped first: the executor borrows the supply, the pool, the
@@ -234,12 +235,12 @@ public:
         supply_.clear();
         expert_scratch_.free();
         vram_pool_.free();
-        host_pool_.free();
-        staging_.reset();
+        tier_.host_pool.free();
+        tier_.staging.reset();
         // The partition's bound staging pointer is now stale; clear it so nothing
         // reaches a freed arena before the next `initialize` re-binds it.
-        host_partition_.bind(HostPartition::Services{});
-        direct_io_.free();
+        tier_.host_partition.bind(HostPartition::Services{});
+        tier_.direct_io.free();
 
         // The layers free their own dense weights and attention state, the
         // resources and the scratch free theirs, and every `free()` nulls what it
@@ -335,8 +336,8 @@ public:
     // The pinned host staging arena's footprint, so all three prefill buffers can be
     // reported side by side rather than only the VRAM pair.
     size_t staging_bytes() const noexcept {
-        if (!staging_ || !experts_ready()) return 0;
-        return static_cast<size_t>(staging_->slot_count()) *
+        if (!tier_.staging || !experts_ready()) return 0;
+        return static_cast<size_t>(tier_.staging->slot_count()) *
                loader_.expert_format().payload_bytes;
     }
 
@@ -398,21 +399,21 @@ public:
     // is the intended steady state; a non-zero value is how a gate says it ran the
     // starved regime (Step 4).
     uint64_t forced_drains() const noexcept {
-        return telemetry_.forced_drains();
+        return tier_.telemetry.forced_drains();
     }
 
     // Staging slots not AVAILABLE. A gate asserts this returns to 0 at the end of a
     // run — the arena must not leak. Reads the concrete executor's arena, so it is
     // safe only after `initialize_experts`; returns 0 when the arena does not exist.
     uint32_t staging_in_use_slots() const noexcept {
-        return staging_ ? staging_->in_use_slots() : 0;
+        return tier_.staging ? tier_.staging->in_use_slots() : 0;
     }
 
     // The staging arena's slot count. A batch dispatcher must not assign more
     // distinct staging indices than this, and the layer-major window refuses a
     // chunk whose `6C` requests would exceed it.
     uint32_t staging_slot_count() const noexcept {
-        return staging_ ? staging_->slot_count() : 0;
+        return tier_.staging ? tier_.staging->slot_count() : 0;
     }
 
     // Re-size the staging arena at runtime: a **depth** change, not a format change.
@@ -420,7 +421,7 @@ public:
     // `HostPartition::resize` (`host_partition.hpp`); this is the host's entry
     // point to it.
     bool resize_staging_slots(uint32_t slots) {
-        return host_partition_.resize(slots, experts_per_layer(), outstanding_expert_leases());
+        return tier_.host_partition.resize(slots, experts_per_layer(), outstanding_expert_leases());
     }
 
     // ---- the Warm/staging partition -----------------------------------------
@@ -430,7 +431,7 @@ public:
     // cut separately, and why moving the boundary is cheap — lives in
     // `HostPartition` (`host_partition.hpp`). This is the host's entry point.
     void apply_host_partition(uint32_t warm_slots, uint32_t staging_slots) {
-        host_partition_.apply(warm_slots, staging_slots, experts_per_layer(),
+        tier_.host_partition.apply(warm_slots, staging_slots, experts_per_layer(),
                               outstanding_expert_leases());
     }
 
@@ -438,7 +439,7 @@ public:
     // chunk has to fit — not the live arena, which is cut to decode's smaller shape
     // between windows.
     uint32_t batch_staging_capacity() const noexcept {
-        return host_partition_.batch_staging_capacity();
+        return tier_.host_partition.batch_staging_capacity();
     }
 
     // Layer-sized staging banks the sweep's arena holds, derived from the arena's
@@ -446,7 +447,7 @@ public:
     // derivation exists so a runtime resize moves the arena and the sweep's bank
     // indexing together, with no second place for the two to disagree.
     uint32_t sweep_staging_banks() const noexcept {
-        return host_partition_.sweep_staging_banks();
+        return tier_.host_partition.sweep_staging_banks();
     }
 
     // The shape of the last expert dispatch: tokens covered, and the distinct
@@ -472,9 +473,9 @@ public:
 
     // Diagnostics, for an assembly gate: the registry's residency claims and the
     // pool it made them against. Not used by the graph.
-    const ExpertRegistry& registry() const noexcept { return registry_; }
+    const ExpertRegistry& registry() const noexcept { return tier_.registry; }
     UnifiedVRAMExpertPool& vram_pool() noexcept { return vram_pool_; }
-    const SupplyTelemetry& telemetry() const noexcept { return telemetry_; }
+    const SupplyTelemetry& telemetry() const noexcept { return tier_.telemetry; }
 
     // Tell the telemetry which phase the next dispatch belongs to. The caller is
     // the generation loop, which already knows whether the token it is about to
@@ -488,7 +489,7 @@ public:
     // before they are released; a copy that is still genuinely in flight is
     // reclaimed by eviction when it settles.
     void set_supply_phase(bool prefill) {
-        telemetry_.set_phase(prefill ? RoutingPhase::Prefill : RoutingPhase::Decode);
+        tier_.telemetry.set_phase(prefill ? RoutingPhase::Prefill : RoutingPhase::Decode);
         if (!freeze_warm_during_prefill_ || !experts_ready()) return;
         // Only the **transition** matters, and only on the way down does work have to
         // be done: leaving frozen must be total, because decode admits single
@@ -496,30 +497,30 @@ public:
         // drains the expert streams (a legate boundary, not the request path) and
         // reaps, which completes every in-flight copy before the idle shadows are
         // released. The swept prefill owns this flag while it is running.
-        if (registry_.prefill_streaming() || prefill == supply_phase_prefill_) return;
+        if (tier_.registry.prefill_streaming() || prefill == supply_phase_prefill_) return;
         supply_phase_prefill_ = prefill;
         if (prefill) {
-            registry_.set_warm_frozen(true);
+            tier_.registry.set_warm_frozen(true);
         } else {
             drain_expert_streams();
             supply_.reap_registry_transfers();
-            registry_.set_warm_frozen(false);
+            tier_.registry.set_warm_frozen(false);
         }
     }
 
     // Frozen-prefill state, for a gate: whether the registry is in frozen mode and
     // how many Warm-owned experts currently hold an extra VRAM copy (Step 6 D-b).
-    bool warm_frozen() const noexcept { return registry_.warm_frozen(); }
+    bool warm_frozen() const noexcept { return tier_.registry.warm_frozen(); }
     uint32_t shadow_resident_count() const noexcept {
-        return registry_.shadow_resident_count();
+        return tier_.registry.shadow_resident_count();
     }
-    int32_t shadow_slot_of(uint32_t gid) const { return registry_.shadow_slot_of(gid); }
-    uint64_t shadow_copies() const noexcept { return registry_.shadow_copies; }
+    int32_t shadow_slot_of(uint32_t gid) const { return tier_.registry.shadow_slot_of(gid); }
+    uint64_t shadow_copies() const noexcept { return tier_.registry.shadow_copies; }
 
     // Logical Warm bytes the supply served in a phase (Step 6 outcome 3). Requires
     // the telemetry sink to have been enabled.
     uint64_t supply_logical_bytes_from_warm(bool prefill) const noexcept {
-        return telemetry_.logical_bytes_from_warm(
+        return tier_.telemetry.logical_bytes_from_warm(
             prefill ? SupplyTelemetryPhase::Prefill : SupplyTelemetryPhase::Decode);
     }
 
@@ -529,40 +530,40 @@ public:
     // AllHot/WarmNoCold/HasCold.
     uint64_t layer_outcome_count(bool prefill, uint32_t outcome) const noexcept {
         if (outcome > 2) return 0;
-        return telemetry_.layer_outcome_count(
+        return tier_.telemetry.layer_outcome_count(
             prefill ? SupplyTelemetryPhase::Prefill : SupplyTelemetryPhase::Decode,
             static_cast<SupplyTelemetry::LayerOutcome>(outcome));
     }
 
     uint64_t layer_dispatches(bool prefill) const noexcept {
-        return telemetry_.layer_dispatches(
+        return tier_.telemetry.layer_dispatches(
             prefill ? SupplyTelemetryPhase::Prefill : SupplyTelemetryPhase::Decode);
     }
 
     // Lifetime supply traffic, for a benchmark. Never reset, independent of the
     // JSONL sink, so a throughput run can state bytes read without opening one.
-    uint64_t supply_requests() const noexcept { return telemetry_.lifetime_requests(); }
+    uint64_t supply_requests() const noexcept { return tier_.telemetry.lifetime_requests(); }
     uint64_t supply_bytes_from_nvme() const noexcept {
-        return telemetry_.lifetime_nvme_bytes();
+        return tier_.telemetry.lifetime_nvme_bytes();
     }
     uint64_t supply_bytes_from_host() const noexcept {
-        return telemetry_.lifetime_host_bytes();
+        return tier_.telemetry.lifetime_host_bytes();
     }
-    uint64_t supply_h2d_bytes() const noexcept { return telemetry_.lifetime_h2d_bytes(); }
+    uint64_t supply_h2d_bytes() const noexcept { return tier_.telemetry.lifetime_h2d_bytes(); }
 
     // Routing reuse-distance profiling (Phase 1 of the routing study): a separate
     // module with its own switch, not part of the supply telemetry.
     bool routing_reuse_enabled() const noexcept {
-        return reuse_profiler_.enabled();
+        return tier_.reuse_profiler.enabled();
     }
 
     RoutingReuseProfiler::Curve routing_reuse_curve() const {
-        return reuse_profiler_.curve();
+        return tier_.reuse_profiler.curve();
     }
 
     // One generated token's worth of decode accounting. A no-op when the sink is off.
     void record_supply_decode_token() {
-        telemetry_.record_decode_token();
+        tier_.telemetry.record_decode_token();
     }
 
     // Host read access, for building an oracle: `embed.weight` is reached through
@@ -623,11 +624,11 @@ public:
     // it. The cost is the re-read and nothing else — the corridor's rent, which a
     // smaller `--staging-blocks` declines to pay.
     void restore_prefill_warm(const ExpertFormatDescriptor& format) {
-        const std::vector<uint32_t> restore = registry_.host_restore_set();
+        const std::vector<uint32_t> restore = tier_.registry.host_restore_set();
         if (restore.empty()) return;
-        const uint32_t per_layer = registry_.experts_per_layer;
+        const uint32_t per_layer = tier_.registry.experts_per_layer;
         const size_t batch = std::max<size_t>(
-            1, direct_io_.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
+            1, tier_.direct_io.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
         // Advance a single cursor rather than stepping `start` by a whole batch: a batch
         // that runs out of room must **stop**, not skip the experts it could not place.
         // (Stepping the outer loop by `batch` after an inner break silently dropped the
@@ -638,7 +639,7 @@ public:
             std::vector<uint8_t*> destinations;
             while (cursor < restore.size() && expert_ids.size() < batch) {
                 const uint32_t gid = restore[cursor++];
-                const int32_t slot = registry_.take_free_host_slot();
+                const int32_t slot = tier_.registry.take_free_host_slot();
                 if (slot < 0) {
                     // The tier is full. Concurrent decode residency took the room the
                     // borrowed expert would need — the pool is a fixed size, so an
@@ -648,16 +649,16 @@ public:
                     cursor = restore.size();
                     break;
                 }
-                registry_.admit_warm(gid, static_cast<uint32_t>(slot));
+                tier_.registry.admit_warm(gid, static_cast<uint32_t>(slot));
                 expert_ids.emplace_back(gid / per_layer, gid % per_layer);
                 destinations.push_back(
-                    host_pool_.get_expert_slot_ptr(static_cast<uint32_t>(slot)));
+                    tier_.host_pool.get_expert_slot_ptr(static_cast<uint32_t>(slot)));
             }
             if (!expert_ids.empty()) {
-                direct_io_.read_blocking(loader_, expert_ids, destinations);
+                tier_.direct_io.read_blocking(loader_, expert_ids, destinations);
             }
         }
-        registry_.clear_host_restore_set();
+        tier_.registry.clear_host_restore_set();
     }
 
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
@@ -814,7 +815,7 @@ private:
                     " slots) cannot hold the corridor's largest requirement (" +
                     std::to_string(staging.peak) + " slots, a swept prefill)");
             }
-            host_region_.allocate(region_slots, format);
+            tier_.host_region.allocate(region_slots, format);
             // The corridor's **resting** size, and therefore the partition every phase
             // cuts back to, is decided by `HostPartition::configure`: with the sweep
             // enabled a window is a cleanly delimited phase, so the resting cut is
@@ -823,23 +824,23 @@ private:
             // window interleave with no phase boundary to cut at and a chunk still
             // binds `min(6C, E)` — so every partition is the same and nothing ever
             // moves. (Sweep-off is a legacy path, kept working rather than optimised.)
-            host_partition_.configure(true, staging, runtime_cfg.prefill_sweep, region_slots);
-            staging_ = std::make_unique<PrefetchStagingArena>(
-                host_region_.slot_ptr(host_partition_.current_warm_slots()),
-                host_partition_.staging_decode_slots(), format);
+            tier_.host_partition.configure(true, staging, runtime_cfg.prefill_sweep, region_slots);
+            tier_.staging = std::make_unique<PrefetchStagingArena>(
+                tier_.host_region.slot_ptr(tier_.host_partition.current_warm_slots()),
+                tier_.host_partition.staging_decode_slots(), format);
         } else {
-            host_partition_.configure(false, staging, false, 0);
-            staging_ = std::make_unique<PrefetchStagingArena>(format, staging_slots);
+            tier_.host_partition.configure(false, staging, false, 0);
+            tier_.staging = std::make_unique<PrefetchStagingArena>(format, staging_slots);
         }
         // Bind the partition's collaborators now that the arena and the region exist,
         // then derive the sweep's bank count from the arena it actually has. The
         // count is `staging_slots / experts_per_layer` whole layer-sized banks — a
         // depth change moves the arena and this derivation together, so there is no
         // second place for the two to disagree (see `apply_host_partition`).
-        host_partition_.bind(HostPartition::Services{
-            &registry_, &host_pool_, staging_.get(), &host_region_,
+        tier_.host_partition.bind(HostPartition::Services{
+            &tier_.registry, &tier_.host_pool, tier_.staging.get(), &tier_.host_region,
             &prefill_controller_.sweep(), &supply_, &budget_});
-        host_partition_.refresh_sweep_banks(experts_per_layer);
+        tier_.host_partition.refresh_sweep_banks(experts_per_layer);
 
         // The direct reader's ring must hold **every read that can be outstanding at
         // once**, not one layer's worth. `dispatch()` queues a batch's cold requests
@@ -858,45 +859,45 @@ private:
         }
         const uint32_t io_queue_depth = static_cast<uint32_t>(
             std::max<size_t>(64, batch_requests));
-        direct_io_.initialize(io_queue_depth, format.sector_size);
+        tier_.direct_io.initialize(io_queue_depth, format.sector_size);
 
         // 11 — the registry. It is what decides residency for every request, and
         // it saturates VRAM at construction: every Hot slot is owned from the
         // first token on, so the production steady state (a cold miss must evict a
         // resident) is the only state that exists.
-        registry_.init(static_cast<uint32_t>(config_.num_hidden_layers),
+        tier_.registry.init(static_cast<uint32_t>(config_.num_hidden_layers),
                        static_cast<uint32_t>(config_.n_routed_experts),
                        budget_.hot_vram_slots, warm_slots,
                        runtime_cfg.preload_warm_host);
         // The per-request audit is a debugging instrument (see
         // `AeonRuntimeConfig::validate_registry_each_request`); the boundary audits
         // and `invariants_hold()` run regardless of it.
-        registry_.set_validate_each_request(runtime_cfg.validate_registry_each_request);
+        tier_.registry.set_validate_each_request(runtime_cfg.validate_registry_each_request);
 
         // The tier's bulk I/O (load and restore) is neutral; bind it now that the
         // registry, pools and reader exist. `preload_*` runs below; `restore_residents`
         // runs at a window boundary, reading the demotion capacity through the pointer
         // (the supply sets it a few lines down).
-        tier_loader_.bind(ExpertTierLoader::Services{
-            &registry_, &vram_pool_, &host_pool_, &direct_io_, &loader_, &budget_,
+        tier_.bulk_loader.bind(ExpertTierLoader::Services{
+            &tier_.registry, &vram_pool_, &tier_.host_pool, &tier_.direct_io, &loader_, &budget_,
             streams_.compute, &demotion_queue_capacity_});
 
         // 12 — Hot, then Warm, filled by batched `O_DIRECT` reads. This is the
         // only step with real mass; the byte-exactness of every route it uses is
         // the item-21 gate's subject, so nothing here re-checks it.
-        tier_loader_.preload_hot(format);
+        tier_.bulk_loader.preload_hot(format);
         if (warm_slots > 0) {
             // The Warm pool is a **view** over the region's head when one is shared,
             // and an allocation of its own otherwise. Either way it is `warm_slots`
             // wide, which is the capacity the registry was initialised with.
-            if (host_partition_.active()) {
-                host_pool_.bind(host_region_.base(), warm_slots, host_region_.format(),
-                                host_region_.is_pinned());
+            if (tier_.host_partition.active()) {
+                tier_.host_pool.bind(tier_.host_region.base(), warm_slots, tier_.host_region.format(),
+                                tier_.host_region.is_pinned());
             } else {
-                host_pool_.allocate(warm_slots, format);
+                tier_.host_pool.allocate(warm_slots, format);
             }
             if (runtime_cfg.preload_warm_host) {
-                tier_loader_.preload_warm(format);
+                tier_.bulk_loader.preload_warm(format);
             }
         }
 
@@ -904,13 +905,13 @@ private:
         supply_.configure(
             &loader_,
             &vram_pool_,
-            warm_slots > 0 ? &host_pool_ : nullptr,
-            &registry_,
-            staging_.get(),
-            &telemetry_,
-            direct_io_.reader(),
-            direct_io_.completions(),
-            direct_io_.next_id(),
+            warm_slots > 0 ? &tier_.host_pool : nullptr,
+            &tier_.registry,
+            tier_.staging.get(),
+            &tier_.telemetry,
+            tier_.direct_io.reader(),
+            tier_.direct_io.completions(),
+            tier_.direct_io.next_id(),
             streams_.compute, streams_.sdma, streams_.sdma_cold, streams_.demotion,
             format.payload_bytes,
             runtime_cfg.demotion_queue_capacity > 0
@@ -943,11 +944,11 @@ private:
         // when the routing study asks for it, and a null pointer is what the
         // executor sees as "off".
         if (runtime_cfg.profile_routing_reuse) {
-            reuse_profiler_.reset(registry_.total_experts);
+            tier_.reuse_profiler.reset(tier_.registry.total_experts);
         }
         executor_ = std::make_unique<V4TieredExpertExecutor>(
-            supply_, vram_pool_, *staging_, registry_, expert_scratch_, streams_,
-            telemetry_, runtime_cfg.profile_routing_reuse ? &reuse_profiler_ : nullptr,
+            supply_, vram_pool_, *tier_.staging, tier_.registry, expert_scratch_, streams_,
+            tier_.telemetry, runtime_cfg.profile_routing_reuse ? &tier_.reuse_profiler : nullptr,
             config_.swiglu_limit);
 
         // 15 — the prefill controller (Step 6 item 6): the sweep and the strategy
@@ -967,9 +968,9 @@ private:
             : std::max<uint32_t>(
                   1, (static_cast<uint32_t>(config_.n_routed_experts) * 3u) / 4u);
         prefill_controller_.bind(PrefillController::Services{
-            &streams_, &supply_, executor_.get(), &registry_, &host_partition_,
+            &streams_, &supply_, executor_.get(), &tier_.registry, &tier_.host_partition,
             [this] { restore_prefill_warm(loader_.expert_format()); },
-            [this] { tier_loader_.restore_residents(loader_.expert_format()); }});
+            [this] { tier_.bulk_loader.restore_residents(loader_.expert_format()); }});
         prefill_controller_.configure(runtime_cfg.prefill_sweep, sweep_min_tokens);
         // P2.3: let the per-token hook pump the swept lookahead's copies. The executor
         // does not know about the sweep, so it gets a callback; the sweep ignores the
@@ -1012,28 +1013,13 @@ private:
     // (see `v4_prefill_workspace.hpp`).
     V4PrefillWorkspace prefill_workspace_;
 
+    // The backend's payload pool: how a payload lies in a VRAM slot is the weight
+    // format's business, so the concrete pool stays here while the neutral tier
+    // state (registry, Warm pool, staging, partition, telemetry, readers) is the
+    // engine-owned `ExpertTierState`. See `expert_tier_state.hpp`.
     UnifiedVRAMExpertPool vram_pool_;
-    HostExpertPool host_pool_;
-    ExpertRegistry registry_;
-    std::unique_ptr<PrefetchStagingArena> staging_;
-    // The pinned region the Warm pool and the corridor share, when a host budget is
-    // configured. Empty otherwise, and the corridor allocates its own memory.
-    ExpertHostRegion host_region_;
-    // The Warm/staging partition: the phase slot arithmetic and the boundary move.
-    // It owns the partition numbers and reaches the region, arena, registry, pool,
-    // sweep and budget as bound services (see `host_partition.hpp`); the host
-    // still owns the region's allocation and the arena's lifetime.
-    HostPartition host_partition_;
-    SupplyTelemetry telemetry_;
-    RoutingReuseProfiler reuse_profiler_;
-    // The direct (`O_DIRECT`) expert-fragment I/O: the reader, the in-flight
-    // completion map and the request-id counter, shared with the supply. See
-    // `expert_direct_io.hpp`.
-    ExpertDirectIO direct_io_;
-    // The tier's bulk load and restore (Hot preload, Warm preload, drained-resident
-    // restore), bound to the pools, registry and reader above. See
-    // `expert_tier_loader.hpp`.
-    ExpertTierLoader tier_loader_;
+    // The engine-owned expert tier: the neutral state the tiered supply operates on.
+    ExpertTierState tier_;
     V4ExpertSupplyCoordinator supply_;
     V4RoutedExpertScratch expert_scratch_;
     std::unique_ptr<V4TieredExpertExecutor> executor_;
