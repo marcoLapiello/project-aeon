@@ -94,7 +94,7 @@ How to read a row: **Group** is the concern the file *is*; **Action** is the pro
 | `v4_expert_executor.hpp` | 516 | **MIXED** | Model's MoE execution *and* the tiered-supply mechanics *and* backend dispatch | DECOUPLE → §6 |
 | `v4_activation_scratch.hpp` | 345 | MDL | Device scratch sized by V4 kernel shapes | STAY (note: engine-owned buffer, model-shaped size) |
 | `v4_attention_trace.hpp` | 77 | MDL | V4 trace record schema | STAY (diagnostic) |
-| `v4_engine.hpp` | 517 | ENG | Binds tokenizer + encoder + loop + graph; "a binding, not a pipeline" | MOVE → `infrastructure` |
+| `v4_engine.hpp` | 517 | MDL | The text binding: it wires *this checkpoint's* tokenizer, prompt encoder, graph and host to the generic generation loop and sampler, and owns the artifact's `generation_policy`. "A binding, not a pipeline" — every strategy it appears to hold is already engine-owned elsewhere (`text::generate_token_ids`, `Sampler`, the prefill controller/sweep, the budget). | STAY (re-assessed — the reusable loop is already in `infrastructure/`; moving the binding would need three single-implementation seams for no reuse) |
 | `v4_sampler.hpp` | 484 | ENG | "Sampling is **not** a model operation" (its own words) | MOVE → `infrastructure` |
 | `v4_device_streams.hpp` | 76 | ENG | Four HIP streams owned by the host, borrowed by everything | MOVE → `infrastructure` |
 | `v4_prefill_controller.hpp` | 258 | ENG | Per-window prefill lifecycle | MOVE → `infrastructure` |
