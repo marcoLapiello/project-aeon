@@ -37,7 +37,7 @@ build/bin/aeon_chat \
 | 4a | Indexer top-k on device | **Done** — removes two stream drains per token per CSA layer |
 | — | `compose_local_rows` gather | **Done** — found by the profile, not in the original plan |
 | 3 | WMMA dense GEMM for the dense projections | **Partly done** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
-| 4 | Batched causal attention over the chunk | **Done (opt-in)** — 4.1, tile + split-keys primitives, all three classes wired; enable-by-default and WMMA/occupancy tuning open |
+| 4 | Batched causal attention over the chunk | **Done** — 4.1, tile + split-keys primitives, all three classes wired and **on by default**; WMMA/occupancy tuning open |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Open** |
 | 6 | Tune for gfx1100 | **Open** |
 | 7 | Re-measure and retune supply | **Open** |
@@ -279,6 +279,24 @@ The kernel is `1.37x` faster where the tile applies; the host line inside `atten
 Two lessons the build enforced. **The softmax loops must be lane-strided.** A key's dot needs all 32 lanes, so a warp-stride alone made every lane sum the *same* keys and the wave reduction multiplied the denominator by `32` — the fp64 gate showed a denominator of `203` where `~7` was expected. **A per-query `-1` index must not form a pointer.** Phase 3 read every key's value row, including masked ones; with a real CSA selection that is an out-of-bounds load, which the small gate did not hit and the production run did (`illegal memory access`) — the value pointer is now null for an invalid row and skipped. Both are the reason the gate is built from an independent reference rather than the kernel's own output.
 
 The switch is again **off**; the parity gate is `test_v4_layer_body_chunk_oracle` section C3, now covering all three classes (`router top-k ids` identical; residual `9e-4 … 7.8e-3`).
+
+**Enabled by default (`2026-09-30`).** The tiled split-keys path is now the production path for all three classes; `attention_tile_enabled()` defaults to `true`, and setting it `false` replays the scalar kernel for a gate. Because the tile is a reorder, the gates that asserted chunk-vs-serial **bit-exactness** moved their chunk comparison to the **agreement bar** — the greedy (argmax) token agrees and every value within a fraction of the peak — while the scalar path keeps its bit-exact regression:
+
+| Gate | Before | After |
+| :--- | :--- | :--- |
+| `test_v4_layer_body_chunk_oracle` | bit-exact C/C2 | C/C2 run with the tile **off** (scalar bit-exact regression); C3 parity, all classes |
+| `test_v4_prefill_window` | `4/10` (pre-existing red, grouped reorder) | **`10/0`** — greedy token agrees (`320`), logits rel `2.6%`, residual rel `0.9%` |
+| `test_v4_routed_prefill` | `20/1` (pre-existing red, grouped reorder) | **`20/0`** — greedy token agrees (`320`), logits rel `0.1%` |
+
+Final production measurement (`n = 1`, `--warm-gib 24`, `~677`-token prompt):
+
+| | M47 baseline | Step 4.1 | Step 4 done (default) |
+| :--- | ---: | ---: | ---: |
+| TTFT | `37.2 s` | `34.4 s` | **`29.5 s`** (`1.26x`) |
+| `attention+norm`, GPU | `20,117 ms` | `17,676 ms` | **`11,895 ms`** (`1.69x`) |
+| total, GPU | `43,260 ms` | `38,357 ms` | **`26,054 ms`** |
+
+**Still open:** the WMMA tile and warp-count tuning. The split kernel is still scalar per element (`warp = 4`, `tile = 16`, both unmeasured), and it does not use the matrix cores at all.
 
 The per-query observations are the `F7` finding of `plans-and-docs/analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md`; that document's *file and line citations predate the module splits and are stale*, so take the concept from it and the location from the tree.
 

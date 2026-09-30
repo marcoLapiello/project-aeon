@@ -37,14 +37,14 @@ inline bool attention_tile_supported(const V4Layer& layer) {
            kind == V4AttentionKind::CSA;
 }
 
-// Switch for the chunk path's attention. It defaults to **off**, so the committed
-// chunk path stays bit-identical to decode until the tiled path is separately enabled;
-// a gate flips it to compare the two in one process. Like the grouped-MoE switch it is
-// not a tuning knob — the tile is a reorder of the same arithmetic, and enabling it
-// moves the gates that assert chunk-vs-serial bit-exactness to a tolerance bar (see
-// `KERNELS_IMPROVEMENT.md` 4.2). Decode never consults it.
+// Switch for the chunk path's attention. It defaults to **on**: the tiled split-keys
+// path is the production path for all three classes. Setting it false replays the
+// per-token scalar kernel, which is slower and exists so a gate can compare the two in
+// one process (the bit-exact chunk-vs-serial gates run with it off, since the tile is a
+// reorder; the parity gate runs with it on). Decode never consults it — a single token
+// goes through `run_layer_body_attention_kernel`'s scalar launch either way.
 inline bool& attention_tile_enabled() {
-    static bool enabled = false;
+    static bool enabled = true;
     return enabled;
 }
 

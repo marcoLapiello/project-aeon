@@ -585,6 +585,11 @@ int main() {
     // C. chunk ≡ serial
     // -------------------------------------------------------------------
     std::cout << "\n--- C. chunk == serial, bit-exact ---\n";
+    // The tiled attention is a reorder of the same arithmetic, so it is not bit-exact
+    // against decode by construction. These sections assert the **scalar** path's
+    // bit-exactness — the per-token regression the tile is measured against — so they
+    // run with the tile off. The tiled path is compared at a tolerance in C3.
+    aeon::core::attention_tile_enabled() = false;
     // Six schedules, each covering the 130 tokens exactly: the serial reference, and
     // five chunkings. Three of them have boundaries inside ratio windows (CSA's ratio
     // is 4) and inside the local window's wrap (10 tokens); the last two are the
@@ -749,12 +754,11 @@ int main() {
     }
 
     // -------------------------------------------------------------------
-    // C3. Tiled attention (Sliding, HCA) vs the per-token attention
+    // C3. Tiled attention (all three classes) vs the per-token attention
     // -------------------------------------------------------------------
     // The tile reorders the same arithmetic over a shared row-set, so it is compared
     // at an fp16 tolerance, not bit-exact — the bar Steps 2–3 moved their chunk
-    // comparisons to. CSA is skipped: its indexer selects a different top-k per query,
-    // so it keeps the scalar path (4.2b).
+    // comparisons to.
     std::cout << "\n--- C3. tiled attention vs per-token (fp16 tolerance) ---\n";
     {
         std::vector<uint32_t> tiled_plan;
@@ -805,6 +809,8 @@ int main() {
                             : (std::to_string(id_diff) + " of " + std::to_string(id_total) +
                                " differ"));
         }
+        // Restore the production default for any later section.
+        aeon::core::attention_tile_enabled() = true;
     }
 
     // -------------------------------------------------------------------
