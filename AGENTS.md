@@ -4,6 +4,8 @@
 
 **Project Aeon** is a bare-metal Mixture-of-Experts inference engine in C++20 and native HIP for consumer AMD RDNA3 (`gfx1100`), scalable across multi-GPU rigs. It attacks the memory wall for very large MoE models on consumer workstations with three mechanisms: **bare-metal RDNA3 execution** (Wave32, WMMA, direct HIP/AMDGCN dispatch — no CUDA, no framework overhead); a **three-tier hierarchy** (VRAM Hot ← host-DDR Warm ← NVMe Cold, via `io_uring` `O_DIRECT` at 4 KiB alignment); and **double-buffered expert-batched prefill** overlapped with asynchronous DMA/storage.
 
+**Scalability-oriented**: while the project in its initial stage is focused on RDNA3 gpu-arch and deepseek-v4-flash model-arch, it is intended to be expanded in the future to other gpu and model architectures - meaning, every piece should be designed and implemented with this future goal in mind, in a modular, scalable and expandable way 
+
 ---
 
 ## 2. Documentation and References
