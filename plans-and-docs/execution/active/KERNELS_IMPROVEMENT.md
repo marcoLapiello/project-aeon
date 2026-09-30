@@ -146,6 +146,25 @@ Measured (`bench_prefill_ab routed 128`, bank arm, chunk `128`, window `1024`, w
 - Keep the degenerate branch exact: `candidates <= index_topk` selects every candidate in ascending index order with no padding.
 - Test: against the same definition the host version implements (order, ties, the degenerate branch), not against a copy of the kernel.
 
+#### Implementation record
+
+_Done `2026-09-30`._
+
+`v4_indexer_topk_kernel` (G4, in `v4_attention_kernels.hpp`): one block per row, iterative max-extraction over the unselected candidates with a block reduction. The comparison takes the higher score and, on an exact tie, the lower index — a total order, so the result does not depend on the reduction tree and matches the host's descending `stable_sort` exactly. The mask is a `ceil(candidates/8)`-byte bitmap in shared memory, so the kernel adds no VRAM; the caller's score buffer is not modified. `select_indexer_topk` keeps its name and signature and now only launches the kernel, so the call site is unchanged.
+
+Measured (`aeon_chat --phase-profile`, 666-token prompt, `W=4096 C=256`, swept, `n = 1`):
+
+| Phase | host before → after | gpu before → after |
+| :--- | :--- | :--- |
+| pre-attention (per token) | `13,057` → **`944`** | `15,718` → `14,657` |
+| attention+norm (per token) | `37,271` → `48,343` | `46,954` → `46,944` |
+| **total** | `66,238` → **`65,145`** | `66,430` → `65,339` |
+| **TTFT** | `71.9 s` → **`70.8 s`** | |
+
+**The honest reading: this removed the stall but not the bottleneck.** Pre-attention's *issuing* cost fell `13.0 s → 0.9 s` — the two drains were real and are gone. But the freed CPU immediately ran ahead into the attention loop, whose own per-token issuance then became the exposed critical path (`37.3 → 48.3 s`); the window is bounded by total host time, so prefill moved only ~`1.5%`. This is the profile's third point restated: the pre-attention sync was expensive *in isolation* and never on the critical path while the attention loop's ~`860k` launches (`666 × 43 × ~30`) were.
+
+Gates: `test_v4_real_scale_state` (the real `index_topk = 512` as a strict selection, `0` differing), `test_v4_indexer_oracle`, `test_v4_layer_body_serial_oracle` / `_compressed_oracle`, `test_v4_engine` (`38/0`) green.
+
 ### Step 5: Fuse elementwise and norm stages over [T, dim]
 
 - Make rmsnorm, rope, HC sinkhorn and the residual/HC mixing multi-row (one launch per stage per chunk, one row per wave). Fuse the rmsnorm scaling into the next GEMM's A-load where it's cheap.
