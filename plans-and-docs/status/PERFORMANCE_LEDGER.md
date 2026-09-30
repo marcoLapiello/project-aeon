@@ -4,7 +4,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 
 * **Last normalized**: 2026-09-22.
 * **Scope**: end-to-end runs through `aeon_chat`, and — as edge cases — directly measured performance values (a benchmark, a machine reference rate) and cache/supply analyses derived from an end-to-end run.
-* **Not recorded here**: per-test correctness results and isolated synthetic-kernel microbenchmarks. Those live in the tests themselves.
+* **Not recorded here**: per-test correctness results and isolated synthetic-kernel microbenchmarks. Correctness lives in the tests; synthetic kernel results live in the execution plan that owns the work.
 * **Status rule**: `[x] Invalidate for comparison` excludes the headline result from cross-entry comparisons.
 
 ## 1. Recording contract
@@ -71,7 +71,6 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `supply-split` | Exposed-load split (io wait / H2D enqueue / H2D drain) for prefill and decode | M45 |
 | `supply-corridor` | Deep swept corridors (`3E`+): read-wave serialization, corridor sizing, Warm borrow | M46 |
 | `e2e-post-relocation` | Post-reorganisation e2e vs the pre-relocation baseline (TTFT, decode, bytes) | M47 |
-| `expert-pair-ab` | GEMV-pair vs grouped-WMMA expert compute: time, weight traffic, M window, crossover | M48 |
 
 ## 4. Milestone cards
 
@@ -377,32 +376,3 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: coherent thinking-mode reply (truncated at the cap); `registry.invariants_hold = true`, `outstanding_leases = 0`, `forced_drains = 0`, `staging_in_use = 0`; budget `[FEASIBLE / APPROVED]`. No code change — this run is the check that the module split, the G1–G4 relocation and the comment pass left the numbers untouched.
 - **Conclusion / next gate**: **No regression.** Prefill is `121.4 ms/prompt-token`, matching the ledger's `~120` target and M43 run 3's `123.2`; decode `3.16 tok/s` sits inside the recorded spread (`3.04–3.64` across M28/M43). The relocation commits were separately audited **path-only** (every rename's content diff, after `#include`/comment lines, is empty), so the reorganisation is performance- and behaviour-neutral. **Caveat:** the run is at the host ceiling — `98%` of the RAM allowance — and will fail on a host without headroom rather than in the engine; that fragility is the open host-memory investigation, not this milestone.
 - **Evidence**: `build/bin/aeon_chat` at `b272cd4`, `/tmp/telemetry_m47.jsonl`, `plans-and-docs/status/CODEBASE_MAP.md`
-
-### M48: Expert pair A/B — K-outer slab reuse takes the grouped path to `16x`, and makes it stop being weight-bound
-- **Run**: `2026-09-29`; branch `main`; commit `76bd7fe` + the K-outer restructure; synthetic experts in the real swizzled format, resident pool `128` experts (`1.69 GiB`, well past the `96 MiB` Infinity Cache)
-- **Class / comparison key**: `Benchmark / expert-pair-ab`
-- **Platform**: `baseline`, Device 0 only
-- **Workload / configuration**: draws sampled from the measured layer-0 prefill expert distribution of `routing-profile/first-real-prompt/counts.csv` (6 distinct experts per token, router-shaped weights); chunk sizes `T = 16, 64, 256, 1024`; M windows `1, 2, 4, 8` token tiles (16-128 tokens sharing one dequantized weight slab); `n = 3` per arm per configuration, best-of reported; all four windows compared elementwise per draw against the GEMV arm (`max |Δ| ≤ 1e-3 · scale`) and **agreeing** at every configuration
-- **Metrics** (`ms`, and traffic as a multiple of the GEMV arm's `draws` reads):
-
-  | T | tok/expt | GEMV ms | w1 | w2 | w4 | w8 | traffic `w4` / `w8` |
-  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-  | 16 | 1.9 | `2.56` | `3.20` | **`3.19`** | `3.50` | `4.69` | `1.9x` / `1.9x` |
-  | 64 | 5.1 | `10.17` | `4.98` | **`4.76`** | `5.13` | `6.80` | `5.1x` / `5.1x` |
-  | 256 | 20.2 | `39.65` | `7.67` | `6.12` | **`5.53`** | `7.25` | `20.2x` / `20.2x` |
-  | 1024 | 80.8 | `159.06` | `15.36` | `11.60` | `10.07` | **`9.99`** | `45.5x` / `70.6x` |
-
-  Speedup over GEMV at the best window: `0.80x` (T=16) / `2.14x` (64) / `7.17x` (256) / `15.93x` (1024). Weight traffic at T=1024: GEMV `81.00 GiB`, `w4` `1.78 GiB`, `w8` `1.15 GiB` against a one-read-per-distinct-expert floor of `1.00 GiB`.
-
-  **Attribution** (T=1024, all ten expert batches, each half of the gate loop run alone with the same grid and trip counts):
-
-  | Arm | ms | Regs | LDS | Wave slots |
-  | :--- | ---: | ---: | ---: | ---: |
-  | staging (dequant + LDS stores) | `3.24` | `39` | `16 KiB` | `16/32` |
-  | matrix multiply | `2.42` | `65` | `128 B` | `32/32` |
-  | production (gate half) | `6.24` — `33.1 TFLOP/s` | `186` | `16 KiB` | `16/32` |
-
-  Double-buffering the slab (staging block `n+1` while block `n` multiplies) was built and measured: **a regression**, `6.2 → 8.8 ms`.
-- **Correctness / service**: all four windows agree with the GEMV arm at all four chunk sizes; `test_rdna3_wmma_oracle` and `test_v4_grouped_wmma_oracle` green, the latter's numbers **bit-identical** across both the loop-nest change and the double-buffer revert (`max_rel` `3.969e-04` / `2.390e-04` / `8.427e-06`). `test_w4a16_swizzle`, `test_w4a16_swizzled_gemv`, `test_w4a16_swizzled_dual_gemv`, `test_v4_expert_oracle` unchanged
-- **Conclusion / next gate**: Five findings. (1) **K-outer fixes the shortfall M48's first form left open.** Inverting the nest so the dequantized slab is held across every token tile took `T=1024` from `15.18 ms` / `10.36x` to `9.99 ms` / `15.93x`, and traffic from `5.51 GiB` to `1.15 GiB` against the `1.00 GiB` one-read floor — the `14.7x` of the first form is now `70.6x`. (2) **Past window 4 the kernel stops being weight-bound.** `w8` cuts `T=1024` traffic `1.55x` over `w4` at the same elapsed time, so the residual cost is not DRAM. (3) **The staging, not the matrix units, is the larger half** — `3.24` of `6.24 ms` (`52%`) — and the two compose almost additively (`production / (staging + mma) = 1.10`), so there is no large serialisation to recover. An earlier attribution reported `2.26x` here; that was a broken arm whose conditional read-back let the compiler delete its stores and which measured `1` register. (4) **Occupancy is LDS-capped, not register-capped.** The slab is `4 KiB` per wave against `64 KiB` LDS and `32` wave slots per CU, so at most `16` waves (`50%`); the `186` registers are not binding. Double-buffering the slab cuts that to `25%` and is the measured regression in (3)'s table, so it stays out. (5) **The window is a dispatcher choice, not a constant.** `w2` is fastest at `T ≤ 64`, `w4` at `256`, `w8` at `1024`; all reach the one-read floor once the window holds the expert (`T ≤ 256`). Default `w4`. The crossover from the first form stands: grouped loses at `T=16` (`0.80x`) and wins from `T=64` (`2.14x`), so `T ≥ 64` is the threshold to wire.
-- **Evidence**: `tests/bench_expert_pair_ab.cpp`, `tests/test_rdna3_wmma_oracle.cpp`, `tests/test_v4_grouped_wmma_oracle.cpp`, `src/backend/swizzled_w4a16/kernels/aeon_moe_grouped_wmma.hpp`, `build/bin/bench_expert_pair_ab`, `plans-and-docs/execution/active/KERNELS_IMPROVEMENT.md` (Step 1)

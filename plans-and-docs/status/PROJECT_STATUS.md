@@ -17,7 +17,7 @@ It got there by **rebuilding the inference graph** against a verified specificat
 | Field | Value |
 | :--- | :--- |
 | Branch | `main` |
-| Default `ctest` | 50 tests |
+| Default `ctest` | 53 tests |
 
 ---
 
