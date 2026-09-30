@@ -497,6 +497,38 @@ inline V4LayerBodyPre run_chunk_pre_attention(
                                         stream, observer);
 }
 
+// Phase 1 for the whole chunk: the same stages as `run_chunk_pre_attention`, with each
+// dense projection issued once over every row instead of once per row. Rows are
+// independent until the tail (ring, compressor and indexer state advance in position
+// order there), so hoisting the projections out of the per-row loop reorders no state.
+inline std::vector<V4LayerBodyPre> run_chunk_pre_attention_batch(
+    V4Layer& layer,
+    V4LayerBodyBatchScratch& workspace,
+    const V4LayerBodyTables& tables,
+    const uint32_t* token_ids,
+    uint32_t start_position,
+    uint32_t count,
+    hipStream_t stream,
+    V4LayerBodyObserver& observer) {
+    std::vector<V4LayerBodyRow> rows(count);
+    for (uint32_t row = 0; row < count; ++row) {
+        rows[row] = workspace.row(row);
+        run_pre_attention_mix(layer, rows[row], stream);
+    }
+    run_pre_attention_x_projections(layer, rows[0], static_cast<int>(count), stream);
+    for (uint32_t row = 0; row < count; ++row) {
+        run_pre_attention_lora_norm(layer, rows[row], stream);
+    }
+    run_pre_attention_q_projections(layer, rows[0], static_cast<int>(count), stream);
+
+    std::vector<V4LayerBodyPre> pre(count);
+    for (uint32_t row = 0; row < count; ++row) {
+        pre[row] = run_pre_attention_tail(layer, rows[row], tables, token_ids[row],
+                                          start_position + row, stream, observer);
+    }
+    return pre;
+}
+
 // The router for the whole chunk, in one pass.
 //
 // This is the per-token `run_layer_body_router` with the token loop lifted out: one
@@ -620,13 +652,11 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
 
     // Phase 1. Every key the chunk owns is produced before any query runs, and
     // none of them touches the ring.
-    std::vector<V4LayerBodyPre> pre(count);
+    std::vector<V4LayerBodyPre> pre;
     {
         auto phase = PhaseProfiler::instance().region("pre-attention (per token)", stream);
-        for (uint32_t row = 0; row < count; ++row) {
-            pre[row] = run_chunk_pre_attention(layer, workspace, tables, token_ids[row],
-                                               start_position + row, row, stream, observer);
-        }
+        pre = run_chunk_pre_attention_batch(layer, workspace, tables, token_ids,
+                                            start_position, count, stream, observer);
     }
 
     // Phase 2, in three sub-phases. This is the order a chunk needs and a single

@@ -12,7 +12,7 @@ At the time this plan was written, every compute kernel in prefill was a GEMV (o
 | 2 | Batch the chunk loop | **Partly done** — router batched; `M`-keyed dispatcher and batched KV/position writes open |
 | 4a | Indexer top-k on device | **Done** — removes two stream drains per token per CSA layer |
 | — | `compose_local_rows` gather | **Done** — found by the profile, not in the original plan |
-| 3 | WMMA dense GEMM for the dense projections | **Open** — next |
+| 3 | WMMA dense GEMM for the dense projections | **Partly done** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
 | 4 | Batched causal attention over the chunk | **Open** |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Open** |
 | 6 | Tune for gfx1100 | **Open** |
@@ -151,9 +151,26 @@ Measured (`bench_prefill_ab routed 128`, bank arm, chunk `128`, window `1024`, w
 
 **Remaining.** Open in this step: the `M`-keyed dispatcher (grouped above the crossover), and the batched KV/position writes. Separately, **enabling the grouped path by default touches gates, not kernels**: flipping `moe_grouped_batch_enabled()` to default-on makes the chunk path grouped everywhere, so the gates that assert chunk-vs-serial bit-exactness through the real executor — `test_v4_prefill_window` ("WINDOW == SERIAL, BIT-EXACT"), `test_v4_warm_frozen_prefill`, and `test_v4_routed_prefill`'s own D-check — must move their chunk comparison to the greedy-agreement bar, while the per-token path keeps its bit-exact regression check.
 
-### Step 3: WMMA dense GEMM for attention and shared-expert projections — **open**
+### Step 3: WMMA dense GEMM for attention and shared-expert projections — **partly done**
 
-The same WMMA core as Step 1 (a single group). Use it for Q/KV/O projections (including `v4_grouped_wo`), the compressor/indexer projections, shared-expert W13/W2 and the HC projections. **The row threshold is `T ≥ 64`, not `16`** — Step 1's sweep puts the crossover between `T = 16` (`0.80x`, grouped loses) and `T = 64` (`2.14x`). Below it (short-prompt routed prefill and decode) keep the GEMV path, selected by the dispatcher on M.
+The same WMMA core as Step 1 (a single group). Remaining consumers: shared-expert W13/W2, `v4_grouped_wo`, and the HC projections. The row threshold is chosen by the dispatcher on `M`, GEMV below it (short-prompt routed prefill and decode).
+
+#### Implementation record
+
+_Started `2026-09-30`._
+
+| Artefact | Role | Gate |
+| :--- | :--- | :--- |
+| `src/platform/rdna3/dense_gemm.hpp` + selector `platform/dense_gemm.hpp` | G2: `Y = X·Wᵀ`, fp32 accumulate, one wave = 16 output columns × `1/2/4` token tiles; both operands read from global (a weight row *is* the B fragment), no LDS | `tests/test_dense_gemm_wmma_oracle.cpp` |
+| `layer/v4_dense_projection.hpp` | G4: `project_dense` — WMMA at `T ≥ 32`, per-token GEMV below (decode unchanged) | chunk / serial / compressed oracles |
+
+Pre-attention is split into stages (`run_pre_attention_mix`, `_x_projections`, `_lora_norm`, `_q_projections`, `_tail`); decode runs them with `count = 1` and the chunk hoists the two projection rounds out of the row loop, so there is still one body. Row pitches are passed (`y_stride`), because the compressor/indexer buffers are strided for the ratio-4 width.
+
+Measured (gate, vs `gemv_fp16_vec8_kernel` on a `(N, T)` grid): `T = 256`, `4096→1024` `0.81 → 0.053 ms` (`15x`); `1024→16384` `2.74 → 0.43 ms` (`6.4x`); `T = 37` `1.7x`; `T = 16`, `N = 64` `0.3x` (hence `T ≥ 32`). All within `1e-3` of a double reference. The crossover is lower than the expert GEMM's because the weight is fp16 (no dequant to amortize).
+
+End to end (`aeon_chat`, swept, `W=4096 C=256`, `n = 1`, `701`-token prefix of `prefill-corpus.txt`; not the baseline prompt): pre-attention GPU `10.3 ms/token` against `21.9` before (`14.6 s / 666`), TTFT `43.5 s` against `50.0 s`. The attention kernel is now `24.5 s` of `67 s` GPU — Step 4. What remains in pre-attention is the per-token tail (RoPE, key write, compressor state, indexer scores/top-k: ~`30` launches per token).
+
+Gates: `test_v4_layer_body_chunk_oracle` (`0` differing; 16-token chunks, GEMV path), `_serial_oracle`, `_compressed_oracle`, `test_v4_engine` (`38/0`) green. `test_v4_prefill_window` fails `A`/`B` bit-exact (`4/10`) with and without this change — the grouped-experts reorder noted in Step 2, not this step. A chunk of `≥ 32` tokens is a reorder of the same kind and is compared at the greedy bar, not bit-exact.
 
 ### Step 4: Batched causal attention over the chunk — **open**
 

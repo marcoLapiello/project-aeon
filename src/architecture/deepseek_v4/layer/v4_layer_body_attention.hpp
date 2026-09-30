@@ -12,6 +12,7 @@
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/layer/v4_layer_body_types.hpp"
+#include "architecture/deepseek_v4/layer/v4_dense_projection.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "platform/ops/cast.hpp"
 #include "infrastructure/profiling/phase_profiler.hpp"
@@ -26,49 +27,19 @@
 
 namespace aeon::core {
 
-// Runs the pre-attention half for **one token**: everything up to, but not
-// including, attention.
-//
-// On entry the row's `d_res_in` (float, `hc_mult × hidden`) holds the four HC
-// residual streams. On return the token's rotated key is in the local ring, the
-// compressor (and on CSA the indexer) has been fed, and a ratio boundary has
-// materialized its compressed entry.
-//
-// Stopping here is deliberately the wrong place to stop for a single-token
-// decode. The two halves are worth separating for exactly one reason: a chunk
-// must interleave them, because **all** of the chunk's keys have to be in the
-// ring before **any** of its queries attends, or an early query cannot see a late
-// key. Splitting the body here is what lets `run_layer_body_chunk` do that while
-// still running the same code as decode; `run_layer_body_decoding` simply calls
-// this and then the attention half, which is why there is one body and not two.
-//
-// The layer class is read from `layer.spec().attention_kind`: a Sliding layer
-// takes the local-only path and never touches the compressor or indexer tensors;
-// CSA and HCA take the compressed path with the indexer on CSA only.
-inline V4LayerBodyPre run_layer_body_pre_attention(
-    V4Layer& layer,
-    V4LayerBodyRow& scratch,
-    const V4LayerBodyTables& tables,
-    uint32_t token_id,
-    uint32_t pos,
-    hipStream_t stream,
-    V4LayerBodyObserver& observer) {
+// Pre-attention stages. The dense projections are the only stages that read a weight
+// matrix, so they are the ones a chunk runs over `count` consecutive rows at once; each
+// row's buffers sit `stride` apart in the chunk workspace (and in the decode scratch
+// `count` is 1), so `scratch` is the first row and the rest are addressed by pitch.
+// The stages between projections (HC mix, norms) stay per row.
+
+// HC pre-mix, Sinkhorn and the attention RMSNorm: `res_in` -> `x_norm`.
+inline void run_pre_attention_mix(
+    V4Layer& layer, V4LayerBodyRow& scratch, hipStream_t stream) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
     constexpr int HC = 4;
-    constexpr int HC_DIM = HC * H;          // 16384
-    constexpr int HC_MULT3 = HC * (2 + HC);// 24
-    constexpr int Q_LORA = kernel::DSV4_Q_LORA_RANK;
-    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
-    constexpr int NUM_HEADS = kernel::DSV4_NUM_HEADS;
-    constexpr int TOTAL_Q = NUM_HEADS * HEAD_DIM;
-    constexpr int INDEXER_Q = kernel::DSV4_INDEX_N_HEADS * kernel::DSV4_INDEX_HEAD_DIM;
+    constexpr int HC_MULT3 = HC * (2 + HC);
 
-    const bool uses_compressed_rope = layer.spec().attention_kind != V4AttentionKind::Sliding;
-    const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
-
-    // -----------------------------------------------------------------
-    // A. Hyper-Connections attention pre-mix & Sinkhorn
-    // -----------------------------------------------------------------
     hipLaunchKernelGGL(
         kernel::hc_project_kernel,
         dim3(HC_MULT3), dim3(256), 0, stream,
@@ -87,31 +58,103 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
         dim3((H / 4 + 255) / 256), dim3(256), 0, stream,
         scratch.d_res_in, scratch.d_pre_a, scratch.d_x_pre, H, HC);
 
-    // -----------------------------------------------------------------
-    // B. Attention RMSNorm
-    // -----------------------------------------------------------------
     hipLaunchKernelGGL(
         kernel::rmsnorm_wave32_kernel,
         dim3(1), dim3(32), 0, stream,
         scratch.d_x_pre, layer.d_attn_norm, scratch.d_x_norm, H, 1e-6f);
+}
 
-    // -----------------------------------------------------------------
-    // C. MLA projections — q_lora -> q_norm -> wq_b -> per-head norm; wkv -> kv_norm
-    // -----------------------------------------------------------------
-    hipLaunchKernelGGL(
-        kernel::gemv_fp16_kernel,
-        dim3(Q_LORA, 1), dim3(32), 0, stream,
-        scratch.d_x_norm, layer.d_wq_a, scratch.d_qa, H, H);
+// Every projection that reads `x_norm`: `wq_a`, `wkv`, and on compressed layers the
+// compressor (and on CSA the indexer) projections.
+inline void run_pre_attention_x_projections(
+    V4Layer& layer, V4LayerBodyRow& scratch, int count, hipStream_t stream) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int Q_LORA = kernel::DSV4_Q_LORA_RANK;
+    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
+    // The compressor and indexer buffers are strided for the widest (ratio-4) layer even
+    // where a ratio-128 layer writes half of each row.
+    constexpr int COMPRESSOR_PITCH = 2 * HEAD_DIM;
+    constexpr int INDEXER_PITCH = 2 * kernel::DSV4_INDEX_HEAD_DIM;
+
+    project_dense(scratch.d_x_norm, layer.d_wq_a, scratch.d_qa, count, H, Q_LORA, H, Q_LORA, stream);
+    project_dense(scratch.d_x_norm, layer.d_wkv, scratch.d_kv, count, H, HEAD_DIM, H, HEAD_DIM, stream);
+
+    if (layer.spec().attention_kind == V4AttentionKind::Sliding) return;
+    const int coefficient = layer.spec().compression_ratio == 4 ? 2 : 1;
+    const int compressor_width = coefficient * HEAD_DIM;
+    project_dense(scratch.d_x_norm, layer.d_compressor_wkv, scratch.d_compressor_kv,
+                  count, H, compressor_width, H, COMPRESSOR_PITCH, stream);
+    project_dense(scratch.d_x_norm, layer.d_compressor_wgate, scratch.d_compressor_score,
+                  count, H, compressor_width, H, COMPRESSOR_PITCH, stream);
+
+    if (layer.spec().attention_kind != V4AttentionKind::CSA) return;
+    const int indexer_width = coefficient * kernel::DSV4_INDEX_HEAD_DIM;
+    project_dense(scratch.d_x_norm, layer.d_indexer_weights_proj, scratch.d_indexer_weights_half,
+                  count, H, kernel::DSV4_INDEX_N_HEADS, H, kernel::DSV4_INDEX_N_HEADS, stream);
+    project_dense(scratch.d_x_norm, layer.d_indexer_compressor_wkv, scratch.d_indexer_compressor_kv,
+                  count, H, indexer_width, H, INDEXER_PITCH, stream);
+    project_dense(scratch.d_x_norm, layer.d_indexer_compressor_wgate,
+                  scratch.d_indexer_compressor_score,
+                  count, H, indexer_width, H, INDEXER_PITCH, stream);
+}
+
+// The norms between the two projection rounds: `qa` -> `qa_norm` and `kv` -> `kv_norm_act`.
+inline void run_pre_attention_lora_norm(
+    V4Layer& layer, V4LayerBodyRow& scratch, hipStream_t stream) {
+    constexpr int Q_LORA = kernel::DSV4_Q_LORA_RANK;
+    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
 
     hipLaunchKernelGGL(
         kernel::rmsnorm_wave32_kernel,
         dim3(1), dim3(32), 0, stream,
         scratch.d_qa, layer.d_q_norm, scratch.d_qa_norm, Q_LORA, 1e-6f);
-
     hipLaunchKernelGGL(
-        kernel::gemv_fp16_kernel,
-        dim3(TOTAL_Q, 1), dim3(32), 0, stream,
-        scratch.d_qa_norm, layer.d_wq_b, scratch.d_q, Q_LORA, Q_LORA);
+        kernel::rmsnorm_wave32_kernel,
+        dim3(1), dim3(32), 0, stream,
+        scratch.d_kv, layer.d_kv_norm, scratch.d_kv_norm_act, HEAD_DIM, 1e-6f);
+}
+
+// The projections that read `qa_norm`: `wq_b`, and the indexer query on CSA.
+inline void run_pre_attention_q_projections(
+    V4Layer& layer, V4LayerBodyRow& scratch, int count, hipStream_t stream) {
+    constexpr int Q_LORA = kernel::DSV4_Q_LORA_RANK;
+    constexpr int TOTAL_Q = kernel::DSV4_NUM_HEADS * kernel::DSV4_HEAD_DIM;
+    constexpr int INDEXER_Q = kernel::DSV4_INDEX_N_HEADS * kernel::DSV4_INDEX_HEAD_DIM;
+
+    project_dense(scratch.d_qa_norm, layer.d_wq_b, scratch.d_q, count, Q_LORA, TOTAL_Q,
+                  Q_LORA, TOTAL_Q, stream);
+    if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+        project_dense(scratch.d_qa_norm, layer.d_indexer_wq_b, scratch.d_indexer_query,
+                      count, Q_LORA, INDEXER_Q, Q_LORA, INDEXER_Q, stream);
+    }
+}
+
+// Everything after the projections for **one token**: the per-head query norm, RoPE,
+// the key write, the compressor and the indexer selection.
+//
+// On return the token's rotated key is in the local ring (or the chunk buffer), the
+// compressor (and on CSA the indexer) has been fed, and a ratio boundary has
+// materialized its compressed entry. The layer class is read from
+// `layer.spec().attention_kind`: a Sliding layer never touches the compressor or
+// indexer tensors; CSA and HCA take the compressed path, the indexer on CSA only.
+inline V4LayerBodyPre run_pre_attention_tail(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    const V4LayerBodyTables& tables,
+    uint32_t token_id,
+    uint32_t pos,
+    hipStream_t stream,
+    V4LayerBodyObserver& observer) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int HC = 4;
+    constexpr int HC_DIM = HC * H;          // 16384
+    constexpr int HC_MULT3 = HC * (2 + HC);// 24
+    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
+    constexpr int NUM_HEADS = kernel::DSV4_NUM_HEADS;
+    constexpr int TOTAL_Q = NUM_HEADS * HEAD_DIM;
+
+    const bool uses_compressed_rope = layer.spec().attention_kind != V4AttentionKind::Sliding;
+    const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
 
     // The per-head norm is WEIGHTLESS: the artifact has no tensor for it, and
     // upstream's fused q-norm/rope takes no weight argument.
@@ -119,53 +162,6 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
         kernel::rmsnorm_unit_wave32_kernel,
         dim3(NUM_HEADS), dim3(32), 0, stream,
         scratch.d_q, scratch.d_q, HEAD_DIM, 1e-6f);
-
-    hipLaunchKernelGGL(
-        kernel::gemv_fp16_kernel,
-        dim3(HEAD_DIM, 1), dim3(32), 0, stream,
-        scratch.d_x_norm, layer.d_wkv, scratch.d_kv, H, H);
-
-    hipLaunchKernelGGL(
-        kernel::rmsnorm_wave32_kernel,
-        dim3(1), dim3(32), 0, stream,
-        scratch.d_kv, layer.d_kv_norm, scratch.d_kv_norm_act, HEAD_DIM, 1e-6f);
-
-    if (uses_compressed_rope) {
-        const int ratio = layer.spec().compression_ratio;
-        const int coefficient = ratio == 4 ? 2 : 1;
-        const int compressor_width = coefficient * HEAD_DIM;
-
-        hipLaunchKernelGGL(
-            kernel::gemv_fp16_kernel,
-            dim3(compressor_width, 1), dim3(32), 0, stream,
-            scratch.d_x_norm, layer.d_compressor_wkv, scratch.d_compressor_kv, H, H);
-        hipLaunchKernelGGL(
-            kernel::gemv_fp16_kernel,
-            dim3(compressor_width, 1), dim3(32), 0, stream,
-            scratch.d_x_norm, layer.d_compressor_wgate, scratch.d_compressor_score, H, H);
-
-        if (layer.spec().attention_kind == V4AttentionKind::CSA) {
-            hipLaunchKernelGGL(
-                kernel::gemv_fp16_kernel,
-                dim3(INDEXER_Q, 1), dim3(32), 0, stream,
-                scratch.d_qa_norm, layer.d_indexer_wq_b, scratch.d_indexer_query, Q_LORA, Q_LORA);
-            hipLaunchKernelGGL(
-                kernel::gemv_fp16_kernel,
-                dim3(kernel::DSV4_INDEX_N_HEADS, 1), dim3(32), 0, stream,
-                scratch.d_x_norm, layer.d_indexer_weights_proj,
-                scratch.d_indexer_weights_half, H, H);
-            hipLaunchKernelGGL(
-                kernel::gemv_fp16_kernel,
-                dim3(coefficient * kernel::DSV4_INDEX_HEAD_DIM, 1), dim3(32), 0, stream,
-                scratch.d_x_norm, layer.d_indexer_compressor_wkv,
-                scratch.d_indexer_compressor_kv, H, H);
-            hipLaunchKernelGGL(
-                kernel::gemv_fp16_kernel,
-                dim3(coefficient * kernel::DSV4_INDEX_HEAD_DIM, 1), dim3(32), 0, stream,
-                scratch.d_x_norm, layer.d_indexer_compressor_wgate,
-                scratch.d_indexer_compressor_score, H, H);
-        }
-    }
 
     V4AttentionTraceRecord* attention_trace =
         observer.begin_trace(layer, token_id, pos);
@@ -426,6 +422,34 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
     pre.compressed_index = emitted_index;
     pre.committed = committed;
     return pre;
+}
+
+// Runs the pre-attention half for **one token**: everything up to, but not
+// including, attention.
+//
+// On entry the row's `d_res_in` (float, `hc_mult × hidden`) holds the four HC
+// residual streams.
+//
+// Stopping here is deliberately the wrong place to stop for a single-token
+// decode. The two halves are worth separating for exactly one reason: a chunk
+// must interleave them, because **all** of the chunk's keys have to be in the
+// ring before **any** of its queries attends, or an early query cannot see a late
+// key. Splitting the body here is what lets `run_layer_body_chunk` do that while
+// still running the same stages as decode; `run_layer_body_decoding` simply calls
+// this and then the attention half, which is why there is one body and not two.
+inline V4LayerBodyPre run_layer_body_pre_attention(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    const V4LayerBodyTables& tables,
+    uint32_t token_id,
+    uint32_t pos,
+    hipStream_t stream,
+    V4LayerBodyObserver& observer) {
+    run_pre_attention_mix(layer, scratch, stream);
+    run_pre_attention_x_projections(layer, scratch, 1, stream);
+    run_pre_attention_lora_norm(layer, scratch, stream);
+    run_pre_attention_q_projections(layer, scratch, 1, stream);
+    return run_pre_attention_tail(layer, scratch, tables, token_id, pos, stream, observer);
 }
 
 // The attention half for **one token**: attention over the class's row-set,

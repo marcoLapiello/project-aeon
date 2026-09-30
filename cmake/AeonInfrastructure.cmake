@@ -68,6 +68,9 @@ if(AEON_BUILD_TESTS)
     # RDNA3 Wave32 WMMA primitive and its operand lane map (silicon).
     aeon_add_test(test_rdna3_wmma_oracle SOURCES tests/test_rdna3_wmma_oracle.cpp)
 
+    # Dense fp16 WMMA GEMM for the dense projections (silicon).
+    aeon_add_test(test_dense_gemm_wmma_oracle SOURCES tests/test_dense_gemm_wmma_oracle.cpp)
+
     # Parallel W4A16 swizzle layout contract (host-side).
     aeon_add_test(test_w4a16_swizzle SOURCES tests/test_w4a16_swizzle.cpp)
 
