@@ -37,7 +37,7 @@ build/bin/aeon_chat \
 | 4a | Indexer top-k on device | **Done** — removes two stream drains per token per CSA layer |
 | — | `compose_local_rows` gather | **Done** — found by the profile, not in the original plan |
 | 3 | WMMA dense GEMM for the dense projections | **Partly done** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
-| 4 | Batched causal attention over the chunk | **Partly done** — per-query softmax/reduction redundancy fixed; tile formulation and G2 primitive landed; G4 wiring open |
+| 4 | Batched causal attention over the chunk | **Partly done** — 4.1 + tile formulation, G2 primitive and Sliding/HCA wiring landed (opt-in); CSA (4.2b), enable-by-default and occupancy open |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Open** |
 | 6 | Tune for gfx1100 | **Open** |
 | 7 | Re-measure and retune supply | **Open** |
@@ -250,6 +250,12 @@ Gated on silicon by `tests/test_tiled_causal_attention.cpp` against the same fp6
 So 4.2a wires Sliding + HCA (22 of 43 layers) and leaves CSA to 4.2b, whose fork is now sharp: either gather each query's selected rows into a per-query block (a shared local block plus a per-query indexed block), or split the compressed range across blocks and combine. `compressed_count` is below `index_topk = 512` for short prompts, so CSA *behaves* like HCA there — but the mask is still per query and cannot be dropped.
 
 **Still open:** the G4 binding (a `*_dispatch.hpp` that supplies the DSV4 scale, sink and row-sets) and wiring it into `run_layer_body_chunk` for Sliding and HCA, then the greedy-agreement comparison. The kernel is still one query per block; the WMMA tile and the key-split across warps that raise occupancy are the next increment behind this seam.
+
+**4.2a wired — split, binding and parity (done `2026-09-30`).** The attention kernel is split out of `run_layer_body_attention_and_norm` into `run_layer_body_attention_kernel`, so a chunk can replace it with one batched tile launch; the remaining tail (inverse RoPE through the FFN norm) is `run_layer_body_attention_tail`, run per row. The G4 binding `layer/v4_attention_tile.hpp` supplies the DSV4 scale and sink and builds the two key blocks; a union compose kernel (`v4_compose_union_rows_kernel` + `compose_tile_rows`) builds the tile's row-set, labelling each row with its position for the mask.
+
+The path is gated behind `attention_tile_enabled()` (**default off**), so the committed chunk path is byte-identical to decode and every existing oracle is unchanged. Parity is asserted in `test_v4_layer_body_chunk_oracle` section C3: with the switch on, the chunk for the `Sliding` and `HCA` layers is compared against the tile-off run, and the **router top-k ids are identical** with the residual at `1.4e-3` / `5.6e-4` and the router weights at `2e-4` relative. `CSA` keeps the scalar path (4.2b). The tile reorders the same arithmetic over a shared row-set, so C3 uses an fp16 tolerance — the bar Steps 2–3 moved their chunk comparisons to.
+
+**Still open:** enable the tile by default (which moves the chunk-vs-serial *bit-exact* gates to the parity/tolerance bar, as Steps 2–3 did for the grouped pair) and measure the phase profile with it on; the WMMA tile and key-split across warps that raise occupancy; and 4.2b for CSA.
 
 The per-query observations are the `F7` finding of `plans-and-docs/analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md`; that document's *file and line citations predate the module splits and are stale*, so take the concept from it and the location from the tree.
 
