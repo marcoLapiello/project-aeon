@@ -621,10 +621,11 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // Phase 2c — the shared expert, the routed accumulate and the FFN post, for
     // every token.
     //
-    // The grouped batch accumulate (`accumulate_routed_batch`) is implemented on the
-    // executor but **not** wired here yet: it changes the routed experts' summation
-    // order, and that difference has not been shown quality-neutral (see the plan's
-    // open decision). Until it is, the per-token path is the default, so a chunk stays
+    // The grouped batch accumulate (`accumulate_routed_batch`) is implemented and
+    // measured (see the plan) but **not** enabled by default: it is a correct fp16-ulp
+    // reorder of the per-token path, yet that reorder amplifies through 43 layers to
+    // ~1/3 of the top-2 logit margin, which is a quality risk rather than a settled
+    // win. Until a generation-level check clears it, the per-token path keeps a chunk
     // bit-identical to serial.
     for (uint32_t row = 0; row < count; ++row) {
         run_layer_body_moe_and_post(layer, views[row], start_position + row, stream,

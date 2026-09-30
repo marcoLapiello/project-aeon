@@ -55,7 +55,7 @@
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "architecture/deepseek_v4/kernels/moe_gemv_dispatch.hpp"
 #include "architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp"
-#include "platform/ops/expert_permutation.hpp"
+#include "architecture/deepseek_v4/moe/moe_grouped_batch.hpp"
 #include "infrastructure/expert/residency/expert_registry.hpp"
 #include "infrastructure/expert/storage/host_expert_pool.hpp"
 #include "infrastructure/expert/transport/prefetch_staging.hpp"
@@ -392,23 +392,7 @@ public:
 
         scratch_.allocate_chunk_scratch();
 
-        // 1. The chunk's draws, gathered expert-contiguous on the device, with the
-        //    routing weights reordered into the same position order.
-        kernel::dispatch_expert_permutation(
-            batch_ids, static_cast<int>(token_count), V4RoutedExpertScratch::kExperts,
-            experts, scratch_.d_perm_offsets, scratch_.d_perm_tokens,
-            scratch_.d_perm_draws, batch_weights, scratch_.d_perm_weights,
-            streams_.compute);
-
-        // 2. The per-expert bounds are needed on the host to batch the experts and to
-        //    size the intermediate; the read is small next to the traffic it schedules.
-        std::vector<int> offsets(static_cast<size_t>(experts) + 1);
-        CHECK_HIP(hipMemcpyAsync(offsets.data(), scratch_.d_perm_offsets,
-                                 offsets.size() * sizeof(int), hipMemcpyDeviceToHost,
-                                 streams_.compute));
-        CHECK_HIP(hipStreamSynchronize(streams_.compute));
-
-        // 3. Global expert id -> VRAM slot for this layer, from the resident set.
+        // Global expert id -> VRAM slot for this layer, from the resident set.
         std::vector<int> slot_of(static_cast<size_t>(experts), -1);
         for (size_t index = 0; index < state_.global_expert_ids.size(); ++index) {
             const int expert =
@@ -416,40 +400,26 @@ public:
             slot_of[static_cast<size_t>(expert)] = state_.vram_slots[index];
         }
 
-        // 4. The widest expert of the chunk sets the intermediate's row pitch.
-        int widest = 1;
-        for (int expert = 0; expert < experts; ++expert) {
-            widest = std::max(widest, offsets[static_cast<size_t>(expert) + 1] -
-                                          offsets[static_cast<size_t>(expert)]);
-        }
+        const MoeGroupedBatchScratch grouped{
+            scratch_.d_perm_offsets, scratch_.d_perm_tokens, scratch_.d_perm_draws,
+            scratch_.d_perm_weights, scratch_.d_batch_offsets, scratch_.d_chunk_hidden,
+            scratch_.d_chunk_contrib, V4RoutedExpertScratch::kIntermediate,
+            V4RoutedExpertScratch::kHidden, V4RoutedExpertScratch::kMaxChunk};
 
-        // 5. Experts in batches of at most the weight table's length. A batch with no
-        //    draws is skipped; a batch's surviving experts are packed to the front, so
-        //    a sparse tail does not widen the dispatch.
-        const int per_launch = kernel::kAeonSwizzledMaxExperts;
-        for (int base = 0; base < experts; base += per_launch) {
-            const int batch_count = std::min(per_launch, experts - base);
-            if (offsets[static_cast<size_t>(base)] ==
-                offsets[static_cast<size_t>(base) + batch_count]) {
-                continue;
-            }
-            const int first_draw = offsets[static_cast<size_t>(base)];
-
-            kernel::SwizzledW13ExpertPtrs w13{};
-            kernel::SwizzledW2ExpertPtrs w2{};
-            std::vector<int> rebased(static_cast<size_t>(batch_count) + 1);
-            for (int j = 0; j < batch_count; ++j) {
-                const int expert = base + j;
-                rebased[static_cast<size_t>(j)] =
-                    offsets[static_cast<size_t>(expert)] - first_draw;
+        run_moe_grouped_expert_batch(
+            batch_input, input_stride, batch_ids, batch_weights, token_count,
+            V4RoutedExpertScratch::kExperts, experts, swiglu_limit_, grouped,
+            [&](int expert, int j, int count, kernel::SwizzledW13ExpertPtrs& w13,
+                kernel::SwizzledW2ExpertPtrs& w2) {
                 const int slot = slot_of[static_cast<size_t>(expert)];
                 if (slot < 0) {
-                    if (offsets[static_cast<size_t>(expert) + 1] >
-                        offsets[static_cast<size_t>(expert)]) {
+                    // An expert with no draws is never read; one with draws must have
+                    // been supplied a slot, or the supply has violated its contract.
+                    if (count > 0) {
                         throw std::logic_error(
                             "V4TieredExpertExecutor: a routed expert has no VRAM slot");
                     }
-                    continue;
+                    return;
                 }
                 const uint32_t s = static_cast<uint32_t>(slot);
                 w13.w1[j] = reinterpret_cast<const uint4*>(vram_pool_.get_w1_packed(s));
@@ -458,43 +428,8 @@ public:
                 w13.s3[j] = vram_pool_.get_w3_scale(s);
                 w2.w2[j] = reinterpret_cast<const uint4*>(vram_pool_.get_w2_packed(s));
                 w2.s2[j] = vram_pool_.get_w2_scale(s);
-            }
-            rebased[static_cast<size_t>(batch_count)] =
-                offsets[static_cast<size_t>(base) + batch_count] - first_draw;
-
-            CHECK_HIP(hipMemcpyAsync(scratch_.d_batch_offsets, rebased.data(),
-                                     rebased.size() * sizeof(int), hipMemcpyHostToDevice,
-                                     streams_.compute));
-
-            kernel::dispatch_aeon_moe_grouped_w13_swiglu_wmma<
-                4, 4, 8, kernel::kMoeGroupedMTiles>(
-                batch_input, scratch_.d_batch_offsets,
-                scratch_.d_perm_tokens + first_draw, w13, scratch_.d_chunk_hidden,
-                batch_count, widest, V4RoutedExpertScratch::kIntermediate,
-                V4RoutedExpertScratch::kHidden, swiglu_limit_, input_stride,
-                streams_.compute);
-            kernel::dispatch_aeon_moe_grouped_w2_wmma<4, 8, 4, kernel::kMoeGroupedMTiles>(
-                scratch_.d_chunk_hidden, scratch_.d_batch_offsets,
-                scratch_.d_perm_draws + first_draw, scratch_.d_perm_weights + first_draw,
-                w2, scratch_.d_chunk_contrib, batch_count, widest,
-                V4RoutedExpertScratch::kHidden, V4RoutedExpertScratch::kIntermediate,
-                streams_.compute);
-        }
-
-        // 6. Per token, the slot-ordered fixed-order reduce, folding in the shared
-        //    expert the body already wrote into that token's accumulator.
-        constexpr int kThreads = 256;
-        for (uint32_t token = 0; token < token_count; ++token) {
-            half* accum = batch_output + static_cast<size_t>(token) * output_stride;
-            kernel::moe_accumulate_fixed_order_kernel
-                <<<(V4RoutedExpertScratch::kHidden + kThreads - 1) / kThreads,
-                   kThreads, 0, streams_.compute>>>(
-                    scratch_.d_chunk_contrib +
-                        static_cast<size_t>(token) * V4RoutedExpertScratch::kExperts *
-                            V4RoutedExpertScratch::kHidden,
-                    V4RoutedExpertScratch::kExperts, accum, accum,
-                    V4RoutedExpertScratch::kHidden);
-        }
+            },
+            batch_output, output_stride, streams_.compute);
     }
 
     void on_routed_consumed(uint32_t layer_id, uint32_t position) override {

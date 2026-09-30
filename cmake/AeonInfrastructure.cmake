@@ -198,6 +198,12 @@ if(AEON_BUILD_TESTS)
     # definition rather than a second copy of the algorithm. No model load.
     aeon_add_test(test_expert_permutation SOURCES tests/test_expert_permutation.cpp)
 
+    # The grouped chunk orchestration vs the per-token GEMV path, on identical
+    # experts and routing: separates "batched too greedily" from "a summation
+    # reorder", which the kernel gates cannot. No model load.
+    aeon_add_test(test_moe_grouped_batch_parity
+        SOURCES tests/test_moe_grouped_batch_parity.cpp)
+
     # Step 2.10.4 — shared expert: dense fp16 FFN, no routing, same clamp. The
     # clamp rule itself is certified at item 14; this certifies the structure,
     # the numerics on real artifact tensors, and that the combine applies the

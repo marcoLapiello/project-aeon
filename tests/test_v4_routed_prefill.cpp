@@ -260,10 +260,23 @@ int main(int argc, char** argv) {
             if (x > best_a) { best_a = x; argmax_a = i; }
             if (y > best_b) { best_b = y; argmax_b = i; }
         }
+        // The decode decision is the argmax, so the top-2 margin is the quantity the
+        // logit delta has to stay under.
+        float second_a = -1e30f;
+        float second_b = -1e30f;
+        for (size_t i = 0; i < n; ++i) {
+            const float x = __half2float(a[i]);
+            const float y = __half2float(b[i]);
+            if (i != argmax_a) second_a = std::max(second_a, x);
+            if (i != argmax_b) second_b = std::max(second_b, y);
+        }
         std::printf("  D: logit delta           max_abs=%.3e max_rel=%.3e, "
                     "fp16-identical %zu/%zu, argmax %s\n",
                     max_abs, max_rel, identical, n,
                     argmax_a == argmax_b ? "unchanged" : "MOVED");
+        std::printf("  D: margin vs delta       peak=%.3f top2-gap serial=%.3f (delta "
+                    "%.3e of it), argmax %s\n",
+                    best_a, best_a - second_a, max_abs, argmax_a == argmax_b ? "held" : "flipped");
     }
 
     assert_that("D: dedup collapsed the chunk draws", distinct < draws,
