@@ -193,6 +193,11 @@ if(AEON_BUILD_TESTS)
     aeon_add_test(test_v4_grouped_wmma_oracle
         SOURCES tests/test_v4_grouped_wmma_oracle.cpp TIMEOUT 600 OPENMP)
 
+    # The permutation those kernels are handed: a device counting sort of the
+    # router's top-k ids into expert-contiguous draws, checked against the
+    # definition rather than a second copy of the algorithm. No model load.
+    aeon_add_test(test_expert_permutation SOURCES tests/test_expert_permutation.cpp)
+
     # Step 2.10.4 — shared expert: dense fp16 FFN, no routing, same clamp. The
     # clamp rule itself is certified at item 14; this certifies the structure,
     # the numerics on real artifact tensors, and that the combine applies the
