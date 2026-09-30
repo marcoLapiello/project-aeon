@@ -1,11 +1,10 @@
-Every compute kernel in prefill today is a GEMV (one token at a time). The chunk path loops over tokens on the host for every stage, so each chunk re-reads the weights T times. Nothing uses WMMA: the 16-row padding in scratch is there, but no kernel reads it. So the swept prefill runs at GEMV rate (bandwidth-bound, around 1 flop per byte) when it could run at matrix-multiply rate. That is the main headroom.
+At the time this plan was written, every compute kernel in prefill was a GEMV (one token at a time): the chunk path looped over tokens on the host for every stage, so each chunk re-read the weights T times, and nothing used WMMA — the 16-row padding in scratch was there, but no kernel read it. So the swept prefill ran at GEMV rate (bandwidth-bound, around 1 flop per byte) when it could run at matrix-multiply rate. That was the main headroom, and Steps 1–2 close it.
 
 ## Findings
 
-- The chunk "batch" is really serial. In `v4_layer_body_batch.hpp:540-610`, pre-attention, attention and norm, the router, and MoE plus post each run for `row < count`. Each row launches its own GEMV kernels, so every weight byte is read T times per chunk.
-- The expert kernels are single-token GEMVs. `aeon_moe_fused_w13_swiglu` and `aeon_moe_fused_w2_contrib` (dispatched at `v4_expert_executor.hpp:305-320`) take one activation vector. An expert chosen by k tokens in a chunk is dequantised k times.
-- The router makes one host sync per row. It returns `std::vector` top-k results, with `hipStreamSynchronize` at `v4_layer_body_moe.hpp:138` and `v4_layer_body_types.hpp:104`. This leaves the GPU idle between rows.
-- Small per-row launches (rmsnorm, rope, HC sinkhorn, KV-cache copies, and an H2D memcpy of the position per row) add launch and sync overhead that scales with T.
+- The chunk "batch" is serial: pre-attention, attention and norm, and the router each run per row (`row < count`), and each row launches its own kernels. The routed experts were per-token too, so an expert chosen by `k` tokens in a chunk was dequantised `k` times — addressed by Step 1/2 (the grouped pair and the permutation).
+- The router makes one host sync per row, returning `std::vector` top-k results, so the GPU idles between rows.
+- Small per-row launches (rmsnorm, rope, HC sinkhorn, KV-cache copies, an H2D memcpy of the position per row) add launch and sync overhead that scales with T.
 
 ## Execution plan (in order of return)
 
@@ -21,7 +20,7 @@ Every compute kernel in prefill today is a GEMV (one token at a time). The chunk
 
 #### Implementation record
 
-_Built `2026-09-29`. What was built, what it measured, and the revisions those measurements imply. These are synthetic microbenchmarks, so they are recorded **here** rather than in the [Performance & Accuracy Ledger](../status/PERFORMANCE_LEDGER.md), which holds end-to-end runs only._
+_Built `2026-09-29`. Synthetic microbenchmarks, recorded here rather than in the [Performance & Accuracy Ledger](../status/PERFORMANCE_LEDGER.md), which holds end-to-end runs only._
 
 Built, smallest verified piece first:
 
@@ -46,41 +45,23 @@ Best-window speedup over GEMV: `0.80x` (T=16) / `2.14x` (64) / `7.17x` (256) / `
 
 Correctness: all four windows agree with the GEMV arm at every chunk size; `test_rdna3_wmma_oracle` and `test_v4_grouped_wmma_oracle` green, the latter bit-identical (`max_rel` `3.969e-04` / `2.390e-04` / `8.427e-06`) across the loop-nest change and the double-buffer revert.
 
-Still open, in the order they should land:
-
-1. **Permutation kernel** (`token→expert` sort + offsets) — **landed** as Step 2's first piece; see Step 2's record below.
-2. **Executor wiring** — dispatch the grouped pair from `V4TieredExpertExecutor` above the crossover, keep the GEMV pair below it.
-3. **Routed-prefill / short-prompt path** — same grouped kernel; per-expert GEMV fallback for 1–3 token experts.
-4. **LDS double-buffering** — deferred pending the measurement below, which decides whether it can pay.
-
-#### Revisions the measurements imply
-
-1. **Step 3's `T ≥ 16` threshold is too thin.** The measured crossover is between `T = 16` (`0.80x`, grouped loses) and `T = 64` (`2.14x`). `T ≥ 64` is where the choice stops being close.
-2. **Step 6's "choose the chunk size so the average tokens per expert reaches ≥ 16" is the wrong stopping rule.** `16` is reached at `T = 256`, yet the reward keeps rising well past it (`7.17x` → `15.93x`). Chunk size, layer-major window and the swept-prefill gate stay **user-configurable**; the deliverable here is the *curve* above, reported, not a constant baked into the engine.
-3. **"K split into 128-wide groups" became 64.** Two 32-wide quantization groups map exactly one int4 load per thread, which is what makes the staging branch-free. 128 would need two loads per thread.
-4. **Chunk and window are not tuning constants.** They are user settings; the engine must accept them and the measurement above tells the user what they buy. Nothing in this plan should hardcode them.
-
-#### Open measurement: is the grouped kernel out of weight bound, or out of compute?
-
-The window sweep above shows weight traffic falling `1.55x` from window 4 to window 8 at `T = 1024` while elapsed time is flat (`10.07` vs `9.99 ms`). Reuse that buys no time means the kernel is no longer bound by the stream. Resolved by measurement — see "Attribution" below.
-
-#### Attribution: what the gate half actually spends its time on
-
-Measured at `T = 1024` over all ten expert batches, by running each half of the production loop alone with the same grid and trip counts (`bench_expert_pair_ab`):
+**Attribution — where the gate half's time goes** (`bench_expert_pair_ab`, `T = 1024`, each half run alone with the same grid and trip counts):
 
 | Arm | ms | Regs | LDS | Wave slots |
 | :--- | ---: | ---: | ---: | ---: |
-| staging alone (dequant + LDS stores) | `3.24` | `39` | `16 KiB` | `16/32` |
-| matrix multiply alone | `2.42` | `65` | `128 B` | `32/32` |
+| staging (dequant + LDS stores) | `3.24` | `39` | `16 KiB` | `16/32` |
+| matrix multiply | `2.42` | `65` | `128 B` | `32/32` |
 | production (gate half) | `6.24` — `33.1 TFLOP/s` | `186` | `16 KiB` | `16/32` |
 
-Three conclusions, two of which contradict what was assumed before measuring:
+The halves compose almost additively (`production/(staging+mma) = 1.10`), so there is no serialisation to recover; and **the staging is the larger half** (`52%`). Occupancy is LDS-capped, not register-capped — the `4 KiB`/wave slab permits `16` of `32` waves, and double-buffering it halves that and is a measured regression (`6.2 → 8.8 ms`), so it is out. Next lever: cut LDS per wave (K block `32` instead of `64`, which needs reworking the two-groups-per-thread staging) and cut the staging itself (it writes one half per element, so its store count is `4x` the global read it came from).
 
-1. **The kernel composes almost additively** (`production / (staging + mma) = 1.10`), so there is *no* large serialisation to recover. The tempting "overlap the staging with the MMAs" saving is at most `10%`, not the `2.3x` an earlier broken staging arm suggested — that arm measured `1` register because a conditional read-back let the compiler delete its stores.
-2. **The staging is the larger half**: `3.24` of `6.24 ms`, `52%`. It is the dequant and the LDS stores, not the matrix units, that bound this kernel.
-3. **Occupancy is capped by LDS, not registers.** The slab is `4 KiB` per wave; gfx1100 has `64 KiB` LDS and `32` wave slots per CU, so `4 KiB` per wave permits at most `16` waves — `50%` — and the `186` registers are not the binding constraint. Double-buffering the slab cuts that to `25%` and is a measured regression (`6.2 → 8.8 ms`), so it stays out.
+**Corrections to the plan, from the measurements:**
 
-**Next lever, in order:** cut the LDS per wave so occupancy can rise (K block `32` instead of `64` halves the slab per wave, at the cost of reworking the staging mapping, which currently relies on two 32-wide quantization groups per thread), and cut the staging itself — it writes one half per element, so its store count is four times the global read it came from.
+1. Step 3's `T ≥ 16` threshold is too thin: the crossover is between `T = 16` (`0.80x`, grouped loses) and `T = 64` (`2.14x`). Wire `T ≥ 64`.
+2. K is split `64`-wide, not `128`: two 32-wide quantization groups map to one int4 load per thread, which is what makes the staging branch-free.
+3. Chunk size and window are **user settings**, not tuning constants; the deliverable is the curve above, not a baked-in value. This also supersedes Step 6's "reach ≥ 16 tokens per expert" rule — `16` is reached at `T = 256` yet the reward keeps rising to `15.93x`.
+
+**Remaining:** the routed-prefill / short-prompt path (same grouped kernel, with a per-expert GEMV fallback for 1–3-token experts), and the `M`-keyed dispatcher that picks grouped above the crossover (see Step 2).
 
 ### Step 2: Batch the chunk loop in the layer body
 
@@ -92,26 +73,13 @@ Three conclusions, two of which contradict what was assumed before measuring:
 
 _Started `2026-09-30`._
 
-**Seam first (structural prerequisite).** The grouped pair was one G2+G3+G4 file: `backend/swizzled_w4a16/kernels/aeon_moe_grouped_wmma.hpp` called the RDNA3 WMMA primitives, decoded the swizzled format, and applied the DSV4 clamp, with the tile/window/batch choices exposed as raw template parameters and no dispatcher. Wiring the executor to it would have built that coupling into production, so the seam landed before any wiring. Three policies, one binding:
+**Seam first (structural prerequisite).** The grouped pair was one G2+G3+G4 file under the G3 path (`aeon_moe_grouped_wmma.hpp`), calling the RDNA3 WMMA primitives, decoding the swizzled format and applying the DSV4 clamp, with the tile/window/batch choices as raw template parameters and no dispatcher. Wiring the executor to it would have built that coupling into production, so the seam landed first. The kernel stays one **fused** kernel — the slab reuse only pays while staging and MMA stay fused — but as compile-time policies, so its G2 file includes neither the format nor the model, and the executor reaches it through one G4 binding:
 
-| Group | File | Owns |
+| G2 (kernel) | G3 (feed) | G4 (epilogue + binding) |
 | :--- | :--- | :--- |
-| G2 | `src/platform/moe_grouped_ffn.hpp` → `src/platform/rdna3/moe_grouped_ffn.hpp` | the WMMA loop: fragments, lane map, K-outer nest, the LDS B-tile `[K][N]` contract. The first is the architecture-free selector; the second is the RDNA3 implementation |
-| G3 | `src/backend/swizzled_w4a16/kernels/swizzled_w4a16_feed.hpp` | `SwizzledW4A16Feed<RPW,LPR>`: dequantize a K-tile into the LDS slab, and state the per-launch expert capacity |
-| G4 | `src/architecture/deepseek_v4/kernels/moe_grouped_epilogue.hpp` | the clamped SwiGLU and the routing-weight scale |
-| G4 | `src/architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp` | the binding, the public entry points, and the tuning defaults |
+| `platform/rdna3/moe_grouped_ffn.hpp` — the WMMA loop, templated on the two policies | `backend/swizzled_w4a16/kernels/swizzled_w4a16_feed.hpp` — dequantize a K-tile into the LDS slab, and state the per-launch expert capacity | `kernels/moe_grouped_epilogue.hpp` (the clamp) + `kernels/moe_grouped_dispatch.hpp` (the binding and the tuning defaults) |
 
-The kernel stays one fused kernel — the slab reuse only pays while staging and MMA stay fused — but as compile-time policies, so it names no format and no model: the G2 file is templated on `Feed` and `Epilogue` and includes neither. The gate (`test_v4_grouped_wmma_oracle`) is **bit-identical** to before the move (`max_rel` `3.969e-04` / `2.390e-04` / `8.427e-06`), and the A/B attribution reports the same shapes (`186` regs, `16 KiB` LDS, `16/32` wave slots), so the restructure is behaviour-preserving.
-
-Two consequences for the rest of this step: the executor now calls the G4 binding by name and never sees a G3 type directly, and the dispatcher — not the kernel — is where the M window, waves and expert batching are chosen, which is where the `T ≥ 64` grouped/GEMV threshold will live.
-
-The **GEMV pair carried the same defect** and was fixed the same way. `aeon_moe_fused_w13.hpp` (G3) defined the model's clamped SwiGLU and baked it into the kernel; it is now a generic gate/up projection with the activation injected as an `Epilogue`, and the model's activation is supplied by the new G4 binding `architecture/deepseek_v4/kernels/moe_gemv_dispatch.hpp`. In the opposite direction, `aeon_w4a16_swizzled_gemv.hpp` (G3) carried the gfx11 `fdot2` intrinsic with its own `#if __gfx11__`; the intrinsic moved to the G2 primitive `platform/rdna3/dot2.hpp`. Every caller of the gate/up dispatch was routed through the binding.
-
-Moving the intrinsic out was only half the job. A consumer that then named `aeon::rdna3::fdot2` would still hardcode the architecture — adding RDNA4 would mean editing a format file. So the architecture is now resolved by neutral selectors: `platform/dot2.hpp` and `platform/moe_grouped_ffn.hpp` re-export the build's architecture under architecture-free names (`aeon::fdot2`, `aeon::dispatch_moe_grouped_gate_up`), and the G3 decoder and the G4 binding call those. Which architecture they resolve to is a **build-visible** macro, `AEON_ARCH_RDNA3`/`RDNA4`, set from `AEON_GPU_TARGET` in `AeonToolchain.cmake` — not the device-only `__gfx1100__`, because a selector keyed on that would take different branches in the host and device passes and name different kernels. Adding an architecture is now a new `platform/<arch>/` directory plus one branch in each selector and one line in CMake; no G3 or G4 file changes. `backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp` now names no architecture at all.
-
-Both expert gates stay bit-identical (`test_v4_expert_oracle`, and `test_v4_expert_executor`'s production-vs-reference `moe_out` `0` differing elements), so the de-coupling is behaviour-preserving.
-
-Still not separated, and noted deliberately: the **superseded** atomic control path (`aeon_moe_fused_w2_accum_kernel`, `moe_accumulate_expert_kernel`) is kept only for the gates and reads the same way; it is not worth a structural change while its only consumer is a control.
+The **GEMV pair carried the same defect** and got the same fix: the SwiGLU baked into `aeon_moe_fused_w13.hpp` (G3) is now an injected `Epilogue` supplied by `kernels/moe_gemv_dispatch.hpp`, and the gfx11 `fdot2` moved out of the G3 decoder into the G2 primitive `platform/rdna3/dot2.hpp`. Architecture is resolved by neutral selectors (`platform/dot2.hpp`, `platform/moe_grouped_ffn.hpp`) keyed on a **build-visible** `AEON_ARCH_*` macro — not the device-only `__gfx1100__`, which would differ between the host and device passes — so adding an architecture is a new `platform/<arch>/` plus a selector branch, and no G3 or G4 file changes. Behaviour-preserving: `test_v4_grouped_wmma_oracle` bit-identical (`8.427e-06`), `test_v4_expert_oracle` unchanged, `test_v4_expert_executor` `moe_out` `0` differing elements. The superseded atomic control path deliberately keeps its coupling; its only consumer is a gate.
 
 **Permutation primitive.** The grouped pair is driven by a token→expert permutation; nothing produced one before.
 
@@ -126,13 +94,11 @@ One property comes from the grouped pair rather than the sort, and one is a corr
 
 Gate — five shapes (`1` token, `7`, `300`, a small `8`-expert count, and `draws = 0`) against the permutation's definition, not a second copy of the algorithm: monotone offsets anchored at `0` and the draw count, every draw under its own expert with `token = draw / slots`, `draw_indices` a bijection onto `0..draws-1`, ascending draw order within each expert, and widths equal to an independently counted histogram. Passes on `gfx1100`; the `300`-token case leaves `227` of `256` experts present with a widest expert of `94` draws (past one 16-row M tile), and the small-count case has all `8` present.
 
-Still open in this step: the batched router, the `M`-keyed dispatcher, and the batched KV/position writes.
-
 **Numerical effect of the grouped chunk path — resolved.** The chunk body now always drives `accumulate_routed_batch`; the tiered executor runs the per-token sequence unless `moe_grouped_batch_enabled()` is set, so one process can compare both paths. The grouped path is a correct reorder, not a defect: `test_moe_grouped_batch_parity` runs `moe_out` through both paths on identical experts and routing — bit-identical on the synthetic fixture, and one fp16 ULP of `moe_out` (`9.8e-4 … 2.0e-3`) in the real executor, which is where a reorder lands once the per-layer value is stored fp16.
 
 Through 43 layers that per-layer ULP becomes a final-logit delta of `2.73e-1` against a top-2 margin of `0.820` — a third of the margin — so a bit-exact chunk comparison fails by construction. But it does not move the answer: `test_v4_routed_prefill` runs the same window both ways and the greedy token and the whole 8-token continuation are identical (`320 62 80 5809 ×5`). The bit-exact bar was the wrong one — it asserts reproducibility against the per-token *implementation*, not model correctness, and a MoE's `Σ_k w_k·Expert_k(x)` has no intended summation order (vLLM/SGLang serve prefill with grouped GEMMs). The greedy comparison replaces it. The A-read needs no gather: it takes a row stride and reads each token's row directly out of the batch scratch's per-token 16-row tile.
 
-**Remaining: enable by default, which touches gates, not kernels.** Flipping `moe_grouped_batch_enabled()` to default-on makes the chunk path grouped everywhere. The gates that assert chunk-vs-serial bit-exactness through the real executor — `test_v4_prefill_window` ("WINDOW == SERIAL, BIT-EXACT"), `test_v4_warm_frozen_prefill`, and `test_v4_routed_prefill`'s own D-check — must move their chunk comparison to the greedy-agreement bar, while the per-token path keeps its bit-exact regression check.
+**Remaining.** Open in this step: the batched router, the `M`-keyed dispatcher (grouped above the crossover), and the batched KV/position writes. Separately, **enabling the grouped path by default touches gates, not kernels**: flipping `moe_grouped_batch_enabled()` to default-on makes the chunk path grouped everywhere, so the gates that assert chunk-vs-serial bit-exactness through the real executor — `test_v4_prefill_window` ("WINDOW == SERIAL, BIT-EXACT"), `test_v4_warm_frozen_prefill`, and `test_v4_routed_prefill`'s own D-check — must move their chunk comparison to the greedy-agreement bar, while the per-token path keeps its bit-exact regression check.
 
 ### Step 3: WMMA dense GEMM for attention and shared-expert projections
 
