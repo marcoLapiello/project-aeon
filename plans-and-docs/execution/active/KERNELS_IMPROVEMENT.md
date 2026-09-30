@@ -237,9 +237,19 @@ Both are gated first by an **independent oracle** for the tile kernel — the sa
 
 The primitive is deliberately **model-agnostic**: it knows positions, a causal window, a scale and an optional `bias`, and nothing else. The DSV4 **sink is passed as that `bias`** — a scalar score that enters the max and the denominator but has no value row, the upstream *"virtual extra K with V=0"* reading — so the G2 file names no model concept and G4 will supply the sink without a coupling. Layout is generic: queries/outputs are `[count, heads, head_dim]` with a **row pitch**, so a caller reads its per-token buffer in place; keys/values carry their own strides and may alias (`V = K`). No G3 file is involved — attention weights are fp16 dense, so there is no quantised format to decode.
 
-Gated on silicon by `tests/test_tiled_causal_attention.cpp` against the same fp64 reference (289 assertions, `0` failures): the sliding window with a sink, full causal (`window <= 0`), and null-bias-equals-inert-sink. Max relative error `2e-4 … 4.2e-4` against a peak near `0.8`, inside the fp16 bar. The kernel is **not wired in yet** — the launch is unchanged — so this step is additive.
+Gated on silicon by `tests/test_tiled_causal_attention.cpp` against the same fp64 reference (four cases, `0` failures): the sliding window with a sink, full causal (`window <= 0`), null-bias-equals-inert-sink, and a **two-block** case (a windowed block plus a causal-only block sharing one softmax). Max relative error `2e-4 … 4.2e-4` against a peak near `0.8`, inside the fp16 bar. The kernel is **not wired in yet** — the launch is unchanged — so this step is additive.
 
-**Still open:** the G4 binding (a `*_dispatch.hpp` that supplies the DSV4 scale, sink and row-set) and wiring it into `run_layer_body_chunk`, then the greedy-agreement comparison. The kernel is still one query per block; the WMMA tile and the key-split across warps that raise occupancy are the next increment behind this seam.
+**Two key blocks, and which layers they unlock.** Reconnaissance for the wiring found that the local window is only **~20%** of a layer's keys: the layers are `2 Sliding / 21 CSA / 20 HCA`, and every CSA/HCA layer attends `local (128) + compressed`, sharing **one softmax** over both — so the local half cannot be tiled on its own without leaving the compressed half per-query. The primitive therefore takes **two blocks, each with its own window** (block 0 the window, block 1 the older compressed set with `window = 0`, i.e. causal only), which is generic and model-agnostic. That fits the layer mix exactly:
+
+| Class | Keys | Shareable across a tile? |
+| :--- | :--- | :--- |
+| Sliding (2) | local `128` | yes — one block |
+| **HCA** (20) | local `128` + compressed `≤ 256` (ratio `128`, no indexer) | yes — two blocks, both shared |
+| **CSA** (21) | local `128` + `512` selected of `ceil(seq/4)` (ratio `4`, indexer) | **no** — the top-k selection is per query |
+
+So 4.2a wires Sliding + HCA (22 of 43 layers) and leaves CSA to 4.2b, whose fork is now sharp: either gather each query's selected rows into a per-query block (a shared local block plus a per-query indexed block), or split the compressed range across blocks and combine. `compressed_count` is below `index_topk = 512` for short prompts, so CSA *behaves* like HCA there — but the mask is still per query and cannot be dropped.
+
+**Still open:** the G4 binding (a `*_dispatch.hpp` that supplies the DSV4 scale, sink and row-sets) and wiring it into `run_layer_body_chunk` for Sliding and HCA, then the greedy-agreement comparison. The kernel is still one query per block; the WMMA tile and the key-split across warps that raise occupancy are the next increment behind this seam.
 
 The per-query observations are the `F7` finding of `plans-and-docs/analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md`; that document's *file and line citations predate the module splits and are stale*, so take the concept from it and the location from the tree.
 

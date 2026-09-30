@@ -12,6 +12,7 @@
 #if defined(AEON_ARCH_RDNA3)
 #include "platform/rdna3/tiled_causal_attention.hpp"
 namespace aeon {
+using rdna3::CausalAttentionBlock;
 using rdna3::dispatch_causal_attention_fp16;
 } // namespace aeon
 #else
