@@ -237,7 +237,16 @@ Two bugs the independent gate caught, not self-consistency: a warp-stride-only s
 | `test_v4_prefill_window` | `4/10` (pre-existing red) | **`10/0`** — greedy `320`, rel `2.6%` |
 | `test_v4_routed_prefill` | `20/1` (pre-existing red) | **`20/0`** — greedy `320`, rel `0.1%` |
 
-**Still open:** the WMMA tile and warp-count tuning (`warp = 4`, `tile = 16`, both unmeasured; the kernel is scalar per element and uses no matrix cores) — Step 6.
+**Still open:** the WMMA tile and warp-count tuning (`warp = 4`, `tile = 16`, both unmeasured) — Step 6.
+
+#### WMMA QKᵀ — built, gated, **not shipped**
+
+The split kernel is scalar per element. A WMMA variant (`causal_attention_wmma_qk_fp16`, `dispatch_causal_attention_wmma_qk_fp16`) computes the `QKᵀ` tile on the matrix cores, gated in `tests/test_tiled_causal_attention.cpp` case G. It is **correct but not faster**, and both facts are worth keeping:
+
+- **Only QKᵀ fits the matrix cores.** A `16 × 512` PV output tile is `8192` fp32 — `256` registers per lane at one wave, past gfx11's limit — so PV stays scalar with a `16`-register/lane accumulator. A WMMA PV would need the output tile staged in LDS, which tightens LDS toward its cap.
+- **One warp per block cancels the gain.** Measured `attention+norm` GPU `11,888 ms` against the split kernel's `11,895 ms` (TTFT `29.8 s` vs `29.5 s`) — i.e. nothing. The WMMA block holds one wave; the split kernel holds `kCausalAttentionWarps = 4`. The matrix-core throughput and the occupancy trade exactly.
+
+So production stays on the split kernel; the primitive remains available for a multi-warp WMMA attempt, which is the only version that could pay. A first-cut bug worth noting: the kernel read the query without the per-head offset, so head `0` matched and every other head did not — an index error the fp64 gate caught immediately.
 
 ### Step 4a: Move the indexer top-k on-device — **done**
 
@@ -267,7 +276,7 @@ Gates: `test_v4_real_scale_state` (the real `index_topk = 512` as a strict selec
 
 - Sweep the WMMA tile config for the dominant expert shapes: N×K tile, waves per workgroup (4–8), LDS ≤ 64 KiB for 2 workgroups per CU.
 - Give the routed-prefill (short-prompt) path the same grouped kernel. Experts with only 1–3 tokens fall back to the GEMV kernel, picked per expert inside one launch.
-- **Attention**: introduce WMMA for QKᵀ/PV in the split-keys kernel (it is scalar per element today) and tune `kCausalAttentionWarps` (`4`) and the sub-tile (`16`), both unmeasured.
+- **Attention**: the split kernel is scalar per element. A single-warp WMMA-QKᵀ build was measured **neutral** (occupancy cancels the matrix cores), so the next attempt must be **multi-warp** WMMA (several warps per block, keys split) before PV can also move to the cores — which needs the `16 × 512` output tile staged in LDS. Tune `kCausalAttentionWarps` (`4`) and the sub-tile (`16`).
 
 ### Step 7: Move the bottleneck back to supply — **open**
 

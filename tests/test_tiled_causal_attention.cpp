@@ -411,6 +411,48 @@ int main() {
         ok &= all;
     }
 
+    // --- G. the WMMA QKᵀ kernel, shared-key tile ------------------------------
+    // 16 queries per block (here 12, so the tile's tail is masked), QKᵀ on the matrix
+    // cores, the same window + sink. Shared-key only, so a single block 0.
+    std::printf("--- G. WMMA QKᵀ kernel, sliding window ---\n");
+    {
+        const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
+        auto run_wmma = [&](const HostBlock& host0, const HostBlock& host1,
+                            int64_t q_base, int count, const float* bias) {
+            CausalAttentionBlock b0;
+            b0.keys = d_k + host0.first * kHeadDim;
+            b0.values = b0.keys;
+            b0.positions = d_kpos + host0.first;
+            b0.rows = host0.rows;
+            b0.key_stride = key_stride;
+            b0.value_stride = key_stride;
+            b0.window = static_cast<int>(host0.window);
+            CausalAttentionBlock b1;
+            if (host1.rows > 0) {
+                b1.keys = d_k + host1.first * kHeadDim;
+                b1.values = b1.keys;
+                b1.positions = d_kpos + host1.first;
+                b1.rows = host1.rows;
+                b1.key_stride = key_stride;
+                b1.value_stride = key_stride;
+                b1.window = static_cast<int>(host1.window);
+            }
+            CHECK_HIP(hipMemset(d_out, 0, h_q.size() * sizeof(__half)));
+            aeon::dispatch_causal_attention_wmma_qk_fp16(
+                d_q, q_stride, b0, b1, q_base, 1, d_out, out_stride,
+                count, static_cast<int>(kHeads), static_cast<int>(kHeadDim),
+                bias, static_cast<float>(kScale), 0);
+            CHECK_HIP(hipGetLastError());
+            CHECK_HIP(hipDeviceSynchronize());
+            std::vector<__half> out(h_q.size());
+            CHECK_HIP(hipMemcpy(out.data(), d_out, out.size() * sizeof(__half), hipMemcpyDeviceToHost));
+            return widen(out);
+        };
+        ok &= compare_all("G", run_wmma(block0, {}, static_cast<int64_t>(kKeys - kQueries),
+                                        static_cast<int>(kQueries), d_sink),
+                          block0, {}, h_query_positions, sink_d, q_d);
+    }
+
     std::cout << (ok ? "[Tier-1 tiled causal attention] PASS\n"
                      : "[Tier-1 tiled causal attention] FAIL\n");
     return ok ? 0 : 1;

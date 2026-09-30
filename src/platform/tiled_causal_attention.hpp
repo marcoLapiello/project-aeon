@@ -15,6 +15,7 @@ namespace aeon {
 using rdna3::CausalAttentionBlock;
 using rdna3::dispatch_causal_attention_fp16;
 using rdna3::dispatch_causal_attention_split_fp16;
+using rdna3::dispatch_causal_attention_wmma_qk_fp16;
 } // namespace aeon
 #else
 #error "platform/tiled_causal_attention.hpp: no causal attention implementation for this architecture"

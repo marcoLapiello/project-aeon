@@ -517,4 +517,182 @@ inline void dispatch_causal_attention_split_fp16(
         num_heads, head_dim, bias, scale);
 }
 
+constexpr int kCausalAttentionQueryTile = kWmmaTileM;   // 16
+
+// WMMA QKᵀ for a **shared-key** query tile: the same arithmetic as the split kernel's
+// scalar dot loop, but the `QKᵀ` tile is one `v_wmma_f32_16x16x16_f16_w32` per
+// 16-key × 16-dim step instead of 16 per-key wave reductions.
+//
+// **Only QKᵀ is on the matrix cores; PV is not.** A `16 × 512` output tile is `8192`
+// fp32 — `256` registers per lane at one wave, past gfx11's limit — so PV keeps the
+// scalar form with a register-resident 16-query accumulator (`16` registers per lane,
+// sweep below). That is a real ceiling, not a shortcut: a WMMA PV would need the output
+// tile staged in LDS, which this primitive does not spend.
+//
+// One wave per `(head, query-tile)`. The tile's queries share the whole key union, so
+// this serves `Sliding` and `HCA`; a `CSA` layer's per-query top-k has no shared key
+// tile and stays on `causal_attention_split_fp16`.
+//
+// The 16×16 score tile has the instruction's lane map: lane `t`, slot `i` holds
+// `C[2i + (t >> 4)][t & 15]`. Masking is applied as the tile is written to shared
+// memory, so padding and out-of-window keys become `-INF` and the softmax ignores them.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    !defined(__HIP_DEVICE_COMPILE__)
+__global__ void __launch_bounds__(kCausalAttentionLanes)
+causal_attention_wmma_qk_fp16_kernel(
+    const __half* __restrict__ q, int q_stride,
+    const __half* __restrict__ keys0, int key_stride0,
+    const __half* __restrict__ values0, int value_stride0,
+    const int64_t* __restrict__ positions0, int rows0, int window0,
+    const __half* __restrict__ keys1, int key_stride1,
+    const __half* __restrict__ values1, int value_stride1,
+    const int64_t* __restrict__ positions1, int rows1, int window1,
+    int64_t query_position_base, int64_t query_position_stride,
+    __half* __restrict__ out, int out_stride,
+    int num_heads, int head_dim, int count,
+    const float* __restrict__ bias, float scale) {
+    extern __shared__ unsigned char raw[];
+    const int total_rows = rows0 + rows1;
+    const int tpad = (total_rows + kWmmaTileN - 1) & ~(kWmmaTileN - 1);
+    float* scores = reinterpret_cast<float*>(raw);                   // [16][tpad]
+    __half* probs = reinterpret_cast<__half*>(scores + 16 * tpad);   // [16][tpad]
+
+    const int head = blockIdx.x;
+    const int first_query = blockIdx.y * kCausalAttentionQueryTile;
+    if (first_query >= count) return;
+    const int lane = threadIdx.x;
+    const int axis = wmma_lane_axis(lane);
+    const int parity = wmma_lane_parity(lane);
+
+    // Phase 1: QKᵀ over the union, one WMMA per (key tile, 16-dim step).
+    for (int kt = 0; kt < tpad; kt += kWmmaTileN) {
+        f32_vec8 acc = wmma_zero_accumulator();
+        for (int kd = 0; kd < head_dim; kd += kWmmaTileK) {
+            const int qrow = min(first_query + axis, count - 1);
+            const f16_vec16 a = wmma_load_a_row(
+                q + static_cast<size_t>(qrow) * q_stride +
+                static_cast<size_t>(head) * head_dim + kd);
+            const int kg = min(kt + axis, total_rows - 1);
+            const __half* krow = kg < rows0
+                ? keys0 + static_cast<size_t>(kg) * key_stride0
+                : keys1 + static_cast<size_t>(kg - rows0) * key_stride1;
+            const f16_vec16 b = wmma_load_a_row(krow + kd);
+            acc = wmma_mma(a, b, acc);
+        }
+        // Apply the causal + window mask as the tile lands in shared memory.
+        for (int i = 0; i < 8; ++i) {
+            const int m = 2 * i + parity;
+            const int kg = kt + axis;
+            const int qidx = first_query + m;
+            bool valid = false;
+            if (qidx < count && kg < total_rows) {
+                const int64_t qp = query_position_base +
+                                   static_cast<int64_t>(qidx) * query_position_stride;
+                const int64_t kp = kg < rows0 ? positions0[kg] : positions1[kg - rows0];
+                const int w = kg < rows0 ? window0 : window1;
+                const int64_t wf = w > 0 ? (qp >= w - 1 ? qp - (w - 1) : 0) : 0;
+                valid = kp >= wf && kp <= qp;
+            }
+            scores[m * tpad + kg] = valid ? acc[i] * scale : -INFINITY;
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: softmax per query row, one row per lane. The bias enters the max and the
+    // denominator, exactly as the scalar kernels do.
+    const float head_bias = bias != nullptr ? bias[head] : -INFINITY;
+    if (lane < kCausalAttentionQueryTile) {
+        const int m = lane;
+        float mx = head_bias;
+        for (int k = 0; k < tpad; ++k) mx = fmaxf(mx, scores[m * tpad + k]);
+        float sum = expf(head_bias - mx);
+        for (int k = 0; k < tpad; ++k) {
+            const float p = expf(scores[m * tpad + k] - mx);
+            scores[m * tpad + k] = p;
+            sum += p;
+        }
+        const float inv = 1.0f / fmaxf(sum, 1e-30f);
+        for (int k = 0; k < tpad; ++k) {
+            probs[m * tpad + k] = __float2half(scores[m * tpad + k] * inv);
+        }
+    }
+    __syncthreads();
+
+    // Phase 3: PV, scalar and lane-strided. Each lane owns `head_dim / 32` output
+    // dimensions and accumulates all 16 queries of the tile for each — `16` registers,
+    // not the `256` a WMMA output tile of this width would need.
+    const int slice = head_dim / kCausalAttentionLanes;
+    for (int i = 0; i < slice; ++i) {
+        const int d = lane * slice + i;
+        float acc[kCausalAttentionQueryTile];
+        #pragma unroll
+        for (int m = 0; m < kCausalAttentionQueryTile; ++m) acc[m] = 0.0f;
+        for (int k = 0; k < total_rows; ++k) {
+            const __half* vrow = k < rows0
+                ? values0 + static_cast<size_t>(k) * value_stride0
+                : values1 + static_cast<size_t>(k - rows0) * value_stride1;
+            const float v = __half2float(vrow[d]);
+            #pragma unroll
+            for (int m = 0; m < kCausalAttentionQueryTile; ++m) {
+                acc[m] += __half2float(probs[m * tpad + k]) * v;
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < kCausalAttentionQueryTile; ++m) {
+            const int qidx = first_query + m;
+            if (qidx < count) {
+                out[static_cast<size_t>(qidx) * out_stride +
+                    static_cast<size_t>(head) * head_dim + d] = __float2half(acc[m]);
+            }
+        }
+    }
+}
+#endif  // gfx11 device pass, or any host pass
+
+inline void dispatch_causal_attention_wmma_qk_fp16(
+    const __half* q, int q_stride,
+    const CausalAttentionBlock& block0,
+    const CausalAttentionBlock& block1,
+    int64_t query_position_base, int64_t query_position_stride,
+    __half* out, int out_stride,
+    int count, int num_heads, int head_dim,
+    const float* bias, float scale, hipStream_t stream) {
+    if (count <= 0 || num_heads <= 0) return;
+    const int total_rows = block0.rows + block1.rows;
+    if (total_rows <= 0) return;
+    // WMMA's K axis is 16 wide, so the head must be a multiple of it.
+    if (head_dim <= 0 || head_dim % kWmmaTileK != 0) {
+        throw std::invalid_argument("dispatch_causal_attention_wmma_qk_fp16: unsupported head_dim");
+    }
+    if (q == nullptr || out == nullptr) {
+        throw std::invalid_argument("dispatch_causal_attention_wmma_qk_fp16: null buffer");
+    }
+    if (block0.keys == nullptr || block0.values == nullptr || block0.positions == nullptr) {
+        throw std::invalid_argument("dispatch_causal_attention_wmma_qk_fp16: null block 0");
+    }
+    if (block1.rows > 0 &&
+        (block1.keys == nullptr || block1.values == nullptr || block1.positions == nullptr)) {
+        throw std::invalid_argument("dispatch_causal_attention_wmma_qk_fp16: null block 1");
+    }
+    if (q_stride < num_heads * head_dim || out_stride < num_heads * head_dim) {
+        throw std::invalid_argument("dispatch_causal_attention_wmma_qk_fp16: row pitch too small");
+    }
+
+    const __half* keys1 = block1.keys != nullptr ? block1.keys : block0.keys;
+    const __half* values1 = block1.values != nullptr ? block1.values : block0.values;
+    const int64_t* positions1 = block1.positions != nullptr ? block1.positions : block0.positions;
+
+    const int tpad = (total_rows + kWmmaTileN - 1) & ~(kWmmaTileN - 1);
+    const dim3 grid(num_heads, (count + kCausalAttentionQueryTile - 1) / kCausalAttentionQueryTile);
+    const size_t shared = static_cast<size_t>(16) * tpad * (sizeof(float) + sizeof(__half));
+    causal_attention_wmma_qk_fp16_kernel<<<grid, kCausalAttentionLanes, shared, stream>>>(
+        q, q_stride,
+        block0.keys, block0.key_stride, block0.values, block0.value_stride,
+        block0.positions, block0.rows, block0.window,
+        keys1, block1.key_stride, values1, block1.value_stride,
+        positions1, block1.rows, block1.window,
+        query_position_base, query_position_stride, out, out_stride,
+        num_heads, head_dim, count, bias, scale);
+}
+
 } // namespace aeon::rdna3

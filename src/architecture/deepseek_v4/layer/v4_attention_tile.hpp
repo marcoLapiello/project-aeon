@@ -103,4 +103,44 @@ inline void run_attention_tile(
         layer.d_attn_sink, kernel::DSV4_ATTN_SCALE, stream);
 }
 
+// The same launch, but QKᵀ on the matrix cores. Only for the shared-key classes
+// (`Sliding`, `HCA`): a `CSA` layer's per-query top-k has no key tile to share across the
+// query tile, so it stays on the split-keys kernel above.
+inline void run_attention_tile_wmma(
+    const V4Layer& layer,
+    const half* q, int q_stride,
+    half* out, int out_stride,
+    int64_t query_position_base,
+    int count,
+    const half* local_keys, const int64_t* local_positions, int local_rows,
+    uint32_t committed,
+    hipStream_t stream) {
+    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
+
+    CausalAttentionBlock block0;
+    block0.keys = local_keys;
+    block0.values = local_keys;
+    block0.positions = local_positions;
+    block0.rows = local_rows;
+    block0.key_stride = HEAD_DIM;
+    block0.value_stride = HEAD_DIM;
+    block0.window = static_cast<int>(layer.local_cache_capacity());
+
+    CausalAttentionBlock block1;
+    if (layer.spec().attention_kind == V4AttentionKind::HCA && committed > 0) {
+        block1.keys = layer.d_compressed_key_cache;
+        block1.values = layer.d_compressed_value_cache;
+        block1.positions = layer.d_compressed_positions;
+        block1.rows = static_cast<int>(committed);
+        block1.key_stride = HEAD_DIM;
+        block1.value_stride = HEAD_DIM;
+        block1.window = 0;
+    }
+
+    aeon::dispatch_causal_attention_wmma_qk_fp16(
+        q, q_stride, block0, block1, query_position_base, 1, out, out_stride,
+        count, static_cast<int>(kernel::DSV4_NUM_HEADS), HEAD_DIM,
+        layer.d_attn_sink, kernel::DSV4_ATTN_SCALE, stream);
+}
+
 } // namespace aeon::core
