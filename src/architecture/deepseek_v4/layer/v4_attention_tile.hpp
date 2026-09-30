@@ -28,11 +28,13 @@
 
 namespace aeon::core {
 
-// Whether this layer's attention can be served by one tiled launch. True for the
-// classes whose compressed keys are shared across a tile.
+// Whether this layer's attention can be served by one tiled launch. All three classes
+// now can: the shared-key classes (`Sliding`, `HCA`) pass the compressed set whole, and
+// `CSA` passes its indexer's per-query selection as an index block.
 inline bool attention_tile_supported(const V4Layer& layer) {
     const V4AttentionKind kind = layer.spec().attention_kind;
-    return kind == V4AttentionKind::Sliding || kind == V4AttentionKind::HCA;
+    return kind == V4AttentionKind::Sliding || kind == V4AttentionKind::HCA ||
+           kind == V4AttentionKind::CSA;
 }
 
 // Switch for the chunk path's attention. It defaults to **off**, so the committed
@@ -53,7 +55,12 @@ inline bool& attention_tile_enabled() {
 // distance between rows (`total_q`). `local_keys`/`local_positions`/`local_rows` are
 // the composed **union** row-set for the tile; `committed` is the number of compressed
 // entries materialized by the time the chunk's attention runs (all of them, since the
-// whole chunk's pre-attention half has completed). Sliding ignores `committed`.
+// whole chunk's pre-attention half has completed).
+//
+// `per_query_keys`/`per_query_count` are the CSA case: one `int` index into the
+// compressed cache per (query, candidate), so each query attends its own indexer top-k.
+// The shared-key classes pass `nullptr` and read the compressed set whole. `Sliding`
+// reads neither.
 inline void run_attention_tile(
     const V4Layer& layer,
     const half* q, int q_stride,
@@ -62,6 +69,7 @@ inline void run_attention_tile(
     int count,
     const half* local_keys, const int64_t* local_positions, int local_rows,
     uint32_t committed,
+    const int32_t* per_query_keys, int per_query_count,
     hipStream_t stream) {
     constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
 
@@ -78,7 +86,7 @@ inline void run_attention_tile(
     block0.window = static_cast<int>(layer.local_cache_capacity());
 
     CausalAttentionBlock block1;
-    if (layer.spec().attention_kind == V4AttentionKind::HCA && committed > 0) {
+    if (layer.spec().attention_kind != V4AttentionKind::Sliding && committed > 0) {
         block1.keys = layer.d_compressed_key_cache;
         block1.values = layer.d_compressed_value_cache;
         block1.positions = layer.d_compressed_positions;
@@ -88,8 +96,9 @@ inline void run_attention_tile(
         block1.window = 0;                   // causal only; older than the window, by design
     }
 
-    aeon::dispatch_causal_attention_fp16(
-        q, q_stride, block0, block1, query_position_base, 1, out, out_stride,
+    aeon::dispatch_causal_attention_split_fp16(
+        q, q_stride, block0, block1, per_query_keys, per_query_count,
+        query_position_base, 1, out, out_stride,
         count, static_cast<int>(kernel::DSV4_NUM_HEADS), HEAD_DIM,
         layer.d_attn_sink, kernel::DSV4_ATTN_SCALE, stream);
 }

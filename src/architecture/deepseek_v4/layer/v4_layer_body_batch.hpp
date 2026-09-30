@@ -735,11 +735,19 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
                 const uint32_t tile = std::min(kTile, count - first);
                 const uint32_t rows =
                     compose_tile_rows(layer, workspace, start_position, first, tile, stream);
+                // CSA selects a different compressed top-k per query; pass each row's
+                // indexer selection as an index block. The shared-key classes read the
+                // compressed set whole (or not at all, for Sliding).
+                const bool csa = layer.spec().attention_kind == V4AttentionKind::CSA;
+                const bool csa_live = csa && committed > 0;
                 run_attention_tile(
                     layer, views[first].d_q, TOTAL_Q, views[first].d_attn_out, TOTAL_Q,
                     static_cast<int64_t>(start_position + first), static_cast<int>(tile),
                     workspace.composed_keys(), workspace.composed_positions(),
-                    static_cast<int>(rows), committed, stream);
+                    static_cast<int>(rows), committed,
+                    csa_live ? views[first].d_indexer_topk_indices : nullptr,
+                    csa_live ? static_cast<int>(layer.state_layout().index_topk) : 0,
+                    stream);
             }
             for (uint32_t row = 0; row < count; ++row) {
                 run_layer_body_attention_tail(layer, views[row], tables, start_position + row,

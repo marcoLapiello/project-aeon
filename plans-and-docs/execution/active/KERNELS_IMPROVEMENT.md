@@ -268,6 +268,18 @@ The path is gated behind `attention_tile_enabled()` (**default off**), so the co
 
 The kernel is `1.37x` faster where the tile applies; the host line inside `attention+norm` also fell (`1,624 → 1,465 ms`), because one batched launch replaces a per-token grid. The gain is bounded by the layers it reaches: `CSA` (`21` of `43`, and the half with the larger key set) still runs the scalar per-token kernel. The switch was left **off** afterwards, so production is unchanged and the bit-exact gates stay green; the measurement above is the record of what turning it on buys today.
 
+**Split-keys kernel, all three classes (`2026-09-30`, `n = 1`).** The tile parallelises the *query* axis and so reaches only the shared-key classes; `CSA` needs the *key* axis, because its indexer selects a different top-k per query. The second primitive — `causal_attention_split_fp16` — gives each block `kCausalAttentionWarps` warps that scan strided slices of the key range and combine a partial `(max, sum, weighted value)` in shared memory, and takes the compressed block **per query** (an index array) so `CSA` is served without a second kernel. Same invocation, tile on:
+
+| | tile off | single-warp tile (Sliding+HCA) | split-keys, all classes |
+| :--- | ---: | ---: | ---: |
+| TTFT | `37.2 s` | `34.4 s` | **`30.0 s`** (`1.24x`) |
+| `attention+norm`, GPU | `20,117 ms` | `17,676 ms` | **`11,879 ms`** (`1.69x`) |
+| total, GPU | `43,260 ms` | `38,357 ms` | **`26,056 ms`** |
+
+Two lessons the build enforced. **The softmax loops must be lane-strided.** A key's dot needs all 32 lanes, so a warp-stride alone made every lane sum the *same* keys and the wave reduction multiplied the denominator by `32` — the fp64 gate showed a denominator of `203` where `~7` was expected. **A per-query `-1` index must not form a pointer.** Phase 3 read every key's value row, including masked ones; with a real CSA selection that is an out-of-bounds load, which the small gate did not hit and the production run did (`illegal memory access`) — the value pointer is now null for an invalid row and skipped. Both are the reason the gate is built from an independent reference rather than the kernel's own output.
+
+The switch is again **off**; the parity gate is `test_v4_layer_body_chunk_oracle` section C3, now covering all three classes (`router top-k ids` identical; residual `9e-4 … 7.8e-3`).
+
 The per-query observations are the `F7` finding of `plans-and-docs/analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md`; that document's *file and line citations predate the module splits and are stale*, so take the concept from it and the location from the tree.
 
 ### Step 4a: Move the indexer top-k on-device — **done**

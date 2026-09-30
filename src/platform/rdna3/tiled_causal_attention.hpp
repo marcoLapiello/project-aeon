@@ -351,8 +351,12 @@ causal_attention_split_fp16_kernel(
         return position >= window_first1 && position <= query_position;
     };
     auto value_ptr_at = [&](int k) -> const __half* {
-        return k < rows0 ? values0 + static_cast<size_t>(k) * value_stride0
-                         : values1 + static_cast<size_t>(block1_row(k - rows0)) * value_stride1;
+        if (k < rows0) return values0 + static_cast<size_t>(k) * value_stride0;
+        const int row = block1_row(k - rows0);
+        // A masked selection (`-1`) or an out-of-range index has no row to read; the
+        // caller skips it rather than forming a pointer past the buffer.
+        if (row < 0 || row >= rows1) return nullptr;
+        return values1 + static_cast<size_t>(row) * value_stride1;
     };
     auto key_ptr_at = [&](int k) -> const __half* {
         return k < rows0 ? keys0 + static_cast<size_t>(k) * key_stride0
@@ -438,7 +442,9 @@ causal_attention_split_fp16_kernel(
     for (int d = lane * slice; d < (lane + 1) * slice; ++d) {
         float acc = 0.0f;
         for (int k = warp; k < total_rows; k += kCausalAttentionWarps) {
-            acc += (scores[k] * inverse_denominator) * __half2float(value_ptr_at(k)[d]);
+            const __half* value_row = value_ptr_at(k);
+            if (value_row == nullptr) continue;
+            acc += (scores[k] * inverse_denominator) * __half2float(value_row[d]);
         }
         warp_out[warp * head_dim + d] = acc;
     }
