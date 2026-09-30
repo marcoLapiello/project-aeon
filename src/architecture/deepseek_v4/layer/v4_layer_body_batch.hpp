@@ -435,6 +435,13 @@ private:
 // same slot order makes the two paths add the same `exp` terms in the same sequence,
 // which turns `chunk ≡ serial` into an equality rather than a tolerance.
 //
+// The row-set has a **closed form**, so it is one gather launch rather than a loop of
+// per-slot copies: output row `r` is slot `(first + r) mod capacity` holding position
+// `first + r`. The loop this replaced submitted two `hipMemcpyAsync` (a key row and a
+// position) per ring slot per query — measured at ~`45 s` of host time and the single
+// largest cost of the swept prefill, because the CPU could not issue a chunk's
+// attention while it was still submitting `C × capacity` tiny copies.
+//
 // `start_position` is the chunk's first position; `chunk_row` is the query's index
 // within the chunk, so the query's own row is included and no later one is.
 // Returns the number of rows.
@@ -446,45 +453,30 @@ inline uint32_t compose_local_rows(
     uint32_t query_position,
     hipStream_t stream) {
     constexpr uint32_t HEAD_DIM = kernel::DSV4_HEAD_DIM;
-    const uint32_t capacity = layer.local_cache_capacity();
+    const int capacity = static_cast<int>(layer.local_cache_capacity());
     const int64_t first = std::max<int64_t>(
         0, static_cast<int64_t>(query_position) - static_cast<int64_t>(capacity) + 1);
+    // The window is at most `capacity` long, so the row count is the window length.
+    const uint32_t rows =
+        static_cast<uint32_t>(static_cast<int64_t>(query_position) - first + 1);
 
-    half* destination = workspace.composed_keys();
-    uint32_t rows = 0;
-    for (uint32_t slot = 0; slot < capacity; ++slot) {
-        // The one position in `[first, query_position]` congruent to this slot, if
-        // the window reaches it. The window is at most `capacity` long, so there is
-        // at most one.
-        const int64_t offset = (static_cast<int64_t>(slot) - first) %
-            static_cast<int64_t>(capacity);
-        const int64_t position = first + (offset < 0 ? offset + capacity : offset);
-        if (position > static_cast<int64_t>(query_position)) continue;
-
-        const half* source = nullptr;
-        if (position < static_cast<int64_t>(start_position)) {
-            // A pre-chunk key: still in the ring, which the chunk has not touched.
-            source = layer.d_local_key_cache + static_cast<size_t>(slot) * HEAD_DIM;
-        } else {
-            const uint32_t index =
-                static_cast<uint32_t>(position - static_cast<int64_t>(start_position));
-            if (index > chunk_row) {
-                throw std::logic_error(
-                    "compose_local_rows: a query cannot read a key that is not yet written");
-            }
-            source = workspace.chunk_key(index);
-        }
-        CHECK_HIP(hipMemcpyAsync(destination + static_cast<size_t>(rows) * HEAD_DIM,
-                                 source, HEAD_DIM * sizeof(half),
-                                 hipMemcpyDeviceToDevice, stream));
-        // The positions live in device memory too, so they are written the same way.
-        CHECK_HIP(hipMemcpyAsync(workspace.composed_positions() + rows, &position,
-                                 sizeof(position), hipMemcpyHostToDevice, stream));
-        ++rows;
-    }
     if (rows > workspace.max_composed_rows()) {
         throw std::invalid_argument("compose_local_rows: row-set exceeds the workspace");
     }
+    // A chunk query may only read a key the chunk has already written. The last row is
+    // the query's own, so this is the only bound that can be violated.
+    if (query_position >= start_position &&
+        query_position - start_position > chunk_row) {
+        throw std::logic_error(
+            "compose_local_rows: a query cannot read a key that is not yet written");
+    }
+
+    constexpr int kThreads = 128;
+    hipLaunchKernelGGL(
+        kernel::v4_compose_local_rows_kernel, dim3(rows), dim3(kThreads), 0, stream,
+        layer.d_local_key_cache, workspace.chunk_key(0), workspace.composed_keys(),
+        workspace.composed_positions(), first, static_cast<int64_t>(start_position),
+        capacity, static_cast<int>(HEAD_DIM));
     return rows;
 }
 

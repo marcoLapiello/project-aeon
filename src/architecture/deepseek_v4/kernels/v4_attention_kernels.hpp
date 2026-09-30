@@ -355,10 +355,57 @@ __global__ void v4_indexer_scores_kernel(
     scores[candidate] = score;
 }
 
+// Assembles one query's local row-set for the compressed classes: the pre-chunk ring
+// rows still inside the query's window, then the chunk's own rows up to and including
+// the query. **Rows are ordered by ring slot (`position mod capacity`), not by
+// position**, because that is the order decode's kernel iterates its ring in — so
+// composing in that order is what makes `chunk ≡ serial` an equality rather than a
+// tolerance. For a wrapped window the two orders are a rotation of each other, which
+// is a small floating-point difference in the softmax and a hard gate failure.
+//
+// The host used to build this row-set with two `hipMemcpyAsync` per ring slot per
+// query (~`256` submissions per token, the largest single cost in the prefill). The
+// row-set has a closed form, so it needs no loop: **row `r` is slot `r`**, holding
+// position `first + ((r - first) mod capacity)`. One block per row reads the ring or
+// the chunk buffer by that formula.
+//
+// `first` is the window's first position; `rows` is its length (at most `capacity`,
+// counted down from `query_position`). `start_position` is the chunk's first position:
+// a position below it lives in the ring (the chunk has not written it), one at or
+// above it in the chunk buffer. Every row emitted has `position <= query_position`, so
+// the chunk index it reads is one the chunk has already written.
+__global__ void v4_compose_local_rows_kernel(
+    const __half* __restrict__ ring_keys,   // [capacity, head_dim]
+    const __half* __restrict__ chunk_keys,  // [chunk_count, head_dim]
+    __half* __restrict__ out_keys,          // [rows, head_dim]
+    int64_t* __restrict__ out_positions,    // [rows]
+    int64_t first,
+    int64_t start_position,
+    int capacity,
+    int head_dim
+) {
+    const int row = blockIdx.x;
+    // Slot `row`'s position inside the window, for a window that starts at `first`.
+    int64_t offset = (static_cast<int64_t>(row) - first) % capacity;
+    if (offset < 0) offset += capacity;
+    const int64_t position = first + offset;
+    const __half* source = position < start_position
+        ? ring_keys + static_cast<size_t>(row) * static_cast<size_t>(head_dim)
+        : chunk_keys + static_cast<size_t>(position - start_position) *
+                           static_cast<size_t>(head_dim);
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        out_keys[static_cast<size_t>(row) * static_cast<size_t>(head_dim) +
+                 static_cast<size_t>(d)] = source[d];
+    }
+    if (threadIdx.x == 0) {
+        out_positions[row] = position;
+    }
+}
+
 // The indexer's candidate selection, on the device: the top `topk` candidates by
 // score, in descending order, ties broken to the **lower index** — the same rule the
 // host used to implement in `select_indexer_topk`, which this replaces.
-//
 // Why a kernel and not the host sort: the host version copied the scores back,
 // synchronized, sorted on the CPU, copied the indices forward, and synchronized
 // again. Those two `hipStreamSynchronize` calls are the reason the attention phase

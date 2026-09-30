@@ -14,6 +14,7 @@
 #include "architecture/deepseek_v4/layer/v4_layer_body_types.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "platform/ops/cast.hpp"
+#include "infrastructure/profiling/phase_profiler.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -481,6 +482,8 @@ inline void run_layer_body_attention_and_norm(
     const int local_rows = scratch.composed_rows > 0
         ? scratch.composed_rows : static_cast<int>(layer.local_cache_capacity());
 
+    auto attention_region =
+        PhaseProfiler::instance().region("  E attention kernel", stream);
     if (layer.spec().attention_kind == V4AttentionKind::Sliding) {
         hipLaunchKernelGGL(
             kernel::v4_cached_sliding_window_attn_wave32_kernel,
@@ -536,10 +539,13 @@ inline void run_layer_body_attention_and_norm(
     if (attention_trace != nullptr) {
         trace_copy(observer, attention_trace->grouped_output, scratch.d_attn_proj, H);
     }
+    attention_region = PhaseProfiler::Region{};
 
     // -----------------------------------------------------------------
     // F. HC attention post expansion: res_mid = comb_a · res_in + post_a · attn_proj
     // -----------------------------------------------------------------
+    auto tail_region =
+        PhaseProfiler::instance().region("  F/G hc + norm", stream);
     kernel::float_to_half_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
         scratch.d_res_in, scratch.d_res_in_half, HC_DIM);
 
@@ -605,6 +611,7 @@ inline void run_layer_body_attention_and_norm(
                                  scratch.d_ffn_norm_act, H * sizeof(half),
                                  hipMemcpyDeviceToDevice, stream));
     }
+    tail_region = PhaseProfiler::Region{};
 }
 
 } // namespace aeon::core
