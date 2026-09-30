@@ -1,12 +1,26 @@
 At the time this plan was written, every compute kernel in prefill was a GEMV (one token at a time): the chunk path looped over tokens on the host for every stage, so each chunk re-read the weights T times, and nothing used WMMA — the 16-row padding in scratch was there, but no kernel read it. So the swept prefill ran at GEMV rate (bandwidth-bound, around 1 flop per byte) when it could run at matrix-multiply rate.
 
-The steps below are numbered in the order they were *written*, not the order the time is. A measured phase profile of the swept prefill (below) later showed that Steps 1–2 address ~2.3% of it, while two per-token loops — the attention half and the pre-attention half — are 94%. The numbering is kept for the record; **the work order is the profile's**, and Step 4a is inserted on that basis.
+**Scope: throughput in general, not one arm.** The swept prefill is profiled first because it has no supply constraint, so its host/GPU split reads cleanly — a *measurement* choice, not a claim about where the work belongs. Routed prefill and decode run the same per-token body (the same attention kernel, the same GEMVs, the same HC/norm stages), so a fix to those helps every arm; each record states its measured effect.
 
-**Scope: throughput in general, not one arm.** The swept prefill is profiled first because it has no supply constraint, so its host/GPU split is clean to read; that is a *measurement* choice, not a statement about where the work belongs. The routed prefill and decode share the same per-token body — the same attention kernel, the same GEMVs, the same HC/norm stages — so a fix to those helps every arm. Steps 3–5 therefore target the kernels and launches that all three pay for, and each step's record states its effect on each arm it touches. Decode's own bottleneck (the batched per-token sequence) is tracked separately.
+**Ordering is the profile's, not the numbering's.** The steps are numbered in the order they were *written*. The profile below showed Steps 1–2 address ~`2.3%` of the swept prefill, while a host loop in `compose_local_rows` — not in the plan at all — was its largest single cost. Steps 3–5 are listed after the ones already done because their numbering is load-bearing for the records; the status table is the work order.
 
-## Measured phase profile (the ordering this plan should follow)
+## Status
 
-`aeon_chat --phase-profile`, swept prefill, 666-token prompt, `W=4096 C=256` (129 chunk bodies over 43 layers). Host = CPU time issuing the phase; GPU = `hipEvent` span on the compute stream. `n = 1`, one prompt.
+| Step | What | State |
+| :--- | :--- | :--- |
+| 1 | Grouped WMMA expert GEMM (W4A16) | **Done** — kernels, seam and oracle; enabled in production |
+| 2 | Batch the chunk loop | **Partly done** — router batched; `M`-keyed dispatcher and batched KV/position writes open |
+| 4a | Indexer top-k on device | **Done** — removes two stream drains per token per CSA layer |
+| — | `compose_local_rows` gather | **Done** — found by the profile, not in the original plan |
+| 3 | WMMA dense GEMM for the dense projections | **Open** — next |
+| 4 | Batched causal attention over the chunk | **Open** |
+| 5 | Fuse elementwise/norm over `[T, dim]` | **Open** |
+| 6 | Tune for gfx1100 | **Open** |
+| 7 | Re-measure and retune supply | **Open** |
+
+## Phase profile
+
+**Baseline** — the state the ordering was decided from. `aeon_chat --phase-profile`, swept prefill, 666-token prompt, `W=4096 C=256` (129 chunk bodies over 43 layers). Host = CPU time issuing the phase; GPU = `hipEvent` span on the compute stream. `n = 1`, one prompt.
 
 | Phase | host ms | gpu ms | gpu share |
 | :--- | ---: | ---: | ---: |
@@ -37,24 +51,21 @@ Result of the three steps so far (`aeon_chat`, 666-token prompt, `W=4096 C=256`,
 | attention kernel, GPU | — | — | `22.8 s` | `22.8 s` |
 | pre-attention, GPU | — | `15.7 s` | `14.7 s` | `14.6 s` |
 
-Prefill is now **GPU-bound**: after the host stalls are gone, the two GPU numbers that matter are the attention kernel (`22.8 s`) and pre-attention (`14.6 s`). That is what Steps 3–4 reduce, and it is why they are the next work rather than more launch surgery.
+Prefill is now **GPU-bound**: after the host stalls are gone, the two GPU numbers that matter are the attention kernel (`22.8 s`) and pre-attention (`14.6 s`). Steps 3–4 reduce those.
 
 ## Findings
-- The chunk "batch" is serial: pre-attention, attention and norm, and the router each run per row (`row < count`), and each row launches its own kernels. The routed experts were per-token too, so an expert chosen by `k` tokens in a chunk was dequantised `k` times — addressed by Step 1/2 (the grouped pair and the permutation).
-- The router makes one host sync per row, returning `std::vector` top-k results, so the GPU idles between rows.
-- Small per-row launches (rmsnorm, rope, HC sinkhorn, KV-cache copies, an H2D memcpy of the position per row) add launch and sync overhead that scales with T.
 
-## Execution plan (in order of return)
+- The chunk "batch" is serial: pre-attention, attention and norm, and the router each run per row (`row < count`). The routed experts were per-token too, so an expert chosen by `k` tokens in a chunk was dequantised `k` times — fixed by Step 1. **Still true of pre-attention and attention+norm (Steps 3–4).**
+- The router made one host sync per row. **Fixed in Step 2.**
+- Small per-row launches (rmsnorm, rope, HC sinkhorn, KV-cache copies, an H2D memcpy of the position per row) scale with T. **Open: Steps 4a (done), 4 and 5.**
 
-### Step 1: W4A16 grouped WMMA GEMM for experts (largest gain)
+## Execution plan
 
-- New G2/G3 kernel `aeon_moe_grouped_w13_wmma` / `_w2_wmma` in `backend/swizzled_w4a16/kernels/`.
-- Input is a token→expert permutation built on the GPU: sort the chunk's (token, slot) pairs by expert, with offsets per expert.
-- Tiling: M=16 tokens per WMMA tile (`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`), N=64–128 output rows per workgroup, K split into 128-wide groups that match the quantisation scale group.
-- Dequantise int4 to fp16 into LDS once per K-tile and reuse it across every token tile of that expert. Double-buffer the LDS loads (global→LDS of the next tile overlaps WMMA on the current one).
-- Fuse SwiGLU-clamp into the W13 epilogue (gate and up interleaved in N). The W2 epilogue writes weighted fp32 contributions per (token, slot), which keeps the existing fixed-order deterministic reduce.
-- Keep the swizzled layout if a WMMA B-fragment can be decoded from it. Otherwise add a second layout pass in the converter (a standard-format ingest, not a new quantisation).
-- Test: an independent CPU reference for per-token expert output, ε < 1e-3.
+Steps 1, 2, 4a and the compose gather are done; their records are kept for the decisions in them. Steps 3–7 are the open work.
+
+### Step 1: W4A16 grouped WMMA GEMM for experts — **done**
+
+Grouped W13+activation and W2 over a token→expert permutation, as one **fused** kernel split into a G2 WMMA loop, a G3 weight feed and a G4 epilogue. Three of the plan's original decisions were corrected by measurement and are superseded: `K` splits **`64`**-wide (not `128`), the kernel lives under `platform/rdna3/` with format and model injected as compile-time policies (not one combined G3 file), and **LDS double-buffering was a measured regression and was reverted**. The `M` window is a dispatcher choice, not a constant. The record below is the authority.
 
 #### Implementation record
 
@@ -101,11 +112,9 @@ The halves compose almost additively (`production/(staging+mma) = 1.10`), so the
 
 **Remaining:** the routed-prefill / short-prompt path (same grouped kernel, with a per-expert GEMV fallback for 1–3-token experts), and the `M`-keyed dispatcher that picks grouped above the crossover (see Step 2).
 
-### Step 2: Batch the chunk loop in the layer body
+### Step 2: Batch the chunk loop in the layer body — **partly done**
 
-- Rewrite `run_chunk` so every stage takes a `[T, dim]` activation. Remove `std::vector<...>` views/pre/outputs per row.
-- Router: one batched gate GEMM, then a top-k kernel over all T rows that writes device-side ids and weights. Hand these to the Step 1 permutation kernel. Copy the ids to the host once per chunk, asynchronously, only for the supply hint (`on_routing_ready_batch`), with no stall on the compute stream.
-- Batch the KV-cache/position writes into one kernel (position computed on the device, no H2D per row).
+The phase split, the batched router and the layer-wide supply dispatch landed. The router's read-back is **one** synchronisation per chunk; the plan's "copy the ids to the host asynchronously, with no stall" is not reachable, because the host must have the ids before it can issue the layer's union — what was removable is the `C − 1` extra drains, and that is done. **Still open: the `M`-keyed dispatcher and the batched KV/position writes.**
 
 #### Implementation record
 
@@ -142,24 +151,20 @@ Measured (`bench_prefill_ab routed 128`, bank arm, chunk `128`, window `1024`, w
 
 **Remaining.** Open in this step: the `M`-keyed dispatcher (grouped above the crossover), and the batched KV/position writes. Separately, **enabling the grouped path by default touches gates, not kernels**: flipping `moe_grouped_batch_enabled()` to default-on makes the chunk path grouped everywhere, so the gates that assert chunk-vs-serial bit-exactness through the real executor — `test_v4_prefill_window` ("WINDOW == SERIAL, BIT-EXACT"), `test_v4_warm_frozen_prefill`, and `test_v4_routed_prefill`'s own D-check — must move their chunk comparison to the greedy-agreement bar, while the per-token path keeps its bit-exact regression check.
 
-### Step 3: WMMA dense GEMM for attention and shared-expert projections
+### Step 3: WMMA dense GEMM for attention and shared-expert projections — **open**
 
-- The same WMMA core as Step 1 (a single group). Use it for Q/KV/O projections (including `v4_grouped_wo`), the compressor/indexer projections, shared-expert W13/W2 and the HC projections, whenever T ≥ 16.
-- Below 16 rows (routed prefill with short prompts, and decode), keep the GEMV path. Set the threshold by the dispatcher on M.
+The same WMMA core as Step 1 (a single group). Use it for Q/KV/O projections (including `v4_grouped_wo`), the compressor/indexer projections, shared-expert W13/W2 and the HC projections. **The row threshold is `T ≥ 64`, not `16`** — Step 1's sweep puts the crossover between `T = 16` (`0.80x`, grouped loses) and `T = 64` (`2.14x`). Below it (short-prompt routed prefill and decode) keep the GEMV path, selected by the dispatcher on M.
 
-### Step 4: Batched causal attention over the chunk
+### Step 4: Batched causal attention over the chunk — **open**
 
-- Replace per-row `run_layer_body_attention_and_norm` with one kernel over a query tile (16 queries × head) using WMMA for QKᵀ and PV, with online softmax plus sink. It reads the composed local and compressed keys once per tile instead of once per query.
+- Replace the per-row attention kernel with one over a query tile (16 queries × head) using WMMA for QKᵀ and PV, with online softmax plus sink. It reads the composed local and compressed keys once per tile instead of once per query. This is the larger of the two GPU numbers (`22.8 s`).
 - Use SGLang dsv4 attention/indexer as the semantic reference.
 
-### Step 4a: Move the indexer top-k on-device (interposed — see the profile)
+### Step 4a: Move the indexer top-k on-device — **done**
 
-`select_indexer_topk` (`v4_layer_body_types.hpp`) selects the CSA layer's `index_topk = 512` compressed rows **on the host**: D2H the candidate scores, `hipStreamSynchronize`, `std::stable_sort` on the CPU, H2D the chosen indices, `hipStreamSynchronize` again. It runs once per token for every CSA layer, so a window pays ~`38k` queue drains — and the drains are why the attention phase (70.7%) has the GPU idle inside it. The profile's `13.8 s` host line for the *router* is the same mechanism at `0.1%` the frequency.
+`select_indexer_topk` (`v4_layer_body_types.hpp`) selects the CSA layer's `index_topk = 512` compressed rows **on the host**: D2H the candidate scores, `hipStreamSynchronize`, `std::stable_sort` on the CPU, H2D the chosen indices, `hipStreamSynchronize` again. It runs once per token for every CSA layer, so a window pays ~`38k` queue drains — and the drains are why the attention phase has the GPU idle inside it. The profile's `13.8 s` host line for the *router* is the same mechanism at `0.1%` the frequency.
 
-- One G2 kernel that reads the candidate scores and writes the `index_topk` indices, so no score leaves the device and no host sort runs. **Same selection, same descending order, same lower-index ties** — it changes no number, which is why the equivalence gates cannot see it.
-- Input and output buffers already exist and are already the right size (`indexer_scores`, `indexer_topk`); the only addition is per-row shared-memory scratch, not VRAM.
-- Keep the degenerate branch exact: `candidates <= index_topk` selects every candidate in ascending index order with no padding.
-- Test: against the same definition the host version implements (order, ties, the degenerate branch), not against a copy of the kernel.
+The fix is one kernel that reads the candidate scores and writes the indices, so no score leaves the device and no host sort runs — **same selection, same descending order, same lower-index ties**, so it changes no number and the equivalence gates cannot see it. Input and output buffers already exist at the right size; the only addition is shared-memory scratch, not VRAM. The degenerate branch (`candidates <= index_topk` → every candidate ascending, `-1`-padded) stays exact.
 
 #### Implementation record
 
@@ -180,19 +185,20 @@ Measured (`aeon_chat --phase-profile`, 666-token prompt, `W=4096 C=256`, swept, 
 
 Gates: `test_v4_real_scale_state` (the real `index_topk = 512` as a strict selection, `0` differing), `test_v4_indexer_oracle`, `test_v4_layer_body_serial_oracle` / `_compressed_oracle`, `test_v4_engine` (`38/0`) green.
 
-### Step 5: Fuse elementwise and norm stages over [T, dim]
+### Step 5: Fuse elementwise and norm stages over [T, dim] — **open**
 
 - Make rmsnorm, rope, HC sinkhorn and the residual/HC mixing multi-row (one launch per stage per chunk, one row per wave). Fuse the rmsnorm scaling into the next GEMM's A-load where it's cheap.
 - Capture the per-layer chunk sequence in a HIP graph for the swept path, where shapes are fixed per chunk size.
 
-### Step 6: Tune for gfx1100
+### Step 6: Tune for gfx1100 — **open**
 
 - Sweep the WMMA tile config for the dominant expert shapes: N×K tile, waves per workgroup (4–8), LDS ≤ 64 KiB for 2 workgroups per CU.
-- Choose the chunk size so the average tokens per expert reaches ≥16 (a full M tile). Pad partial tiles through the permutation rather than giving tiny tiles a separate path.
-- Give the routed-prefill (short-prompt) path the same grouped kernel. Experts with only 1–3 tokens fall back to the GEMV kernel, which is picked per expert inside one launch.
+- Give the routed-prefill (short-prompt) path the same grouped kernel. Experts with only 1–3 tokens fall back to the GEMV kernel, picked per expert inside one launch.
 
-### Step 7: Move the bottleneck back to supply
+### Step 7: Move the bottleneck back to supply — **open**
 
-- Re-measure the swept prefill once Steps 1–3 land. Compute should then be faster than supply. Then tune the lookahead depth and chunk size together so the GPU stays fed.
+- Re-measure the swept prefill once Steps 3–5 land. Compute should then be faster than supply. Then tune the lookahead depth and chunk size together so the GPU stays fed.
 
-**Scope:** dependencies are G2/G3 (new kernels) → G4 (batched layer body and attention) → G1 (chunk sizing and lookahead). Each step can be verified alone with an independent-oracle test before moving on.
+## Dependencies
+
+`G2/G3` (kernels) → `G4` (batched layer body and attention) → `G1` (chunk sizing and lookahead). Each step is verified alone with an independent-oracle test before the next.
