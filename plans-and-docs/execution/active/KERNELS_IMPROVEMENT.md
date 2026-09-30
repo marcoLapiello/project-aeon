@@ -257,6 +257,17 @@ The path is gated behind `attention_tile_enabled()` (**default off**), so the co
 
 **Still open:** enable the tile by default (which moves the chunk-vs-serial *bit-exact* gates to the parity/tolerance bar, as Steps 2–3 did for the grouped pair) and measure the phase profile with it on; the WMMA tile and key-split across warps that raise occupancy; and 4.2b for CSA.
 
+**Measured with the tile on (`2026-09-30`, `n = 1`).** Same invocation as the pinned configuration but `--warm-gib 24` (to keep the pinned footprint off the host's ceiling) and the trimmed `~677`-token prompt; the tile was enabled by editing the switch's default. The tile covers `Sliding` and `HCA` only, so this is a **partial** result:
+
+| | tile off | tile on |
+| :--- | ---: | ---: |
+| TTFT | `37.2 s` | `34.4 s` (`1.08x`) |
+| `E attention kernel`, GPU | `8,988 ms` | `6,560 ms` (**`1.37x`**) |
+| `attention+norm`, GPU | `20,117 ms` | `17,676 ms` |
+| total, GPU | `43,260 ms` | `38,357 ms` |
+
+The kernel is `1.37x` faster where the tile applies; the host line inside `attention+norm` also fell (`1,624 → 1,465 ms`), because one batched launch replaces a per-token grid. The gain is bounded by the layers it reaches: `CSA` (`21` of `43`, and the half with the larger key set) still runs the scalar per-token kernel. The switch was left **off** afterwards, so production is unchanged and the bit-exact gates stay green; the measurement above is the record of what turning it on buys today.
+
 The per-query observations are the `F7` finding of `plans-and-docs/analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md`; that document's *file and line citations predate the module splits and are stale*, so take the concept from it and the location from the tree.
 
 ### Step 4a: Move the indexer top-k on-device — **done**
