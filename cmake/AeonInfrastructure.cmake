@@ -167,6 +167,11 @@ if(AEON_BUILD_TESTS)
     aeon_add_test(test_v4_tiled_attention_oracle
         SOURCES tests/test_v4_tiled_attention_oracle.cpp)
 
+    # The G2 tiled causal attention primitive (one launch per query tile, shared key
+    # union, causal mask, optional per-head bias) against the fp64 reference.
+    aeon_add_test(test_tiled_causal_attention
+        SOURCES tests/test_tiled_causal_attention.cpp)
+
     # Step 2.4.2 — compressor + APE, both ratio classes (4 with overlap, 128
     # without). Asserts that APE is a score-only term, the APE row periodicity,
     # the window length, the two-segment overlap mapping, and the RoPE position.

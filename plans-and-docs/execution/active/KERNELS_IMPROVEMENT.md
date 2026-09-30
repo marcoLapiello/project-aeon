@@ -37,7 +37,7 @@ build/bin/aeon_chat \
 | 4a | Indexer top-k on device | **Done** — removes two stream drains per token per CSA layer |
 | — | `compose_local_rows` gather | **Done** — found by the profile, not in the original plan |
 | 3 | WMMA dense GEMM for the dense projections | **Partly done** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
-| 4 | Batched causal attention over the chunk | **Partly done** — per-query softmax/reduction redundancy fixed; query-tile kernel open |
+| 4 | Batched causal attention over the chunk | **Partly done** — per-query softmax/reduction redundancy fixed; tile formulation and G2 primitive landed; G4 wiring open |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Open** |
 | 6 | Tune for gfx1100 | **Open** |
 | 7 | Re-measure and retune supply | **Open** |
@@ -228,6 +228,18 @@ So the increment splits, and only the first part is the clean WMMA win:
 Both are gated first by an **independent oracle** for the tile kernel — the same rule that pinned the WMMA lane map before the expert GEMM was built on it — and only then compared at the greedy-agreement bar, not bit-exact, for the same reorder reason as Steps 2–3. Use SGLang `srt/layers/attention/dsv4/**` as the semantic reference.
 
 **Formulation gate (done `2026-09-30`).** `tests/test_v4_tiled_attention_oracle.cpp` pins the masked-union reading before any kernel exists, by comparing two independent fp64 implementations: each query over the **contiguous sub-range** of the union that is its own window (via the shipped `attention_scores_sink`, itself certified against the scalar kernel), versus each query over the **whole union with the outside keys masked off** (written from the masking rule). They agree **bit-for-bit** (`0.0` max abs, 16 queries over a `W=8` window in a `23`-row union), which sharpens the property: in position order the surviving terms accumulate in the *same sequence* on both sides, so the mask is an exact selection, not an approximation. The gate also pins the workspace bound — the union is `≤ W + tile − 1` rows (`23 = 8 + 16 − 1`, exactly at the bound) — and refuses to pass vacuously. It is CPU-only and needs no GPU.
+
+**G2 primitive and seam (done `2026-09-30`).** The formulation now exists as a real primitive with the group split intact:
+
+| Artefact | Group | Contains |
+| :--- | :--- | :--- |
+| `platform/rdna3/tiled_causal_attention.hpp` + selector `platform/tiled_causal_attention.hpp` | **G2** | one launch per query tile over a shared key union, causal mask, per-head scale, optional per-head `bias`; the `AEON_ARCH_*`-keyed selector |
+
+The primitive is deliberately **model-agnostic**: it knows positions, a causal window, a scale and an optional `bias`, and nothing else. The DSV4 **sink is passed as that `bias`** — a scalar score that enters the max and the denominator but has no value row, the upstream *"virtual extra K with V=0"* reading — so the G2 file names no model concept and G4 will supply the sink without a coupling. Layout is generic: queries/outputs are `[count, heads, head_dim]` with a **row pitch**, so a caller reads its per-token buffer in place; keys/values carry their own strides and may alias (`V = K`). No G3 file is involved — attention weights are fp16 dense, so there is no quantised format to decode.
+
+Gated on silicon by `tests/test_tiled_causal_attention.cpp` against the same fp64 reference (289 assertions, `0` failures): the sliding window with a sink, full causal (`window <= 0`), and null-bias-equals-inert-sink. Max relative error `2e-4 … 4.2e-4` against a peak near `0.8`, inside the fp16 bar. The kernel is **not wired in yet** — the launch is unchanged — so this step is additive.
+
+**Still open:** the G4 binding (a `*_dispatch.hpp` that supplies the DSV4 scale, sink and row-set) and wiring it into `run_layer_body_chunk`, then the greedy-agreement comparison. The kernel is still one query per block; the WMMA tile and the key-split across warps that raise occupancy are the next increment behind this seam.
 
 The per-query observations are the `F7` finding of `plans-and-docs/analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md`; that document's *file and line citations predate the module splits and are stale*, so take the concept from it and the location from the tree.
 
