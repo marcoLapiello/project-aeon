@@ -32,6 +32,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -314,6 +315,53 @@ int main() {
                 (std::to_string(clamped_count) + " values").c_str(),
                 clamped_count > 0 ? "PASS" : "FAIL");
     ok &= clamped_count > 0;
+
+    // ---------------------------------------------------------------------
+    // Strided A-read. The same activation rows, each padded out to a wider pitch
+    // and read with `activation_stride`, must produce the identical hidden output.
+    // The batch workspace pads every token to its own 16-row tile, so the grouped
+    // gate is called with a tile pitch rather than a compact `[T, K]` batch; this
+    // proves the A-read honours that pitch instead of assuming compactness.
+    // ---------------------------------------------------------------------
+    {
+        const int stride = kW1Columns + 64;   // +128 B keeps each row 16-byte aligned
+        std::vector<half> padded(static_cast<size_t>(token_count) * stride,
+                                 __float2half(0.0f));
+        for (int t = 0; t < token_count; ++t) {
+            std::copy(host_activation.begin() + static_cast<size_t>(t) * kW1Columns,
+                      host_activation.begin() + static_cast<size_t>(t + 1) * kW1Columns,
+                      padded.begin() + static_cast<size_t>(t) * stride);
+        }
+        half* d_padded = nullptr;
+        half* d_hidden_strided = nullptr;
+        CHECK_HIP(hipMalloc(&d_padded, padded.size() * sizeof(half)));
+        CHECK_HIP(hipMalloc(&d_hidden_strided, hidden_elements * sizeof(half)));
+        CHECK_HIP(hipMemcpy(d_padded, padded.data(), padded.size() * sizeof(half),
+                            hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemset(d_hidden_strided, 0, hidden_elements * sizeof(half)));
+
+        kernel::dispatch_aeon_moe_grouped_w13_swiglu_wmma<4, 4, 8, kernel::kMoeGroupedMTiles>(
+            d_padded, d_offsets, d_indices, w13_weights, d_hidden_strided, expert_count,
+            hidden_tokens, kW1Rows, kW1Columns, static_cast<float>(kLimit), stride);
+        CHECK_HIP(hipGetLastError());
+        CHECK_HIP(hipDeviceSynchronize());
+
+        std::vector<half> host_strided(hidden_elements);
+        CHECK_HIP(hipMemcpy(host_strided.data(), d_hidden_strided,
+                            hidden_elements * sizeof(half), hipMemcpyDeviceToHost));
+        int differing = 0;
+        for (size_t i = 0; i < hidden_elements; ++i) {
+            if (__half2float(host_strided[i]) != __half2float(host_hidden[i])) ++differing;
+        }
+        std::printf("  %-52s %-22s %s\n", "strided A-read equals the compact A-read",
+                    (differing == 0 ? "bit-identical" : std::to_string(differing) + " differ")
+                        .c_str(),
+                    differing == 0 ? "PASS" : "FAIL");
+        ok &= differing == 0;
+
+        CHECK_HIP(hipFree(d_padded));
+        CHECK_HIP(hipFree(d_hidden_strided));
+    }
 
     CHECK_HIP(hipFree(d_activation));
     CHECK_HIP(hipFree(d_hidden));

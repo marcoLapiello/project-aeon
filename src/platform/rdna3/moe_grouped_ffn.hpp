@@ -84,6 +84,7 @@ void moe_grouped_gate_up_kernel(
     int expert_hidden_tokens,
     int N,
     int K,
+    int activation_stride,
     Epilogue epilogue
 ) {
     constexpr int kNTile = WAVES * 16;
@@ -122,7 +123,11 @@ void moe_grouped_gate_up_kernel(
             const int row_in_group = m_window + tile * kM + lane_axis;
             const int activation_row =
                 row_in_group < count ? token_indices[first + row_in_group] : pad_row;
-            row_ptr[tile] = activation + static_cast<size_t>(activation_row) * K;
+            // `activation_stride` is the row pitch, `K` for a compact `[T, H]` batch
+            // and larger when the caller's workspace pads each token to its own tile.
+            // A stride instead of a gather keeps the copy out of the hot path.
+            row_ptr[tile] = activation +
+                            static_cast<size_t>(activation_row) * activation_stride;
         }
 
         f32_vec8 gate_accumulator[MTILES];
@@ -289,6 +294,7 @@ inline void dispatch_moe_grouped_gate_up(
     int expert_hidden_tokens,
     int N,
     int K,
+    int activation_stride,
     Epilogue epilogue,
     hipStream_t stream = 0
 ) {
@@ -297,7 +303,7 @@ inline void dispatch_moe_grouped_gate_up(
         throw std::invalid_argument("dispatch_moe_grouped_gate_up: expert count out of range");
     }
     if (N <= 0 || N % (WAVES * 16) != 0 || K <= 0 || K % kGroupedKBlock != 0 ||
-        (K / 32) % Feed::kLpr != 0) {
+        (K / 32) % Feed::kLpr != 0 || activation_stride < K) {
         throw std::invalid_argument("dispatch_moe_grouped_gate_up: incompatible N/K shape");
     }
 
@@ -305,7 +311,7 @@ inline void dispatch_moe_grouped_gate_up(
     const dim3 grid(N / (WAVES * 16), expert_count);
     moe_grouped_gate_up_kernel<WAVES, MTILES, Feed, Epilogue><<<grid, block, 0, stream>>>(
         activation, expert_offsets, token_indices, weights, expert_hidden, expert_count,
-        expert_hidden_tokens, N, K, epilogue);
+        expert_hidden_tokens, N, K, activation_stride, epilogue);
 }
 
 template <int WAVES, int MTILES, class Feed, class Epilogue>

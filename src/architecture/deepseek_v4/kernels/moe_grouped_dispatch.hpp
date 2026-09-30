@@ -40,6 +40,8 @@ namespace aeon::kernel {
 inline constexpr int kMoeGroupedMTiles = 4;
 
 // Gate/up plus the clamped SwiGLU, over a token->expert permutation.
+// `activation_stride` is the row pitch of `activation`; `0` means a compact `[T, K]`
+// batch (pitch `K`). A caller whose tokens live in padded tiles passes the tile pitch.
 template <int WAVES, int RPW, int LPR, int MTILES>
 inline void dispatch_aeon_moe_grouped_w13_swiglu_wmma(
     const half* activation,
@@ -52,13 +54,15 @@ inline void dispatch_aeon_moe_grouped_w13_swiglu_wmma(
     int N,
     int K,
     float swiglu_limit,
+    int activation_stride = 0,
     hipStream_t stream = 0
 ) {
     using Feed = SwizzledW4A16Feed<RPW, LPR>;
     aeon::dispatch_moe_grouped_gate_up<WAVES, MTILES, Feed,
                                        Dsv4ClampedSwiGLUEpilogue>(
         activation, expert_offsets, token_indices, weights, expert_hidden, expert_count,
-        expert_hidden_tokens, N, K, Dsv4ClampedSwiGLUEpilogue{swiglu_limit}, stream);
+        expert_hidden_tokens, N, K, activation_stride == 0 ? K : activation_stride,
+        Dsv4ClampedSwiGLUEpilogue{swiglu_limit}, stream);
 }
 
 // The down projection, scaled by the routing weight and written per draw.
