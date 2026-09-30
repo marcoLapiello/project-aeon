@@ -89,7 +89,7 @@ causal_attention_fp16_wave32_kernel(
     const __half* __restrict__ keys1, int key_stride1,
     const __half* __restrict__ values1, int value_stride1,
     const int64_t* __restrict__ positions1, int rows1, int window1,
-    const int64_t* __restrict__ query_positions,
+    int64_t query_position_base, int64_t query_position_stride,
     __half* __restrict__ out, int out_stride,
     int num_heads, int head_dim,
     const float* __restrict__ bias, float scale) {
@@ -100,7 +100,8 @@ causal_attention_fp16_wave32_kernel(
     const int lane = threadIdx.x;
     const int slice = head_dim / kCausalAttentionLanes;
 
-    const int64_t query_position = query_positions[query];
+    const int64_t query_position =
+        query_position_base + static_cast<int64_t>(query) * query_position_stride;
     // A window of 0 (or less) is no window: the causal mask alone bounds the block.
     const int64_t window_first0 = window0 > 0
         ? (query_position >= window0 - 1 ? query_position - (window0 - 1) : 0)
@@ -225,7 +226,7 @@ inline void dispatch_causal_attention_fp16(
     const __half* q, int q_stride,
     const CausalAttentionBlock& block0,
     const CausalAttentionBlock& block1,
-    const int64_t* query_positions,
+    int64_t query_position_base, int64_t query_position_stride,
     __half* out, int out_stride,
     int count, int num_heads, int head_dim,
     const float* bias, float scale, hipStream_t stream) {
@@ -236,7 +237,7 @@ inline void dispatch_causal_attention_fp16(
         head_dim > kCausalAttentionMaxHeadDim) {
         throw std::invalid_argument("dispatch_causal_attention_fp16: unsupported head_dim");
     }
-    if (q == nullptr || out == nullptr || query_positions == nullptr) {
+    if (q == nullptr || out == nullptr) {
         throw std::invalid_argument("dispatch_causal_attention_fp16: null buffer");
     }
     // Block 0 carries the required buffers even when it is empty; either block that
@@ -269,7 +270,7 @@ inline void dispatch_causal_attention_fp16(
         block0.positions, block0.rows, block0.window,
         keys1, block1.key_stride, values1, block1.value_stride,
         positions1, block1.rows, block1.window,
-        query_positions, out, out_stride,
+        query_position_base, query_position_stride, out, out_stride,
         num_heads, head_dim, bias, scale);
 }
 

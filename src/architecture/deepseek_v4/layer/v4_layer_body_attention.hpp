@@ -465,40 +465,32 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
 // the next begins: the router of every token must have run before the layer's
 // union can be issued as one set, and the MoE of none of them may have run before
 // it.
-inline void run_layer_body_attention_and_norm(
+//
+// Section E (the attention kernel) is its own function for one reason: a chunk
+// replaces it with a single batched tile launch over all its rows, because the
+// per-token launch is one block per head — a grid too small to fill the GPU. Decode
+// calls it and then the tail, exactly as before; the arithmetic and the launch are
+// unchanged.
+inline void run_layer_body_attention_kernel(
     V4Layer& layer,
     V4LayerBodyRow& scratch,
-    const V4LayerBodyTables& tables,
-    uint32_t token_id,
     uint32_t pos,
     hipStream_t stream,
     V4LayerBodyObserver& observer,
     V4LayerBodyPre pre) {
-    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
-    constexpr int HC = 4;
-    constexpr int HC_DIM = HC * H;          // 16384
-    constexpr int HC_MULT3 = HC * (2 + HC);// 24
-    constexpr int M_PAD = 16;
     constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
     constexpr int NUM_HEADS = kernel::DSV4_NUM_HEADS;
     constexpr int TOTAL_Q = NUM_HEADS * HEAD_DIM;
-    constexpr int O_LORA = kernel::DSV4_O_LORA_RANK;
-    constexpr int O_GROUPS = kernel::DSV4_O_GROUPS;
-    constexpr int TOT_LORA = kernel::DSV4_TOTAL_O_LORA_DIM;
 
     V4AttentionTraceRecord* attention_trace = pre.trace;
-    const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
     const int64_t absolute_position = static_cast<int64_t>(pos);
 
-    // -----------------------------------------------------------------
-    // E. Class-specific attention over the cached states
-    // -----------------------------------------------------------------
-    // The local rows come either from the ring itself (decode) or from the
-    // caller's composed row-set (a chunk, whose own keys are not in the ring yet).
-    // In both cases the rows are handed to the kernel with the row count as the
-    // "capacity" and the positions alongside, so the kernel's own window filter —
-    // `local_start <= key_position <= current_position` — is satisfied by every
-    // row and the arithmetic is the same code with the same summation order.
+    // The local rows come either from the ring itself (decode) or from the caller's
+    // composed row-set (a chunk, whose own keys are not in the ring yet). In both cases
+    // the rows are handed to the kernel with the row count as the "capacity" and the
+    // positions alongside, so the kernel's own window filter —
+    // `local_start <= key_position <= current_position` — is satisfied by every row and
+    // the arithmetic is the same code with the same summation order.
     const half* local_keys = scratch.d_composed_keys != nullptr
         ? scratch.d_composed_keys : layer.d_local_key_cache;
     const int64_t* local_positions = scratch.d_composed_positions != nullptr
@@ -537,6 +529,54 @@ inline void run_layer_body_attention_and_norm(
     if (attention_trace != nullptr) {
         trace_copy(observer, attention_trace->attention_output, scratch.d_attn_out, TOTAL_Q);
     }
+    attention_region = PhaseProfiler::Region{};
+}
+
+// Defined below; declared here so `run_layer_body_attention_and_norm` can compose the
+// two halves while a chunk calls the tail directly.
+inline void run_layer_body_attention_tail(
+    V4Layer& layer, V4LayerBodyRow& scratch, const V4LayerBodyTables& tables,
+    uint32_t pos, hipStream_t stream, V4LayerBodyObserver& observer, V4LayerBodyPre pre);
+
+inline void run_layer_body_attention_and_norm(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    const V4LayerBodyTables& tables,
+    uint32_t token_id,
+    uint32_t pos,
+    hipStream_t stream,
+    V4LayerBodyObserver& observer,
+    V4LayerBodyPre pre) {
+    run_layer_body_attention_kernel(layer, scratch, pos, stream, observer, pre);
+    run_layer_body_attention_tail(layer, scratch, tables, pos, stream, observer, pre);
+}
+
+// The per-token tail after a layer's attention kernel: inverse RoPE, the grouped output
+// projection, the HC expansion and the FFN RMSNorm. Position-dependent and cheap next to
+// the kernel, so a chunk runs one batched attention launch over its rows and then this
+// per row.
+inline void run_layer_body_attention_tail(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    const V4LayerBodyTables& tables,
+    uint32_t pos,
+    hipStream_t stream,
+    V4LayerBodyObserver& observer,
+    V4LayerBodyPre pre) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int HC = 4;
+    constexpr int HC_DIM = HC * H;          // 16384
+    constexpr int HC_MULT3 = HC * (2 + HC);// 24
+    constexpr int M_PAD = 16;
+    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
+    constexpr int NUM_HEADS = kernel::DSV4_NUM_HEADS;
+    constexpr int TOTAL_Q = NUM_HEADS * HEAD_DIM;
+    constexpr int O_LORA = kernel::DSV4_O_LORA_RANK;
+    constexpr int O_GROUPS = kernel::DSV4_O_GROUPS;
+    constexpr int TOT_LORA = kernel::DSV4_TOTAL_O_LORA_DIM;
+
+    V4AttentionTraceRecord* attention_trace = pre.trace;
+    const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
 
     // Inverse RoPE on the attention output tail, before the grouped projection.
     hipLaunchKernelGGL(
@@ -563,7 +603,6 @@ inline void run_layer_body_attention_and_norm(
     if (attention_trace != nullptr) {
         trace_copy(observer, attention_trace->grouped_output, scratch.d_attn_proj, H);
     }
-    attention_region = PhaseProfiler::Region{};
 
     // -----------------------------------------------------------------
     // F. HC attention post expansion: res_mid = comb_a · res_in + post_a · attn_proj

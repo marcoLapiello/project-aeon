@@ -1,0 +1,97 @@
+#pragma once
+
+// -----------------------------------------------------------------------------
+// G4 binding: the DSV4 tiled causal attention over a chunk's rows.
+//
+// Binds the G2 tile primitive (`platform/tiled_causal_attention.hpp`) to the model:
+// it supplies the full-head scale, the per-head attention sink, and the layer class's
+// key sets, and it names no WMMA, lane or tile detail. The two key blocks are exactly
+// what the primitive was given for:
+//
+//   * **Sliding** — one block, the local union (the sliding window).
+//   * **HCA** — two: the local union, plus **every committed compressed row** with
+//     window `0` (causal only), because HCA attends the whole compressed set and its
+//     per-position causality is enforced by the mask, not by a top-k.
+//   * **CSA** — deliberately unsupported. Its indexer selects a *different* top-k per
+//     query, so there is no shared compressed block to tile; it keeps the scalar path
+//     until 4.2b.
+//
+// The local union is a whole tile's row-set, composed once by the caller. Each query
+// masks into its own window, which `tests/test_v4_tiled_attention_oracle.cpp` pins as
+// an exact selection before any kernel runs.
+// -----------------------------------------------------------------------------
+
+#include "platform/tiled_causal_attention.hpp"
+
+#include "architecture/deepseek_v4/kernels/v4_attention.hpp"
+#include "architecture/deepseek_v4/layer/v4_layer.hpp"
+
+namespace aeon::core {
+
+// Whether this layer's attention can be served by one tiled launch. True for the
+// classes whose compressed keys are shared across a tile.
+inline bool attention_tile_supported(const V4Layer& layer) {
+    const V4AttentionKind kind = layer.spec().attention_kind;
+    return kind == V4AttentionKind::Sliding || kind == V4AttentionKind::HCA;
+}
+
+// Switch for the chunk path's attention. It defaults to **off**, so the committed
+// chunk path stays bit-identical to decode until the tiled path is separately enabled;
+// a gate flips it to compare the two in one process. Like the grouped-MoE switch it is
+// not a tuning knob — the tile is a reorder of the same arithmetic, and enabling it
+// moves the gates that assert chunk-vs-serial bit-exactness to a tolerance bar (see
+// `KERNELS_IMPROVEMENT.md` 4.2). Decode never consults it.
+inline bool& attention_tile_enabled() {
+    static bool enabled = false;
+    return enabled;
+}
+
+// One tiled attention launch over `count` consecutive rows starting at
+// `query_position_base` (row `r` is at position `query_position_base + r`).
+//
+// `q`/`out` are the chunk workspace's contiguous per-row buffers, `q_stride` the
+// distance between rows (`total_q`). `local_keys`/`local_positions`/`local_rows` are
+// the composed **union** row-set for the tile; `committed` is the number of compressed
+// entries materialized by the time the chunk's attention runs (all of them, since the
+// whole chunk's pre-attention half has completed). Sliding ignores `committed`.
+inline void run_attention_tile(
+    const V4Layer& layer,
+    const half* q, int q_stride,
+    half* out, int out_stride,
+    int64_t query_position_base,
+    int count,
+    const half* local_keys, const int64_t* local_positions, int local_rows,
+    uint32_t committed,
+    hipStream_t stream) {
+    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
+
+    CausalAttentionBlock block0;
+    block0.keys = local_keys;
+    block0.values = local_keys;              // MLA: V = K
+    block0.positions = local_positions;
+    block0.rows = local_rows;
+    block0.key_stride = HEAD_DIM;
+    block0.value_stride = HEAD_DIM;
+    // The local window: a query keeps only the keys within `capacity` of its position,
+    // which the mask enforces. It is the ring capacity, which equals the sliding window
+    // once the sequence is long enough.
+    block0.window = static_cast<int>(layer.local_cache_capacity());
+
+    CausalAttentionBlock block1;
+    if (layer.spec().attention_kind == V4AttentionKind::HCA && committed > 0) {
+        block1.keys = layer.d_compressed_key_cache;
+        block1.values = layer.d_compressed_value_cache;
+        block1.positions = layer.d_compressed_positions;
+        block1.rows = static_cast<int>(committed);
+        block1.key_stride = HEAD_DIM;
+        block1.value_stride = HEAD_DIM;
+        block1.window = 0;                   // causal only; older than the window, by design
+    }
+
+    aeon::dispatch_causal_attention_fp16(
+        q, q_stride, block0, block1, query_position_base, 1, out, out_stride,
+        count, static_cast<int>(kernel::DSV4_NUM_HEADS), HEAD_DIM,
+        layer.d_attn_sink, kernel::DSV4_ATTN_SCALE, stream);
+}
+
+} // namespace aeon::core

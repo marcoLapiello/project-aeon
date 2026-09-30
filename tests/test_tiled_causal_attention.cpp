@@ -126,18 +126,16 @@ int main() {
 
     // --- device buffers ------------------------------------------------------
     __half *d_q = nullptr, *d_k = nullptr, *d_out = nullptr;
-    int64_t *d_kpos = nullptr, *d_qpos = nullptr;
+    int64_t* d_kpos = nullptr;
     float* d_sink = nullptr;
     CHECK_HIP(hipMalloc(&d_q, h_q.size() * sizeof(__half)));
     CHECK_HIP(hipMalloc(&d_k, h_keys.size() * sizeof(__half)));
     CHECK_HIP(hipMalloc(&d_out, h_q.size() * sizeof(__half)));
     CHECK_HIP(hipMalloc(&d_kpos, kKeys * sizeof(int64_t)));
-    CHECK_HIP(hipMalloc(&d_qpos, kQueries * sizeof(int64_t)));
     CHECK_HIP(hipMalloc(&d_sink, kHeads * sizeof(float)));
     CHECK_HIP(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(__half), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(d_k, h_keys.data(), h_keys.size() * sizeof(__half), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(d_kpos, h_key_positions.data(), kKeys * sizeof(int64_t), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(d_qpos, h_query_positions.data(), kQueries * sizeof(int64_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(d_sink, h_sink.data(), kHeads * sizeof(float), hipMemcpyHostToDevice));
 
     const int q_stride = static_cast<int>(kHeads * kHeadDim);
@@ -147,7 +145,7 @@ int main() {
     // Runs the primitive for a tile of queries and returns the widened output.
     // `host0`/`host1` describe the two blocks; block 1 may be empty.
     auto run = [&](const HostBlock& host0, const HostBlock& host1,
-                   const int64_t* d_query_positions, int count,
+                   int64_t query_position_base, int count,
                    const float* bias) {
         CausalAttentionBlock block0;
         block0.keys = d_k + host0.first * kHeadDim;
@@ -171,7 +169,7 @@ int main() {
 
         CHECK_HIP(hipMemset(d_out, 0, h_q.size() * sizeof(__half)));
         aeon::dispatch_causal_attention_fp16(
-            d_q, q_stride, block0, block1, d_query_positions, d_out, out_stride,
+            d_q, q_stride, block0, block1, query_position_base, 1, d_out, out_stride,
             count, static_cast<int>(kHeads), static_cast<int>(kHeadDim),
             bias, static_cast<float>(kScale), 0);
         CHECK_HIP(hipGetLastError());
@@ -237,7 +235,7 @@ int main() {
     std::printf("--- A. sliding window W=%lld with per-head sink ---\n", (long long)kWindow);
     {
         const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
-        ok &= compare_all("A", run(block0, {}, d_qpos, static_cast<int>(kQueries), d_sink),
+        ok &= compare_all("A", run(block0, {}, static_cast<int64_t>(kKeys - kQueries), static_cast<int>(kQueries), d_sink),
                           block0, {}, h_query_positions, sink_d, q_d);
     }
 
@@ -245,7 +243,7 @@ int main() {
     std::printf("--- B. full causal (window 0) with sink ---\n");
     {
         const HostBlock block0{0, static_cast<int>(kKeys), 0};
-        ok &= compare_all("B", run(block0, {}, d_qpos, static_cast<int>(kQueries), d_sink),
+        ok &= compare_all("B", run(block0, {}, static_cast<int64_t>(kKeys - kQueries), static_cast<int>(kQueries), d_sink),
                           block0, {}, h_query_positions, sink_d, q_d);
     }
 
@@ -254,7 +252,7 @@ int main() {
     {
         const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
         std::vector<double> inert(kHeads, -1000.0);
-        ok &= compare_all("C", run(block0, {}, d_qpos, static_cast<int>(kQueries), nullptr),
+        ok &= compare_all("C", run(block0, {}, static_cast<int64_t>(kKeys - kQueries), static_cast<int>(kQueries), nullptr),
                           block0, {}, h_query_positions, inert, q_d);
     }
 
@@ -270,10 +268,6 @@ int main() {
         for (int64_t p = 6; p < 12; ++p) query_positions.push_back(p);
 
         const int count = static_cast<int>(query_positions.size());
-        int64_t* d_qpos_d = nullptr;
-        CHECK_HIP(hipMalloc(&d_qpos_d, query_positions.size() * sizeof(int64_t)));
-        CHECK_HIP(hipMemcpy(d_qpos_d, query_positions.data(),
-                            query_positions.size() * sizeof(int64_t), hipMemcpyHostToDevice));
         std::vector<__half> h_qd(static_cast<size_t>(count) * kHeads * kHeadDim);
         for (size_t i = 0; i < h_qd.size(); ++i) {
             h_qd[i] = __float2half(static_cast<float>(gen.symmetric(1.0)));
@@ -281,9 +275,8 @@ int main() {
         // d_q is large enough for `count` rows and the kernel indexes by `query`
         // against `query_positions`, so overwriting its prefix is a valid tile.
         CHECK_HIP(hipMemcpy(d_q, h_qd.data(), h_qd.size() * sizeof(__half), hipMemcpyHostToDevice));
-        const std::vector<double> got = run(block0, block1, d_qpos_d, count, d_sink);
+        const std::vector<double> got = run(block0, block1, 6, count, d_sink);
         CHECK_HIP(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(__half), hipMemcpyHostToDevice));
-        CHECK_HIP(hipFree(d_qpos_d));
 
         ok &= compare_all("D", got, block0, block1, query_positions, sink_d, widen(h_qd));
     }

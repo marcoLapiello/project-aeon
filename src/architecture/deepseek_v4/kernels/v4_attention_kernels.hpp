@@ -430,6 +430,43 @@ __global__ void v4_compose_local_rows_kernel(
     }
 }
 
+// Gather a position-contiguous row range for a whole query tile: output row `r` holds
+// position `first + r`, read from the ring (slot `position % capacity`) when it predates
+// the chunk and from the chunk buffer otherwise.
+//
+// This is the tile form of `v4_compose_local_rows_kernel`. That kernel composes **one
+// query's** window and deliberately orders rows by ring slot, so the chunk and the
+// decode path add the same `exp` terms in the same sequence and stay bit-identical. A
+// tile instead masks by position — every query reads the same union and keeps only its
+// own window — so it can use position order directly, and each row is labelled with its
+// position for the mask.
+__global__ void v4_compose_union_rows_kernel(
+    const __half* __restrict__ ring_keys,   // [capacity, head_dim]
+    const __half* __restrict__ chunk_keys,  // [chunk_count, head_dim]
+    __half* __restrict__ out_keys,          // [rows, head_dim]
+    int64_t* __restrict__ out_positions,    // [rows]
+    int64_t first,
+    int64_t start_position,
+    int capacity,
+    int head_dim
+) {
+    const int row = blockIdx.x;
+    const int64_t position = first + row;
+    const int64_t slot = position % capacity;
+    const __half* source = position < start_position
+        ? ring_keys + static_cast<size_t>(slot) * static_cast<size_t>(head_dim)
+        : chunk_keys + static_cast<size_t>(position - start_position) *
+                           static_cast<size_t>(head_dim);
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        out_keys[static_cast<size_t>(row) * static_cast<size_t>(head_dim) +
+                 static_cast<size_t>(d)] = source[d];
+    }
+    if (threadIdx.x == 0) {
+        out_positions[row] = position;
+    }
+}
+
 // The indexer's candidate selection, on the device: the top `topk` candidates by
 // score, in descending order, ties broken to the **lower index** — the same rule the
 // host used to implement in `select_indexer_topk`, which this replaces.

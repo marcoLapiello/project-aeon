@@ -40,6 +40,7 @@
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
+#include "architecture/deepseek_v4/layer/v4_attention_tile.hpp"
 #include "infrastructure/profiling/phase_profiler.hpp"
 
 #include <hip/hip_runtime.h>
@@ -480,6 +481,39 @@ inline uint32_t compose_local_rows(
     return rows;
 }
 
+// The **union** row-set for a tile of `tile_rows` queries starting at chunk row
+// `first_chunk_row`: every key position the tile needs, `[earliest window start, last
+// query]`, in position order. Each query then masks into its own window in the kernel.
+//
+// Unlike `compose_local_rows` — which orders one query's rows by ring slot so a chunk
+// stays bit-identical to decode — this labels each row with its position and lets the
+// mask do the work, which is what a shared tile needs.
+inline uint32_t compose_tile_rows(
+    const V4Layer& layer,
+    const V4LayerBodyBatchScratch& workspace,
+    uint32_t start_position,
+    uint32_t first_chunk_row,
+    uint32_t tile_rows,
+    hipStream_t stream) {
+    constexpr uint32_t HEAD_DIM = kernel::DSV4_HEAD_DIM;
+    const int capacity = static_cast<int>(layer.local_cache_capacity());
+    const int64_t first_query = static_cast<int64_t>(start_position) + first_chunk_row;
+    const int64_t last_query = first_query + tile_rows - 1;
+    const int64_t first = std::max<int64_t>(0, first_query - capacity + 1);
+    const uint32_t rows = static_cast<uint32_t>(last_query - first + 1);
+    if (rows > workspace.max_composed_rows()) {
+        throw std::invalid_argument("compose_tile_rows: row-set exceeds the workspace");
+    }
+
+    constexpr int kThreads = 128;
+    hipLaunchKernelGGL(
+        kernel::v4_compose_union_rows_kernel, dim3(rows), dim3(kThreads), 0, stream,
+        layer.d_local_key_cache, workspace.chunk_key(0), workspace.composed_keys(),
+        workspace.composed_positions(), first, static_cast<int64_t>(start_position),
+        capacity, static_cast<int>(HEAD_DIM));
+    return rows;
+}
+
 // Phase 1 of a chunk, for one token, exposed so a gate can drive the phases
 // separately and assert the property the ordering exists for: that after every
 // token's pre-attention half the ring has not moved, and no query has run.
@@ -684,14 +718,43 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     {
         auto phase = PhaseProfiler::instance().region("attention+norm (per token)", stream);
         for (uint32_t row = 0; row < count; ++row) {
-            const uint32_t query_position = start_position + row;
             views[row] = workspace.row(row);
-            views[row].composed_rows = static_cast<int32_t>(compose_local_rows(
-                layer, workspace, start_position, row, query_position, stream));
-            views[row].d_composed_keys = workspace.composed_keys();
-            views[row].d_composed_positions = workspace.composed_positions();
-            run_layer_body_attention_and_norm(layer, views[row], tables, token_ids[row],
-                                              query_position, stream, observer, pre[row]);
+        }
+
+        if (attention_tile_enabled() && attention_tile_supported(layer)) {
+            // One batched attention launch per sub-tile, then the per-token tail. The
+            // sub-tile keeps the composed union tight: every query scans the whole
+            // union masked to its own window, so a larger tile re-reads more masked
+            // keys. Sliding and HCA share their compressed keys; CSA does not (its
+            // indexer top-k is per query) and keeps the per-token path below.
+            constexpr uint32_t kTile = 16;
+            constexpr int TOTAL_Q = static_cast<int>(kernel::DSV4_NUM_HEADS) *
+                                    static_cast<int>(kernel::DSV4_HEAD_DIM);
+            const uint32_t committed = pre[count - 1].committed;
+            for (uint32_t first = 0; first < count; first += kTile) {
+                const uint32_t tile = std::min(kTile, count - first);
+                const uint32_t rows =
+                    compose_tile_rows(layer, workspace, start_position, first, tile, stream);
+                run_attention_tile(
+                    layer, views[first].d_q, TOTAL_Q, views[first].d_attn_out, TOTAL_Q,
+                    static_cast<int64_t>(start_position + first), static_cast<int>(tile),
+                    workspace.composed_keys(), workspace.composed_positions(),
+                    static_cast<int>(rows), committed, stream);
+            }
+            for (uint32_t row = 0; row < count; ++row) {
+                run_layer_body_attention_tail(layer, views[row], tables, start_position + row,
+                                              stream, observer, pre[row]);
+            }
+        } else {
+            for (uint32_t row = 0; row < count; ++row) {
+                const uint32_t query_position = start_position + row;
+                views[row].composed_rows = static_cast<int32_t>(compose_local_rows(
+                    layer, workspace, start_position, row, query_position, stream));
+                views[row].d_composed_keys = workspace.composed_keys();
+                views[row].d_composed_positions = workspace.composed_positions();
+                run_layer_body_attention_and_norm(layer, views[row], tables, token_ids[row],
+                                                  query_position, stream, observer, pre[row]);
+            }
         }
     }
 
