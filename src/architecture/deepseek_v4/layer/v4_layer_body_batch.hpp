@@ -618,18 +618,37 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     experts.on_routing_ready_batch(static_cast<uint32_t>(layer.layer_id), start_position,
                                    batch_ids, batch_weights);
 
-    // Phase 2c — the shared expert, the routed accumulate and the FFN post, for
-    // every token.
+    // Phase 2c — the shared expert for every token, then **one** batched routed
+    // accumulate over them all, then every token's FFN post.
     //
-    // The grouped batch accumulate (`accumulate_routed_batch`) is implemented and
-    // measured (see the plan) but **not** enabled by default: it is a correct fp16-ulp
-    // reorder of the per-token path, yet that reorder amplifies through 43 layers to
-    // ~1/3 of the top-2 logit margin, which is a quality risk rather than a settled
-    // win. Until a generation-level check clears it, the per-token path keeps a chunk
-    // bit-identical to serial.
+    // The chunk body always calls the batched accumulate: a synthetic executor inherits
+    // the base-class default, which reproduces the per-token sequence exactly (so a
+    // chunk stays bit-identical to serial), while the tiered executor may run the
+    // grouped path behind its own switch. That keeps one code path in the body.
     for (uint32_t row = 0; row < count; ++row) {
-        run_layer_body_moe_and_post(layer, views[row], start_position + row, stream,
-                                    experts, observer, pre[row]);
+        run_layer_body_moe_shared_expert(layer, views[row], stream, observer, pre[row]);
+    }
+    {
+        constexpr int kMPad = static_cast<int>(V4LayerBodyBatchScratch::kMPad);
+        constexpr int kH = static_cast<int>(kernel::DSV4_HIDDEN_SIZE);
+        // The model's top-k; the workspace's `topk_weights`/`topk_indices` rows are
+        // `[kRoutedSlots]`, so that is their per-token stride.
+        constexpr int kRoutedSlots = 6;
+        experts.accumulate_routed_batch(
+            static_cast<uint32_t>(layer.layer_id), start_position, count,
+            views[0].d_ffn_norm_act, kMPad * kH,
+            views[0].d_topk_indices, kRoutedSlots,
+            views[0].d_topk_weights, kRoutedSlots,
+            views[0].d_moe_accum, kMPad * kH);
+    }
+    for (uint32_t row = 0; row < count; ++row) {
+        if (pre[row].trace != nullptr) {
+            trace_copy(observer, pre[row].trace->moe_output, views[row].d_moe_accum,
+                       kernel::DSV4_HIDDEN_SIZE);
+        }
+        experts.on_routed_consumed(static_cast<uint32_t>(layer.layer_id),
+                                   start_position + row);
+        run_layer_body_moe_post(layer, views[row], stream, observer, pre[row]);
     }
 
     // Commit. Only now may the ring move: every query that could have needed a

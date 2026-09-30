@@ -76,6 +76,16 @@
 
 namespace aeon::core {
 
+// Experimental switch: when set, the chunk path runs the grouped batched routed
+// accumulate instead of the per-token one. Process-wide because a gate may drive the
+// chunk body through a synthetic executor, and it is off by default so a chunk stays
+// bit-identical to serial until the grouped path's numerical effect is validated end to
+// end (see the kernel plan). Production flips it once that validation holds.
+inline bool& moe_grouped_batch_enabled() {
+    static bool enabled = false;
+    return enabled;
+}
+
 // Device scratch owned by the routed-expert path. Separate from `V4ActivationScratch`
 // because these buffers belong to whichever supply tier is being consumed, not to one
 // token's activations; keeping them apart lets the executor be handed to a gate with
@@ -366,6 +376,17 @@ public:
                                  const float* batch_weights, int weights_stride,
                                  half* batch_output, int output_stride) override {
         if (token_count == 0) {
+            return;
+        }
+        // Off by default: reproduce the per-token sequence exactly, so a chunk stays
+        // bit-identical to serial until the grouped path is validated.
+        if (!moe_grouped_batch_enabled()) {
+            for (uint32_t token = 0; token < token_count; ++token) {
+                accumulate_routed(layer_id, first_position + token,
+                                  batch_input + static_cast<size_t>(token) * input_stride,
+                                  batch_weights + static_cast<size_t>(token) * weights_stride,
+                                  batch_output + static_cast<size_t>(token) * output_stride);
+            }
             return;
         }
         if (current_layer_ != layer_id || first_position != state_.first_position ||

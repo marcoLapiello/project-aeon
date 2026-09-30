@@ -161,6 +161,36 @@ int main(int argc, char** argv) {
     const std::vector<uint8_t> serial_logits =
         read_bytes(graph.logits(), static_cast<size_t>(vocab) * sizeof(uint16_t));
 
+    // Greedy-decode `n` tokens continuing from a prefill's last logits, reading the
+    // argmax back and feeding it in. This is the product signal: the token sequence a
+    // user sees, which is what "quality" means for deterministic decoding.
+    auto greedy_tokens = [&](const std::vector<uint8_t>& base, uint32_t n) {
+        const __half* lg = reinterpret_cast<const __half*>(base.data());
+        int next = 0;
+        float best = -1e30f;
+        for (size_t i = 0; i < vocab; ++i) {
+            const float v = __half2float(lg[i]);
+            if (v > best) { best = v; next = static_cast<int>(i); }
+        }
+        std::vector<int> tokens;
+        for (uint32_t i = 0; i < n; ++i) {
+            tokens.push_back(next);
+            (void)graph.forward_token(static_cast<uint32_t>(next), kWindow + i,
+                                      host.streams().compute);
+            const std::vector<uint8_t> step =
+                read_bytes(graph.logits(), static_cast<size_t>(vocab) * sizeof(uint16_t));
+            const __half* sl = reinterpret_cast<const __half*>(step.data());
+            float b = -1e30f;
+            int t = 0;
+            for (size_t j = 0; j < vocab; ++j) {
+                const float v = __half2float(sl[j]);
+                if (v > b) { b = v; t = static_cast<int>(j); }
+            }
+            next = t;
+        }
+        return tokens;
+    };
+
     // ---- enter the routed prefill -------------------------------------------
     std::printf("\n[B] Prefill begin (bounded drain, routed bank)\n");
     const std::set<uint32_t> warm_before_switch = warm_set(host);
@@ -193,6 +223,24 @@ int main(int argc, char** argv) {
 
     const std::set<uint32_t> warm_after = warm_set(host);
     const std::set<uint32_t> hot_after = hot_set(host);
+
+    // Greedy continuation from the per-token prefill, captured before the state resets.
+    constexpr uint32_t kDecode = 8;
+    const std::vector<int> tokens_per_token = greedy_tokens(routed_logits, kDecode);
+
+    // ---- the same window with the grouped batched accumulate ----------------
+    // The chunk path always calls `accumulate_routed_batch`; the tiered executor runs
+    // the per-token sequence unless the switch is set, so this is the one place the
+    // grouped path's numerical effect on the final logits is measured against the
+    // per-token result, in the same process and window.
+    std::printf("\n[C2] The same window, grouped batched experts\n");
+    aeon::core::moe_grouped_batch_enabled() = true;
+    host.reset_generation_state();
+    (void)graph.forward_window(ids.data(), 0, kWindow, kChunk, host.streams().compute);
+    const std::vector<uint8_t> grouped_logits =
+        read_bytes(graph.logits(), static_cast<size_t>(vocab) * sizeof(uint16_t));
+    const std::vector<int> tokens_grouped = greedy_tokens(grouped_logits, kDecode);
+    aeon::core::moe_grouped_batch_enabled() = false;
 
     std::printf("\n--- results ---\n");
 
@@ -277,6 +325,52 @@ int main(int argc, char** argv) {
         std::printf("  D: margin vs delta       peak=%.3f top2-gap serial=%.3f (delta "
                     "%.3e of it), argmax %s\n",
                     best_a, best_a - second_a, max_abs, argmax_a == argmax_b ? "held" : "flipped");
+    }
+
+    // The decision the product makes is the argmax; compare the grouped path's against
+    // the serial reference directly. A bit-exact comparison is deliberately not made —
+    // the grouped GEMM changes the reduction order, which cannot be bit-identical.
+    {
+        const __half* a = reinterpret_cast<const __half*>(serial_logits.data());
+        const __half* g = reinterpret_cast<const __half*>(grouped_logits.data());
+        const size_t n = serial_logits.size() / sizeof(__half);
+        float max_abs = 0.0f;
+        size_t argmax_a = 0;
+        size_t argmax_g = 0;
+        float best_a = -1e30f;
+        float best_g = -1e30f;
+        for (size_t i = 0; i < n; ++i) {
+            const float x = __half2float(a[i]);
+            const float y = __half2float(g[i]);
+            max_abs = std::max(max_abs, std::fabs(x - y));
+            if (x > best_a) { best_a = x; argmax_a = i; }
+            if (y > best_g) { best_g = y; argmax_g = i; }
+        }
+        std::printf("  D: grouped vs serial     max_abs=%.3e, greedy token %s\n",
+                    max_abs, argmax_a == argmax_g ? "agrees" : "DIFFERS");
+        assert_that("D: the grouped path picks the same greedy token as serial",
+                    argmax_a == argmax_g,
+                    "token " + std::to_string(argmax_g) + " vs " +
+                        std::to_string(argmax_a) + ", logit delta " +
+                        std::to_string(max_abs));
+    }
+
+    // The multi-token signal: the sequences must not drift apart over the decode.
+    {
+        size_t first_divergence = tokens_per_token.size();
+        for (size_t i = 0; i < tokens_per_token.size(); ++i) {
+            if (tokens_per_token[i] != tokens_grouped[i]) { first_divergence = i; break; }
+        }
+        std::printf("  D: greedy %u tokens        per-token", kDecode);
+        for (int t : tokens_per_token) std::printf(" %d", t);
+        std::printf("\n                            grouped  ");
+        for (int t : tokens_grouped) std::printf(" %d", t);
+        std::printf("\n");
+        assert_that("D: the grouped path answers the same as the per-token path",
+                    first_divergence == tokens_per_token.size(),
+                    first_divergence == tokens_per_token.size()
+                        ? std::to_string(kDecode) + " tokens agree"
+                        : "first divergence at token " + std::to_string(first_divergence));
     }
 
     assert_that("D: dedup collapsed the chunk draws", distinct < draws,
