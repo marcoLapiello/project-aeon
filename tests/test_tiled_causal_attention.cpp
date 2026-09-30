@@ -281,6 +281,136 @@ int main() {
         ok &= compare_all("D", got, block0, block1, query_positions, sink_d, widen(h_qd));
     }
 
+    // --- E. the split-keys kernel == the same reference ----------------------
+    // Multi-warp: each warp scans part of the key range, combined in shared memory.
+    std::printf("--- E. split-keys kernel, sliding window ---\n");
+    {
+        const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
+        auto run_split = [&](const HostBlock& host0, const HostBlock& host1,
+                             const int32_t* d_per_query, int per_query_count,
+                             int64_t q_base, int count, const float* bias) {
+            CausalAttentionBlock b0;
+            b0.keys = d_k + host0.first * kHeadDim;
+            b0.values = b0.keys;
+            b0.positions = d_kpos + host0.first;
+            b0.rows = host0.rows;
+            b0.key_stride = key_stride;
+            b0.value_stride = key_stride;
+            b0.window = static_cast<int>(host0.window);
+            CausalAttentionBlock b1;
+            if (host1.rows > 0) {
+                b1.keys = d_k + host1.first * kHeadDim;
+                b1.values = b1.keys;
+                b1.positions = d_kpos + host1.first;
+                b1.rows = host1.rows;
+                b1.key_stride = key_stride;
+                b1.value_stride = key_stride;
+                b1.window = static_cast<int>(host1.window);
+            }
+            CHECK_HIP(hipMemset(d_out, 0, h_q.size() * sizeof(__half)));
+            aeon::dispatch_causal_attention_split_fp16(
+                d_q, q_stride, b0, b1, d_per_query, per_query_count, q_base, 1,
+                d_out, out_stride, count, static_cast<int>(kHeads),
+                static_cast<int>(kHeadDim), bias, static_cast<float>(kScale), 0);
+            CHECK_HIP(hipGetLastError());
+            CHECK_HIP(hipDeviceSynchronize());
+            std::vector<__half> out(h_q.size());
+            CHECK_HIP(hipMemcpy(out.data(), d_out, out.size() * sizeof(__half), hipMemcpyDeviceToHost));
+            return widen(out);
+        };
+        ok &= compare_all("E", run_split(block0, {}, nullptr, 0,
+                                         static_cast<int64_t>(kKeys - kQueries),
+                                         static_cast<int>(kQueries), d_sink),
+                          block0, {}, h_query_positions, sink_d, q_d);
+    }
+
+    // --- F. per-query compressed selection (CSA-style) -----------------------
+    // Block 1 is the whole cache; each query selects a distinct, scrambled subset of it,
+    // some rows ahead of the query (excluded by the causal mask). This is the shape a CSA
+    // layer needs, and the reference reads the selected rows per query.
+    std::printf("--- F. per-query compressed selection ---\n");
+    {
+        constexpr int kSelect = 6;
+        const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
+        const HostBlock block1{0, static_cast<int>(kKeys), 0};
+        std::vector<int32_t> h_select(static_cast<size_t>(kQueries) * kSelect);
+        for (size_t r = 0; r < kQueries; ++r) {
+            for (int j = 0; j < kSelect; ++j) {
+                h_select[r * kSelect + j] = static_cast<int32_t>((r * 2 + j) % kKeys);
+            }
+        }
+        int32_t* d_select = nullptr;
+        CHECK_HIP(hipMalloc(&d_select, h_select.size() * sizeof(int32_t)));
+        CHECK_HIP(hipMemcpy(d_select, h_select.data(), h_select.size() * sizeof(int32_t),
+                            hipMemcpyHostToDevice));
+
+        CausalAttentionBlock b0;
+        b0.keys = d_k;
+        b0.values = d_k;
+        b0.positions = d_kpos;
+        b0.rows = static_cast<int>(kKeys);
+        b0.key_stride = key_stride;
+        b0.value_stride = key_stride;
+        b0.window = static_cast<int>(kWindow);
+        CausalAttentionBlock b1;
+        b1.keys = d_k;
+        b1.values = d_k;
+        b1.positions = d_kpos;
+        b1.rows = static_cast<int>(kKeys);
+        b1.key_stride = key_stride;
+        b1.value_stride = key_stride;
+        b1.window = 0;
+
+        CHECK_HIP(hipMemset(d_out, 0, h_q.size() * sizeof(__half)));
+        aeon::dispatch_causal_attention_split_fp16(
+            d_q, q_stride, b0, b1, d_select, kSelect,
+            static_cast<int64_t>(kKeys - kQueries), 1, d_out, out_stride,
+            static_cast<int>(kQueries), static_cast<int>(kHeads),
+            static_cast<int>(kHeadDim), d_sink, static_cast<float>(kScale), 0);
+        CHECK_HIP(hipGetLastError());
+        CHECK_HIP(hipDeviceSynchronize());
+        std::vector<__half> out(h_q.size());
+        CHECK_HIP(hipMemcpy(out.data(), d_out, out.size() * sizeof(__half), hipMemcpyDeviceToHost));
+        const std::vector<double> got = widen(out);
+        CHECK_HIP(hipFree(d_select));
+
+        bool all = true;
+        for (size_t r = 0; r < kQueries; ++r) {
+            const int64_t query_position = h_query_positions[r];
+            std::vector<double> rows;
+            const int64_t first0 = window_first(query_position, kWindow);
+            for (int i = 0; i < block0.rows; ++i) {
+                const int64_t position = h_key_positions[i];
+                if (position >= first0 && position <= query_position) {
+                    rows.insert(rows.end(), k_d.begin() + static_cast<size_t>(i) * kHeadDim,
+                                k_d.begin() + static_cast<size_t>(i + 1) * kHeadDim);
+                }
+            }
+            for (int j = 0; j < kSelect; ++j) {
+                const int row = h_select[r * kSelect + j];
+                const int64_t position = h_key_positions[row];
+                if (position <= query_position) {
+                    rows.insert(rows.end(), k_d.begin() + static_cast<size_t>(row) * kHeadDim,
+                                k_d.begin() + static_cast<size_t>(row + 1) * kHeadDim);
+                }
+            }
+            for (size_t h = 0; h < kHeads; ++h) {
+                const std::vector<double> query_rows(
+                    q_d.begin() + (r * kHeads + h) * kHeadDim,
+                    q_d.begin() + (r * kHeads + h + 1) * kHeadDim);
+                const std::vector<double> one_sink{sink_d[h]};
+                const std::vector<double> want = aeon::reference::attention_scores_sink(
+                    query_rows, 1, kHeadDim, rows, rows.size() / kHeadDim, one_sink, kScale);
+                const std::vector<double> slice(got.begin() + (r * kHeads + h) * kHeadDim,
+                                                got.begin() + (r * kHeads + h + 1) * kHeadDim);
+                char label[96];
+                std::snprintf(label, sizeof(label), "F q%zu h%zu", r, h);
+                if (!report(label, want, slice)) all = false;
+            }
+        }
+        ok &= all;
+    }
+
     std::cout << (ok ? "[Tier-1 tiled causal attention] PASS\n"
                      : "[Tier-1 tiled causal attention] FAIL\n");
     return ok ? 0 : 1;
