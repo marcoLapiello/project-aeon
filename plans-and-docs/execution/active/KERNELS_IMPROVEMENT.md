@@ -37,7 +37,7 @@ build/bin/aeon_chat \
 | 4a | Indexer top-k on device | **Done** — removes two stream drains per token per CSA layer |
 | — | `compose_local_rows` gather | **Done** — found by the profile, not in the original plan |
 | 3 | WMMA dense GEMM for the dense projections | **Partly done** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
-| 4 | Batched causal attention over the chunk | **Partly done** — 4.1 + tile formulation, G2 primitive and Sliding/HCA wiring landed (opt-in); CSA (4.2b), enable-by-default and occupancy open |
+| 4 | Batched causal attention over the chunk | **Done (opt-in)** — 4.1, tile + split-keys primitives, all three classes wired; enable-by-default and WMMA/occupancy tuning open |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Open** |
 | 6 | Tune for gfx1100 | **Open** |
 | 7 | Re-measure and retune supply | **Open** |
@@ -223,7 +223,7 @@ Gates: `test_v4_attention_sink_oracle`, `test_v4_mla_oracle`, `test_v4_layer_bod
 So the increment splits, and only the first part is the clean WMMA win:
 
 - **4.2a — the local window, batched.** One launch per chunk for the sliding window: block = `16` queries × `1` head, keys split across warps. The tile's queries share one key *sequence* (the composed row-set is position-ordered), so causal masking is just `key_position <= query_position` and WMMA applies to QKᵀ and PV directly, with online softmax and the sink. This covers the `Sliding` layers whole and the local half of `CSA`/`HCA` (`128` of `640` keys).
-- **4.2b — the compressed half.** Needs its own decision, because a shared key tile is not available: either gather each query's selected rows into a dense per-query tile and batch the matmul over queries with a per-query `A` row, or keep the per-query selection but raise occupancy by splitting the key range across blocks (flash-decoding) and combining. Which one wins is a measurement, to be taken after 4.2a.
+- **4.2b — the compressed half — resolved by the key-split, not by a tiled CSA.** The fork was: either gather each query's selected rows into a dense per-query tile and batch the matmul over queries with a per-query `A` row, or keep the per-query selection and raise occupancy by splitting the key range across blocks. **The second option was built** (`causal_attention_split_fp16`, the compressed block taken per query as an index array), and it serves `CSA` directly, so no gather and no tiled CSA are needed to bring those layers into the fast path. The first option survives only as a residual optimization — queries sharing a block's compressed load — which costs a row-duplicating gather and is not obviously worth it; treat it as a measurement to make only if `CSA` still dominates after the cheaper wins. The measurement that decided it is in the table below.
 
 Both are gated first by an **independent oracle** for the tile kernel — the same rule that pinned the WMMA lane map before the expert GEMM was built on it — and only then compared at the greedy-agreement bar, not bit-exact, for the same reorder reason as Steps 2–3. Use SGLang `srt/layers/attention/dsv4/**` as the semantic reference.
 
@@ -255,7 +255,7 @@ So 4.2a wires Sliding + HCA (22 of 43 layers) and leaves CSA to 4.2b, whose fork
 
 The path is gated behind `attention_tile_enabled()` (**default off**), so the committed chunk path is byte-identical to decode and every existing oracle is unchanged. Parity is asserted in `test_v4_layer_body_chunk_oracle` section C3: with the switch on, the chunk for the `Sliding` and `HCA` layers is compared against the tile-off run, and the **router top-k ids are identical** with the residual at `1.4e-3` / `5.6e-4` and the router weights at `2e-4` relative. `CSA` keeps the scalar path (4.2b). The tile reorders the same arithmetic over a shared row-set, so C3 uses an fp16 tolerance — the bar Steps 2–3 moved their chunk comparisons to.
 
-**Still open:** enable the tile by default (which moves the chunk-vs-serial *bit-exact* gates to the parity/tolerance bar, as Steps 2–3 did for the grouped pair) and measure the phase profile with it on; the WMMA tile and key-split across warps that raise occupancy; and 4.2b for CSA.
+**Still open:** enable the tile by default (which moves the chunk-vs-serial *bit-exact* gates to the parity/tolerance bar, as Steps 2–3 did for the grouped pair); and the WMMA tile / warp-count tuning, which the split kernel does not yet use.
 
 **Measured with the tile on (`2026-09-30`, `n = 1`).** Same invocation as the pinned configuration but `--warm-gib 24` (to keep the pinned footprint off the host's ceiling) and the trimmed `~677`-token prompt; the tile was enabled by editing the switch's default. The tile covers `Sliding` and `HCA` only, so this is a **partial** result:
 
