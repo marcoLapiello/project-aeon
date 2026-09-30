@@ -648,7 +648,7 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
         }
         experts.on_routed_consumed(static_cast<uint32_t>(layer.layer_id),
                                    start_position + row);
-        run_layer_body_moe_post(layer, views[row], stream, observer, pre[row]);
+        run_layer_body_moe_post(views[row], stream, observer, pre[row]);
     }
 
     // Commit. Only now may the ring move: every query that could have needed a

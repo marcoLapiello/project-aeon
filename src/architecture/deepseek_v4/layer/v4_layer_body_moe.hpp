@@ -231,14 +231,12 @@ inline void run_layer_body_moe_shared_expert(
 
 // The HC FFN post expansion and the hand-back to the next layer's input, one token.
 inline void run_layer_body_moe_post(
-    V4Layer& layer,
     V4LayerBodyRow& scratch,
     hipStream_t stream,
     V4LayerBodyObserver& observer,
     V4LayerBodyPre pre) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
     constexpr int HC_DIM = 4 * H;
-    (void)layer;
     V4AttentionTraceRecord* attention_trace = pre.trace;
 
     hipLaunchKernelGGL(
@@ -284,7 +282,7 @@ inline void run_layer_body_moe_and_post(
     experts.on_routed_consumed(static_cast<uint32_t>(layer.layer_id), pos);
 
     // HC FFN post expansion: res_out = comb_f · res_mid + post_f · moe_accum.
-    run_layer_body_moe_post(layer, scratch, stream, observer, pre);
+    run_layer_body_moe_post(scratch, stream, observer, pre);
 }
 
 } // namespace aeon::core

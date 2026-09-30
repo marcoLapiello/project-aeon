@@ -279,53 +279,10 @@ int main(int argc, char** argv) {
     }
 
     const size_t logits_diff = differing_bytes(serial_logits, routed_logits);
-    assert_that("D: routed logits == serial, bit-exact", logits_diff == 0,
+    assert_that("D: routed logits == serial, bit-exact (per-token regression)",
+                logits_diff == 0,
                 std::to_string(logits_diff) + " differing of " +
                     std::to_string(serial_logits.size()));
-
-    // Magnitude of the chunk-vs-serial difference, not just its presence. The grouped
-    // expert GEMM sums its K reduction in a different order than the per-token GEMV, so
-    // the logits are no longer bit-identical by construction; what matters for quality
-    // is whether the difference stays inside fp16 noise and never moves the greedy
-    // token.
-    {
-        const __half* a = reinterpret_cast<const __half*>(serial_logits.data());
-        const __half* b = reinterpret_cast<const __half*>(routed_logits.data());
-        const size_t n = serial_logits.size() / sizeof(__half);
-        float max_abs = 0.0f;
-        float max_rel = 0.0f;
-        size_t identical = 0;
-        size_t argmax_a = 0;
-        size_t argmax_b = 0;
-        float best_a = -1e30f;
-        float best_b = -1e30f;
-        for (size_t i = 0; i < n; ++i) {
-            const float x = __half2float(a[i]);
-            const float y = __half2float(b[i]);
-            max_abs = std::max(max_abs, std::fabs(x - y));
-            max_rel = std::max(max_rel, std::fabs(x - y) / std::max(1e-6f, std::fabs(x)));
-            if (x == y) ++identical;
-            if (x > best_a) { best_a = x; argmax_a = i; }
-            if (y > best_b) { best_b = y; argmax_b = i; }
-        }
-        // The decode decision is the argmax, so the top-2 margin is the quantity the
-        // logit delta has to stay under.
-        float second_a = -1e30f;
-        float second_b = -1e30f;
-        for (size_t i = 0; i < n; ++i) {
-            const float x = __half2float(a[i]);
-            const float y = __half2float(b[i]);
-            if (i != argmax_a) second_a = std::max(second_a, x);
-            if (i != argmax_b) second_b = std::max(second_b, y);
-        }
-        std::printf("  D: logit delta           max_abs=%.3e max_rel=%.3e, "
-                    "fp16-identical %zu/%zu, argmax %s\n",
-                    max_abs, max_rel, identical, n,
-                    argmax_a == argmax_b ? "unchanged" : "MOVED");
-        std::printf("  D: margin vs delta       peak=%.3f top2-gap serial=%.3f (delta "
-                    "%.3e of it), argmax %s\n",
-                    best_a, best_a - second_a, max_abs, argmax_a == argmax_b ? "held" : "flipped");
-    }
 
     // The decision the product makes is the argmax; compare the grouped path's against
     // the serial reference directly. A bit-exact comparison is deliberately not made —

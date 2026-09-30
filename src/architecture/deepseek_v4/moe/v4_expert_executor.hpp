@@ -54,7 +54,6 @@
 #include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "architecture/deepseek_v4/kernels/moe_gemv_dispatch.hpp"
-#include "architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp"
 #include "architecture/deepseek_v4/moe/moe_grouped_batch.hpp"
 #include "infrastructure/expert/residency/expert_registry.hpp"
 #include "infrastructure/expert/storage/host_expert_pool.hpp"
