@@ -25,8 +25,7 @@
 #include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
+#include "architecture/deepseek_v4/kernels/moe_gemv_dispatch.hpp"
 #include "infrastructure/artifact/aeon_loader.hpp"
 #include "platform/ops/moe_accumulate.hpp"
 
@@ -287,7 +286,7 @@ public:
             // Mirrors the pipeline's default (atomic) accumulation exactly. One
             // dispatch for all six experts; the shared expert is folded in as
             // `initial_output`, which is the fused form the pipeline uses.
-            aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
+            aeon::kernel::dispatch_dsv4_moe_gemv_w13_swiglu<8, 4, 8, 16>(
                 expert_input, w13, scratch->d_swizzled_expert_hidden,
                 scratch->d_swizzled_moe_accum_f32, kHidden, kRoutedExperts,
                 2048, kHidden, 10.0f, stream);
@@ -325,7 +324,7 @@ public:
             single2.w2[0] = w2.w2[k];
             single2.s2[0] = w2.s2[k];
 
-            aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
+            aeon::kernel::dispatch_dsv4_moe_gemv_w13_swiglu<8, 4, 8, 16>(
                 expert_input, single13, expert_hidden, expert_down_f32,
                 kHidden, 1, 2048, kHidden, 10.0f, stream);
 

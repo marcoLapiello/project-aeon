@@ -19,15 +19,14 @@ struct SwizzledW13ExpertPtrs {
     const half* s3[kAeonSwizzledMaxExperts];
 };
 
-__device__ __forceinline__ float aeon_swiglu_clamped(float gate, float up, float limit) {
-    gate = fminf(gate, limit);
-    up = fminf(fmaxf(up, -limit), limit);
-    return (gate / (1.0f + expf(-gate))) * up;
-}
-
-template <int WAVES, int RPW, int LPR, int ITERS>
+// The gate/up pair with an **injected** activation. This file owns the swizzled GEMV
+// and the two projections; it does not own what is done with the pair — the caller
+// passes an `Epilogue` whose `gate_up(gate, up)` produces the stored value. The
+// activation is a model choice, so it lives in G4 and arrives as a template parameter,
+// the same seam the grouped kernel uses.
+template <int WAVES, int RPW, int LPR, int ITERS, class Epilogue>
 __global__ __launch_bounds__(WAVES * 32)
-void aeon_moe_fused_w13_swiglu_kernel(
+void aeon_moe_fused_gate_up_kernel(
     const half* __restrict__ activation,
     SwizzledW13ExpertPtrs weights,
     half* __restrict__ expert_hidden,
@@ -35,7 +34,7 @@ void aeon_moe_fused_w13_swiglu_kernel(
     int output_dim,
     int expert_count,
     int N,
-    float swiglu_limit
+    Epilogue epilogue
 ) {
     static_assert(WAVES > 0, "WAVES must be positive");
     static_assert(RPW > 0 && LPR > 0 && RPW * LPR == 32,
@@ -107,12 +106,12 @@ void aeon_moe_fused_w13_swiglu_kernel(
 
     if (row < N && slice == 0) {
         expert_hidden[static_cast<size_t>(expert) * N + row] =
-            __float2half(aeon_swiglu_clamped(gate_accumulator, up_accumulator, swiglu_limit));
+            epilogue.gate_up(gate_accumulator, up_accumulator);
     }
 }
 
-template <int WAVES, int RPW, int LPR, int ITERS>
-inline void dispatch_aeon_moe_fused_w13_swiglu(
+template <int WAVES, int RPW, int LPR, int ITERS, class Epilogue>
+inline void dispatch_aeon_moe_fused_gate_up(
     const half* activation,
     const SwizzledW13ExpertPtrs& weights,
     half* expert_hidden,
@@ -121,7 +120,7 @@ inline void dispatch_aeon_moe_fused_w13_swiglu(
     int expert_count,
     int N,
     int K,
-    float swiglu_limit,
+    Epilogue epilogue,
     hipStream_t stream = 0
 ) {
     static_assert(RPW * LPR == 32, "RPW and LPR must describe one Wave32");
@@ -129,16 +128,16 @@ inline void dispatch_aeon_moe_fused_w13_swiglu(
     if (expert_count <= 0 || expert_count > kAeonSwizzledMaxExperts ||
         N <= 0 || K != expected_k || N % RPW != 0) {
         throw std::invalid_argument(
-            "dispatch_aeon_moe_fused_w13_swiglu: incompatible expert or N/K shape");
+            "dispatch_aeon_moe_fused_gate_up: incompatible expert or N/K shape");
     }
 
     constexpr int threads_per_block = WAVES * 32;
     const dim3 block(threads_per_block);
     const dim3 grid((N / RPW + WAVES - 1) / WAVES, expert_count);
-    aeon_moe_fused_w13_swiglu_kernel<WAVES, RPW, LPR, ITERS>
+    aeon_moe_fused_gate_up_kernel<WAVES, RPW, LPR, ITERS, Epilogue>
         <<<grid, block, 0, stream>>>(activation, weights, expert_hidden,
                                       output_f32, output_dim,
-                                      expert_count, N, swiglu_limit);
+                                      expert_count, N, epilogue);
 }
 
 } // namespace aeon::kernel

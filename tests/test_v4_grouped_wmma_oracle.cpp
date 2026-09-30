@@ -27,7 +27,7 @@
 #include "platform/rdna3/device.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_grouped_wmma.hpp"
+#include "architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -269,10 +269,10 @@ int main() {
     CHECK_HIP(hipMemset(d_hidden, 0, hidden_elements * sizeof(half)));
     CHECK_HIP(hipMemset(d_contrib, 0, contrib_elements * sizeof(float)));
 
-    kernel::dispatch_aeon_moe_grouped_w13_swiglu_wmma<4, 4, 8, kernel::kGroupedWmmaMTiles>(
+    kernel::dispatch_aeon_moe_grouped_w13_swiglu_wmma<4, 4, 8, kernel::kMoeGroupedMTiles>(
         d_activation, d_offsets, d_indices, w13_weights, d_hidden, expert_count,
         hidden_tokens, kW1Rows, kW1Columns, static_cast<float>(kLimit));
-    kernel::dispatch_aeon_moe_grouped_w2_wmma<4, 8, 4, kernel::kGroupedWmmaMTiles>(
+    kernel::dispatch_aeon_moe_grouped_w2_wmma<4, 8, 4, kernel::kMoeGroupedMTiles>(
         d_hidden, d_offsets, d_draws, d_draw_weights, w2_weights, d_contrib,
         expert_count, hidden_tokens, kW2Rows, kW2Columns);
     CHECK_HIP(hipGetLastError());

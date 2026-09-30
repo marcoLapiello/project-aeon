@@ -338,7 +338,7 @@ public:
             w2.s2[k] = reinterpret_cast<const __half*>(base + aeon::core::AEON_W2_SCALE_OFFSET);
         }
 
-        aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
+        aeon::kernel::dispatch_dsv4_moe_gemv_w13_swiglu<8, 4, 8, 16>(
             expert_input, w13, scratch.d_expert_hidden, nullptr, kHidden, kExperts, 2048,
             kHidden, swiglu_limit, stream);
         aeon::kernel::dispatch_aeon_moe_fused_w2_contrib<8, 8, 4, 16>(

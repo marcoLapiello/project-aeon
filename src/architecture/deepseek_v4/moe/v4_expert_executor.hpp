@@ -53,8 +53,7 @@
 #include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
 #include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
+#include "architecture/deepseek_v4/kernels/moe_gemv_dispatch.hpp"
 #include "infrastructure/expert/residency/expert_registry.hpp"
 #include "infrastructure/expert/storage/host_expert_pool.hpp"
 #include "infrastructure/expert/transport/prefetch_staging.hpp"
@@ -302,7 +301,7 @@ public:
         // 1. gate/up → clamped SwiGLU, per expert, into its own 2048-wide row.
         //    (`output_f32` is the atomic path's accumulator; the contribution path
         //    below does not use it, so it is null.)
-        kernel::dispatch_aeon_moe_fused_w13_swiglu<8, 4, 8, 16>(
+        kernel::dispatch_dsv4_moe_gemv_w13_swiglu<8, 4, 8, 16>(
             expert_input, w13, scratch_.d_expert_hidden, nullptr,
             V4RoutedExpertScratch::kHidden,
             V4RoutedExpertScratch::kExperts,

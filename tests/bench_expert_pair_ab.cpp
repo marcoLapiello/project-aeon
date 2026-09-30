@@ -64,9 +64,9 @@
 
 #include "platform/rdna3/device.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_grouped_wmma.hpp"
+#include "backend/swizzled_w4a16/kernels/swizzled_w4a16_feed.hpp"
+#include "architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp"
+#include "architecture/deepseek_v4/kernels/moe_gemv_dispatch.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -119,6 +119,11 @@ constexpr int kGroupedW2Rpw = 8, kGroupedW2Lpr = 4;
 constexpr int kMTileSweep[] = {1, 2, 4, 8};
 
 constexpr int kM = 16;
+
+// The arch kernel's policies, named once so the introspection below can name the
+// instantiation it measures.
+using GroupedFeed = kernel::SwizzledW4A16Feed<kGroupedW13Rpw, kGroupedW13Lpr>;
+using GroupedEpilogue = kernel::Dsv4ClampedSwiGLUEpilogue;
 
 // Timed passes per arm. The reported figure is the best of these; see `time_arm`.
 constexpr int kRepetitions = 3;
@@ -354,8 +359,8 @@ void run_gemv_arm(const Device& device, const Permutation& permutation, int toke
         const float* token_weights =
             device.slot_weights + static_cast<size_t>(token) * kSlots;
 
-        kernel::dispatch_aeon_moe_fused_w13_swiglu<kGemvWaves, kGemvW13Rpw, kGemvW13Lpr,
-                                                   kGemvIterations>(
+        kernel::dispatch_dsv4_moe_gemv_w13_swiglu<kGemvWaves, kGemvW13Rpw, kGemvW13Lpr,
+                                                  kGemvIterations>(
             token_activation, w13, device.expert_hidden, nullptr, kHidden, kSlots,
             kIntermediate, kHidden, kLimit);
         kernel::dispatch_aeon_moe_fused_w2_contrib<kGemvWaves, kGemvW2Rpw, kGemvW2Lpr,
@@ -486,7 +491,7 @@ float time_arm(hipEvent_t start, hipEvent_t stop, int repetitions, Pass pass) {
 // production loop nest with one half removed, so the time can be split between
 // staging and matrix multiply instead of argued about.
 //
-// Both mirror `aeon_moe_grouped_w13_swiglu_wmma_kernel`'s trip counts exactly —
+// Both mirror `moe_grouped_gate_up_kernel`'s trip counts exactly —
 // same grid, same M window, same K blocks, same number of MMAs per K sub-block —
 // so the difference between them and the real kernel is attributable.
 // ---------------------------------------------------------------------------
@@ -512,15 +517,15 @@ void staging_only_kernel(
     }
 
     const int n_base = blockIdx.x * kNTile;
-    __shared__ half w1_slab[kernel::kGroupedWmmaKBlock * kNTile];
-    __shared__ half w3_slab[kernel::kGroupedWmmaKBlock * kNTile];
+    __shared__ half w1_slab[aeon::rdna3::kGroupedKBlock * kNTile];
+    __shared__ half w3_slab[aeon::rdna3::kGroupedKBlock * kNTile];
 
     const int first = expert_offsets[expert];
     const int count = expert_offsets[expert + 1] - first;
     const int iterations = (K / 32) / LPR;
 
     for (int m_window = 0; m_window < count; m_window += kMWindow) {
-        for (int k_base = 0; k_base < K; k_base += kernel::kGroupedWmmaKBlock) {
+        for (int k_base = 0; k_base < K; k_base += aeon::rdna3::kGroupedKBlock) {
             kernel::grouped_dequant_w4a16_slab<RPW, LPR>(
                 weights.w1[expert], weights.s1[expert], w1_slab, kNTile, n_base, k_base,
                 iterations);
@@ -576,9 +581,9 @@ void mma_only_kernel(
     }
 
     for (int m_window = 0; m_window < count; m_window += kMWindow) {
-        for (int k_base = 0; k_base < K; k_base += kernel::kGroupedWmmaKBlock) {
+        for (int k_base = 0; k_base < K; k_base += aeon::rdna3::kGroupedKBlock) {
             #pragma unroll
-            for (int k_sub = 0; k_sub < kernel::kGroupedWmmaKBlock / aeon::rdna3::kWmmaTileK;
+            for (int k_sub = 0; k_sub < aeon::rdna3::kGroupedKBlock / aeon::rdna3::kWmmaTileK;
                  ++k_sub) {
                 // Indexed by the loop variables so no fragment folds to a constant.
                 const int offset = (k_sub * 16) & 48;
@@ -902,26 +907,26 @@ int main(int argc, char** argv) {
                         100.0 * waves / waves_per_cu);
         };
         report_kernel("gate half (MTILES=4)",
-                      reinterpret_cast<const void*>(&kernel::aeon_moe_grouped_w13_swiglu_wmma_kernel<
-                          kGroupedWaves, kGroupedW13Rpw, kGroupedW13Lpr, 4>),
-                      2 * kernel::kGroupedWmmaKBlock * (kGroupedWaves * 16) * 2,
+                      reinterpret_cast<const void*>(&aeon::rdna3::moe_grouped_gate_up_kernel<
+                          kGroupedWaves, 4, GroupedFeed, GroupedEpilogue>),
+                      2 * aeon::rdna3::kGroupedKBlock * (kGroupedWaves * 16) * 2,
                       kGroupedWaves * 32);
         report_kernel("gate half (MTILES=1)",
-                      reinterpret_cast<const void*>(&kernel::aeon_moe_grouped_w13_swiglu_wmma_kernel<
-                          kGroupedWaves, kGroupedW13Rpw, kGroupedW13Lpr, 1>),
-                      2 * kernel::kGroupedWmmaKBlock * (kGroupedWaves * 16) * 2,
+                      reinterpret_cast<const void*>(&aeon::rdna3::moe_grouped_gate_up_kernel<
+                          kGroupedWaves, 1, GroupedFeed, GroupedEpilogue>),
+                      2 * aeon::rdna3::kGroupedKBlock * (kGroupedWaves * 16) * 2,
                       kGroupedWaves * 32);
         report_kernel("staging arm",
                       reinterpret_cast<const void*>(&staging_only_kernel<
                           kGroupedWaves, kGroupedW13Rpw, kGroupedW13Lpr, 4>),
-                      2 * kernel::kGroupedWmmaKBlock * (kGroupedWaves * 16) * 2,
+                      2 * aeon::rdna3::kGroupedKBlock * (kGroupedWaves * 16) * 2,
                       kGroupedWaves * 32);
         report_kernel("mma arm",
                       reinterpret_cast<const void*>(&mma_only_kernel<kGroupedWaves, 4>),
                       static_cast<int>(64 * sizeof(half)), kGroupedWaves * 32);
         std::printf("    (gfx1100: 64 KiB LDS and 32 wave slots per CU; the slab of\n"
                     "     %d B per wave caps the real kernel at 16 waves even at 1 reg)\n",
-                    2 * 2 * kernel::kGroupedWmmaKBlock * 16);
+                    2 * 2 * aeon::rdna3::kGroupedKBlock * 16);
 
         for (const Batch& batch : batches) {
             CHECK_HIP(hipFree(batch.offsets));

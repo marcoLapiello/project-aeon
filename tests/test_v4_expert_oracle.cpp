@@ -29,8 +29,7 @@
 #include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
-#include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
+#include "architecture/deepseek_v4/kernels/moe_gemv_dispatch.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp"
 #include "infrastructure/artifact/aeon_loader.hpp"
 
@@ -464,7 +463,7 @@ int main() {
                                std::vector<__half>& hidden_out,
                                std::vector<__half>& ffn_out) {
         CHECK_HIP(hipMemcpy(d_x, x.data(), x.size() * sizeof(__half), hipMemcpyHostToDevice));
-        aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<kWaves, kW1Rpw, kW1Lpr, kIterations>(
+        aeon::kernel::dispatch_dsv4_moe_gemv_w13_swiglu<kWaves, kW1Rpw, kW1Lpr, kIterations>(
             d_x, w13, d_hidden, nullptr, 0, 1, kW1Rows, kW1Columns,
             static_cast<float>(kLimit));
         CHECK_HIP(hipGetLastError());
@@ -646,7 +645,7 @@ int main() {
         real_w2.w2[0] = reinterpret_cast<const uint4*>(base + aeon::core::AEON_W2_PACKED_OFFSET);
         real_w2.s2[0] = reinterpret_cast<const half*>(base + aeon::core::AEON_W2_SCALE_OFFSET);
 
-        aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<kWaves, kW1Rpw, kW1Lpr, kIterations>(
+        aeon::kernel::dispatch_dsv4_moe_gemv_w13_swiglu<kWaves, kW1Rpw, kW1Lpr, kIterations>(
             d_x, real_w13, d_hidden, nullptr, 0, 1, kW1Rows, kW1Columns,
             static_cast<float>(kLimit));
         CHECK_HIP(hipGetLastError());
@@ -720,7 +719,7 @@ int main() {
         __half* d_hidden_many = nullptr;
         CHECK_HIP(hipMalloc(&d_hidden_many,
                             aeon::kernel::kAeonSwizzledMaxExperts * kW1Rows * sizeof(__half)));
-        aeon::kernel::dispatch_aeon_moe_fused_w13_swiglu<kWaves, kW1Rpw, kW1Lpr, kIterations>(
+        aeon::kernel::dispatch_dsv4_moe_gemv_w13_swiglu<kWaves, kW1Rpw, kW1Lpr, kIterations>(
             d_x, many_w13, d_hidden_many, nullptr, 0, kExperts, kW1Rows, kW1Columns,
             static_cast<float>(kLimit));
         CHECK_HIP(hipGetLastError());

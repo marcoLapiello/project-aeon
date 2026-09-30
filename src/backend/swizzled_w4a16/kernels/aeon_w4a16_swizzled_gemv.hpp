@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp"
+#include "platform/dot2.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -10,19 +11,10 @@
 
 namespace aeon::kernel {
 
-using half2v = _Float16 __attribute__((ext_vector_type(2)));
-
-__device__ __forceinline__ float fdot2(half2 a, half2 b, float accumulator) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
-    return __builtin_amdgcn_fdot2(__builtin_bit_cast(half2v, a),
-                                  __builtin_bit_cast(half2v, b),
-                                  accumulator, false);
-#else
-    return accumulator + __half2float(a.x) * __half2float(b.x) +
-           __half2float(a.y) * __half2float(b.y);
-#endif
-}
-
+// The nibble unpack is this format's own; the dot product is the architecture's,
+// resolved through the neutral selector (`platform/dot2.hpp`), so this file names no
+// architecture. The two 32-wide K groups per `uint4` are decoded by the permutation of
+// nibbles below and fed to the `v_dot2_f32_f16` primitive.
 __device__ __forceinline__ half2 unpack2(uint32_t word, int pair) {
     const uint32_t bits = ((word >> (4 * pair)) & 0x000F000Fu) | 0x64006400u;
     const half2 encoded = *reinterpret_cast<const half2*>(&bits);
@@ -41,8 +33,8 @@ __device__ __forceinline__ float swizzled_group_dot(
         const half2* word_activation = activation_pairs + word * 4;
         #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
-            dot = fdot2(unpack2(packed_words[word], pair),
-                        word_activation[pair], dot);
+            dot = aeon::fdot2(unpack2(packed_words[word], pair),
+                              word_activation[pair], dot);
         }
     }
     return dot;

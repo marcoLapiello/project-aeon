@@ -26,6 +26,23 @@ message(STATUS "Project Aeon: Using ROCm path: ${ROCM_PATH}")
 set(AEON_GPU_TARGET "gfx1100" CACHE STRING "Target AMD GPU architecture")
 message(STATUS "Project Aeon: Offload target architecture: ${AEON_GPU_TARGET}")
 
+# Architecture identity as a **build-visible** macro, derived from the target above.
+# It exists because a selector header (which arch kernel or primitive to instantiate)
+# cannot key on the device-only `__gfx1100__` macro: the host pass would take the
+# fallback branch and the device pass the real one, so the two passes would name
+# different kernel symbols and fail to link. A definition set here is identical in
+# both passes, so a selector header can switch on it. Adding an architecture is a new
+# `platform/<arch>/` directory plus a branch here — no consumer changes.
+if(AEON_GPU_TARGET MATCHES "^gfx11")
+    add_compile_definitions(AEON_ARCH_RDNA3=1)
+elseif(AEON_GPU_TARGET MATCHES "^gfx12")
+    add_compile_definitions(AEON_ARCH_RDNA4=1)
+else()
+    message(FATAL_ERROR
+        "AeonToolchain: AEON_GPU_TARGET '${AEON_GPU_TARGET}' has no architecture "
+        "selector; add one in AeonToolchain.cmake and a matching platform/<arch>/.")
+endif()
+
 # --- Compiler flags ----------------------------------------------------------
 # -mno-wavefrontsize64 enforces Wave32 execution mode on RDNA3.
 add_compile_options(
