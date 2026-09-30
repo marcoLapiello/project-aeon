@@ -215,6 +215,51 @@ size_t compare_bits(const std::string& label, const std::vector<T>& want,
     return differing;
 }
 
+// Max |want - got| over fp16 (bit-pattern) buffers, relative to the peak of `want`.
+// Used where a reorder makes bit-identity the wrong bar, so the comparison does not
+// feed `total_differences` (which counts bit-exact escapes only).
+template <typename T>
+bool compare_half_tolerance(const std::string& label, const std::vector<T>& want,
+                            const std::vector<T>& got, double tol) {
+    if (want.size() != got.size()) {
+        std::printf("  %-58s SIZE %zu vs %zu  FAIL\n", label.c_str(), want.size(), got.size());
+        return false;
+    }
+    double peak = 0.0;
+    double worst = 0.0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const float a = __half2float(*reinterpret_cast<const __half*>(&want[i]));
+        const float b = __half2float(*reinterpret_cast<const __half*>(&got[i]));
+        peak = std::max(peak, static_cast<double>(std::fabs(a)));
+        worst = std::max(worst, static_cast<double>(std::fabs(a - b)));
+    }
+    const double rel = peak > 0.0 ? worst / peak : worst;
+    const bool pass = rel <= tol;
+    std::printf("  %-58s max_abs=%.3e rel=%.3e  %s\n", label.c_str(), worst, rel,
+                pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+// The same comparison for fp32 buffers.
+bool compare_float_tolerance(const std::string& label, const std::vector<float>& want,
+                             const std::vector<float>& got, double tol) {
+    if (want.size() != got.size()) {
+        std::printf("  %-58s SIZE %zu vs %zu  FAIL\n", label.c_str(), want.size(), got.size());
+        return false;
+    }
+    double peak = 0.0;
+    double worst = 0.0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        peak = std::max(peak, static_cast<double>(std::fabs(want[i])));
+        worst = std::max(worst, static_cast<double>(std::fabs(want[i] - got[i])));
+    }
+    const double rel = peak > 0.0 ? worst / peak : worst;
+    const bool pass = rel <= tol;
+    std::printf("  %-58s max_abs=%.3e rel=%.3e  %s\n", label.c_str(), worst, rel,
+                pass ? "PASS" : "FAIL");
+    return pass;
+}
+
 // Runs one schedule over one layer and returns every token's record.
 //
 // `limit` is how many tokens to process: `kTokens` for a full run, less for the
@@ -701,6 +746,65 @@ int main() {
                     state_diff == 0,
                     state_diff == 0 ? std::string("bit-identical")
                                     : std::string("state differs"));
+    }
+
+    // -------------------------------------------------------------------
+    // C3. Tiled attention (Sliding, HCA) vs the per-token attention
+    // -------------------------------------------------------------------
+    // The tile reorders the same arithmetic over a shared row-set, so it is compared
+    // at an fp16 tolerance, not bit-exact — the bar Steps 2–3 moved their chunk
+    // comparisons to. CSA is skipped: its indexer selects a different top-k per query,
+    // so it keeps the scalar path (4.2b).
+    std::cout << "\n--- C3. tiled attention vs per-token (fp16 tolerance) ---\n";
+    {
+        std::vector<uint32_t> tiled_plan;
+        for (size_t cycle = 0; cycle < 8; ++cycle) tiled_plan.push_back(16);
+        tiled_plan.push_back(2);
+        constexpr double kTol = 2e-2;
+        for (size_t li = 0; li < stack.size(); ++li) {
+            if (!aeon::core::attention_tile_supported(stack[li].device)) {
+                std::printf("  [%s] CSA keeps the scalar path — skipped\n", stack[li].label);
+                continue;
+            }
+            reset_all();
+            aeon::core::attention_tile_enabled() = false;
+            const std::vector<TokenRecord> reference = run_layer_schedule(
+                stack[li], workspaces[li], tables, tiled_plan, false, d_residuals,
+                scratch, executor, observer);
+            reset_all();
+            aeon::core::attention_tile_enabled() = true;
+            const std::vector<TokenRecord> tiled = run_layer_schedule(
+                stack[li], workspaces[li], tables, tiled_plan, false, d_residuals,
+                scratch, executor, observer);
+            aeon::core::attention_tile_enabled() = false;
+
+            std::vector<uint16_t> r_want, r_got;
+            std::vector<float> w_want, w_got;
+            size_t id_diff = 0;
+            size_t id_total = 0;
+            for (uint32_t t = 0; t < kTokens; ++t) {
+                r_want.insert(r_want.end(), reference[t].residual.begin(),
+                              reference[t].residual.end());
+                r_got.insert(r_got.end(), tiled[t].residual.begin(), tiled[t].residual.end());
+                w_want.insert(w_want.end(), reference[t].weights.begin(),
+                              reference[t].weights.end());
+                w_got.insert(w_got.end(), tiled[t].weights.begin(), tiled[t].weights.end());
+                for (size_t k = 0; k < reference[t].ids.size(); ++k) {
+                    ++id_total;
+                    if (reference[t].ids[k] != tiled[t].ids[k]) ++id_diff;
+                }
+            }
+            ok &= compare_half_tolerance(std::string("  [") + stack[li].label + "] residual",
+                                         r_want, r_got, kTol);
+            ok &= compare_float_tolerance(std::string("  [") + stack[li].label + "] router weights",
+                                          w_want, w_got, kTol);
+            ok &= check((std::string("  [") + stack[li].label + "] router top-k ids").c_str(),
+                        id_diff == 0,
+                        id_diff == 0
+                            ? std::string("identical")
+                            : (std::to_string(id_diff) + " of " + std::to_string(id_total) +
+                               " differ"));
+        }
     }
 
     // -------------------------------------------------------------------
