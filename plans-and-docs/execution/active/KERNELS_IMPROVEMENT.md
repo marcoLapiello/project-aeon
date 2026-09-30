@@ -227,6 +227,8 @@ So the increment splits, and only the first part is the clean WMMA win:
 
 Both are gated first by an **independent oracle** for the tile kernel — the same rule that pinned the WMMA lane map before the expert GEMM was built on it — and only then compared at the greedy-agreement bar, not bit-exact, for the same reorder reason as Steps 2–3. Use SGLang `srt/layers/attention/dsv4/**` as the semantic reference.
 
+**Formulation gate (done `2026-09-30`).** `tests/test_v4_tiled_attention_oracle.cpp` pins the masked-union reading before any kernel exists, by comparing two independent fp64 implementations: each query over the **contiguous sub-range** of the union that is its own window (via the shipped `attention_scores_sink`, itself certified against the scalar kernel), versus each query over the **whole union with the outside keys masked off** (written from the masking rule). They agree **bit-for-bit** (`0.0` max abs, 16 queries over a `W=8` window in a `23`-row union), which sharpens the property: in position order the surviving terms accumulate in the *same sequence* on both sides, so the mask is an exact selection, not an approximation. The gate also pins the workspace bound — the union is `≤ W + tile − 1` rows (`23 = 8 + 16 − 1`, exactly at the bound) — and refuses to pass vacuously. It is CPU-only and needs no GPU.
+
 The per-query observations are the `F7` finding of `plans-and-docs/analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md`; that document's *file and line citations predate the module splits and are stale*, so take the concept from it and the location from the tree.
 
 ### Step 4a: Move the indexer top-k on-device — **done**

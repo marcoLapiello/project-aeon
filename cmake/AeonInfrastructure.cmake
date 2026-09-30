@@ -161,6 +161,12 @@ if(AEON_BUILD_TESTS)
     aeon_add_test(test_v4_attention_sink_oracle
         SOURCES tests/test_v4_attention_sink_oracle.cpp)
 
+    # Tiled causal attention — the *formulation*, not a kernel. Two independent fp64
+    # implementations (per-query window vs masked union) must agree before the tiled
+    # kernel is built on the masked-union reading. CPU only.
+    aeon_add_test(test_v4_tiled_attention_oracle
+        SOURCES tests/test_v4_tiled_attention_oracle.cpp)
+
     # Step 2.4.2 — compressor + APE, both ratio classes (4 with overlap, 128
     # without). Asserts that APE is a score-only term, the APE row periodicity,
     # the window length, the two-segment overlap mapping, and the RoPE position.
