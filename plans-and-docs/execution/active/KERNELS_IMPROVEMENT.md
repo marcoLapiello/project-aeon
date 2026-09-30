@@ -1,4 +1,27 @@
-At the time this plan was written, every compute kernel in prefill was a GEMV (one token at a time): the chunk path looped over tokens on the host for every stage, so each chunk re-read the weights T times, and nothing used WMMA — the 16-row padding in scratch was there, but no kernel read it. So the swept prefill ran at GEMV rate (bandwidth-bound, around 1 flop per byte) when it could run at matrix-multiply rate. That was the main headroom, and Steps 1–2 close it.
+At the time this plan was written, every compute kernel in prefill was a GEMV (one token at a time): the chunk path looped over tokens on the host for every stage, so each chunk re-read the weights T times, and nothing used WMMA — the 16-row padding in scratch was there, but no kernel read it. So the swept prefill ran at GEMV rate (bandwidth-bound, around 1 flop per byte) when it could run at matrix-multiply rate.
+
+The steps below are numbered in the order they were *written*, not the order the time is. A measured phase profile of the swept prefill (below) later showed that Steps 1–2 address ~2.3% of it, while two per-token loops — the attention half and the pre-attention half — are 94%. The numbering is kept for the record; **the work order is the profile's**, and Step 4a is inserted on that basis.
+
+## Measured phase profile (the ordering this plan should follow)
+
+`aeon_chat --phase-profile`, swept prefill, 666-token prompt, `W=4096 C=256` (129 chunk bodies over 43 layers). Host = CPU time issuing the phase; GPU = `hipEvent` span on the compute stream. `n = 1`, one prompt.
+
+| Phase | host ms | gpu ms | gpu share |
+| :--- | ---: | ---: | ---: |
+| **attention+norm (per token)** | `37,271` | `46,954` | **`70.7%`** |
+| **pre-attention (per token)** | `13,057` | `15,718` | **`23.7%`** |
+| router (batched) | `13,756` | `62` | `0.1%` |
+| routed experts (batched, Step 1) | `1,035` | `1,433` | `2.2%` |
+| routing dispatch | `443` | `461` | `0.7%` |
+| shared expert (per token) | `227` | `1,149` | `1.7%` |
+| moe post / commit | `449` | `653` | `0.8%` |
+| **total** | **`66,238`** | **`66,430`** | |
+
+Three things it settles:
+
+1. **The two per-token loops are 94% of prefill.** `run_chunk_pre_attention` and `run_layer_body_attention_and_norm` are still `for (row …)` loops — one token's full pipeline at a time. Steps 3–5 replace them; that is where the time is.
+2. **Steps 1–2 bought ~2.3% directly.** The grouped expert pair is `2.2%` and the batched router's device work `0.1%`. The router's `13.8 s` of host time is *not* issuance — it is its read-back `hipStreamSynchronize` draining the attention backlog queued ahead of it. The launch/queue cost of a phase is only visible as host time, which is why the profile reports both columns.
+3. **The same drain, per token per CSA layer, is inside the 70.7%.** `select_indexer_topk` synchronizes the stream **twice** to sort the indexer's candidates on the host, once per token for every CSA layer (~`38k` drains per window). That is Step 4a.
 
 ## Findings
 
@@ -113,6 +136,15 @@ Measured (`bench_prefill_ab routed 128`, bank arm, chunk `128`, window `1024`, w
 
 - Replace per-row `run_layer_body_attention_and_norm` with one kernel over a query tile (16 queries × head) using WMMA for QKᵀ and PV, with online softmax plus sink. It reads the composed local and compressed keys once per tile instead of once per query.
 - Use SGLang dsv4 attention/indexer as the semantic reference.
+
+### Step 4a: Move the indexer top-k on-device (interposed — see the profile)
+
+`select_indexer_topk` (`v4_layer_body_types.hpp`) selects the CSA layer's `index_topk = 512` compressed rows **on the host**: D2H the candidate scores, `hipStreamSynchronize`, `std::stable_sort` on the CPU, H2D the chosen indices, `hipStreamSynchronize` again. It runs once per token for every CSA layer, so a window pays ~`38k` queue drains — and the drains are why the attention phase (70.7%) has the GPU idle inside it. The profile's `13.8 s` host line for the *router* is the same mechanism at `0.1%` the frequency.
+
+- One G2 kernel that reads the candidate scores and writes the `index_topk` indices, so no score leaves the device and no host sort runs. **Same selection, same descending order, same lower-index ties** — it changes no number, which is why the equivalence gates cannot see it.
+- Input and output buffers already exist and are already the right size (`indexer_scores`, `indexer_topk`); the only addition is per-row shared-memory scratch, not VRAM.
+- Keep the degenerate branch exact: `candidates <= index_topk` selects every candidate in ascending index order with no padding.
+- Test: against the same definition the host version implements (order, ties, the degenerate branch), not against a copy of the kernel.
 
 ### Step 5: Fuse elementwise and norm stages over [T, dim]
 

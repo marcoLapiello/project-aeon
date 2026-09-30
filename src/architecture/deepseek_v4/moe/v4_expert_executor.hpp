@@ -75,13 +75,16 @@
 
 namespace aeon::core {
 
-// Experimental switch: when set, the chunk path runs the grouped batched routed
-// accumulate instead of the per-token one. Process-wide because a gate may drive the
-// chunk body through a synthetic executor, and it is off by default so a chunk stays
-// bit-identical to serial until the grouped path's numerical effect is validated end to
-// end (see the kernel plan). Production flips it once that validation holds.
+// Debug switch for the chunk path's routed accumulate. It defaults to the
+// production behaviour — the grouped batched pair, one permutation and one grouped
+// dispatch per chunk — and setting it false replays the per-token sequence instead,
+// which is what lets a gate compare the two paths in one process. It is not a
+// tuning knob: the per-token replay is slower by construction (it re-dequantizes a
+// slab per token) and exists only so the grouped result can be shown against the
+// path it replaced. Decode never consults it — a single token goes through
+// `accumulate_routed`, which is the GEMV pair.
 inline bool& moe_grouped_batch_enabled() {
-    static bool enabled = false;
+    static bool enabled = true;
     return enabled;
 }
 

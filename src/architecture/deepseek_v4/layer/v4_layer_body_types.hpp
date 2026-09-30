@@ -13,6 +13,7 @@
 #include "architecture/deepseek_v4/layer/v4_activation_scratch.hpp"
 #include "architecture/deepseek_v4/layer/v4_attention_trace.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"
+#include "architecture/deepseek_v4/kernels/v4_attention_kernels.hpp"
 #include "infrastructure/hip_check.hpp"
 
 #include <hip/hip_fp16.h>
@@ -89,43 +90,24 @@ struct V4LayerBodyOutput {
 // **lower index** — the same rule as the router — and the degenerate case
 // `candidates <= index_topk` selects every candidate with no padding.
 //
-// This is the one host-side sync left in the body. It is a candidate for moving
-// on-device for chunked batched prefill, which would change no result and therefore
-// cannot be seen by the equivalence gate.
+// This used to be a host sort: D2H the scores, `hipStreamSynchronize`,
+// `std::stable_sort`, H2D the indices, synchronize again — once per token per CSA
+// layer. Both synchronizations drained the queue behind them, which is what left the
+// GPU idle inside the attention phase. The selection now runs in one kernel
+// (`v4_indexer_topk_kernel`), so the only ordering is the stream's own and no score
+// reaches the host. The result is identical by construction: the same candidates, the
+// same descending order, the same lower-index ties, the same `-1` padding — which is
+// why the equivalence gates cannot see the change.
 inline void select_indexer_topk(const V4Layer& layer, const float* device_scores,
                                 int32_t* device_topk, size_t candidate_count,
                                 hipStream_t stream) {
     if (candidate_count == 0) return;
-
-    std::vector<float> scores(candidate_count);
-    CHECK_HIP(hipMemcpyAsync(scores.data(), device_scores,
-                             candidate_count * sizeof(float),
-                             hipMemcpyDeviceToHost, stream));
-    CHECK_HIP(hipStreamSynchronize(stream));
-
-    std::vector<int32_t> order(candidate_count);
-    for (size_t index = 0; index < candidate_count; ++index) {
-        order[index] = static_cast<int32_t>(index);
-    }
-    const size_t topk = std::min(
-        candidate_count, static_cast<size_t>(layer.state_layout().index_topk));
-    std::vector<int32_t> selected(static_cast<size_t>(layer.state_layout().index_topk), -1);
-    if (candidate_count <= static_cast<size_t>(layer.state_layout().index_topk)) {
-        std::copy(order.begin(), order.end(), selected.begin());
-    } else {
-        std::stable_sort(order.begin(), order.end(),
-                         [&scores](int32_t left, int32_t right) {
-                             const float left_score = scores[static_cast<size_t>(left)];
-                             const float right_score = scores[static_cast<size_t>(right)];
-                             if (left_score != right_score) return left_score > right_score;
-                             return left < right;
-                         });
-        std::copy_n(order.begin(), topk, selected.begin());
-    }
-    CHECK_HIP(hipMemcpyAsync(device_topk, selected.data(),
-                             selected.size() * sizeof(int32_t),
-                             hipMemcpyHostToDevice, stream));
-    CHECK_HIP(hipStreamSynchronize(stream));
+    constexpr int kThreads = 256;
+    const size_t shared_bytes = (candidate_count + 7) / 8;  // one bit per candidate
+    hipLaunchKernelGGL(
+        kernel::v4_indexer_topk_kernel, dim3(1), dim3(kThreads), shared_bytes, stream,
+        device_scores, device_topk, static_cast<int>(candidate_count),
+        static_cast<int>(layer.state_layout().index_topk));
 }
 
 // How many compressed entries exist on or before `pos`. Every caller that used to

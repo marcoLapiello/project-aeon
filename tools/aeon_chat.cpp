@@ -26,6 +26,7 @@
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/memory/memory_budget.hpp"
+#include "infrastructure/profiling/phase_profiler.hpp"
 #include "architecture/deepseek_v4/runtime/v4_engine.hpp"
 #include "platform/rdna3/device.hpp"
 
@@ -65,6 +66,7 @@ struct Options {
     std::string dump_logits_path;
     uint64_t demotion_queue{0};
     bool profile_routing{false};
+    bool phase_profile{false};
     bool validate_registry{false};
     uint32_t prefill_window{4096};
     uint32_t prefill_chunk{64};
@@ -104,6 +106,7 @@ void print_usage(const char* executable) {
         << "                           Prompt length at or above which the sweep supplies\n"
         << "                           experts; below it, the routed cache (0 = 3E/4)\n"
         << "  --profile-routing        Print the decode routing reuse-distance (ideal-LRU) curve\n"
+        << "  --phase-profile          Print the prefill chunk's per-phase host/GPU time split\n"
         << "  --validate-registry      Audit the registry after every expert operation (slow; debug)\n"
         << "  --no-warm-preload        Allocate Warm capacity without startup payload reads\n"
         << "  --no-warm-refill         Disable asynchronous Hot-to-Warm refill\n"
@@ -216,6 +219,8 @@ Options parse_options(int argc, char** argv) {
                 require_value(argc, argv, index, "--staging-blocks"), "--staging-blocks"));
         } else if (argument == "--profile-routing") {
             options.profile_routing = true;
+        } else if (argument == "--phase-profile") {
+            options.phase_profile = true;
         } else if (argument == "--validate-registry") {
             options.validate_registry = true;
         } else if (argument == "--no-warm-preload") {
@@ -347,6 +352,12 @@ int main(int argc, char** argv) {
         engine_options.runtime.prefill_chunk = options.prefill_chunk;
         engine_options.runtime.prefill_sweep_min_tokens = options.prefill_sweep_min_tokens;
         engine_options.runtime.prefill_sweep_staging_blocks = options.staging_blocks;
+
+        // The phase profiler is a process-wide sink the layer body writes into, so
+        // enabling it is a single switch here rather than a parameter threaded
+        // through every phase call. It is off unless asked for; when on, the engine
+        // prints the per-phase host/GPU split after the prefill.
+        aeon::core::PhaseProfiler::instance().set_enabled(options.phase_profile);
 
         aeon::core::V4Engine engine;
         engine.initialize(engine_options);

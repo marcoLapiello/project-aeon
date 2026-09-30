@@ -36,6 +36,7 @@
 #include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
 #include "infrastructure/json.hpp"
 #include "infrastructure/expert/transport/prefetch_staging.hpp"
+#include "infrastructure/profiling/phase_profiler.hpp"
 #include "infrastructure/text/text_generation.hpp"
 
 #include <algorithm>
@@ -348,11 +349,22 @@ public:
                 host_.set_supply_phase(true);
                 const uint32_t count = static_cast<uint32_t>(tokens.size());
                 const half* logits = nullptr;
+                PhaseProfiler& phases = PhaseProfiler::instance();
+                const bool profiling = phases.enabled();
+                if (profiling) phases.reset();
                 for (uint32_t offset = 0; offset < count; offset += window) {
                     const uint32_t span = std::min(window, count - offset);
                     logits = graph_->forward_window(
                         tokens.data() + offset, offset, span, std::min(chunk, span),
                         host_.streams().compute);
+                }
+                // The phase breakdown is a per-prompt aggregate, so it is read and
+                // printed once here rather than per window. `resolve` synchronizes
+                // only the profiler's own events; the prefill already has a stream
+                // boundary inside `forward_window`.
+                if (profiling) {
+                    phases.resolve();
+                    phases.report(stdout);
                 }
                 if (logits_dump_.is_open()) dump_logits(logits);
                 // TTFT is the moment the *last* prompt token's forward produced a

@@ -355,6 +355,105 @@ __global__ void v4_indexer_scores_kernel(
     scores[candidate] = score;
 }
 
+// The indexer's candidate selection, on the device: the top `topk` candidates by
+// score, in descending order, ties broken to the **lower index** — the same rule the
+// host used to implement in `select_indexer_topk`, which this replaces.
+//
+// Why a kernel and not the host sort: the host version copied the scores back,
+// synchronized, sorted on the CPU, copied the indices forward, and synchronized
+// again. Those two `hipStreamSynchronize` calls are the reason the attention phase
+// spends its time with the GPU idle — the CPU cannot enqueue the next token's work
+// until the whole queue behind it has drained. The selection is unchanged; only
+// where it runs is.
+//
+// The degenerate branch is kept exact: `candidate_count <= topk` selects every
+// candidate in ascending index order and pads the tail with `-1`, with no sort.
+// A CSA layer commits one entry per `ratio` tokens, so at short contexts this is
+// every token, and it is a pure index ramp.
+//
+// One block per row; `selected` is a `ceil(candidate_count/8)`-byte dynamic-shared
+// bitmap so a chosen candidate is excluded without touching the caller's scores.
+__global__ void v4_indexer_topk_kernel(
+    const float* __restrict__ scores,
+    int32_t* __restrict__ topk_indices,
+    int candidate_count,
+    int topk
+) {
+    extern __shared__ unsigned char selected[];
+
+    const int tid = threadIdx.x;
+
+    if (candidate_count <= topk) {
+        for (int i = tid; i < topk; i += blockDim.x) {
+            topk_indices[i] = (i < candidate_count) ? i : -1;
+        }
+        return;
+    }
+
+    const int mask_bytes = (candidate_count + 7) >> 3;
+    for (int i = tid; i < mask_bytes; i += blockDim.x) {
+        selected[i] = 0;
+    }
+    __syncthreads();
+
+    // Iterative max-extraction, `topk` rounds. Each round reduces over the
+    // unselected candidates; the comparison takes the higher score, and on an exact
+    // tie the lower index, so the order matches a descending stable sort exactly and
+    // does not depend on the reduction tree.
+    __shared__ int s_best_index[64];
+    __shared__ float s_best_score[64];
+
+    for (int k = 0; k < topk; ++k) {
+        float best_score = -3.402823466e+38F;
+        int best_index = -1;
+        for (int i = tid; i < candidate_count; i += blockDim.x) {
+            if ((selected[i >> 3] >> (i & 7)) & 1) continue;
+            const float s = scores[i];
+            if (s > best_score || (s == best_score && best_index >= 0 && i < best_index)) {
+                best_score = s;
+                best_index = i;
+            }
+        }
+
+        // Block reduction, applying the same (score, lower-index) rule at each step.
+        const int warp = tid >> 5;
+        const int lane = tid & 31;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            const float other_score = __shfl_xor(best_score, offset);
+            const int other_index = __shfl_xor(best_index, offset);
+            if (other_score > best_score ||
+                (other_score == best_score && other_index >= 0 &&
+                 (best_index < 0 || other_index < best_index))) {
+                best_score = other_score;
+                best_index = other_index;
+            }
+        }
+        if (lane == 0) {
+            s_best_score[warp] = best_score;
+            s_best_index[warp] = best_index;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            const int warps = (blockDim.x + 31) >> 5;
+            float block_score = -3.402823466e+38F;
+            int block_index = -1;
+            for (int w = 0; w < warps; ++w) {
+                if (s_best_score[w] > block_score ||
+                    (s_best_score[w] == block_score && s_best_index[w] >= 0 &&
+                     (block_index < 0 || s_best_index[w] < block_index))) {
+                    block_score = s_best_score[w];
+                    block_index = s_best_index[w];
+                }
+            }
+            topk_indices[k] = block_index;
+            selected[block_index >> 3] |= static_cast<unsigned char>(1u << (block_index & 7));
+        }
+        __syncthreads();
+    }
+}
+
 // Serial local-plus-compressed attention for C4A and C128A. The bounded
 // shared score array covers the 128-token local ring plus a 512-entry top-k.
 __global__ void __launch_bounds__(32) v4_cached_compressed_attention_wave32_kernel(

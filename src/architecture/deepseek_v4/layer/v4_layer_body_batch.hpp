@@ -40,6 +40,7 @@
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
+#include "infrastructure/profiling/phase_profiler.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -628,9 +629,12 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // Phase 1. Every key the chunk owns is produced before any query runs, and
     // none of them touches the ring.
     std::vector<V4LayerBodyPre> pre(count);
-    for (uint32_t row = 0; row < count; ++row) {
-        pre[row] = run_chunk_pre_attention(layer, workspace, tables, token_ids[row],
-                                           start_position + row, row, stream, observer);
+    {
+        auto phase = PhaseProfiler::instance().region("pre-attention (per token)", stream);
+        for (uint32_t row = 0; row < count; ++row) {
+            pre[row] = run_chunk_pre_attention(layer, workspace, tables, token_ids[row],
+                                               start_position + row, row, stream, observer);
+        }
     }
 
     // Phase 2, in three sub-phases. This is the order a chunk needs and a single
@@ -655,15 +659,18 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // composes its own row-set, because the row-set is a property of the query's
     // position.
     std::vector<V4LayerBodyRow> views(count);
-    for (uint32_t row = 0; row < count; ++row) {
-        const uint32_t query_position = start_position + row;
-        views[row] = workspace.row(row);
-        views[row].composed_rows = static_cast<int32_t>(compose_local_rows(
-            layer, workspace, start_position, row, query_position, stream));
-        views[row].d_composed_keys = workspace.composed_keys();
-        views[row].d_composed_positions = workspace.composed_positions();
-        run_layer_body_attention_and_norm(layer, views[row], tables, token_ids[row],
-                                          query_position, stream, observer, pre[row]);
+    {
+        auto phase = PhaseProfiler::instance().region("attention+norm (per token)", stream);
+        for (uint32_t row = 0; row < count; ++row) {
+            const uint32_t query_position = start_position + row;
+            views[row] = workspace.row(row);
+            views[row].composed_rows = static_cast<int32_t>(compose_local_rows(
+                layer, workspace, start_position, row, query_position, stream));
+            views[row].d_composed_keys = workspace.composed_keys();
+            views[row].d_composed_positions = workspace.composed_positions();
+            run_layer_body_attention_and_norm(layer, views[row], tables, token_ids[row],
+                                              query_position, stream, observer, pre[row]);
+        }
     }
 
     // Phase 2b — the router for every token, in one pass. The selections have to
@@ -671,8 +678,11 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // batched router pays for that with a single synchronisation for the whole chunk
     // instead of one per token.
     std::vector<V4LayerBodyOutput> outputs;
-    run_layer_body_router_batch(layer, workspace, token_ids, count, stream, observer,
-                                pre, outputs);
+    {
+        auto phase = PhaseProfiler::instance().region("router (batched)", stream);
+        run_layer_body_router_batch(layer, workspace, token_ids, count, stream, observer,
+                                    pre, outputs);
+    }
     std::vector<std::vector<int32_t>> batch_ids(count);
     std::vector<std::vector<float>> batch_weights(count);
     for (uint32_t row = 0; row < count; ++row) {
@@ -683,8 +693,11 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // The one layer-wide dispatch: the chunk's `6C` requests as a deduplicated set.
     // Leases are released at the layer boundary by the caller
     // (`V4Graph::forward_window`).
-    experts.on_routing_ready_batch(static_cast<uint32_t>(layer.layer_id), start_position,
-                                   batch_ids, batch_weights);
+    {
+        auto phase = PhaseProfiler::instance().region("routing dispatch", stream);
+        experts.on_routing_ready_batch(static_cast<uint32_t>(layer.layer_id),
+                                       start_position, batch_ids, batch_weights);
+    }
 
     // Phase 2c — the shared expert for every token, then **one** batched routed
     // accumulate over them all, then every token's FFN post.
@@ -693,8 +706,12 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // the base-class default, which reproduces the per-token sequence exactly (so a
     // chunk stays bit-identical to serial), while the tiered executor may run the
     // grouped path behind its own switch. That keeps one code path in the body.
-    for (uint32_t row = 0; row < count; ++row) {
-        run_layer_body_moe_shared_expert(layer, views[row], stream, observer, pre[row]);
+    {
+        auto phase = PhaseProfiler::instance().region("shared expert (per token)", stream);
+        for (uint32_t row = 0; row < count; ++row) {
+            run_layer_body_moe_shared_expert(layer, views[row], stream, observer,
+                                             pre[row]);
+        }
     }
     {
         constexpr int kMPad = static_cast<int>(V4LayerBodyBatchScratch::kMPad);
@@ -702,6 +719,7 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
         // The model's top-k; the workspace's `topk_weights`/`topk_indices` rows are
         // `[kRoutedSlots]`, so that is their per-token stride.
         constexpr int kRoutedSlots = 6;
+        auto phase = PhaseProfiler::instance().region("routed experts (batched)", stream);
         experts.accumulate_routed_batch(
             static_cast<uint32_t>(layer.layer_id), start_position, count,
             views[0].d_ffn_norm_act, kMPad * kH,
@@ -709,31 +727,39 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
             views[0].d_topk_weights, kRoutedSlots,
             views[0].d_moe_accum, kMPad * kH);
     }
-    for (uint32_t row = 0; row < count; ++row) {
-        if (pre[row].trace != nullptr) {
-            trace_copy(observer, pre[row].trace->moe_output, views[row].d_moe_accum,
-                       kernel::DSV4_HIDDEN_SIZE);
+    {
+        auto phase = PhaseProfiler::instance().region("moe post (per token)", stream);
+        for (uint32_t row = 0; row < count; ++row) {
+            if (pre[row].trace != nullptr) {
+                trace_copy(observer, pre[row].trace->moe_output, views[row].d_moe_accum,
+                           kernel::DSV4_HIDDEN_SIZE);
+            }
+            experts.on_routed_consumed(static_cast<uint32_t>(layer.layer_id),
+                                       start_position + row);
+            run_layer_body_moe_post(views[row], stream, observer, pre[row]);
         }
-        experts.on_routed_consumed(static_cast<uint32_t>(layer.layer_id),
-                                   start_position + row);
-        run_layer_body_moe_post(views[row], stream, observer, pre[row]);
     }
 
     // Commit. Only now may the ring move: every query that could have needed a
     // pre-chunk row has run.
     const uint32_t capacity = layer.local_cache_capacity();
-    for (uint32_t row = 0; row < count; ++row) {
-        const uint32_t position = start_position + row;
-        const uint32_t slot = position % capacity;
-        CHECK_HIP(hipMemcpyAsync(layer.d_local_key_cache + static_cast<size_t>(slot) * HEAD_DIM,
-                                 workspace.chunk_key(row), HEAD_DIM * sizeof(half),
-                                 hipMemcpyDeviceToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(layer.d_local_value_cache + static_cast<size_t>(slot) * HEAD_DIM,
-                                 workspace.chunk_key(row), HEAD_DIM * sizeof(half),
-                                 hipMemcpyDeviceToDevice, stream));
-        const int64_t absolute = static_cast<int64_t>(position);
-        CHECK_HIP(hipMemcpyAsync(layer.d_local_positions + slot, &absolute,
-                                 sizeof(absolute), hipMemcpyHostToDevice, stream));
+    {
+        auto phase = PhaseProfiler::instance().region("commit (per token)", stream);
+        for (uint32_t row = 0; row < count; ++row) {
+            const uint32_t position = start_position + row;
+            const uint32_t slot = position % capacity;
+            CHECK_HIP(hipMemcpyAsync(
+                layer.d_local_key_cache + static_cast<size_t>(slot) * HEAD_DIM,
+                workspace.chunk_key(row), HEAD_DIM * sizeof(half),
+                hipMemcpyDeviceToDevice, stream));
+            CHECK_HIP(hipMemcpyAsync(
+                layer.d_local_value_cache + static_cast<size_t>(slot) * HEAD_DIM,
+                workspace.chunk_key(row), HEAD_DIM * sizeof(half),
+                hipMemcpyDeviceToDevice, stream));
+            const int64_t absolute = static_cast<int64_t>(position);
+            CHECK_HIP(hipMemcpyAsync(layer.d_local_positions + slot, &absolute,
+                                     sizeof(absolute), hipMemcpyHostToDevice, stream));
+        }
     }
     return outputs;
 }
