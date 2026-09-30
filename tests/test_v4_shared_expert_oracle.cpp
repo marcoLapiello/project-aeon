@@ -135,11 +135,11 @@ int main() {
     auto run_shared = [&]() {
         hipLaunchKernelGGL(aeon::kernel::gemv_fp16_vec8_kernel,
                            dim3(kIntermediate), dim3(32), 0, 0,
-                           d_x, d_w1, d_gate, kHidden);
+                           d_x, d_w1, d_gate, kHidden, kHidden);
         CHECK_HIP(hipGetLastError());
         hipLaunchKernelGGL(aeon::kernel::gemv_fp16_vec8_kernel,
                            dim3(kIntermediate), dim3(32), 0, 0,
-                           d_x, d_w3, d_up, kHidden);
+                           d_x, d_w3, d_up, kHidden, kHidden);
         CHECK_HIP(hipGetLastError());
         hipLaunchKernelGGL(aeon::kernel::v4_swiglu_clamp_kernel,
                            dim3((kIntermediate + 255) / 256), dim3(256), 0, 0,
@@ -148,7 +148,7 @@ int main() {
         CHECK_HIP(hipGetLastError());
         hipLaunchKernelGGL(aeon::kernel::gemv_fp16_vec8_kernel,
                            dim3(kHidden), dim3(32), 0, 0,
-                           d_hidden, d_w2, d_out, kIntermediate);
+                           d_hidden, d_w2, d_out, kIntermediate, kIntermediate);
         CHECK_HIP(hipGetLastError());
         CHECK_HIP(hipDeviceSynchronize());
 

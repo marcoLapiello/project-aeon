@@ -19,6 +19,12 @@
 // Both accumulate in fp32 and write fp16, and both use `gridDim.x` as the output
 // stride, so the launch must be `dim3(out_dim, num_tokens)` with 32 threads.
 //
+// The activation row pitch is passed as `x_stride` rather than assumed equal to
+// `in_dim`: a batched caller whose rows live inside a larger per-token buffer (the
+// layered workspace stores each token in its own padded tile) hands the kernel the
+// pitch it actually uses, and reads each token's row in place instead of gathering
+// it into a dense copy first. A contiguous caller passes `in_dim`.
+//
 // NOTE on weight orientation: `W` is `[out_dim, in_dim]` row-major — the same
 // layout the checkpoint stores (`nn.Linear.weight`) — and the kernel computes
 // `y[o] = Σ_i W[o, i] · x[i]`. There is no transpose anywhere in the path.
@@ -30,18 +36,19 @@
 namespace aeon::kernel {
 
 // One lane per output column, striding the input dimension by the wave width.
-// `y[token * gridDim.x + out_col] = dot(x_row, w_row)`.
+// `y[token * gridDim.x + out_col] = dot(x_row, w_row)`, the row at `x_stride`.
 __global__ void gemv_fp16_kernel(
-    const __half* __restrict__ x,       // [T, in_dim]
+    const __half* __restrict__ x,       // [T, x_stride]
     const __half* __restrict__ w,       // [out_dim, in_dim]
     __half*       __restrict__ y,       // [T, out_dim]
-    int in_dim
+    int in_dim,
+    int x_stride
 ) {
     int out_col = blockIdx.x;           // row of W, output feature index
     int token   = blockIdx.y;           // token index
     int lane    = threadIdx.x;          // 0..31
 
-    const __half* x_row = x + token * in_dim;
+    const __half* x_row = x + token * x_stride;
     const __half* w_row = w + out_col * in_dim;
 
     float dot = 0.0f;
@@ -60,18 +67,20 @@ __global__ void gemv_fp16_kernel(
 }
 
 // Vectorized FP16 GEMV: each lane streams 8 halves per iteration via uint4 — 8x
-// fewer global transactions and FP32 FMA accumulation.
+// fewer global transactions and FP32 FMA accumulation. `x_stride` must be a multiple
+// of 8 halves so the row start stays 16-byte aligned for the uint4 load.
 __global__ void __launch_bounds__(32) gemv_fp16_vec8_kernel(
-    const __half* __restrict__ x,       // [T, in_dim]
+    const __half* __restrict__ x,       // [T, x_stride]
     const __half* __restrict__ w,       // [out_dim, in_dim]
     __half*       __restrict__ y,       // [T, out_dim]
-    int in_dim
+    int in_dim,
+    int x_stride
 ) {
     int out_col = blockIdx.x;
     int token   = blockIdx.y;
     int lane    = threadIdx.x;
 
-    const uint4* x_row = reinterpret_cast<const uint4*>(x + token * in_dim);
+    const uint4* x_row = reinterpret_cast<const uint4*>(x + token * x_stride);
     const uint4* w_row = reinterpret_cast<const uint4*>(w + out_col * in_dim);
     const int vec_dim = in_dim >> 3; // 8 halves per uint4
 

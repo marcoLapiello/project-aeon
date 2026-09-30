@@ -504,6 +504,73 @@ inline V4LayerBodyPre run_chunk_pre_attention(
                                         stream, observer);
 }
 
+// The router for the whole chunk, in one pass.
+//
+// This is the per-token `run_layer_body_router` with the token loop lifted out: one
+// gate GEMV over `[C, H]`, one logit widening, one top-k launch for all `C` rows, then
+// a single read-back of every token's selection. It is not a second algorithm — it
+// calls the same `dispatch_router` the decode path does — but it removes the `C − 1`
+// `hipStreamSynchronize` calls that the per-token loop paid to learn each token's
+// top-k, which is what let the CPU run ahead of the GPU between rows.
+//
+// The rows are addressed by stride out of the chunk workspace rather than gathered
+// first: `ffn_norm_act` is the row-0 prefix of each token's padded tile, and the
+// logits/top-k rows are contiguous per token, so every buffer is read in place.
+inline void run_layer_body_router_batch(
+    V4Layer& layer,
+    V4LayerBodyBatchScratch& workspace,
+    const uint32_t* token_ids,
+    uint32_t count,
+    hipStream_t stream,
+    V4LayerBodyObserver& observer,
+    const std::vector<V4LayerBodyPre>& pre,
+    std::vector<V4LayerBodyOutput>& outputs) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int M_PAD = static_cast<int>(V4LayerBodyBatchScratch::kMPad);
+    constexpr int kRouted = 6;
+    constexpr int kExperts = 256;
+    if (count == 0) return;
+
+    const int tokens = static_cast<int>(count);
+    const V4LayerBodyRow base = workspace.row(0);
+
+    dispatch_router(layer, base.d_ffn_norm_act, M_PAD * H,
+                    base.d_router_logits_half, base.d_router_logits,
+                    token_ids, base.d_token_id,
+                    base.d_topk_weights, base.d_topk_indices, tokens, stream);
+
+    // One read-back for the chunk. The rows are `kRouted` apart, so each token's
+    // selection is a contiguous slice of the same block.
+    std::vector<float> weights(static_cast<size_t>(tokens) * kRouted);
+    std::vector<int32_t> indices(static_cast<size_t>(tokens) * kRouted);
+    CHECK_HIP(hipMemcpyAsync(weights.data(), base.d_topk_weights,
+                             weights.size() * sizeof(float), hipMemcpyDeviceToHost,
+                             stream));
+    CHECK_HIP(hipMemcpyAsync(indices.data(), base.d_topk_indices,
+                             indices.size() * sizeof(int32_t), hipMemcpyDeviceToHost,
+                             stream));
+    CHECK_HIP(hipStreamSynchronize(stream));
+
+    outputs.assign(static_cast<size_t>(tokens), V4LayerBodyOutput{});
+    for (int row = 0; row < tokens; ++row) {
+        V4LayerBodyOutput& output = outputs[static_cast<size_t>(row)];
+        output.topk_weights.assign(weights.begin() + row * kRouted,
+                                   weights.begin() + (row + 1) * kRouted);
+        output.topk_indices.assign(indices.begin() + row * kRouted,
+                                   indices.begin() + (row + 1) * kRouted);
+        V4AttentionTraceRecord* trace = pre[static_cast<size_t>(row)].trace;
+        if (trace != nullptr) {
+            trace_copy(observer, trace->router_logits,
+                       base.d_router_logits + static_cast<size_t>(row) * kExperts,
+                       kExperts);
+            trace->routed_expert_indices.assign(output.topk_indices.begin(),
+                                                output.topk_indices.end());
+            trace->routed_expert_weights.assign(output.topk_weights.begin(),
+                                                output.topk_weights.end());
+        }
+    }
+}
+
 // Runs one layer and a **chunk of tokens**.
 //
 // The order of operations is the whole content of this function:
@@ -599,15 +666,16 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
                                           query_position, stream, observer, pre[row]);
     }
 
-    // Phase 2b — the router for every token. The selections have to reach the host
-    // before the layer's union can be issued as one set; `run_layer_body_router`
-    // already synchronizes to read their top-k back.
-    std::vector<V4LayerBodyOutput> outputs(count);
+    // Phase 2b — the router for every token, in one pass. The selections have to
+    // reach the host before the layer's union can be issued as one set, and the
+    // batched router pays for that with a single synchronisation for the whole chunk
+    // instead of one per token.
+    std::vector<V4LayerBodyOutput> outputs;
+    run_layer_body_router_batch(layer, workspace, token_ids, count, stream, observer,
+                                pre, outputs);
     std::vector<std::vector<int32_t>> batch_ids(count);
     std::vector<std::vector<float>> batch_weights(count);
     for (uint32_t row = 0; row < count; ++row) {
-        outputs[row] = run_layer_body_router(layer, views[row], token_ids[row],
-                                             start_position + row, stream, observer, pre[row]);
         batch_ids[row] = outputs[row].topk_indices;
         batch_weights[row] = outputs[row].topk_weights;
     }

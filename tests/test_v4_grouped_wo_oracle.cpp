@@ -174,7 +174,7 @@ int main() {
 
         aeon::kernel::gemv_fp16_kernel<<<
             dim3(static_cast<unsigned>(kHidden), static_cast<unsigned>(kTokens)),
-            dim3(32)>>>(d_z, d_b, d_y, static_cast<int>(kZ));
+            dim3(32)>>>(d_z, d_b, d_y, static_cast<int>(kZ), static_cast<int>(kZ));
         CHECK_HIP(hipGetLastError());
         CHECK_HIP(hipDeviceSynchronize());
 

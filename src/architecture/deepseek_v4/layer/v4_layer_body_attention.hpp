@@ -100,7 +100,7 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
     hipLaunchKernelGGL(
         kernel::gemv_fp16_kernel,
         dim3(Q_LORA, 1), dim3(32), 0, stream,
-        scratch.d_x_norm, layer.d_wq_a, scratch.d_qa, H);
+        scratch.d_x_norm, layer.d_wq_a, scratch.d_qa, H, H);
 
     hipLaunchKernelGGL(
         kernel::rmsnorm_wave32_kernel,
@@ -110,7 +110,7 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
     hipLaunchKernelGGL(
         kernel::gemv_fp16_kernel,
         dim3(TOTAL_Q, 1), dim3(32), 0, stream,
-        scratch.d_qa_norm, layer.d_wq_b, scratch.d_q, Q_LORA);
+        scratch.d_qa_norm, layer.d_wq_b, scratch.d_q, Q_LORA, Q_LORA);
 
     // The per-head norm is WEIGHTLESS: the artifact has no tensor for it, and
     // upstream's fused q-norm/rope takes no weight argument.
@@ -122,7 +122,7 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
     hipLaunchKernelGGL(
         kernel::gemv_fp16_kernel,
         dim3(HEAD_DIM, 1), dim3(32), 0, stream,
-        scratch.d_x_norm, layer.d_wkv, scratch.d_kv, H);
+        scratch.d_x_norm, layer.d_wkv, scratch.d_kv, H, H);
 
     hipLaunchKernelGGL(
         kernel::rmsnorm_wave32_kernel,
@@ -137,32 +137,32 @@ inline V4LayerBodyPre run_layer_body_pre_attention(
         hipLaunchKernelGGL(
             kernel::gemv_fp16_kernel,
             dim3(compressor_width, 1), dim3(32), 0, stream,
-            scratch.d_x_norm, layer.d_compressor_wkv, scratch.d_compressor_kv, H);
+            scratch.d_x_norm, layer.d_compressor_wkv, scratch.d_compressor_kv, H, H);
         hipLaunchKernelGGL(
             kernel::gemv_fp16_kernel,
             dim3(compressor_width, 1), dim3(32), 0, stream,
-            scratch.d_x_norm, layer.d_compressor_wgate, scratch.d_compressor_score, H);
+            scratch.d_x_norm, layer.d_compressor_wgate, scratch.d_compressor_score, H, H);
 
         if (layer.spec().attention_kind == V4AttentionKind::CSA) {
             hipLaunchKernelGGL(
                 kernel::gemv_fp16_kernel,
                 dim3(INDEXER_Q, 1), dim3(32), 0, stream,
-                scratch.d_qa_norm, layer.d_indexer_wq_b, scratch.d_indexer_query, Q_LORA);
+                scratch.d_qa_norm, layer.d_indexer_wq_b, scratch.d_indexer_query, Q_LORA, Q_LORA);
             hipLaunchKernelGGL(
                 kernel::gemv_fp16_kernel,
                 dim3(kernel::DSV4_INDEX_N_HEADS, 1), dim3(32), 0, stream,
                 scratch.d_x_norm, layer.d_indexer_weights_proj,
-                scratch.d_indexer_weights_half, H);
+                scratch.d_indexer_weights_half, H, H);
             hipLaunchKernelGGL(
                 kernel::gemv_fp16_kernel,
                 dim3(coefficient * kernel::DSV4_INDEX_HEAD_DIM, 1), dim3(32), 0, stream,
                 scratch.d_x_norm, layer.d_indexer_compressor_wkv,
-                scratch.d_indexer_compressor_kv, H);
+                scratch.d_indexer_compressor_kv, H, H);
             hipLaunchKernelGGL(
                 kernel::gemv_fp16_kernel,
                 dim3(coefficient * kernel::DSV4_INDEX_HEAD_DIM, 1), dim3(32), 0, stream,
                 scratch.d_x_norm, layer.d_indexer_compressor_wgate,
-                scratch.d_indexer_compressor_score, H);
+                scratch.d_indexer_compressor_score, H, H);
         }
     }
 
@@ -531,7 +531,7 @@ inline void run_layer_body_attention_and_norm(
     hipLaunchKernelGGL(
         kernel::gemv_fp16_kernel,
         dim3(H, 1), dim3(32), 0, stream,
-        scratch.d_z_lora, layer.d_wo_b, scratch.d_attn_proj, TOT_LORA);
+        scratch.d_z_lora, layer.d_wo_b, scratch.d_attn_proj, TOT_LORA, TOT_LORA);
 
     if (attention_trace != nullptr) {
         trace_copy(observer, attention_trace->grouped_output, scratch.d_attn_proj, H);

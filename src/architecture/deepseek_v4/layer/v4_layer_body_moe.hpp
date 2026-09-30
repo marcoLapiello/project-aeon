@@ -111,9 +111,60 @@ public:
     }
 };
 
+// Enqueues the router's device work for `count` tokens. It is the whole device half of
+// routing — the gate projection, the logit widening and the top-k selection — and
+// nothing more: the read-back is the caller's, because a single token needs its
+// selection at once while a chunk wants all `C` of them counted together.
+//
+// Every buffer is addressed as `base + token * stride`, so one launch sweeps the whole
+// batch. That is the reason `count` is a parameter at all: the same sequence serves a
+// decode step (`count == 1`, rows `H` apart in one padded tile) and a chunk (`count == C`,
+// rows `kMPad * H` apart in the layered workspace) with no second kernel set and no
+// gather into a dense copy.
+inline void dispatch_router(
+    const V4Layer& layer,
+    const half* activation, int activation_stride,
+    half* logits_half, float* logits,
+    const uint32_t* host_token_ids, int32_t* device_token_ids,
+    float* topk_weights, int32_t* topk_indices,
+    int count, hipStream_t stream) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int kExperts = 256;
+    constexpr int kTopK = 6;
+
+    hipLaunchKernelGGL(
+        kernel::gemv_fp16_vec8_kernel,
+        dim3(kExperts, count), dim3(32), 0, stream,
+        activation, layer.d_gate_weight, logits_half, H, activation_stride);
+
+    const int n = count * kExperts;
+    kernel::v4_half_to_float_n_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        logits_half, logits, n);
+
+    // The hash branch indexes `tid2eid` by token id, so the ids have to be on the
+    // device. Staging them here rather than expecting the caller to have done it
+    // removes a precondition that would be invisible at the call site.
+    CHECK_HIP(hipMemcpyAsync(device_token_ids, host_token_ids,
+                             static_cast<size_t>(count) * sizeof(uint32_t),
+                             hipMemcpyHostToDevice, stream));
+
+    hipLaunchKernelGGL(
+        kernel::moe_router_kernel,
+        dim3(count), dim3(64), 0, stream,
+        logits,
+        layer.is_hash_layer ? nullptr : layer.d_gate_bias,
+        layer.d_tid2eid, device_token_ids,
+        topk_weights, topk_indices,
+        kExperts, kTopK, 1.5f, true);
+}
+
 // The router. Writes the per-token top-k ids and weights and returns them, because
 // a chunk-wide dispatch needs every token's selection on the host before it can
 // issue the layer's union as one set.
+//
+// Decode's form of the router: one token, one read-back. The chunk's form
+// (`run_layer_body_router_batch`) enqueues the same `dispatch_router` with `count = C`
+// and pays the synchronisation once for the whole chunk.
 inline V4LayerBodyOutput run_layer_body_router(
     V4Layer& layer,
     V4LayerBodyRow& scratch,
@@ -123,38 +174,13 @@ inline V4LayerBodyOutput run_layer_body_router(
     V4LayerBodyObserver& observer,
     V4LayerBodyPre pre) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
-    constexpr int M_PAD = 16;
     V4AttentionTraceRecord* attention_trace = pre.trace;
-    (void)M_PAD;
+    (void)pos;
 
-    // -----------------------------------------------------------------
-    // MoE router
-    // -----------------------------------------------------------------
-    hipLaunchKernelGGL(
-        kernel::gemv_fp16_vec8_kernel,
-        dim3(256, 1), dim3(32), 0, stream,
-        scratch.d_ffn_norm_act, layer.d_gate_weight, scratch.d_router_logits_half, H);
-
-    kernel::v4_half_to_float_n_kernel<<<(256 + 255) / 256, 256, 0, stream>>>(
-        scratch.d_router_logits_half, scratch.d_router_logits, 256);
-
-    // The hash branch indexes `tid2eid` by token id, so the id has to be on the
-    // device. Staging it here rather than expecting the caller to have done it
-    // removes a precondition that would be invisible at the call site.
-    {
-        const int32_t h_token = static_cast<int32_t>(token_id);
-        CHECK_HIP(hipMemcpyAsync(scratch.d_token_id, &h_token, sizeof(int32_t),
-                                 hipMemcpyHostToDevice, stream));
-    }
-
-    hipLaunchKernelGGL(
-        kernel::moe_router_kernel,
-        dim3(1), dim3(64), 0, stream,
-        scratch.d_router_logits,
-        layer.is_hash_layer ? nullptr : layer.d_gate_bias,
-        layer.d_tid2eid, scratch.d_token_id,
-        scratch.d_topk_weights, scratch.d_topk_indices,
-        256, 6, 1.5f, true);
+    dispatch_router(layer, scratch.d_ffn_norm_act, H,
+                    scratch.d_router_logits_half, scratch.d_router_logits,
+                    &token_id, scratch.d_token_id,
+                    scratch.d_topk_weights, scratch.d_topk_indices, 1, stream);
 
     V4LayerBodyOutput output;
     output.topk_weights.resize(6);
@@ -203,11 +229,11 @@ inline void run_layer_body_moe_shared_expert(
     hipLaunchKernelGGL(
         kernel::gemv_fp16_vec8_kernel,
         dim3(INTER_DIM, 1), dim3(32), 0, stream,
-        scratch.d_ffn_norm_act, layer.d_shared_w1, scratch.d_shared_gate, H);
+        scratch.d_ffn_norm_act, layer.d_shared_w1, scratch.d_shared_gate, H, H);
     hipLaunchKernelGGL(
         kernel::gemv_fp16_vec8_kernel,
         dim3(INTER_DIM, 1), dim3(32), 0, stream,
-        scratch.d_ffn_norm_act, layer.d_shared_w3, scratch.d_shared_up, H);
+        scratch.d_ffn_norm_act, layer.d_shared_w3, scratch.d_shared_up, H, H);
 
     {
         constexpr int swiglu_threads = 256;
@@ -222,7 +248,7 @@ inline void run_layer_body_moe_shared_expert(
     hipLaunchKernelGGL(
         kernel::gemv_fp16_vec8_kernel,
         dim3(H, 1), dim3(32), 0, stream,
-        scratch.d_shared_swiglu, layer.d_shared_w2, scratch.d_moe_accum, INTER_DIM);
+        scratch.d_shared_swiglu, layer.d_shared_w2, scratch.d_moe_accum, INTER_DIM, INTER_DIM);
 
     if (attention_trace != nullptr) {
         trace_copy(observer, attention_trace->shared_expert_output, scratch.d_moe_accum, H);

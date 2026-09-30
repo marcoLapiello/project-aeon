@@ -184,7 +184,7 @@ int main() {
     // Stage 1 — Q_a = wq_a @ x_norm  [4096 -> 1024]
     // =======================================================================
     aeon::kernel::gemv_fp16_kernel<<<dim3(kQLoraRank, 1), 32>>>(
-        d_x, d_wq_a, d_qa, static_cast<int>(kHidden));
+        d_x, d_wq_a, d_qa, static_cast<int>(kHidden), static_cast<int>(kHidden));
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
     const std::vector<__half> h_qa = download(d_qa, kQLoraRank);
@@ -225,7 +225,7 @@ int main() {
     // Stage 3 — Q = wq_b @ q_a_norm  [1024 -> 64 * 512]
     // =======================================================================
     aeon::kernel::gemv_fp16_kernel<<<dim3(kQWidth, 1), 32>>>(
-        d_qa_norm, d_wq_b, d_q, static_cast<int>(kQLoraRank));
+        d_qa_norm, d_wq_b, d_q, static_cast<int>(kQLoraRank), static_cast<int>(kQLoraRank));
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
     const std::vector<__half> h_q_raw = download(d_q, kQWidth);
@@ -276,7 +276,7 @@ int main() {
     // Stage 5 — KV = wkv @ x_norm  [4096 -> 512]
     // =======================================================================
     aeon::kernel::gemv_fp16_kernel<<<dim3(kHeadDim, 1), 32>>>(
-        d_x, d_wkv, d_kv, static_cast<int>(kHidden));
+        d_x, d_wkv, d_kv, static_cast<int>(kHidden), static_cast<int>(kHidden));
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
     const std::vector<__half> h_kv_raw = download(d_kv, kHeadDim);

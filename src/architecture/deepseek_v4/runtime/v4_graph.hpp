@@ -141,7 +141,7 @@ public:
         // the artifact. One block per logit, fp32 accumulate, fp16 store.
         hipLaunchKernelGGL(
             kernel::gemv_fp16_vec8_kernel, dim3(vocab), dim3(32), 0, stream,
-            scratch.d_head_norm, resources.d_lm_head, scratch.d_logits, hidden);
+            scratch.d_head_norm, resources.d_lm_head, scratch.d_logits, hidden, hidden);
 
         return scratch.d_logits;
     }
