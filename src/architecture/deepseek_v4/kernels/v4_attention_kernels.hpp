@@ -119,6 +119,17 @@ __global__ void __launch_bounds__(32) v4_cached_sliding_window_attn_wave32_kerne
 
     const int j_start = max(0, current_pos - window_size + 1);
     const __half* q_ptr = q + head * DSV4_HEAD_DIM;
+    constexpr int kLaneElements = static_cast<int>(DSV4_HEAD_DIM) / 32;
+
+    // The query is loop-invariant, so it is read once into registers. The old loop
+    // re-read it from L1 for every one of the `window_size` slots — `128` redundant
+    // `q` walks per head — and hoisting is what makes the staging loop below a
+    // key-only stream.
+    float q_reg[kLaneElements];
+    #pragma unroll
+    for (int i = 0; i < kLaneElements; ++i) {
+        q_reg[i] = __half2float(q_ptr[lane * kLaneElements + i]);
+    }
 
     // Phase 1: Dot products with valid cached ring slots.
     for (int slot = 0; slot < window_size; ++slot) {
@@ -129,9 +140,9 @@ __global__ void __launch_bounds__(32) v4_cached_sliding_window_attn_wave32_kerne
 
         float dot = 0.0f;
         if (valid) {
-            #pragma unroll 4
-            for (int d = lane * 16; d < (lane + 1) * 16; ++d) {
-                dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d]);
+            #pragma unroll
+            for (int i = 0; i < kLaneElements; ++i) {
+                dot += q_reg[i] * __half2float(k_ptr[lane * kLaneElements + i]);
             }
 
             #pragma unroll
@@ -146,22 +157,38 @@ __global__ void __launch_bounds__(32) v4_cached_sliding_window_attn_wave32_kerne
     }
     __syncthreads();
 
-    // Phase 2: Softmax with attention sink.
-    float max_score = attn_sink[head];
-    for (int slot = 0; slot < window_size; ++slot) {
-        max_score = fmaxf(max_score, lds_scores[slot]);
+    // Phase 2: Softmax with attention sink, lane-strided.
+    //
+    // Only the two order-exact-or-cheap halves are parallelised. The max is a tree
+    // reduction — `fmaxf` is associative and exact, so the result is unchanged. The
+    // `expf` is strided across the lanes instead of issued in lockstep by all of
+    // them, which is where the `window_size`-fold transcendental redundancy goes.
+    // The denominator is deliberately left a single ascending walk: its terms sit at
+    // array positions that depend on the caller's row count (decode passes the full
+    // ring, a chunk passes its composed row count), so a tree sum would regroup them
+    // and break bit-identity against the per-token path. A sequential `fadd` is
+    // cheap; the `expf` that fed it was not.
+    float thread_max = attn_sink[head];
+    for (int slot = lane; slot < window_size; slot += 32) {
+        thread_max = fmaxf(thread_max, lds_scores[slot]);
     }
-
-    float sink_weight = expf(attn_sink[head] - max_score);
-    float sum_exp = sink_weight;
-
-    for (int slot = 0; slot < window_size; ++slot) {
-        float p = expf(lds_scores[slot] - max_score);
-        lds_scores[slot] = p;
-        sum_exp += p;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        thread_max = fmaxf(thread_max, __shfl_xor(thread_max, offset, 32));
     }
+    const float max_score = thread_max;
 
-    float inv_sum = 1.0f / fmaxf(sum_exp, 1e-30f);
+    for (int slot = lane; slot < window_size; slot += 32) {
+        lds_scores[slot] = expf(lds_scores[slot] - max_score);
+    }
+    __syncthreads();
+
+    // A masked slot holds `-INFINITY`, so its `expf` is exactly `0`.
+    float sum_exp = expf(attn_sink[head] - max_score);
+    for (int slot = 0; slot < window_size; ++slot) {
+        sum_exp += lds_scores[slot];
+    }
+    const float inv_sum = 1.0f / fmaxf(sum_exp, 1e-30f);
     __syncthreads();
 
     // Phase 3: Weighted sum of value vectors.
@@ -528,6 +555,15 @@ __global__ void __launch_bounds__(32) v4_cached_compressed_attention_wave32_kern
     const int local_start = max(0, static_cast<int>(current_position) - local_capacity + 1);
     const __half* query = q + static_cast<size_t>(head) * DSV4_HEAD_DIM;
     const int compressed_slots = uses_indexer ? topk_count : compressed_count;
+    constexpr int kLaneElements = static_cast<int>(DSV4_HEAD_DIM) / 32;
+
+    // Same loop-invariant hoist as the sliding kernel: one query walk into
+    // registers instead of one per key slot, for up to `local + topk` slots.
+    float q_reg[kLaneElements];
+    #pragma unroll
+    for (int i = 0; i < kLaneElements; ++i) {
+        q_reg[i] = __half2float(query[lane + i * 32]);
+    }
 
     for (int slot = 0; slot < local_capacity; ++slot) {
         const int64_t key_position = local_positions[slot];
@@ -535,8 +571,9 @@ __global__ void __launch_bounds__(32) v4_cached_compressed_attention_wave32_kern
         float dot = 0.0f;
         if (valid) {
             const __half* key = local_key_cache + static_cast<size_t>(slot) * DSV4_HEAD_DIM;
-            for (int dimension = lane; dimension < static_cast<int>(DSV4_HEAD_DIM); dimension += 32) {
-                dot += __half2float(query[dimension]) * __half2float(key[dimension]);
+            #pragma unroll
+            for (int i = 0; i < kLaneElements; ++i) {
+                dot += q_reg[i] * __half2float(key[lane + i * 32]);
             }
             for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_xor(dot, offset, 32);
         }
@@ -550,8 +587,9 @@ __global__ void __launch_bounds__(32) v4_cached_compressed_attention_wave32_kern
         float dot = 0.0f;
         if (valid) {
             const __half* key = compressed_key_cache + static_cast<size_t>(compressed_index) * DSV4_HEAD_DIM;
-            for (int dimension = lane; dimension < static_cast<int>(DSV4_HEAD_DIM); dimension += 32) {
-                dot += __half2float(query[dimension]) * __half2float(key[dimension]);
+            #pragma unroll
+            for (int i = 0; i < kLaneElements; ++i) {
+                dot += q_reg[i] * __half2float(key[lane + i * 32]);
             }
             for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_xor(dot, offset, 32);
         }
@@ -559,12 +597,31 @@ __global__ void __launch_bounds__(32) v4_cached_compressed_attention_wave32_kern
     }
     __syncthreads();
 
+    // Softmax, lane-strided on the same principle as the sliding kernel: the max is
+    // an exact tree, the `expf` is strided off the redundant lockstep issue, and the
+    // denominator keeps its ascending walk so the result stays bit-identical. That
+    // last point is load-bearing here — `scores[]` packs the local block then the
+    // compressed block at `local_capacity`, so the caller's row count shifts every
+    // compressed term's position; a tree sum would regroup them and diverge from the
+    // per-token path, which the chunk equality gates would see.
     const int total_keys = local_capacity + compressed_slots;
-    float maximum = attn_sink[head];
-    for (int index = 0; index < total_keys; ++index) maximum = fmaxf(maximum, scores[index]);
+    float thread_max = attn_sink[head];
+    for (int index = lane; index < total_keys; index += 32) {
+        thread_max = fmaxf(thread_max, scores[index]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        thread_max = fmaxf(thread_max, __shfl_xor(thread_max, offset, 32));
+    }
+    const float maximum = thread_max;
+
+    for (int index = lane; index < total_keys; index += 32) {
+        scores[index] = expf(scores[index] - maximum);
+    }
+    __syncthreads();
+
     float denominator = expf(attn_sink[head] - maximum);
     for (int index = 0; index < total_keys; ++index) {
-        scores[index] = expf(scores[index] - maximum);
         denominator += scores[index];
     }
     const float inverse_denominator = 1.0f / fmaxf(denominator, 1e-30f);

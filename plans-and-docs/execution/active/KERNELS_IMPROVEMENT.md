@@ -4,6 +4,30 @@ At the time this plan was written, every compute kernel in prefill was a GEMV (o
 
 **Ordering is the profile's, not the numbering's.** The steps are numbered in the order they were *written*. The profile below showed Steps 1–2 address ~`2.3%` of the swept prefill, while a host loop in `compose_local_rows` — not in the plan at all — was its largest single cost. Steps 3–5 are listed after the ones already done because their numbering is load-bearing for the records; the status table is the work order.
 
+## Run configuration
+
+The numbers below are only comparable if the invocation is fixed, and it drifted between sessions. This is the pinned command; every table in this document is a run of it unless a row says otherwise. Change one flag and the comparison is void, so record any deviation in the row that made it.
+
+```
+build/bin/aeon_chat \
+  --model-dir models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon \
+  --prompt "$(cat profiling-prompts/prefill-corpus.txt)" \
+  --warm-gib 35 \
+  --context-size 32768 \
+  --prefill-window 4096 \
+  --prefill-chunk 256 \
+  --staging-blocks 3 \
+  --max-new-tokens 32 \
+  --diagnostic --verbose \
+  --supply-telemetry <path.jsonl> --run-id <id> \
+  --phase-profile
+```
+
+- **Prompt** — `profiling-prompts/prefill-corpus.txt`, rendered through the DSV4 encoder to ~`700` tokens (the count `--diagnostic` prints; `profiling-prompts/first-prompt.txt` is the single-sentence first prompt and is not this run). Every table in this document predates this pin and was run on a ~`666`-token prompt, so the two are separated by the prompt-token count rather than mixed across a row. The exact count moves with templating, so the prompt-token count belongs beside every per-token figure.
+- **`--prefill-chunk 256`** — valid: `kMaxTokens = 256` (`v4_layer_body_batch.hpp`). The `--help` text still says `1..64`; the cap was raised and the string was not, so trust the constant, not the usage line.
+- **`--prefill-window 4096` / `--prefill-chunk 256`** — `W = 4096`, `C = 256` (`16` chunks fill a full window). The `666`-token prompt fits one window, so it is `ceil(666/256) = 3` chunk bodies per layer × `43` layers = `129` chunk bodies — the count the phase-profile tables divide by.
+- **`--staging-blocks 3`** — the swept-prefill staging arena in layer-blocks. It moves the prefetch depth and the pinned footprint, not throughput, so it does not move the phase split; record it anyway because it changes the memory budget the `--verbose` report prints.
+
 ## Status
 
 | Step | What | State |
@@ -13,14 +37,14 @@ At the time this plan was written, every compute kernel in prefill was a GEMV (o
 | 4a | Indexer top-k on device | **Done** — removes two stream drains per token per CSA layer |
 | — | `compose_local_rows` gather | **Done** — found by the profile, not in the original plan |
 | 3 | WMMA dense GEMM for the dense projections | **Partly done** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
-| 4 | Batched causal attention over the chunk | **Open** |
+| 4 | Batched causal attention over the chunk | **Partly done** — per-query softmax/reduction redundancy fixed; query-tile kernel open |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Open** |
 | 6 | Tune for gfx1100 | **Open** |
 | 7 | Re-measure and retune supply | **Open** |
 
 ## Phase profile
 
-**Baseline** — the state the ordering was decided from. `aeon_chat --phase-profile`, swept prefill, 666-token prompt, `W=4096 C=256` (129 chunk bodies over 43 layers). Host = CPU time issuing the phase; GPU = `hipEvent` span on the compute stream. `n = 1`, one prompt.
+**Baseline** — the state the ordering was decided from. The pinned invocation in **Run configuration**, swept prefill, ~`666`-token prompt, `W=4096 C=256`. Host = CPU time issuing the phase; GPU = `hipEvent` span on the compute stream. `n = 1`, one prompt.
 
 | Phase | host ms | gpu ms | gpu share |
 | :--- | ---: | ---: | ---: |
@@ -172,10 +196,25 @@ End to end (`aeon_chat`, swept, `W=4096 C=256`, `n = 1`, `701`-token prefix of `
 
 Gates: `test_v4_layer_body_chunk_oracle` (`0` differing; 16-token chunks, GEMV path), `_serial_oracle`, `_compressed_oracle`, `test_v4_engine` (`38/0`) green. `test_v4_prefill_window` fails `A`/`B` bit-exact (`4/10`) with and without this change — the grouped-experts reorder noted in Step 2, not this step. A chunk of `≥ 32` tokens is a reorder of the same kind and is compared at the greedy bar, not bit-exact.
 
-### Step 4: Batched causal attention over the chunk — **open**
+### Step 4: Batched causal attention over the chunk — **partly done**
 
-- Replace the per-row attention kernel with one over a query tile (16 queries × head) using WMMA for QKᵀ and PV, with online softmax plus sink. It reads the composed local and compressed keys once per tile instead of once per query. This is the larger of the two GPU numbers (`22.8 s`).
-- Use SGLang dsv4 attention/indexer as the semantic reference.
+Two increments, cheapest first. 4.1 is an internal reformulation of the same algebra, so the byte-comparable attention oracles are its exact gate; 4.2 is the structural change and can only be judged at the greedy-agreement bar, because a tile assigns different causal windows and different indexer top-k sets to the queries in it.
+
+#### Implementation record
+
+_Done `2026-09-30`._
+
+**4.1 — the per-query redundancy.** The kernels are `v4_cached_sliding_window_attn_wave32_kernel` and `v4_cached_compressed_attention_wave32_kernel` in `src/architecture/deepseek_v4/kernels/v4_attention_kernels.hpp`. Two fixes, both per (head, token): the loop-invariant query is now read **once into registers** instead of re-read from cache for every key slot, and the softmax max and `expf` are **lane-strided** with one 5-step reduction instead of being walked by all 32 lanes in lockstep (~`640 × 32` `expf` down to ~`640` on a CSA layer).
+
+The denominator is deliberately **left a sequential ascending walk**. `scores[]` is indexed by the caller's row count — decode passes the full ring (`local_capacity = 128`), a chunk passes its composed row count — so the terms sit at different array positions on the two paths and a tree sum would regroup them; the chunk-vs-serial equality gate caught exactly that (the CSA `decode body == chunk path at count 1` comparison, `3` differing of `1.5M`) and it is why only the max and the transcendental are parallelised. The max is an exact tree; the transcendental and its operand are not order-sensitive. Every comparison in `test_v4_layer_body_chunk_oracle` is bit-identical after the change, not merely within tolerance.
+
+What this does **not** yet do: the per-key serial `dot` over `[head_dim]` (one slot at a time, no cross-slot blocking) and the per-key write of `scores[slot]` from lane 0 remain, and the launch is still one query per block, not a query tile. Re-measure the phase profile when convenient to size the win; the gates below are the correctness bar, not the speed one.
+
+Gates: `test_v4_attention_sink_oracle`, `test_v4_mla_oracle`, `test_v4_layer_body_serial_oracle`, `_compressed_oracle`, `_oracle`, `_chunk_oracle` (bit-identical throughout) and `test_v4_indexer_oracle` green. `test_v4_prefill_window` (`4/10`) and `test_v4_routed_prefill` (D-check) fail on the grouped-expert reorder of Step 2, with and without this change.
+
+**4.2 — one query tile per block.** Replace the per-row launch with a block over a query tile (16 queries × head) using WMMA for QKᵀ and PV, online softmax plus sink, reading the composed local and compressed keys once per tile instead of once per query. Use SGLang `srt/layers/attention/dsv4/**` as the semantic reference.
+
+The per-query observations are the `F7` finding of `plans-and-docs/analysis/current/KERNEL_COMPUTE_PATH_ANALYSIS.md`; that document's *file and line citations predate the module splits and are stale*, so take the concept from it and the location from the tree.
 
 ### Step 4a: Move the indexer top-k on-device — **done**
 
