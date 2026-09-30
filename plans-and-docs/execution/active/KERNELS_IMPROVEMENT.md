@@ -2,6 +2,8 @@ At the time this plan was written, every compute kernel in prefill was a GEMV (o
 
 The steps below are numbered in the order they were *written*, not the order the time is. A measured phase profile of the swept prefill (below) later showed that Steps 1–2 address ~2.3% of it, while two per-token loops — the attention half and the pre-attention half — are 94%. The numbering is kept for the record; **the work order is the profile's**, and Step 4a is inserted on that basis.
 
+**Scope: throughput in general, not one arm.** The swept prefill is profiled first because it has no supply constraint, so its host/GPU split is clean to read; that is a *measurement* choice, not a statement about where the work belongs. The routed prefill and decode share the same per-token body — the same attention kernel, the same GEMVs, the same HC/norm stages — so a fix to those helps every arm. Steps 3–5 therefore target the kernels and launches that all three pay for, and each step's record states its effect on each arm it touches. Decode's own bottleneck (the batched per-token sequence) is tracked separately.
+
 ## Measured phase profile (the ordering this plan should follow)
 
 `aeon_chat --phase-profile`, swept prefill, 666-token prompt, `W=4096 C=256` (129 chunk bodies over 43 layers). Host = CPU time issuing the phase; GPU = `hipEvent` span on the compute stream. `n = 1`, one prompt.
@@ -23,8 +25,21 @@ Three things it settles:
 2. **Steps 1–2 bought ~2.3% directly.** The grouped expert pair is `2.2%` and the batched router's device work `0.1%`. The router's `13.8 s` of host time is *not* issuance — it is its read-back `hipStreamSynchronize` draining the attention backlog queued ahead of it. The launch/queue cost of a phase is only visible as host time, which is why the profile reports both columns.
 3. **The same drain, per token per CSA layer, is inside the 70.7%.** `select_indexer_topk` synchronizes the stream **twice** to sort the indexer's candidates on the host, once per token for every CSA layer (~`38k` drains per window). That is Step 4a.
 
-## Findings
+**Then the profile was used to split its own largest number.** `attention+norm` divided into the attention kernel, the HC/norm tail, and `compose_local_rows` — and the last was ~`45 s` host / ~`23 s` GPU, the largest single cost of the prefill. It assembled each query's local row-set with two `hipMemcpyAsync` per ring slot per query (~`256` submissions per token). The row-set has a closed form (`row r` = slot `r`, position `first + ((r − first) mod capacity)`), so it is now **one gather launch**; row order must be slot order, not position order, because decode iterates the ring in slot order and for a wrapped window the two are a rotation — composing by position is a softmax summation-order change, which `test_v4_layer_body_chunk_oracle` caught (`313` differing) before it was fixed.
 
+Result of the three steps so far (`aeon_chat`, 666-token prompt, `W=4096 C=256`, swept, `n = 1`):
+
+| | M47 baseline | after Steps 1–2 | after 4a | after the compose gather |
+| :--- | ---: | ---: | ---: | ---: |
+| TTFT | `79.4 s` | `73.3 s` | `70.8 s` | **`50.0 s`** |
+| ms / prompt-token | `121.4` | `110.1` | `106.3` | **`75.1`** |
+| `attention+norm` host | — | `37.3 s` | `48.3 s` | **`1.5 s`** |
+| attention kernel, GPU | — | — | `22.8 s` | `22.8 s` |
+| pre-attention, GPU | — | `15.7 s` | `14.7 s` | `14.6 s` |
+
+Prefill is now **GPU-bound**: after the host stalls are gone, the two GPU numbers that matter are the attention kernel (`22.8 s`) and pre-attention (`14.6 s`). That is what Steps 3–4 reduce, and it is why they are the next work rather than more launch surgery.
+
+## Findings
 - The chunk "batch" is serial: pre-attention, attention and norm, and the router each run per row (`row < count`), and each row launches its own kernels. The routed experts were per-token too, so an expert chosen by `k` tokens in a chunk was dequantised `k` times — addressed by Step 1/2 (the grouped pair and the permutation).
 - The router makes one host sync per row, returning `std::vector` top-k results, so the GPU idles between rows.
 - Small per-row launches (rmsnorm, rope, HC sinkhorn, KV-cache copies, an H2D memcpy of the position per row) add launch and sync overhead that scales with T.
