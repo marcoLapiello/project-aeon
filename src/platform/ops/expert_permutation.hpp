@@ -108,9 +108,30 @@ __global__ void expert_permutation_scatter_kernel(
     }
 }
 
+// Reorders a per-draw array into per-position order: `out[p] = weights[draw_indices[p]]`.
+//
+// The grouped down kernel reads the routing weight by permutation **position**
+// (`draw_weights[position]`), while the layer body holds the weights by **draw**
+// (`weights[token * slots + slot]`). This is the one-line bridge between the two. Kept
+// as a separate kernel rather than folding the index into the grouped kernel so that
+// kernel's contract stays "both arrays are per position", as its oracle assumes.
+__global__ void expert_permutation_gather_weights_kernel(
+    const float* __restrict__ weights,
+    const int* __restrict__ draw_indices,
+    int draws,
+    float* __restrict__ out
+) {
+    const int position = blockIdx.x * blockDim.x + threadIdx.x;
+    if (position < draws) {
+        out[position] = weights[draw_indices[position]];
+    }
+}
+
 // `topk_indices` is `[token_count * slots]`, row-major by token, so draw
 // `token * slots + slot` selects `token`'s `slot`-th expert. `expert_offsets` is
 // `[expert_count + 1]`; `token_indices` and `draw_indices` are `[token_count * slots]`.
+// When `weights_by_draw`/`weights_by_position` are supplied, the weights are reordered
+// into position order in the same dispatch.
 inline void dispatch_expert_permutation(
     const int* topk_indices,
     int token_count,
@@ -119,6 +140,8 @@ inline void dispatch_expert_permutation(
     int* expert_offsets,
     int* token_indices,
     int* draw_indices,
+    const float* weights_by_draw = nullptr,
+    float* weights_by_position = nullptr,
     hipStream_t stream = 0
 ) {
     if (topk_indices == nullptr || expert_offsets == nullptr ||
@@ -132,6 +155,10 @@ inline void dispatch_expert_permutation(
         throw std::invalid_argument(
             "dispatch_expert_permutation: expert count out of range");
     }
+    if ((weights_by_draw == nullptr) != (weights_by_position == nullptr)) {
+        throw std::invalid_argument(
+            "dispatch_expert_permutation: weights need both a source and a destination");
+    }
 
     const int draws = token_count * slots;
     constexpr int kOffsetThreads = 256;
@@ -140,6 +167,11 @@ inline void dispatch_expert_permutation(
             topk_indices, draws, expert_count, expert_offsets);
     expert_permutation_scatter_kernel<<<expert_count, 1, 0, stream>>>(
         topk_indices, expert_offsets, draws, slots, token_indices, draw_indices);
+    if (weights_by_draw != nullptr && draws > 0) {
+        const int blocks = (draws + kOffsetThreads - 1) / kOffsetThreads;
+        expert_permutation_gather_weights_kernel<<<blocks, kOffsetThreads, 0, stream>>>(
+            weights_by_draw, draw_indices, draws, weights_by_position);
+    }
 }
 
 } // namespace aeon::kernel

@@ -110,7 +110,11 @@ void moe_grouped_gate_up_kernel(
 
     const int first = expert_offsets[expert];
     const int count = expert_offsets[expert + 1] - first;
-    const int pad_row = token_indices[first];
+    // An expert with no draws (an expert of the layer the chunk never routed to) has
+    // `first == expert_offsets[expert + 1]`, so `token_indices[first]` would read the
+    // next expert's first entry or past the end. Guard it; the padding row is unused
+    // when `count == 0` because the M loop below does not run.
+    const int pad_row = count > 0 ? token_indices[first] : 0;
 
     const int iterations = (K / 32) / Feed::kLpr;
 

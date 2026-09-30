@@ -235,6 +235,37 @@ int main(int argc, char** argv) {
                 std::to_string(logits_diff) + " differing of " +
                     std::to_string(serial_logits.size()));
 
+    // Magnitude of the chunk-vs-serial difference, not just its presence. The grouped
+    // expert GEMM sums its K reduction in a different order than the per-token GEMV, so
+    // the logits are no longer bit-identical by construction; what matters for quality
+    // is whether the difference stays inside fp16 noise and never moves the greedy
+    // token.
+    {
+        const __half* a = reinterpret_cast<const __half*>(serial_logits.data());
+        const __half* b = reinterpret_cast<const __half*>(routed_logits.data());
+        const size_t n = serial_logits.size() / sizeof(__half);
+        float max_abs = 0.0f;
+        float max_rel = 0.0f;
+        size_t identical = 0;
+        size_t argmax_a = 0;
+        size_t argmax_b = 0;
+        float best_a = -1e30f;
+        float best_b = -1e30f;
+        for (size_t i = 0; i < n; ++i) {
+            const float x = __half2float(a[i]);
+            const float y = __half2float(b[i]);
+            max_abs = std::max(max_abs, std::fabs(x - y));
+            max_rel = std::max(max_rel, std::fabs(x - y) / std::max(1e-6f, std::fabs(x)));
+            if (x == y) ++identical;
+            if (x > best_a) { best_a = x; argmax_a = i; }
+            if (y > best_b) { best_b = y; argmax_b = i; }
+        }
+        std::printf("  D: logit delta           max_abs=%.3e max_rel=%.3e, "
+                    "fp16-identical %zu/%zu, argmax %s\n",
+                    max_abs, max_rel, identical, n,
+                    argmax_a == argmax_b ? "unchanged" : "MOVED");
+    }
+
     assert_that("D: dedup collapsed the chunk draws", distinct < draws,
                 std::to_string(distinct) + " distinct of " + std::to_string(draws) + " draws");
 

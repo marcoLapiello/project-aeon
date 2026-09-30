@@ -54,6 +54,8 @@
 #include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/core/vram_expert_pool.hpp"
 #include "architecture/deepseek_v4/kernels/moe_gemv_dispatch.hpp"
+#include "architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp"
+#include "platform/ops/expert_permutation.hpp"
 #include "infrastructure/expert/residency/expert_registry.hpp"
 #include "infrastructure/expert/storage/host_expert_pool.hpp"
 #include "infrastructure/expert/transport/prefetch_staging.hpp"
@@ -82,11 +84,24 @@ struct V4RoutedExpertScratch {
     static constexpr int kExperts = 6;
     static constexpr int kHidden = 4096;
     static constexpr int kIntermediate = 2048;
+    // The chunk width the grouped path is sized for; a chunk larger than this is
+    // refused rather than silently truncated.
+    static constexpr int kMaxChunk = 256;
 
     // The fused W13 kernel indexes its weight structs by expert id, and the structs
     // are sized for the kernel's own maximum; only `kExperts` slots are written.
     half* d_expert_hidden{nullptr};   // [kAeonSwizzledMaxExperts, kIntermediate]
     float* d_contrib{nullptr};        // [kExperts, kHidden]
+
+    // --- Chunk (grouped) path scratch. Small next to the weight traffic it serves;
+    // allocated once for the maximum chunk rather than reallocated per chunk.
+    int* d_perm_offsets{nullptr};     // [kMaxChunk + 1] expert offsets of the permutation
+    int* d_perm_tokens{nullptr};      // [kMaxChunk * kExperts] token of each draw
+    int* d_perm_draws{nullptr};       // [kMaxChunk * kExperts] global draw of each permuted position
+    float* d_perm_weights{nullptr};   // [kMaxChunk * kExperts] routing weight per permuted position
+    int* d_batch_offsets{nullptr};    // [kAeonSwizzledMaxExperts + 1] rebased per launch
+    half* d_chunk_hidden{nullptr};    // [kAeonSwizzledMaxExperts, kMaxChunk, kIntermediate]
+    float* d_chunk_contrib{nullptr};  // [kMaxChunk * kExperts, kHidden] fp32, by draw
 
     V4RoutedExpertScratch() = default;
 
@@ -104,12 +119,40 @@ struct V4RoutedExpertScratch {
         allocate_buffer(d_contrib, static_cast<size_t>(kExperts) * kHidden);
     }
 
+    // The chunk (grouped) scratch, allocated on first use rather than with the base
+    // scratch. It is a **prefill** resource: the decode path never runs a grouped
+    // chunk, and the decode workspace's allowance is fixed by the per-token kernel
+    // shapes, so folding this in at load would fail a decode-only budget for memory
+    // prefill alone would touch.
+    void allocate_chunk_scratch() {
+        if (d_chunk_hidden != nullptr) {
+            return;
+        }
+        allocate_buffer(d_perm_offsets, static_cast<size_t>(kMaxChunk) + 1);
+        allocate_buffer(d_perm_tokens, static_cast<size_t>(kMaxChunk) * kExperts);
+        allocate_buffer(d_perm_draws, static_cast<size_t>(kMaxChunk) * kExperts);
+        allocate_buffer(d_perm_weights, static_cast<size_t>(kMaxChunk) * kExperts);
+        allocate_buffer(d_batch_offsets, static_cast<size_t>(kernel::kAeonSwizzledMaxExperts) + 1);
+        allocate_buffer(d_chunk_hidden,
+                        static_cast<size_t>(kernel::kAeonSwizzledMaxExperts) * kMaxChunk *
+                            kIntermediate);
+        allocate_buffer(d_chunk_contrib,
+                        static_cast<size_t>(kMaxChunk) * kExperts * kHidden);
+    }
+
     // Exact VRAM this scratch holds; the budget reports it rather than a literal.
     size_t bytes() const noexcept { return bytes_allocated_; }
 
     void free() noexcept {
         if (d_expert_hidden) { (void)hipFree(d_expert_hidden); d_expert_hidden = nullptr; }
         if (d_contrib) { (void)hipFree(d_contrib); d_contrib = nullptr; }
+        if (d_perm_offsets) { (void)hipFree(d_perm_offsets); d_perm_offsets = nullptr; }
+        if (d_perm_tokens) { (void)hipFree(d_perm_tokens); d_perm_tokens = nullptr; }
+        if (d_perm_draws) { (void)hipFree(d_perm_draws); d_perm_draws = nullptr; }
+        if (d_perm_weights) { (void)hipFree(d_perm_weights); d_perm_weights = nullptr; }
+        if (d_batch_offsets) { (void)hipFree(d_batch_offsets); d_batch_offsets = nullptr; }
+        if (d_chunk_hidden) { (void)hipFree(d_chunk_hidden); d_chunk_hidden = nullptr; }
+        if (d_chunk_contrib) { (void)hipFree(d_chunk_contrib); d_chunk_contrib = nullptr; }
         bytes_allocated_ = 0;
     }
 
@@ -255,27 +298,7 @@ public:
         }
 
         if (!batch_materialized_) {
-            // Waits for the io_uring completions; the submission already happened.
-            supply_.materialize_layer_prefetch(state_);
-            for (size_t index = 0; index < state_.expert_count(); ++index) {
-                if (!state_.is_prefetched[index]) {
-                    continue;
-                }
-                // The upload may be in flight on a side stream. The supply records a
-                // per-transfer event on the stream that carries the upload, and waiting
-                // on it here is what orders this batch's kernels behind the copy — the
-                // one ordering the executor must not skip. Waited once per distinct
-                // expert, not once per token, because the transfer is shared.
-                supply_.mark_gpu_readiness_wait_start(state_.operation_ids[index]);
-                const uint32_t staging_idx = state_.staging_indices[index];
-                CHECK_HIP(hipStreamWaitEvent(
-                    streams_.compute, staging_.events[staging_idx], 0));
-                if (std::find(staging_in_use_.begin(), staging_in_use_.end(), staging_idx) ==
-                    staging_in_use_.end()) {
-                    staging_in_use_.push_back(staging_idx);
-                }
-            }
-            batch_materialized_ = true;
+            materialize_batch();
         }
 
         const auto& token_map = state_.token_indices[token_index];
@@ -327,6 +350,151 @@ public:
                 moe_accum,
                 moe_accum,
                 V4RoutedExpertScratch::kHidden);
+    }
+
+    // The chunk-wide routed accumulate: the grouped WMMA expert pair over the whole
+    // chunk instead of the per-token GEMV pair. The chunk's draws are permuted
+    // expert-contiguous once, the experts are dispatched in batches of at most
+    // `kAeonSwizzledMaxExperts` (the weight-pointer table's length), and each token's
+    // contribution is reduced in slot order exactly as the per-token path does — so the
+    // only difference from the per-token path is the summation order *inside* one
+    // expert's GEMM.
+    void accumulate_routed_batch(uint32_t layer_id, uint32_t first_position,
+                                 uint32_t token_count,
+                                 const half* batch_input, int input_stride,
+                                 const int* batch_ids, int ids_stride,
+                                 const float* batch_weights, int weights_stride,
+                                 half* batch_output, int output_stride) override {
+        if (token_count == 0) {
+            return;
+        }
+        if (current_layer_ != layer_id || first_position != state_.first_position ||
+            token_count != state_.token_count) {
+            throw std::logic_error(
+                "V4TieredExpertExecutor: accumulate_routed_batch without a matching "
+                "batch dispatch");
+        }
+        if (batch_ids == nullptr || ids_stride != V4RoutedExpertScratch::kExperts ||
+            weights_stride != V4RoutedExpertScratch::kExperts) {
+            throw std::invalid_argument(
+                "V4TieredExpertExecutor: batch ids and weights must be [token, kExperts]");
+        }
+        const int experts = static_cast<int>(registry_.experts_per_layer);
+        if (experts <= 0 || experts > V4RoutedExpertScratch::kMaxChunk ||
+            token_count > V4RoutedExpertScratch::kMaxChunk) {
+            throw std::invalid_argument(
+                "V4TieredExpertExecutor: chunk too wide for the grouped path");
+        }
+
+        if (!batch_materialized_) {
+            materialize_batch();
+        }
+
+        scratch_.allocate_chunk_scratch();
+
+        // 1. The chunk's draws, gathered expert-contiguous on the device, with the
+        //    routing weights reordered into the same position order.
+        kernel::dispatch_expert_permutation(
+            batch_ids, static_cast<int>(token_count), V4RoutedExpertScratch::kExperts,
+            experts, scratch_.d_perm_offsets, scratch_.d_perm_tokens,
+            scratch_.d_perm_draws, batch_weights, scratch_.d_perm_weights,
+            streams_.compute);
+
+        // 2. The per-expert bounds are needed on the host to batch the experts and to
+        //    size the intermediate; the read is small next to the traffic it schedules.
+        std::vector<int> offsets(static_cast<size_t>(experts) + 1);
+        CHECK_HIP(hipMemcpyAsync(offsets.data(), scratch_.d_perm_offsets,
+                                 offsets.size() * sizeof(int), hipMemcpyDeviceToHost,
+                                 streams_.compute));
+        CHECK_HIP(hipStreamSynchronize(streams_.compute));
+
+        // 3. Global expert id -> VRAM slot for this layer, from the resident set.
+        std::vector<int> slot_of(static_cast<size_t>(experts), -1);
+        for (size_t index = 0; index < state_.global_expert_ids.size(); ++index) {
+            const int expert =
+                static_cast<int>(state_.global_expert_ids[index] % static_cast<uint32_t>(experts));
+            slot_of[static_cast<size_t>(expert)] = state_.vram_slots[index];
+        }
+
+        // 4. The widest expert of the chunk sets the intermediate's row pitch.
+        int widest = 1;
+        for (int expert = 0; expert < experts; ++expert) {
+            widest = std::max(widest, offsets[static_cast<size_t>(expert) + 1] -
+                                          offsets[static_cast<size_t>(expert)]);
+        }
+
+        // 5. Experts in batches of at most the weight table's length. A batch with no
+        //    draws is skipped; a batch's surviving experts are packed to the front, so
+        //    a sparse tail does not widen the dispatch.
+        const int per_launch = kernel::kAeonSwizzledMaxExperts;
+        for (int base = 0; base < experts; base += per_launch) {
+            const int batch_count = std::min(per_launch, experts - base);
+            if (offsets[static_cast<size_t>(base)] ==
+                offsets[static_cast<size_t>(base) + batch_count]) {
+                continue;
+            }
+            const int first_draw = offsets[static_cast<size_t>(base)];
+
+            kernel::SwizzledW13ExpertPtrs w13{};
+            kernel::SwizzledW2ExpertPtrs w2{};
+            std::vector<int> rebased(static_cast<size_t>(batch_count) + 1);
+            for (int j = 0; j < batch_count; ++j) {
+                const int expert = base + j;
+                rebased[static_cast<size_t>(j)] =
+                    offsets[static_cast<size_t>(expert)] - first_draw;
+                const int slot = slot_of[static_cast<size_t>(expert)];
+                if (slot < 0) {
+                    if (offsets[static_cast<size_t>(expert) + 1] >
+                        offsets[static_cast<size_t>(expert)]) {
+                        throw std::logic_error(
+                            "V4TieredExpertExecutor: a routed expert has no VRAM slot");
+                    }
+                    continue;
+                }
+                const uint32_t s = static_cast<uint32_t>(slot);
+                w13.w1[j] = reinterpret_cast<const uint4*>(vram_pool_.get_w1_packed(s));
+                w13.s1[j] = vram_pool_.get_w1_scale(s);
+                w13.w3[j] = reinterpret_cast<const uint4*>(vram_pool_.get_w3_packed(s));
+                w13.s3[j] = vram_pool_.get_w3_scale(s);
+                w2.w2[j] = reinterpret_cast<const uint4*>(vram_pool_.get_w2_packed(s));
+                w2.s2[j] = vram_pool_.get_w2_scale(s);
+            }
+            rebased[static_cast<size_t>(batch_count)] =
+                offsets[static_cast<size_t>(base) + batch_count] - first_draw;
+
+            CHECK_HIP(hipMemcpyAsync(scratch_.d_batch_offsets, rebased.data(),
+                                     rebased.size() * sizeof(int), hipMemcpyHostToDevice,
+                                     streams_.compute));
+
+            kernel::dispatch_aeon_moe_grouped_w13_swiglu_wmma<
+                4, 4, 8, kernel::kMoeGroupedMTiles>(
+                batch_input, scratch_.d_batch_offsets,
+                scratch_.d_perm_tokens + first_draw, w13, scratch_.d_chunk_hidden,
+                batch_count, widest, V4RoutedExpertScratch::kIntermediate,
+                V4RoutedExpertScratch::kHidden, swiglu_limit_, input_stride,
+                streams_.compute);
+            kernel::dispatch_aeon_moe_grouped_w2_wmma<4, 8, 4, kernel::kMoeGroupedMTiles>(
+                scratch_.d_chunk_hidden, scratch_.d_batch_offsets,
+                scratch_.d_perm_draws + first_draw, scratch_.d_perm_weights + first_draw,
+                w2, scratch_.d_chunk_contrib, batch_count, widest,
+                V4RoutedExpertScratch::kHidden, V4RoutedExpertScratch::kIntermediate,
+                streams_.compute);
+        }
+
+        // 6. Per token, the slot-ordered fixed-order reduce, folding in the shared
+        //    expert the body already wrote into that token's accumulator.
+        constexpr int kThreads = 256;
+        for (uint32_t token = 0; token < token_count; ++token) {
+            half* accum = batch_output + static_cast<size_t>(token) * output_stride;
+            kernel::moe_accumulate_fixed_order_kernel
+                <<<(V4RoutedExpertScratch::kHidden + kThreads - 1) / kThreads,
+                   kThreads, 0, streams_.compute>>>(
+                    scratch_.d_chunk_contrib +
+                        static_cast<size_t>(token) * V4RoutedExpertScratch::kExperts *
+                            V4RoutedExpertScratch::kHidden,
+                    V4RoutedExpertScratch::kExperts, accum, accum,
+                    V4RoutedExpertScratch::kHidden);
+        }
     }
 
     void on_routed_consumed(uint32_t layer_id, uint32_t position) override {
@@ -389,6 +557,31 @@ private:
     // On a pool large enough for `6 x 43` leases this is never reached, which is
     // the intended steady state; the counter exists so a gate can say which of the
     // two regimes it ran in.
+    // Waits for the batch's transfers and orders this stream behind them. Shared by
+    // the per-token and chunk accumulators so the ordering exists once.
+    void materialize_batch() {
+        // Waits for the io_uring completions; the submission already happened.
+        supply_.materialize_layer_prefetch(state_);
+        for (size_t index = 0; index < state_.expert_count(); ++index) {
+            if (!state_.is_prefetched[index]) {
+                continue;
+            }
+            // The upload may be in flight on a side stream. The supply records a
+            // per-transfer event on the stream that carries the upload, and waiting
+            // on it here is what orders this batch's kernels behind the copy — the
+            // one ordering the executor must not skip. Waited once per distinct
+            // expert, not once per token, because the transfer is shared.
+            supply_.mark_gpu_readiness_wait_start(state_.operation_ids[index]);
+            const uint32_t staging_idx = state_.staging_indices[index];
+            CHECK_HIP(hipStreamWaitEvent(streams_.compute, staging_.events[staging_idx], 0));
+            if (std::find(staging_in_use_.begin(), staging_in_use_.end(), staging_idx) ==
+                staging_in_use_.end()) {
+                staging_in_use_.push_back(staging_idx);
+            }
+        }
+        batch_materialized_ = true;
+    }
+
     void ensure_pool_headroom(size_t incoming_leases = V4RoutedExpertScratch::kExperts) {
         // During a swept prefill nothing evicts: the sweep allocates from the free
         // list only and releases whole layers in order, so there is no victim

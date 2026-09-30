@@ -75,6 +75,34 @@ public:
                                    const float* expert_weights,
                                    half* moe_accum) = 0;
 
+    // The chunk-wide form: the same accumulate for `token_count` tokens in one call,
+    // so a batched executor can run the routed experts as grouped GEMMs over the
+    // whole chunk instead of per token.
+    //
+    // The activation is passed as a batch with a row stride, not a set of pointers:
+    // the layer body's workspace stores each token's row inside its own 16-row padded
+    // tile, so the stride (`16 x H`) is what lets the kernel read them in place. Both
+    // the activations and the outputs are strided the same way.
+    //
+    // The default is the per-token sequence, so an executor with nothing to batch —
+    // a gate's synthetic one — needs no override, and `token_count == 1` reproduces
+    // `accumulate_routed`.
+    virtual void accumulate_routed_batch(uint32_t layer_id, uint32_t first_position,
+                                         uint32_t token_count,
+                                         const half* batch_input, int input_stride,
+                                         const int* batch_ids, int ids_stride,
+                                         const float* batch_weights, int weights_stride,
+                                         half* batch_output, int output_stride) {
+        (void)batch_ids;
+        (void)ids_stride;
+        for (uint32_t token = 0; token < token_count; ++token) {
+            accumulate_routed(layer_id, first_position + token,
+                              batch_input + static_cast<size_t>(token) * input_stride,
+                              batch_weights + static_cast<size_t>(token) * weights_stride,
+                              batch_output + static_cast<size_t>(token) * output_stride);
+        }
+    }
+
     // Runs after the routed experts have been consumed, so the executor can
     // remember which staging slots to release on the next layer.
     virtual void on_routed_consumed(uint32_t layer_id, uint32_t position) {
@@ -153,25 +181,23 @@ inline V4LayerBodyOutput run_layer_body_router(
 // the layer's union once for all of its tokens, between the router and this phase,
 // so the caller owns that call. Decode issues it per token, exactly where it always
 // did.
-inline void run_layer_body_moe_and_post(
+//
+// The first and last phases are exposed separately so a chunk can run every token's
+// shared expert, then one batched routed accumulate over them all, then every token's
+// post. Decode runs the three in sequence through `run_layer_body_moe_and_post`.
+
+// Clears the accumulation buffer and runs the shared expert into it, for one token.
+inline void run_layer_body_moe_shared_expert(
     V4Layer& layer,
     V4LayerBodyRow& scratch,
-    uint32_t pos,
     hipStream_t stream,
-    V4RoutedExpertExecutor& experts,
     V4LayerBodyObserver& observer,
     V4LayerBodyPre pre) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
-    constexpr int HC = 4;
-    constexpr int HC_DIM = HC * H;
     constexpr int INTER_DIM = 2048;
     constexpr int M_PAD = 16;
     V4AttentionTraceRecord* attention_trace = pre.trace;
 
-    // -----------------------------------------------------------------
-    // Shared expert (always fires), accumulating into the cleared buffer
-    // -----------------------------------------------------------------
-    // Clear MoE accumulation buffer
     CHECK_HIP(hipMemsetAsync(scratch.d_moe_accum, 0, M_PAD * H * sizeof(half), stream));
 
     hipLaunchKernelGGL(
@@ -201,23 +227,20 @@ inline void run_layer_body_moe_and_post(
     if (attention_trace != nullptr) {
         trace_copy(observer, attention_trace->shared_expert_output, scratch.d_moe_accum, H);
     }
+}
 
-    // -----------------------------------------------------------------
-    // Routed experts, supplied by the executor
-    // -----------------------------------------------------------------
-    experts.accumulate_routed(static_cast<uint32_t>(layer.layer_id), pos,
-                              scratch.d_ffn_norm_act, scratch.d_topk_weights,
-                              scratch.d_moe_accum);
+// The HC FFN post expansion and the hand-back to the next layer's input, one token.
+inline void run_layer_body_moe_post(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    hipStream_t stream,
+    V4LayerBodyObserver& observer,
+    V4LayerBodyPre pre) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int HC_DIM = 4 * H;
+    (void)layer;
+    V4AttentionTraceRecord* attention_trace = pre.trace;
 
-    if (attention_trace != nullptr) {
-        trace_copy(observer, attention_trace->moe_output, scratch.d_moe_accum, H);
-    }
-
-    experts.on_routed_consumed(static_cast<uint32_t>(layer.layer_id), pos);
-
-    // -----------------------------------------------------------------
-    // I. HC FFN post expansion: res_out = comb_f · res_mid + post_f · moe_accum
-    // -----------------------------------------------------------------
     hipLaunchKernelGGL(
         kernel::hc_post_kernel,
         dim3((H + 255) / 256, 1), dim3(256), 0, stream,
@@ -229,11 +252,39 @@ inline void run_layer_body_moe_and_post(
                    scratch.d_res_out_half, HC_DIM);
     }
 
-    // Hand the output back as the next layer's input.
     CHECK_HIP(hipMemcpyAsync(scratch.d_res_in_half, scratch.d_res_out_half,
                              HC_DIM * sizeof(half), hipMemcpyDeviceToDevice, stream));
     kernel::half_to_float_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
         scratch.d_res_in_half, scratch.d_res_in, HC_DIM);
+}
+
+inline void run_layer_body_moe_and_post(
+    V4Layer& layer,
+    V4LayerBodyRow& scratch,
+    uint32_t pos,
+    hipStream_t stream,
+    V4RoutedExpertExecutor& experts,
+    V4LayerBodyObserver& observer,
+    V4LayerBodyPre pre) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    V4AttentionTraceRecord* attention_trace = pre.trace;
+
+    // Shared expert (always fires), accumulating into the cleared buffer.
+    run_layer_body_moe_shared_expert(layer, scratch, stream, observer, pre);
+
+    // Routed experts, supplied by the executor.
+    experts.accumulate_routed(static_cast<uint32_t>(layer.layer_id), pos,
+                              scratch.d_ffn_norm_act, scratch.d_topk_weights,
+                              scratch.d_moe_accum);
+
+    if (attention_trace != nullptr) {
+        trace_copy(observer, attention_trace->moe_output, scratch.d_moe_accum, H);
+    }
+
+    experts.on_routed_consumed(static_cast<uint32_t>(layer.layer_id), pos);
+
+    // HC FFN post expansion: res_out = comb_f · res_mid + post_f · moe_accum.
+    run_layer_body_moe_post(layer, scratch, stream, observer, pre);
 }
 
 } // namespace aeon::core
