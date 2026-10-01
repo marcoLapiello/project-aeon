@@ -980,10 +980,6 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
                     csa_live ? static_cast<int>(layer.state_layout().index_topk) : 0,
                     stream);
             }
-            for (uint32_t row = 0; row < count; ++row) {
-                run_layer_body_attention_tail(layer, views[row], tables, start_position + row,
-                                              stream, observer, pre[row]);
-            }
         } else {
             for (uint32_t row = 0; row < count; ++row) {
                 const uint32_t query_position = start_position + row;
@@ -991,10 +987,22 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
                     layer, workspace, start_position, row, query_position, stream));
                 views[row].d_composed_keys = workspace.composed_keys();
                 views[row].d_composed_positions = workspace.composed_positions();
-                run_layer_body_attention_and_norm(layer, views[row], tables, token_ids[row],
-                                                  query_position, stream, observer, pre[row]);
+                run_layer_body_attention_kernel(layer, views[row], query_position, stream,
+                                                observer, pre[row]);
             }
         }
+
+        // The post-attention tail, for every row: the inverse RoPE and the output
+        // projection, then **one** batched F/G over the whole chunk. Deferring F/G out
+        // of the per-row tail is what makes each of its stages a single launch. It is
+        // shared by both attention paths, so the tile-off path — the one the chunk
+        // oracle compares bit-exact against serial — exercises the same batched code.
+        for (uint32_t row = 0; row < count; ++row) {
+            run_layer_body_attention_tail(layer, views[row], tables, start_position + row,
+                                          stream, observer, pre[row],
+                                          /*defer_hc_ffn=*/true);
+        }
+        run_hc_ffn_batch(layer, views[0], count, stream);
     }
 
     // Phase 2b — the router for every token, in one pass. The selections have to

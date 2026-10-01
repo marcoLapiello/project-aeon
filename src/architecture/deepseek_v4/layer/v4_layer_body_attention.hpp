@@ -64,7 +64,65 @@ inline void run_pre_attention_mix(
         scratch.d_x_pre, layer.d_attn_norm, scratch.d_x_norm, H, 1e-6f);
 }
 
-// The same HC pre-mix, Sinkhorn and attention RMSNorm for a chunk. Every stage takes
+// The F/G block for a chunk: HC post expansion, HC FFN pre-mix, Sinkhorn, pre-combine
+// and the FFN RMSNorm — the per-row twin of `run_pre_attention_mix_batch`, and the
+// largest per-row term left after Area 5's A. Every stage takes its token on a grid
+// axis (`hc_post`, `hc_project` and `hc_pre_combine` on `blockIdx.y`; the Sinkhorn on
+// `blockIdx.x`), and the two casts are flat over the chunk's contiguous per-token
+// buffers, so the batch is the row count. Decode keeps the inline form in
+// `run_layer_body_attention_tail`.
+//
+// The final norm and the padded-row replication stay **per row**: the norm's input
+// `ffn_pre` is compact (pitch `H`) but its output `ffn_norm_act` is a `M_PAD`-row tile
+// (pitch `M_PAD*H`), and `rmsnorm_wave32_kernel` writes at the input pitch, so a single
+// batched launch would have each token overwrite the next tile's row 0.
+inline void run_hc_ffn_batch(
+    V4Layer& layer, V4LayerBodyRow& base, int count, hipStream_t stream) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int HC = 4;
+    constexpr int HC_DIM = HC * H;          // 16384
+    constexpr int HC_MULT3 = HC * (2 + HC);// 24
+    constexpr int M_PAD = 16;
+    constexpr int threads = 256;
+
+    // F. HC attention post expansion: res_mid = comb_a · res_in + post_a · attn_proj
+    kernel::float_to_half_kernel<<<(count * HC_DIM + threads - 1) / threads, threads, 0,
+                                   stream>>>(base.d_res_in, base.d_res_in_half,
+                                             count * HC_DIM);
+    hipLaunchKernelGGL(
+        kernel::hc_post_kernel, dim3((H + 255) / 256, count), dim3(256), 0, stream,
+        base.d_attn_proj, base.d_res_in_half, base.d_post_a, base.d_comb_a,
+        base.d_res_mid_half, H);
+    kernel::half_to_float_kernel<<<(count * HC_DIM + threads - 1) / threads, threads, 0,
+                                   stream>>>(base.d_res_mid_half, base.d_res_mid,
+                                             count * HC_DIM);
+
+    // G. HC FFN pre-mix and Sinkhorn.
+    hipLaunchKernelGGL(
+        kernel::hc_project_kernel, dim3(HC_MULT3, count), dim3(256), 0, stream,
+        base.d_res_mid, layer.d_hc_ffn_fn, base.d_mixes_f, H, HC, 1e-6f);
+    hipLaunchKernelGGL(
+        kernel::hc_sinkhorn_normalize_kernel, dim3(count), dim3(32), 0, stream,
+        base.d_mixes_f, layer.d_hc_ffn_scale, layer.d_hc_ffn_base,
+        base.d_pre_f, base.d_post_f, base.d_comb_f, 1e-6f, 1e-6f, 2.0f, 20);
+    hipLaunchKernelGGL(
+        kernel::hc_pre_combine_kernel, dim3((H / 4 + 255) / 256, count), dim3(256), 0,
+        stream, base.d_res_mid, base.d_pre_f, base.d_ffn_pre, H, HC);
+
+    // FFN RMSNorm into row 0 of each token's tile, then the WMMA-compatibility
+    // replication into its padded rows — per row, for the pitch reason above.
+    for (int row = 0; row < count; ++row) {
+        half* pre = base.d_ffn_pre + static_cast<size_t>(row) * H;
+        half* act = base.d_ffn_norm_act + static_cast<size_t>(row) * M_PAD * H;
+        hipLaunchKernelGGL(
+            kernel::rmsnorm_wave32_kernel, dim3(1), dim3(32), 0, stream,
+            pre, layer.d_ffn_norm, act, H, 1e-6f);
+        for (int r = 1; r < M_PAD; ++r) {
+            CHECK_HIP(hipMemcpyAsync(act + r * H, act, H * sizeof(half),
+                                     hipMemcpyDeviceToDevice, stream));
+        }
+    }
+}
 // its token on a grid axis — the two HC kernels on `blockIdx.y`, the Sinkhorn
 // (`blockIdx.x`) and the RMSNorm (`blockIdx.x`) already do — and the chunk's per-token
 // buffers are contiguous at their vector pitches (`res_in` at `hc_mult*hidden`,
@@ -646,7 +704,8 @@ inline void run_layer_body_attention_kernel(
 // two halves while a chunk calls the tail directly.
 inline void run_layer_body_attention_tail(
     V4Layer& layer, V4LayerBodyRow& scratch, const V4LayerBodyTables& tables,
-    uint32_t pos, hipStream_t stream, V4LayerBodyObserver& observer, V4LayerBodyPre pre);
+    uint32_t pos, hipStream_t stream, V4LayerBodyObserver& observer, V4LayerBodyPre pre,
+    bool defer_hc_ffn = false);
 
 inline void run_layer_body_attention_and_norm(
     V4Layer& layer,
@@ -672,7 +731,8 @@ inline void run_layer_body_attention_tail(
     uint32_t pos,
     hipStream_t stream,
     V4LayerBodyObserver& observer,
-    V4LayerBodyPre pre) {
+    V4LayerBodyPre pre,
+    bool defer_hc_ffn) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
     constexpr int HC = 4;
     constexpr int HC_DIM = HC * H;          // 16384
@@ -717,6 +777,11 @@ inline void run_layer_body_attention_tail(
     // -----------------------------------------------------------------
     // F. HC attention post expansion: res_mid = comb_a · res_in + post_a · attn_proj
     // -----------------------------------------------------------------
+    // A chunk defers F/G to one batched pass (`run_hc_ffn_batch`), so it skips it here
+    // and keeps only the per-row inverse RoPE and output projection above.
+    if (defer_hc_ffn) {
+        return;
+    }
     auto tail_region =
         PhaseProfiler::instance().region("  F/G hc + norm", stream);
     kernel::float_to_half_kernel<<<(HC_DIM + 255) / 256, 256, 0, stream>>>(
