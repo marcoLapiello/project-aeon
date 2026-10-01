@@ -4,7 +4,7 @@ At the time this plan was written, every compute kernel in prefill was a GEMV (o
 
 **Scope: throughput in general, not one arm.** The swept prefill is profiled first because it has no supply constraint, so its host/GPU split reads cleanly — a *measurement* choice, not a claim about where the work belongs. Routed prefill and decode run the same per-token body (the same attention kernel, the same GEMVs, the same HC/norm stages), so a fix to those helps every arm; each record states its measured effect.
 
-**Numbering is write-order, not work-order.** Steps are numbered in the order they were *written*; the status table is the work order. The profile below showed Steps 1–2 address ~`2.3%` of the swept prefill, while a host loop in `compose_local_rows` — not in the plan at all — was its largest single cost.
+**Areas, not steps.** An area is a piece of work, not a position in a sequence: the numbers are write-order, and the status table is the work order, so an area's number ranks nothing. The name is deliberately not "step", because the work is done by convenience rather than top-down — Area 8 was found by measurement after Areas 1–4 were closed, and the largest single term when this began — a host loop in `compose_local_rows` — was never an area at all.
 
 ## Run configuration
 
@@ -30,66 +30,149 @@ build/bin/aeon_chat \
 - **`--prefill-window 4096`** — `W = 4096`, `C = 256`: `16` chunks fill a window, and the `~677`-token prompt is `ceil(677/256) = 3` chunk bodies per layer × `43` = `129`.
 - **`--staging-blocks 3`** — the swept staging arena, carved **inside** the single pinned `--warm-gib` allocation (not added to it). It moves the prefetch depth, not throughput. Some rows below use `--warm-gib 24` to stay off the host ceiling.
 
+### Host memory discipline
+
+The host has `62.62 GiB`, and the pinned config plus the runtime's own allocation peaks
+near `52 GiB` — about `98%` of the allowance (M47). Any further host allocation aborts
+the load, so the way a run fails here is memory pressure, not the engine. The pressure
+seen while this plan was written was **not** the engine's; it was the build beside it:
+
+- **Never build next to a measurement.** `cmake --build … -j$(nproc)` spawns `64`
+  `clang++` on heavyweight HIP template headers, each transiently holding `1–3 GiB`, so
+  the parallel maximum is tens of GiB and the compiler's pages do not return instantly.
+  Build and measure **serialised**, with a small job count (`-j8`).
+- **VS Code is `~2.6 GiB`** across its processes. The `buffer/cache` column is
+  reclaimable file cache, not pressure — read `available`, not `used`.
+- **Do not shrink `--warm-gib` to dodge pressure.** The Warm tier is part of the pinned
+  config and its size *is* a performance variable, so lowering it voids the comparison.
+  Free host memory instead of changing the config.
+- **One `aeon_chat` process at a time.** Two concurrent runs do not fit.
+
 ## Status
 
-| Step | What | State |
+| Area | What | State |
 | :--- | :--- | :--- |
 | 1 | Grouped WMMA expert GEMM (W4A16) | **Done** — enabled in production |
 | 2 | Batch the chunk loop in the layer body | **Partly** — phase split and router done; `M`-keyed dispatcher and batched KV/position writes open |
 | 3 | WMMA dense GEMM for the dense projections | **Partly** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
-| 4 | Batched causal attention over the chunk | **Done** — tile + split-keys, all classes on by default; WMMA/occupancy tuning open (Step 6) |
-| 4a | Indexer top-k on device | **Done** |
+| 4 | Batched causal attention over the chunk | **Done** — tile + split-keys, all classes on by default; WMMA/occupancy tuning open (Area 6) |
+| 4a | Indexer top-k on device | **Done** — cheap: `E5b = 0.13 s`; the *scores* kernel `E5a = 4.3 s` was never batched |
 | — | `compose_local_rows` gather | **Done** |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Open** |
 | 6 | Tune for gfx1100 | **Open** |
 | 7 | Re-measure and retune supply | **Open** |
+| 8 | Batch the indexer scores over the chunk | **Open** — found `2026-10-01`; `4.3 s`, `18%` of GPU, a per-token single-block launch |
 
 ## Phase profile
 
-**Baseline** — the state the ordering was decided from. The pinned invocation in **Run configuration**, swept prefill, ~`666`-token prompt, `W=4096 C=256`. Host = CPU time issuing the phase; GPU = `hipEvent` span on the compute stream. `n = 1`, one prompt.
+### Baseline — 2026-10-01
+
+The state the work starts from, on `main` at commit `7295137`, after Areas 1–4.2 and 4a.
+Same pinned invocation as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`,
+`Warm 35 GiB`, `3` staging blocks); `n = 3`, runs 2–3 stable to `<1%`, run 1 a cold start
+excluded. Each step record below carries its own implementation-time before/after; this
+is the one cross-step reference, and it is **replaced, never accumulated** — a superseded
+baseline is deleted, not kept beside the new one. Ledger entries are taken only at the end
+of the plan.
 
 | Phase | host ms | gpu ms | gpu share |
 | :--- | ---: | ---: | ---: |
-| **attention+norm (per token)** | `37,271` | `46,954` | **`70.7%`** |
-| **pre-attention (per token)** | `13,057` | `15,718` | **`23.7%`** |
-| router (batched) | `13,756` | `62` | `0.1%` |
-| routed experts (batched, Step 1) | `1,035` | `1,433` | `2.2%` |
-| routing dispatch | `443` | `461` | `0.7%` |
-| shared expert (per token) | `227` | `1,149` | `1.7%` |
-| moe post / commit | `449` | `653` | `0.8%` |
-| **total** | **`66,238`** | **`66,430`** | |
+| **attention+norm (per token)** | `1,260` | `11,939` | **`45.7%`** |
+| &nbsp;&nbsp;· F/G hc + norm (nested) | `937` | `3,049` | `11.7%` |
+| **pre-attention (per token)** | `800` | `6,961` | **`26.7%`** |
+| **routed experts (batched)** | `1,075` | `1,472` | `5.6%` |
+| shared expert (per token) | `295` | `1,241` | `4.8%` |
+| routing dispatch | `529` | `542` | `2.1%` |
+| moe post (per token) | `706` | `346` | `1.3%` |
+| commit (per token) | `145` | `365` | `1.4%` |
+| router (batched) | `18,072` | `197` | `0.8%` |
+| **total** | **`23,821`** | **`26,113`** | |
 
-Three readings:
+- **TTFT `28.6 s`** (`42.2 ms/prompt-token`), decode `2.94 tok/s`, prompt `677` tokens.
+- Derived: the **attention tile** is `11,939 − 3,049 = 8,890 ms` (`34.0%` of GPU) — the
+  largest single kernel. `pre-attention`'s `~7.0 s` is `10.3 ms/token`, matching Area 3.
+- The router's `18 s` host line is *not* issuance: its `hipStreamSynchronize` drains the
+  attention backlog queued ahead of it, so it is a barrier reading of GPU-wait. True
+  host issuance is `23,821 − 18,072 ≈ 5.7 s`, so prefill is **GPU-bound**.
+- Supply is fully hidden: `nvme_gib 141.5`, `io_ms 892`, `load_ms 442` against a
+  `~30 s` run — Area 7 is not yet the limiter.
 
-1. **The two per-token loops are 94% of prefill** — `run_chunk_pre_attention` and `run_layer_body_attention_and_norm` are `for (row …)` loops. Steps 3–4 replace them.
-2. **Steps 1–2 bought ~2.3% directly.** The router's `13.8 s` host line is *not* issuance: it is its read-back `hipStreamSynchronize` draining the attention backlog queued ahead of it — why the profile reports both columns.
-3. **The same drain, per CSA layer, is inside the 70.7%.** `select_indexer_topk` synchronizes **twice** per token per CSA layer (~`38k` drains per window) — Step 4a.
+#### Pre-attention attribution — 2026-10-01
 
-**The profile then split its own largest number.** `attention+norm` divided into the attention kernel, the HC/norm tail, and `compose_local_rows` — the last ~`45 s` host / ~`23 s` GPU, the largest single cost. It issued ~`256` tiny copies per token; the row-set has a closed form, so it is now one gather launch. Row order must be **slot order**, not position order: composing by position is a softmax summation-order change, which the chunk oracle caught (`313` differing) before it was fixed.
+Pre-attention was one number (`~7 s`); it is now a breakdown, added because the plan had
+no way to say which stage held it. Sub-regions fire once per `(row, stage)` and are
+**sampled at stride `16` and scaled back** — at stride `1` the two event records per
+region cost more than the region measures, which is the profiler's own rule.
 
-Milestone chain (historical; `n = 1`, `666`-token prompt, swept — superseded by the Step 4 table):
+| Sub-region | gpu ms |
+| :--- | ---: |
+| A hc mix + norm | `1,087` |
+| B x-projections | `33` |
+| C lora norm | `408` |
+| D q-projections | `106` |
+| E pre-attn tail | `5,668` |
+| &nbsp;&nbsp;· E1 q-norm | `339` |
+| &nbsp;&nbsp;· E2 rope + kv write | `692` |
+| &nbsp;&nbsp;· E3 compressor state | `279` |
+| &nbsp;&nbsp;· E3b indexer feed | `231` |
+| &nbsp;&nbsp;· E4 materialize | `114` |
+| &nbsp;&nbsp;· **E5a indexer scores** | **`4,345`** |
+| &nbsp;&nbsp;· E5b indexer topk | `127` |
+| **pre-attention total** | **`7,304`** |
 
-| | M47 baseline | after Steps 1–2 | after 4a | after the compose gather |
-| :--- | ---: | ---: | ---: | ---: |
-| TTFT | `79.4 s` | `73.3 s` | `70.8 s` | **`50.0 s`** |
-| ms / prompt-token | `121.4` | `110.1` | `106.3` | **`75.1`** |
-| `attention+norm` host | — | `37.3 s` | `48.3 s` | **`1.5 s`** |
-| attention kernel, GPU | — | — | `22.8 s` | `22.8 s` |
-| pre-attention, GPU | — | `15.7 s` | `14.7 s` | `14.6 s` |
+**Finding — the indexer *scores* kernel, not its top-k.** `E5a = 4.3 s` is `60%` of
+pre-attention and `18%` of all prefill GPU; Area 4a's device top-k (`E5b`) is `0.13 s`,
+so the plan's Area 4a record fixed the cheap half. `E5a` launches
+`dim3(ceil(committed/256))` = **one block** per call (at a `677`-token context,
+`committed = 677/4 = 169`) and runs `21 CSA layers × 677 tokens ≈ 14k` times — the same
+per-row, tiny-grid defect Areas 2–3 batched for the router and the projections, never
+batched here. A/B confirmation (ranking disabled): pre-attention GPU `7,304 → 3,052`
+(`Δ = 4,253`, matching `E5a`) and TTFT `29.1 → 27.1 s`.
 
-Prefill became **GPU-bound** once the host stalls were gone: the attention kernel and pre-attention were the two GPU numbers that mattered — what Steps 3–4 reduce.
+Area 4.2's recorded `26,054 ms` GPU / `29.5 s` TTFT match this baseline (`26,113` /
+`28.6`) within run variance, so the intermediate step records below are consistent with a
+fresh run.
+
+#### Correctness is intact — the run-config prompt is a timing fixture, not a chat
+
+A first read of the baseline's reply looks alarming: the prompt is English but the
+answer is Chinese. It is **not** a regression, and the confusion is worth recording so
+it is not re-raised:
+
+- `prefill-corpus.txt` is a **raw English text blob with no instruction** — a prompt
+  token-count fixture selected for the profile, not a question. Given that alone the
+  model emits Chinese *commentary on the passage*, which is this model family's default
+  for instruction-less input.
+- Any instruction restores English: appending `"Question: In one sentence, what is
+  this passage about?"` to the same corpus answers in English and on topic; the
+  unrelated `first-prompt.txt` (`"Explain in simple terms how a hot and warm expert
+  cache can reduce inference latency."`) answers in fluent English; `"What is the
+  capital of France?"` answers `"The capital of France is Paris."`.
+- The two default-on new paths do **not** move the output: with `attention_tile_enabled`
+  and `moe_grouped_batch_enabled` toggled in all four combinations the corpus reply is
+  byte-identical.
+- The gates agree: `test_v4_layer_body_chunk_oracle`, `test_v4_prefill_window`,
+  `test_v4_routed_prefill` and `test_v4_engine` (end-to-end) all pass at this commit.
+
+**Conclusion:** correctness is a sound baseline value; the chinese output is an artifact
+of the fixture. Correctness must be measured with an instructed prompt (M47 used the
+corpus *plus an instruction*), which is why the run-config invocation alone can never be
+the correctness signal.
 
 ## Findings
 
-- The chunk "batch" was serial — pre-attention and attention+norm ran per row; fixed by Steps 3–4.
-- The router made one host sync per row — fixed in Step 2.
-- Small per-row launches (rmsnorm, rope, HC sinkhorn, KV copies, a position H2D per row) scale with T — Step 5 open.
+- The chunk "batch" was serial — pre-attention and attention+norm ran per row; fixed by Areas 3–4.
+- The router made one host sync per row — fixed in Area 2.
+- Small per-row launches (rmsnorm, rope, HC sinkhorn, KV copies, a position H2D per row) scale with T — Area 5 open.
+- The **indexer scores** kernel, not its top-k, is the pre-attention cost: `E5a = 4.3 s` against `E5b = 0.13 s`, `~18%` of prefill GPU. It is a per-token, single-block launch (`21 CSA layers × 677 tokens`), the same per-row defect Areas 2–3 fixed for the router and the projections — Area 8.
 
 ## Execution plan
 
-Step 1 and Step 4 are done; Step 4a and the compose gather with them; Steps 2–3 are partly done. Each record below is kept for the decisions in it — the status table is authoritative for state.
+Area 1 and Area 4 are done; Area 4a and the compose gather with them; Areas 2–3 are
+partly done; Area 8 is new. Each record below is kept for the decisions in it — the
+status table is authoritative for state.
 
-### Step 1: W4A16 grouped WMMA GEMM for experts — **done**
+### Area 1: W4A16 grouped WMMA GEMM for experts — **done**
 
 Grouped W13+activation and W2 over a token→expert permutation, as one **fused** kernel split into a G2 WMMA loop, a G3 weight feed and a G4 epilogue. Three of the plan's original decisions were corrected by measurement and are superseded: `K` splits **`64`**-wide (not `128`), the kernel lives under `platform/rdna3/` with format and model injected as compile-time policies (not one combined G3 file), and **LDS double-buffering was a measured regression and was reverted**. The `M` window is a dispatcher choice, not a constant. The record below is the authority.
 
@@ -132,13 +215,13 @@ The halves compose almost additively (`production/(staging+mma) = 1.10`), so the
 
 **Corrections to the plan, from the measurements:**
 
-1. Step 3's `T ≥ 16` threshold is too thin: the crossover is between `T = 16` (`0.80x`, grouped loses) and `T = 64` (`2.14x`). Wire `T ≥ 64`.
+1. Area 3's `T ≥ 16` threshold is too thin: the crossover is between `T = 16` (`0.80x`, grouped loses) and `T = 64` (`2.14x`). Wire `T ≥ 64`.
 2. K is split `64`-wide, not `128`: two 32-wide quantization groups map to one int4 load per thread, which is what makes the staging branch-free.
-3. Chunk size and window are **user settings**, not tuning constants; the deliverable is the curve above, not a baked-in value. This also supersedes Step 6's "reach ≥ 16 tokens per expert" rule — `16` is reached at `T = 256` yet the reward keeps rising to `15.93x`.
+3. Chunk size and window are **user settings**, not tuning constants; the deliverable is the curve above, not a baked-in value. This also supersedes Area 6's "reach ≥ 16 tokens per expert" rule — `16` is reached at `T = 256` yet the reward keeps rising to `15.93x`.
 
-**Remaining:** the routed-prefill / short-prompt path (same grouped kernel, with a per-expert GEMV fallback for 1–3-token experts), and the `M`-keyed dispatcher that picks grouped above the crossover (see Step 2).
+**Remaining:** the routed-prefill / short-prompt path (same grouped kernel, with a per-expert GEMV fallback for 1–3-token experts), and the `M`-keyed dispatcher that picks grouped above the crossover (see Area 2).
 
-### Step 2: Batch the chunk loop in the layer body — **partly done**
+### Area 2: Batch the chunk loop in the layer body — **partly done**
 
 The phase split, the batched router and the layer-wide supply dispatch landed. The router's read-back is **one** synchronisation per chunk; the plan's "copy the ids to the host asynchronously, with no stall" is not reachable, because the host must have the ids before it can issue the layer's union — what was removable is the `C − 1` extra drains, and that is done. **Still open: the `M`-keyed dispatcher and the batched KV/position writes.**
 
@@ -167,17 +250,17 @@ One property comes from the grouped pair rather than the sort, and one is a corr
 
 Gate — five shapes (`1` token, `7`, `300`, a small `8`-expert count, and `draws = 0`) against the permutation's definition, not a second copy of the algorithm: monotone offsets anchored at `0` and the draw count, every draw under its own expert with `token = draw / slots`, `draw_indices` a bijection onto `0..draws-1`, ascending draw order within each expert, and widths equal to an independently counted histogram. Passes on `gfx1100`; the `300`-token case leaves `227` of `256` experts present with a widest expert of `94` draws (past one 16-row M tile), and the small-count case has all `8` present.
 
-**Numerical effect — resolved.** The chunk body drives `accumulate_routed_batch`; the executor runs the per-token sequence unless `moe_grouped_batch_enabled()` is set, so one process compares both. The grouped path is a correct reorder, not a defect: `test_moe_grouped_batch_parity` is bit-identical on the synthetic fixture and one fp16 ULP in the real executor (`9.8e-4 … 2.0e-3`), which through `43` layers is a final-logit delta of `2.73e-1` against a top-2 margin of `0.820` — enough that a bit-exact chunk comparison fails by construction. It does not move the answer: `test_v4_routed_prefill` agrees on the greedy token and the whole 8-token continuation, so the bar became greedy agreement — the same move Step 4 later made for attention.
+**Numerical effect — resolved.** The chunk body drives `accumulate_routed_batch`; the executor runs the per-token sequence unless `moe_grouped_batch_enabled()` is set, so one process compares both. The grouped path is a correct reorder, not a defect: `test_moe_grouped_batch_parity` is bit-identical on the synthetic fixture and one fp16 ULP in the real executor (`9.8e-4 … 2.0e-3`), which through `43` layers is a final-logit delta of `2.73e-1` against a top-2 margin of `0.820` — enough that a bit-exact chunk comparison fails by construction. It does not move the answer: `test_v4_routed_prefill` agrees on the greedy token and the whole 8-token continuation, so the bar became greedy agreement — the same move Area 4 later made for attention.
 
 **Per-token router removed.** The router ran once per row, ending in a `hipStreamSynchronize` to read that row's top-k, so phase 2b drained the queue `C` times per layer. Its device work was already batched (`moe_router_kernel` is one block per token); only the read-back was per token. It is now `dispatch_router(count)` — one gate GEMV, one logit widening and one top-k launch for the whole chunk, buffers addressed by row stride (`ffn_norm_act` is the row-0 prefix of each token's padded tile) — read back with **one** synchronisation; decode calls it with `count = 1`. The GEMV primitive gained an activation row pitch (`x_stride`) so a batched caller reads rows in place.
 
 Measured (`bench_prefill_ab routed 128`, bank arm, chunk `128`, window `1024`, warm `0`): `24.181 s` → `23.426 s` (`5.29` → `5.46 tok/s`). The run reads `66.6 GiB` over NVMe, which does not move, so this isolates the ~`0.75 s` of compute the `43 × 127` removed drains cost. Gates green: the layer-body oracles (`0` differing), `test_v4_prefill_window`, `test_v4_routed_prefill`, `test_v4_expert_executor`, `test_v4_mla_oracle`, `test_v4_shared_expert_oracle`, `test_v4_grouped_wo_oracle`, `test_v4_graph_head`, `test_v4_engine`.
 
-**Remaining:** the `M`-keyed dispatcher (grouped above the crossover) and the batched KV/position writes. (The grouped path's chunk comparisons were moved to the agreement bar in Step 4.)
+**Remaining:** the `M`-keyed dispatcher (grouped above the crossover) and the batched KV/position writes. (The grouped path's chunk comparisons were moved to the agreement bar in Area 4.)
 
-### Step 3: WMMA dense GEMM for attention and shared-expert projections — **partly done**
+### Area 3: WMMA dense GEMM for attention and shared-expert projections — **partly done**
 
-The same WMMA core as Step 1 (a single group). Remaining consumers: shared-expert W13/W2, `v4_grouped_wo`, and the HC projections. The row threshold is chosen by the dispatcher on `M`, GEMV below it (short-prompt routed prefill and decode).
+The same WMMA core as Area 1 (a single group). Remaining consumers: shared-expert W13/W2, `v4_grouped_wo`, and the HC projections. The row threshold is chosen by the dispatcher on `M`, GEMV below it (short-prompt routed prefill and decode).
 
 #### Implementation record
 
@@ -192,13 +275,13 @@ Pre-attention is split into stages (`run_pre_attention_mix`, `_x_projections`, `
 
 Measured (gate, vs `gemv_fp16_vec8_kernel` on a `(N, T)` grid): `T = 256`, `4096→1024` `0.81 → 0.053 ms` (`15x`); `1024→16384` `2.74 → 0.43 ms` (`6.4x`); `T = 37` `1.7x`; `T = 16`, `N = 64` `0.3x` (hence `T ≥ 32`). All within `1e-3` of a double reference. The crossover is lower than the expert GEMM's because the weight is fp16 (no dequant to amortize).
 
-End to end (`aeon_chat`, swept, `W=4096 C=256`, `n = 1`, `701`-token prefix of `prefill-corpus.txt`; not the baseline prompt): pre-attention GPU `10.3 ms/token` against `21.9` before (`14.6 s / 666`), TTFT `43.5 s` against `50.0 s`. The attention kernel is now `24.5 s` of `67 s` GPU — Step 4. What remains in pre-attention is the per-token tail (RoPE, key write, compressor state, indexer scores/top-k: ~`30` launches per token).
+End to end (`aeon_chat`, swept, `W=4096 C=256`, `n = 1`, `701`-token prefix of `prefill-corpus.txt`; not the baseline prompt): pre-attention GPU `10.3 ms/token` against `21.9` before (`14.6 s / 666`), TTFT `43.5 s` against `50.0 s`. The attention kernel is now `24.5 s` of `67 s` GPU — Area 4. What remains in pre-attention is the per-token tail (RoPE, key write, compressor state, indexer scores/top-k: ~`30` launches per token).
 
-Gates: the layer-body oracles and `test_v4_engine` green. `test_v4_prefill_window` failed `A`/`B` bit-exact (`4/10`) at the time — the grouped-experts reorder, later moved to the agreement bar (Step 4).
+Gates: the layer-body oracles and `test_v4_engine` green. `test_v4_prefill_window` failed `A`/`B` bit-exact (`4/10`) at the time — the grouped-experts reorder, later moved to the agreement bar (Area 4).
 
-### Step 4: Batched causal attention over the chunk — **done**
+### Area 4: Batched causal attention over the chunk — **done**
 
-4.1 removed a per-query redundancy; 4.2 replaced the per-token launch with a batched tile plus a split-keys kernel covering all three classes, now **on by default**. WMMA and warp tuning remain (Step 6). Each primitive was pinned in fp64 against an independent reference before anything was built on it.
+4.1 removed a per-query redundancy; 4.2 replaced the per-token launch with a batched tile plus a split-keys kernel covering all three classes, now **on by default**. WMMA and warp tuning remain (Area 6). Each primitive was pinned in fp64 against an independent reference before anything was built on it.
 
 #### 4.1 — the per-query redundancy
 
@@ -237,7 +320,7 @@ Two bugs the independent gate caught, not self-consistency: a warp-stride-only s
 | `test_v4_prefill_window` | `4/10` (pre-existing red) | **`10/0`** — greedy `320`, rel `2.6%` |
 | `test_v4_routed_prefill` | `20/1` (pre-existing red) | **`20/0`** — greedy `320`, rel `0.1%` |
 
-**Still open:** the WMMA tile and warp-count tuning (`warp = 4`, `tile = 16`, both unmeasured) — Step 6.
+**Still open:** the WMMA tile and warp-count tuning (`warp = 4`, `tile = 16`, both unmeasured) — Area 6.
 
 #### WMMA QKᵀ — built, gated, **not shipped**
 
@@ -248,7 +331,7 @@ The split kernel is scalar per element. A WMMA variant (`causal_attention_wmma_q
 
 So production stays on the split kernel; the primitive remains available for a multi-warp WMMA attempt, which is the only version that could pay. A first-cut bug worth noting: the kernel read the query without the per-head offset, so head `0` matched and every other head did not — an index error the fp64 gate caught immediately.
 
-### Step 4a: Move the indexer top-k on-device — **done**
+### Area 4a: Move the indexer top-k on-device — **done**
 
 `select_indexer_topk` selected the CSA layer's `index_topk = 512` compressed rows **on the host** — D2H the scores, `hipStreamSynchronize`, CPU `stable_sort`, H2D the indices, `hipStreamSynchronize` again — once per token per CSA layer (~`38k` drains per window), the mechanism behind the router's `13.8 s` host line at `0.1%` the frequency.
 
@@ -267,21 +350,43 @@ Measured (`aeon_chat --phase-profile`, 666-token prompt, `W=4096 C=256`, swept, 
 
 Gates: `test_v4_real_scale_state` (the real `index_topk = 512` as a strict selection, `0` differing), `test_v4_indexer_oracle`, `test_v4_layer_body_serial_oracle` / `_compressed_oracle`, `test_v4_engine` (`38/0`) green.
 
-### Step 5: Fuse elementwise and norm stages over [T, dim] — **open**
+### Area 5: Fuse elementwise and norm stages over [T, dim] — **open**
 
 - Make rmsnorm, rope, HC sinkhorn and the residual/HC mixing multi-row (one launch per stage per chunk, one row per wave). Fuse the rmsnorm scaling into the next GEMM's A-load where it's cheap.
 - Capture the per-layer chunk sequence in a HIP graph for the swept path, where shapes are fixed per chunk size.
 
-### Step 6: Tune for gfx1100 — **open**
+### Area 6: Tune for gfx1100 — **open**
 
 - Sweep the WMMA tile config for the dominant expert shapes: N×K tile, waves per workgroup (4–8), LDS ≤ 64 KiB for 2 workgroups per CU.
 - Give the routed-prefill (short-prompt) path the same grouped kernel. Experts with only 1–3 tokens fall back to the GEMV kernel, picked per expert inside one launch.
 - **Attention**: the split kernel is scalar per element. A single-warp WMMA-QKᵀ build was measured **neutral** (occupancy cancels the matrix cores), so the next attempt must be **multi-warp** WMMA (several warps per block, keys split) before PV can also move to the cores — which needs the `16 × 512` output tile staged in LDS. Tune `kCausalAttentionWarps` (`4`) and the sub-tile (`16`).
 
-### Step 7: Move the bottleneck back to supply — **open**
+### Area 7: Move the bottleneck back to supply — **open**
 
-- Re-measure the swept prefill once Steps 3–5 land. Compute should then be faster than supply. Then tune the lookahead depth and chunk size together so the GPU stays fed.
+- Re-measure the swept prefill once Areas 3–5 land. Compute should then be faster than supply. Then tune the lookahead depth and chunk size together so the GPU stays fed.
+
+### Area 8: Batch the indexer scores over the chunk — **open**
+
+Found by the `2026-10-01` pre-attention attribution, not by the plan: `v4_indexer_scores_kernel`
+(`E5a`) is `4.3 s` GPU — `60%` of pre-attention and `18%` of all prefill GPU — while the
+top-k it feeds (`E5b`) is `0.13 s`. The plan's Area 4a record fixed the top-k, the cheap
+half, and never batched the scores.
+
+The defect is the one Areas 2–3 fixed twice: `E5a` is launched `dim3(ceil(committed/256))`
+= **one block** and runs once per token per CSA layer (`21 × 677 ≈ 14k` times at this
+context). A chunk's `C` rows share the query weights and read the same compressed key
+cache, so the whole chunk is one larger grid with row pitch — the shape `dispatch_router`
+and `project_dense` already take. Expected to move the bulk of `4.3 s` into the launch
+count it removes, the same `~0.75 s`-per-`127`-drains scale Area 2 measured, but the
+ceiling should be higher because the per-call grid is one block rather than a full one.
+
+Gate: the indexer selection is a strict, order-independent reduction over `committed`
+candidates, so a batched scores kernel must reproduce `test_v4_indexer_oracle` and
+`test_v4_real_scale_state` exactly (the ranking's total order is already pinned), plus
+`test_v4_layer_body_serial_oracle` / `_compressed_oracle`. A per-token replay switch, as
+Areas 1–2 use, lets one process compare both path forms.
 
 ## Dependencies
 
-`G2/G3` (kernels) → `G4` (batched layer body and attention) → `G1` (chunk sizing and lookahead). Each step is verified alone with an independent-oracle test before the next.
+`G2/G3` (kernels) → `G4` (batched layer body and attention) → `G1` (chunk sizing and
+lookahead). Each area is verified alone with an independent-oracle test before the next.
