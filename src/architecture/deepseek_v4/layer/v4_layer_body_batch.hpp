@@ -535,6 +535,12 @@ inline V4LayerBodyPre run_chunk_pre_attention(
 // dense projection issued once over every row instead of once per row. Rows are
 // independent until the tail (ring, compressor and indexer state advance in position
 // order there), so hoisting the projections out of the per-row loop reorders no state.
+//
+// The tail's per-stage sub-regions are sampled at this stride: they fire once per
+// (row, stage) and would otherwise dominate the run they measure. See
+// `PhaseProfiler::set_sample_stride`.
+inline constexpr size_t kTailSampleStride = 16;
+
 inline std::vector<V4LayerBodyPre> run_chunk_pre_attention_batch(
     V4Layer& layer,
     V4LayerBodyBatchScratch& workspace,
@@ -545,20 +551,44 @@ inline std::vector<V4LayerBodyPre> run_chunk_pre_attention_batch(
     hipStream_t stream,
     V4LayerBodyObserver& observer) {
     std::vector<V4LayerBodyRow> rows(count);
-    for (uint32_t row = 0; row < count; ++row) {
-        rows[row] = workspace.row(row);
-        run_pre_attention_mix(layer, rows[row], stream);
+    {
+        // Sub-regions inside "pre-attention (per token)" so an attribution run can see
+        // which stage holds the `~7 s` GPU, rather than counting launches from source.
+        // The two projection rounds are already batched; the per-row stages are the
+        // candidates, so the split is drawn along exactly that line.
+        auto region = PhaseProfiler::instance().region("  A hc mix + norm", stream);
+        for (uint32_t row = 0; row < count; ++row) {
+            rows[row] = workspace.row(row);
+            run_pre_attention_mix(layer, rows[row], stream);
+        }
     }
-    run_pre_attention_x_projections(layer, rows[0], static_cast<int>(count), stream);
-    for (uint32_t row = 0; row < count; ++row) {
-        run_pre_attention_lora_norm(layer, rows[row], stream);
+    {
+        auto region = PhaseProfiler::instance().region("  B x-projections", stream);
+        run_pre_attention_x_projections(layer, rows[0], static_cast<int>(count), stream);
     }
-    run_pre_attention_q_projections(layer, rows[0], static_cast<int>(count), stream);
+    {
+        auto region = PhaseProfiler::instance().region("  C lora norm", stream);
+        for (uint32_t row = 0; row < count; ++row) {
+            run_pre_attention_lora_norm(layer, rows[row], stream);
+        }
+    }
+    {
+        auto region = PhaseProfiler::instance().region("  D q-projections", stream);
+        run_pre_attention_q_projections(layer, rows[0], static_cast<int>(count), stream);
+    }
 
     std::vector<V4LayerBodyPre> pre(count);
-    for (uint32_t row = 0; row < count; ++row) {
-        pre[row] = run_pre_attention_tail(layer, rows[row], tables, token_ids[row],
-                                          start_position + row, stream, observer);
+    {
+        auto region = PhaseProfiler::instance().region("  E pre-attn tail", stream);
+        // The tail's sub-regions fire once per (row, stage); at that granularity the
+        // event records cost more than they measure, so they are sampled and scaled
+        // back. The coarse regions above are one per chunk and stay exact.
+        PhaseProfiler::instance().set_sample_stride(kTailSampleStride);
+        for (uint32_t row = 0; row < count; ++row) {
+            pre[row] = run_pre_attention_tail(layer, rows[row], tables, token_ids[row],
+                                              start_position + row, stream, observer);
+        }
+        PhaseProfiler::instance().set_sample_stride(1);
     }
     return pre;
 }

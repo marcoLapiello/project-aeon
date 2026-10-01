@@ -30,6 +30,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -48,6 +49,15 @@ public:
 
     void set_enabled(bool enabled) noexcept { enabled_ = enabled; }
     bool enabled() const noexcept { return enabled_; }
+
+    // A per-name sample stride. At per-row granularity the two event records per
+    // region cost more than the region measures, so a region finer than the phase
+    // can only be timed by sampling it. A stride of `n` records one occurrence in
+    // every `n` and reports the mean scaled back to the full count, which keeps the
+    // total comparable to an unsampled phase. `1` (the default) records everything.
+    void set_sample_stride(size_t stride) noexcept {
+        sample_stride_ = stride == 0 ? 1 : stride;
+    }
 
     // Drops every sample and destroys its events, so a previous window cannot leak
     // into the next report.
@@ -79,6 +89,10 @@ public:
                 return;
             }
             index_ = profiler_->start(name, stream);
+            if (index_ == kSkipped) {
+                profiler_ = nullptr;
+                return;
+            }
             host_start_ = Clock::now();
         }
         Region(const Region&) = delete;
@@ -112,6 +126,10 @@ public:
         Clock::time_point host_start_{};
     };
 
+    // Returned by `start` when the sample stride skips this occurrence; the `Region`
+    // becomes a no-op so the caller pays neither an event nor a stop call.
+    static constexpr size_t kSkipped = static_cast<size_t>(-1);
+
     [[nodiscard]] Region region(const char* name, hipStream_t stream) {
         return Region(this, name, stream);
     }
@@ -137,18 +155,33 @@ public:
 
     void report(std::FILE* out) const {
         if (samples_.empty()) return;
+        // A region nested inside another (its name is indented) is a breakdown of a
+        // parent, so summing it into the total would count the same GPU work twice.
+        // The total is taken from top-level regions only; nested ones are shown for
+        // their share but never added in.
+        auto top_level = [](const std::string& name) {
+            return name.empty() || name[0] != ' ';
+        };
         double total_gpu = 0.0;
         double total_host = 0.0;
         for (const Sample& sample : samples_) {
-            total_gpu += sample.gpu_ms;
-            total_host += sample.host_ms;
+            if (!top_level(sample.name)) continue;
+            const double scale = sample.recorded > 0
+                ? static_cast<double>(sample.calls) / static_cast<double>(sample.recorded)
+                : 0.0;
+            total_gpu += sample.gpu_ms * scale;
+            total_host += sample.host_ms * scale;
         }
         std::fprintf(out, "\n  [Phase] %-30s %11s %11s %7s\n", "phase", "host ms",
                      "gpu ms", "gpu%");
         for (const Sample& sample : samples_) {
+            const double scale = sample.recorded > 0
+                ? static_cast<double>(sample.calls) / static_cast<double>(sample.recorded)
+                : 0.0;
             std::fprintf(out, "  [Phase] %-30s %11.1f %11.1f %6.1f%%\n",
-                         sample.name.c_str(), sample.host_ms, sample.gpu_ms,
-                         total_gpu > 0.0 ? 100.0 * sample.gpu_ms / total_gpu : 0.0);
+                         sample.name.c_str(), sample.host_ms * scale,
+                         sample.gpu_ms * scale,
+                         total_gpu > 0.0 ? 100.0 * sample.gpu_ms * scale / total_gpu : 0.0);
         }
         std::fprintf(out, "  [Phase] %-30s %11.1f %11.1f\n", "total", total_host,
                      total_gpu);
@@ -159,6 +192,10 @@ private:
         std::string name;
         double host_ms{0.0};
         double gpu_ms{0.0};
+        // Occurrences and how many were actually recorded. With a sample stride the
+        // two differ, and `report` scales the recorded sum back by their ratio.
+        uint64_t calls{0};
+        uint64_t recorded{0};
         // One (start, stop) pair per closure. Kept as a list rather than overwritten
         // so a phase visited once per chunk accumulates instead of measuring only the
         // last chunk — the difference between a per-window total and one chunk.
@@ -177,6 +214,11 @@ private:
             samples_.push_back(std::move(sample));
         }
         Sample& sample = samples_[index];
+        sample.calls += 1;
+        if (sample_stride_ > 1 && (sample.calls % sample_stride_) != 0) {
+            return kSkipped;
+        }
+        sample.recorded += 1;
         sample.stream = stream;
         const hipEvent_t start_event = make_event();
         const hipEvent_t stop_event = make_event();
@@ -196,6 +238,8 @@ private:
         CHECK_HIP(hipEventCreate(&event));
         return event;
     }
+
+    size_t sample_stride_{1};
 
     static void destroy(hipEvent_t& event) noexcept {
         if (event != nullptr) {

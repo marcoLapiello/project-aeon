@@ -158,10 +158,13 @@ inline V4LayerBodyPre run_pre_attention_tail(
 
     // The per-head norm is WEIGHTLESS: the artifact has no tensor for it, and
     // upstream's fused q-norm/rope takes no weight argument.
-    hipLaunchKernelGGL(
-        kernel::rmsnorm_unit_wave32_kernel,
-        dim3(NUM_HEADS), dim3(32), 0, stream,
-        scratch.d_q, scratch.d_q, HEAD_DIM, 1e-6f);
+    {
+        auto region = PhaseProfiler::instance().region("    E1 q-norm", stream);
+        hipLaunchKernelGGL(
+            kernel::rmsnorm_unit_wave32_kernel,
+            dim3(NUM_HEADS), dim3(32), 0, stream,
+            scratch.d_q, scratch.d_q, HEAD_DIM, 1e-6f);
+    }
 
     V4AttentionTraceRecord* attention_trace =
         observer.begin_trace(layer, token_id, pos);
@@ -219,6 +222,8 @@ inline V4LayerBodyPre run_pre_attention_tail(
         scratch.d_local_position_write = layer.d_local_positions + local_slot;
     }
 
+    auto rope_write_region =
+        PhaseProfiler::instance().region("    E2 rope + kv write", stream);
     hipLaunchKernelGGL(
         kernel::v4_forward_rope_at_pos_wave32_kernel,
         dim3(NUM_HEADS), dim3(32), 0, stream,
@@ -245,6 +250,7 @@ inline V4LayerBodyPre run_pre_attention_tail(
                                  hipMemcpyHostToDevice, stream));
     }
     layer.record_position(pos);
+    rope_write_region = PhaseProfiler::Region{};
 
     if (attention_trace != nullptr) {
         trace_copy(observer, attention_trace->rotated_query, scratch.d_q, TOTAL_Q);
@@ -281,15 +287,21 @@ inline V4LayerBodyPre run_pre_attention_tail(
 
         // Compressor partial state. The APE add lives inside the kernel and
         // applies to `score` only.
-        hipLaunchKernelGGL(
-            kernel::v4_save_compressor_state_kernel,
-            dim3(1), dim3(256), 0, stream,
-            scratch.d_compressor_kv, scratch.d_compressor_score,
-            layer.d_compressor_partial_kv, layer.d_compressor_partial_score,
-            layer.d_compressor_partial_positions, layer.d_compressor_ape,
-            absolute_position, ratio, partial_capacity, compressor_width);
+        {
+            auto region =
+                PhaseProfiler::instance().region("    E3 compressor state", stream);
+            hipLaunchKernelGGL(
+                kernel::v4_save_compressor_state_kernel,
+                dim3(1), dim3(256), 0, stream,
+                scratch.d_compressor_kv, scratch.d_compressor_score,
+                layer.d_compressor_partial_kv, layer.d_compressor_partial_score,
+                layer.d_compressor_partial_positions, layer.d_compressor_ape,
+                absolute_position, ratio, partial_capacity, compressor_width);
+        }
 
         if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+            auto region =
+                PhaseProfiler::instance().region("    E3b indexer feed", stream);
             hipLaunchKernelGGL(
                 kernel::v4_forward_rope_at_pos_wave32_kernel,
                 dim3(kernel::DSV4_INDEX_N_HEADS), dim3(32), 0, stream,
@@ -313,6 +325,8 @@ inline V4LayerBodyPre run_pre_attention_tail(
 
         // Compressed entries fire only on the boundary of a ratio window.
         if ((pos + 1u) % static_cast<uint32_t>(ratio) == 0) {
+            auto region =
+                PhaseProfiler::instance().region("    E4 materialize", stream);
             const int compressed_index = static_cast<int>(
                 (pos + 1u) / static_cast<uint32_t>(ratio) - 1u);
             emitted_compressed = true;
@@ -351,7 +365,10 @@ inline V4LayerBodyPre run_pre_attention_tail(
         // The indexer runs on CSA only. HCA attends every committed compressed
         // row and has no indexer tensors at all.
         if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+            auto region =
+                PhaseProfiler::instance().region("    E5 indexer scores/topk", stream);
             if (committed != 0) {
+                auto region = PhaseProfiler::instance().region("    E5a indexer scores", stream);
                 hipLaunchKernelGGL(
                     kernel::v4_indexer_scores_kernel,
                     dim3((committed + 255u) / 256u), dim3(256), 0, stream,
@@ -362,9 +379,12 @@ inline V4LayerBodyPre run_pre_attention_tail(
                     1.0f / std::sqrt(static_cast<float>(kernel::DSV4_INDEX_HEAD_DIM)),
                     1.0f / std::sqrt(static_cast<float>(kernel::DSV4_INDEX_N_HEADS)));
             }
-            select_indexer_topk(layer, scratch.d_indexer_scores,
-                                scratch.d_indexer_topk_indices,
-                                static_cast<size_t>(committed), stream);
+            {
+                auto region = PhaseProfiler::instance().region("    E5b indexer topk", stream);
+                select_indexer_topk(layer, scratch.d_indexer_scores,
+                                    scratch.d_indexer_topk_indices,
+                                    static_cast<size_t>(committed), stream);
+            }
         }
 
         if (attention_trace != nullptr) {
