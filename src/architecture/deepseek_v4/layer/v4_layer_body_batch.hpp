@@ -770,6 +770,74 @@ inline void run_layer_body_router_batch(
     }
 }
 
+// Phase 2c's shared expert over the whole chunk, in the three weight reads the
+// per-token path pays per token.
+//
+// The shared expert is a dense FFN that fires on every token, so a chunk reads its
+// weights once per projection instead of once per token — the same refactor
+// `project_dense` already gave the pre-attention projections, and the reason the dense
+// path is the largest byte term. Below `kDenseGemmMinTokens` the WMMA GEMM loses to the
+// vectorized GEMV (the crossover `project_dense` was measured at), so a sub-threshold
+// chunk keeps the exact per-token sequence — which is also what keeps the chunk oracle
+// bit-identical to serial for its small schedules.
+//
+// The per-token path is not traced here: the chunk that reaches the batched branch is
+// production, which observes with a null observer, and a chunk below the threshold
+// still emits its per-row traces through `run_layer_body_moe_shared_expert`.
+inline void run_layer_body_moe_shared_expert_batch(
+    V4Layer& layer,
+    V4LayerBodyBatchScratch& workspace,
+    const std::vector<V4LayerBodyPre>& pre,
+    uint32_t count,
+    hipStream_t stream,
+    V4LayerBodyObserver& observer) {
+    if (count == 0) return;
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int INTER_DIM = 2048;
+    constexpr int M_PAD = static_cast<int>(V4LayerBodyBatchScratch::kMPad);
+
+    auto region = PhaseProfiler::instance().region("shared expert (batched)", stream);
+
+    if (count < static_cast<uint32_t>(kDenseGemmMinTokens)) {
+        for (uint32_t row = 0; row < count; ++row) {
+            V4LayerBodyRow view = workspace.row(row);
+            run_layer_body_moe_shared_expert(layer, view, stream, observer, pre[row]);
+        }
+        return;
+    }
+
+    const V4LayerBodyRow base = workspace.row(0);
+
+    // One clear for every token's accumulator tile, where the per-token path cleared
+    // each row's own tile.
+    CHECK_HIP(hipMemsetAsync(base.d_moe_accum, 0,
+                             static_cast<size_t>(count) * M_PAD * H * sizeof(half), stream));
+
+    // w1 and w3 read the FFN RMSNorm out of row 0 of each token's padded tile and write
+    // the per-token gate/up, once for the whole chunk.
+    project_dense(base.d_ffn_norm_act, layer.d_shared_w1, base.d_shared_gate,
+                  static_cast<int>(count), H, INTER_DIM, M_PAD * H, INTER_DIM, stream);
+    project_dense(base.d_ffn_norm_act, layer.d_shared_w3, base.d_shared_up,
+                  static_cast<int>(count), H, INTER_DIM, M_PAD * H, INTER_DIM, stream);
+
+    // The gate/up/swiglu buffers are contiguous per token, so one elementwise launch
+    // over the whole chunk replaces one per token.
+    {
+        constexpr int swiglu_threads = 256;
+        const int elements = static_cast<int>(count) * INTER_DIM;
+        hipLaunchKernelGGL(
+            kernel::v4_swiglu_clamp_kernel,
+            dim3((elements + swiglu_threads - 1) / swiglu_threads), dim3(swiglu_threads),
+            0, stream, base.d_shared_gate, base.d_shared_up, base.d_shared_swiglu,
+            elements, 10.0f);
+    }
+
+    // w2 writes row 0 of each token's padded accumulator tile — where the routed reduce
+    // and the FFN post read the shared contribution.
+    project_dense(base.d_shared_swiglu, layer.d_shared_w2, base.d_moe_accum,
+                  static_cast<int>(count), INTER_DIM, H, INTER_DIM, M_PAD * H, stream);
+}
+
 // Runs one layer and a **chunk of tokens**.
 //
 // The order of operations is the whole content of this function:
@@ -939,13 +1007,7 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
     // the base-class default, which reproduces the per-token sequence exactly (so a
     // chunk stays bit-identical to serial), while the tiered executor may run the
     // grouped path behind its own switch. That keeps one code path in the body.
-    {
-        auto phase = PhaseProfiler::instance().region("shared expert (per token)", stream);
-        for (uint32_t row = 0; row < count; ++row) {
-            run_layer_body_moe_shared_expert(layer, views[row], stream, observer,
-                                             pre[row]);
-        }
-    }
+    run_layer_body_moe_shared_expert_batch(layer, workspace, pre, count, stream, observer);
     {
         constexpr int kMPad = static_cast<int>(V4LayerBodyBatchScratch::kMPad);
         constexpr int kH = static_cast<int>(kernel::DSV4_HIDDEN_SIZE);

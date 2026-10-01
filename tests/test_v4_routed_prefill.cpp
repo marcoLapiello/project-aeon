@@ -17,6 +17,10 @@
 //   D. CORRECT AND NON-VACUOUS. The window is byte-identical to the certified serial
 //      path, dedup collapsed its `6C` draws, Warm was frozen (unchanged across the
 //      window), and nothing leaked.
+//   E. THE DENSE-GEMM THRESHOLD IS CROSSED. The window is run again at a chunk at or
+//      above `kDenseGemmMinTokens`, so the batched shared expert (and every other
+//      `project_dense` consumer) is certified on its WMMA branch, not only on the
+//      per-token fallback the smaller chunks reach.
 // -----------------------------------------------------------------------------
 
 #include "platform/rdna3/device.hpp"
@@ -50,6 +54,14 @@ constexpr uint32_t kContext = 256;
 // — which is what exercises the cross-chunk residency the bank exists to give.
 constexpr uint32_t kWindow = 48;
 constexpr uint32_t kChunk = 16;
+// A chunk at or above `kDenseGemmMinTokens` (32) is where `project_dense` swaps the
+// per-token GEMV for the WMMA GEMM, and the shared expert now rides that dispatcher.
+// `kBigChunk` drives the window once more above the threshold so the batched path is
+// certified numerically, not merely executed. It does not divide `kWindow` on purpose:
+// the window runs a `32` chunk and a `16` chunk, so both branches of the dispatcher are
+// compared against serial in one pass. The corridor is sized from the configured
+// `prefill_chunk`, so that is raised to `kBigChunk`.
+constexpr uint32_t kBigChunk = 32;
 // The host budget is the **total** pinned region: Warm *and* the transport corridor
 // share it (`ExpertHostRegion`), so a figure that only covers the Warm residency the
 // routed bank wants is now rejected at load. `8 GiB` covers the corridor at this
@@ -122,7 +134,9 @@ int main(int argc, char** argv) {
     aeon::core::AeonRuntimeConfig runtime;
     runtime.context_size = kContext;
     runtime.warm_host_bytes = kWarmBytes;
-    runtime.prefill_chunk = kChunk;
+    // Sized for the largest chunk the gate runs (`kBigChunk`); the `kChunk` windows
+    // below it use the same corridor.
+    runtime.prefill_chunk = kBigChunk;
     runtime.prefill_sweep = true;
     runtime.max_hot_vram_slots = max_hot_slots;
 
@@ -242,6 +256,17 @@ int main(int argc, char** argv) {
     const std::vector<int> tokens_grouped = greedy_tokens(grouped_logits, kDecode);
     aeon::core::moe_grouped_batch_enabled() = false;
 
+    // ---- the same window at a chunk above the dense-GEMM threshold ----------
+    // This is the numeric certification of the batched shared expert: at `kChunk`
+    // every projection ran the per-token GEMV fallback, so a defect in the WMMA branch
+    // (a wrong row pitch into a token's padded tile, say) would be invisible. Run the
+    // identical window at `kBigChunk` and compare against the same serial reference.
+    std::printf("\n[C3] The same window, chunk >= kDenseGemmMinTokens\n");
+    host.reset_generation_state();
+    (void)graph.forward_window(ids.data(), 0, kWindow, kBigChunk, host.streams().compute);
+    const std::vector<uint8_t> bigchunk_logits =
+        read_bytes(graph.logits(), static_cast<size_t>(vocab) * sizeof(uint16_t));
+
     std::printf("\n--- results ---\n");
 
     const bool bank_engaged = prefill_active;
@@ -305,6 +330,34 @@ int main(int argc, char** argv) {
         assert_that("D: routed logits agree with serial (argmax + tol)",
                     argmax_s == argmax_r && rel <= 0.5,
                     "greedy " + std::to_string(argmax_r) + " vs " +
+                        std::to_string(argmax_s) + ", rel " + std::to_string(rel));
+    }
+
+    // The batch above the threshold must agree with serial on the same bar. This is
+    // what fails if the batched shared expert mis-addresses the token rows: the answer
+    // moves, and the per-token fallback the smaller chunks used could not have shown it.
+    {
+        const __half* s = reinterpret_cast<const __half*>(serial_logits.data());
+        const __half* b = reinterpret_cast<const __half*>(bigchunk_logits.data());
+        const size_t n = serial_logits.size() / sizeof(__half);
+        double peak = 0.0;
+        double worst = 0.0;
+        size_t argmax_s = 0;
+        size_t argmax_b = 0;
+        float best_s = -1e30f;
+        float best_b = -1e30f;
+        for (size_t i = 0; i < n; ++i) {
+            const float x = __half2float(s[i]);
+            const float y = __half2float(b[i]);
+            peak = std::max(peak, static_cast<double>(std::fabs(x)));
+            worst = std::max(worst, static_cast<double>(std::fabs(x - y)));
+            if (x > best_s) { best_s = x; argmax_s = i; }
+            if (y > best_b) { best_b = y; argmax_b = i; }
+        }
+        const double rel = peak > 0.0 ? worst / peak : worst;
+        assert_that("D: chunk >= threshold logits agree with serial (argmax + tol)",
+                    argmax_s == argmax_b && rel <= 0.5,
+                    "greedy " + std::to_string(argmax_b) + " vs " +
                         std::to_string(argmax_s) + ", rel " + std::to_string(rel));
     }
 
@@ -414,9 +467,9 @@ int main(int argc, char** argv) {
     assert_that("D: registry invariants hold", host.registry().invariants_hold(),
                 "invariants_hold()");
 
-    std::printf("\n  window %u tokens (chunk %u) over %u layers, %u experts each, "
-                "NVMe %.3f GiB\n",
-                kWindow, kChunk, layers, per_layer, nvme_bytes / 1073741824.0);
+    std::printf("\n  window %u tokens (chunk %u, plus a chunk %u pass) over %u layers, "
+                "%u experts each, NVMe %.3f GiB\n",
+                kWindow, kChunk, kBigChunk, layers, per_layer, nvme_bytes / 1073741824.0);
     (void)hc_dim;
 
     std::printf("\n================================================================================\n");

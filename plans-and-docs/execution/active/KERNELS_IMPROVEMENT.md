@@ -45,7 +45,7 @@ The host has `62.62 GiB` and the pinned config plus the runtime's own allocation
 | :--- | :--- | :--- |
 | 1 | Grouped WMMA expert GEMM (W4A16) | **Done** — enabled in production |
 | 2 | Batch the chunk loop in the layer body | **Partly** — phase split and router done; `M`-keyed dispatcher and batched KV/position writes open |
-| 3 | WMMA dense GEMM for the dense projections | **Partly** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
+| 3 | WMMA dense GEMM for the dense projections | **Partly** — pre-attention projections and the shared expert batched; `v4_grouped_wo`, HC and dispatcher-on-`M` open |
 | 4 | Batched causal attention over the chunk | **Done** — tile + split-keys, all classes on by default; attention variants measured, redesign untried (Area 6) |
 | 4a | Indexer top-k on device | **Done** — the top-k only (`0.13 s`); the scores it feeds were Area 8 |
 | — | `compose_local_rows` gather | **Done** |
@@ -230,7 +230,7 @@ Measured (`bench_prefill_ab routed 128`, bank arm, chunk `128`, window `1024`, w
 
 ### Area 3: WMMA dense GEMM for attention and shared-expert projections — **partly done**
 
-The same WMMA core as Area 1 (a single group). Remaining consumers: shared-expert W13/W2, `v4_grouped_wo`, and the HC projections. The row threshold is chosen by the dispatcher on `M`, GEMV below it (short-prompt routed prefill and decode).
+The same WMMA core as Area 1 (a single group). Remaining consumers: `v4_grouped_wo` and the HC projections. The row threshold is chosen by the dispatcher on `M`, GEMV below it (short-prompt routed prefill and decode).
 
 #### Implementation record
 
@@ -248,6 +248,16 @@ Measured (gate, vs `gemv_fp16_vec8_kernel` on a `(N, T)` grid): `T = 256`, `4096
 End to end (`aeon_chat`, swept, `W=4096 C=256`, `n = 1`, `701`-token prefix of `prefill-corpus.txt`; not the baseline prompt): pre-attention GPU `10.3 ms/token` against `21.9` before (`14.6 s / 666`), TTFT `43.5 s` against `50.0 s`. The attention kernel is now `24.5 s` of `67 s` GPU — Area 4. What remains in pre-attention is the per-token tail (RoPE, key write, compressor state, indexer scores/top-k: ~`30` launches per token).
 
 Gates: the layer-body oracles and `test_v4_engine` green. `test_v4_prefill_window` failed `A`/`B` bit-exact (`4/10`) at the time — the grouped-experts reorder, later moved to the agreement bar (Area 4).
+
+#### Implementation record — shared expert batched
+
+The shared expert is a dense FFN that fires on every token, so it was four per-token launches (`w1` GEMV, `w3` GEMV, SwiGLU, `w2` GEMV) plus an `M_PAD·H` memset, re-reading `48 MiB` of dense weights **per token**. That is the same defect Area 3 fixed for the pre-attention projections, and unlike the routed experts its byte saving is **true** `C×` headroom, because every token reads the same dense weight (`294 MiB` per CSA token-layer against `81 MiB` for the routed path is the same argument at larger scale).
+
+One `run_layer_body_moe_shared_expert_batch` now serves the chunk: `project_dense` for `w1`/`w3`/`w2` (WMMA above `kDenseGemmMinTokens`), one SwiGLU over the contiguous `count × INTER_DIM`, one memset for every token's accumulator tile. Below the threshold it keeps the exact per-token sequence — the crossover `project_dense` was measured at — which is also what keeps `test_v4_layer_body_chunk_oracle` bit-identical to serial, since its schedules are all `≤ 16` tokens.
+
+Measured (`aeon_chat`, pinned config, `n = 1`, `677`-token prompt): the `shared expert` phase falls from `1,197 ms → 118 ms` GPU (`−90%`) and `245 ms → 4.3 ms` host (`−98%`).
+
+**Coverage.** No gate *certified* the `count ≥ 32` branch when it landed: the window gate runs `kWindow = 16` and its chunked pass `5`, and the routed gate's window (`48`) was driven at chunk `16`; both are below `kDenseGemmMinTokens = 32`, so they exercised only the per-token fallback. The branch was *executed* by `test_v4_staging_depth` (it runs `forward_window(…, min(64, 256))`), but that gate checks timing-flatness and work-identity, not numerics. The routed gate now drives the same window again at `kBigChunk = 32` and compares it against the serial reference on the same bar (`21` checks, `0` failures; greedy `320` agrees, rel `1.2%`), so both branches of the dispatcher are certified in one pass (`kBigChunk` does not divide `kWindow`, so the window runs a `32` chunk and a `16` chunk).
 
 ### Area 4: Batched causal attention over the chunk — **done**
 
