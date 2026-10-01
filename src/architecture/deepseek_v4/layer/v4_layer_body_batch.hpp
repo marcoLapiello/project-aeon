@@ -46,6 +46,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -246,6 +247,11 @@ public:
     // allowance there, so a configuration that would overrun fails with a named message
     // instead of silently eating into the Hot pool.
     size_t bytes() const noexcept { return bytes_allocated_; }
+
+    // Per-row pitch of the indexer candidate scores, for the batched selection. Read
+    // from the scratch and not the layer because a layer-major window sizes the scratch
+    // for the widest layer in the stack, which can exceed a given layer's own capacity.
+    uint32_t index_scores_stride() const noexcept { return index_scores_per_token_; }
 
     // The chunk's key row for local index `index` (0 = the chunk's first token),
     // written during the pre-attention phase instead of the ring.
@@ -541,6 +547,57 @@ inline V4LayerBodyPre run_chunk_pre_attention(
 // `PhaseProfiler::set_sample_stride`.
 inline constexpr size_t kTailSampleStride = 16;
 
+// One batched indexer scores launch for the whole chunk, then the per-row top-k.
+//
+// `v4_indexer_scores_kernel` was launched once per row with `ceil(committed / 256)` =
+// one block; the profile measured it at `4.3 s` of prefill GPU — `60%` of pre-attention,
+// `18%` of the whole prefill — against `0.13 s` for the top-k it feeds. The rows share
+// the indexer weights and read the same committed key cache, so the chunk is one larger
+// grid with a row pitch.
+//
+// The scores are read **after** the tail loop, once every compressed entry the chunk
+// materializes is in the cache. A row ranks only the `committed` entries that predate
+// it, so the entries later rows add are never read by an earlier row — which is what
+// makes deferring the selection safe, and why the tail takes `defer_indexer_select`
+// rather than the scores moving to another phase. The top-k stays per row: it is cheap,
+// and its candidate count differs per row.
+inline void run_chunk_indexer_select_batch(
+    V4Layer& layer,
+    V4LayerBodyBatchScratch& workspace,
+    uint32_t start_position,
+    const std::vector<V4LayerBodyPre>& pre,
+    hipStream_t stream) {
+    if (layer.spec().attention_kind != V4AttentionKind::CSA) return;
+    const int ratio = layer.spec().compression_ratio;
+    const uint32_t count = static_cast<uint32_t>(pre.size());
+    if (ratio <= 0 || count == 0 || !layer.state_layout().is_compressed()) return;
+
+    auto region = PhaseProfiler::instance().region("  E5 indexer (batched)", stream);
+
+    constexpr int INDEX_HEADS = static_cast<int>(kernel::DSV4_INDEX_N_HEADS);
+    constexpr int INDEX_DIM = static_cast<int>(kernel::DSV4_INDEX_HEAD_DIM);
+    const int capacity = static_cast<int>(layer.state_layout().compressed_capacity);
+    const V4LayerBodyRow base = workspace.row(0);
+    // `committed` grows with position, so the last row bounds the grid.
+    const int max_committed = static_cast<int>(pre[count - 1].committed);
+    if (max_committed > 0) {
+        const int tiles = (max_committed + 255) / 256;
+        hipLaunchKernelGGL(
+            kernel::v4_indexer_scores_batch_kernel, dim3(tiles, count), dim3(256), 0,
+            stream, base.d_indexer_query, INDEX_HEADS * INDEX_DIM,
+            base.d_indexer_weights, INDEX_HEADS, layer.d_indexer_key_cache,
+            base.d_indexer_scores, static_cast<int>(workspace.index_scores_stride()),
+            static_cast<int>(start_position), ratio, capacity, INDEX_HEADS, INDEX_DIM,
+            1.0f / std::sqrt(static_cast<float>(INDEX_DIM)),
+            1.0f / std::sqrt(static_cast<float>(INDEX_HEADS)));
+    }
+    for (uint32_t row = 0; row < count; ++row) {
+        const V4LayerBodyRow view = workspace.row(row);
+        select_indexer_topk(layer, view.d_indexer_scores, view.d_indexer_topk_indices,
+                            static_cast<size_t>(pre[row].committed), stream);
+    }
+}
+
 inline std::vector<V4LayerBodyPre> run_chunk_pre_attention_batch(
     V4Layer& layer,
     V4LayerBodyBatchScratch& workspace,
@@ -586,9 +643,13 @@ inline std::vector<V4LayerBodyPre> run_chunk_pre_attention_batch(
         PhaseProfiler::instance().set_sample_stride(kTailSampleStride);
         for (uint32_t row = 0; row < count; ++row) {
             pre[row] = run_pre_attention_tail(layer, rows[row], tables, token_ids[row],
-                                              start_position + row, stream, observer);
+                                              start_position + row, stream, observer,
+                                              /*defer_indexer_select=*/true);
         }
         PhaseProfiler::instance().set_sample_stride(1);
+        // All rows' keys are in place, so the chunk's indexer is ranked in one scores
+        // launch instead of one per row.
+        run_chunk_indexer_select_batch(layer, workspace, start_position, pre, stream);
     }
     return pre;
 }

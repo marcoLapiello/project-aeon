@@ -382,6 +382,55 @@ __global__ void v4_indexer_scores_kernel(
     scores[candidate] = score;
 }
 
+// The indexer's candidate scores for a whole chunk: the same arithmetic as
+// `v4_indexer_scores_kernel`, with the row on `blockIdx.y` and every buffer read by a
+// row pitch. Row `r` is at position `start_position + r` and ranks
+// `min(capacity, (position + 1) / ratio)` committed entries; a thread past its row's
+// count returns. The per-row form launched `ceil(committed / 256)` = **one** block,
+// which is why batching removes launch overhead rather than arithmetic.
+__global__ void v4_indexer_scores_batch_kernel(
+    const __half* __restrict__ queries,
+    int query_stride,
+    const float* __restrict__ weights,
+    int weights_stride,
+    const __half* __restrict__ key_cache,
+    float* __restrict__ scores,
+    int scores_stride,
+    int start_position,
+    int compression_ratio,
+    int compressed_capacity,
+    int num_heads,
+    int head_dim,
+    float softmax_scale,
+    float head_scale
+) {
+    const int row = blockIdx.y;
+    const int64_t position = static_cast<int64_t>(start_position) + row;
+    int committed = static_cast<int>((position + 1) / compression_ratio);
+    if (committed > compressed_capacity) committed = compressed_capacity;
+    if (committed <= 0) return;
+
+    const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate >= committed) return;
+
+    const __half* query = queries + static_cast<size_t>(row) * query_stride;
+    const float* w = weights + static_cast<size_t>(row) * weights_stride;
+    const __half* key = key_cache + static_cast<size_t>(candidate) * head_dim;
+
+    float score = 0.0f;
+    for (int head = 0; head < num_heads; ++head) {
+        float dot = 0.0f;
+        const size_t head_offset = static_cast<size_t>(head) * head_dim;
+        for (int dimension = 0; dimension < head_dim; ++dimension) {
+            dot += __half2float(query[head_offset + static_cast<size_t>(dimension)]) *
+                   __half2float(key[static_cast<size_t>(dimension)]);
+        }
+        // ReLU here, per head, before the weight — the same order as the per-row form.
+        score += fmaxf(dot, 0.0f) * w[head] * softmax_scale * head_scale;
+    }
+    scores[static_cast<size_t>(row) * scores_stride + candidate] = score;
+}
+
 // Assembles one query's local row-set for the compressed classes: the pre-chunk ring
 // rows still inside the query's window, then the chunk's own rows up to and including
 // the query. **Rows are ordered by ring slot (`position mod capacity`), not by

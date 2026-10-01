@@ -132,11 +132,16 @@ inline void run_pre_attention_q_projections(
 // Everything after the projections for **one token**: the per-head query norm, RoPE,
 // the key write, the compressor and the indexer selection.
 //
+// `defer_indexer_select` moves the CSA indexer's scores and top-k out of the tail, so a
+// chunk can rank every row with one batched launch instead of one per row. The chunk
+// passes `true` and calls `run_chunk_indexer_select_batch` once the whole tail has run;
+// decode and every single-row caller keep the default and select here.
+//
 // On return the token's rotated key is in the local ring (or the chunk buffer), the
-// compressor (and on CSA the indexer) has been fed, and a ratio boundary has
-// materialized its compressed entry. The layer class is read from
-// `layer.spec().attention_kind`: a Sliding layer never touches the compressor or
-// indexer tensors; CSA and HCA take the compressed path, the indexer on CSA only.
+// compressor (and on CSA the indexer) has been fed, and a ratio boundary has materialized
+// its compressed entry. The layer class is read from `layer.spec().attention_kind`: a
+// Sliding layer never touches the compressor or indexer tensors; CSA and HCA take the
+// compressed path, the indexer on CSA only.
 inline V4LayerBodyPre run_pre_attention_tail(
     V4Layer& layer,
     V4LayerBodyRow& scratch,
@@ -144,7 +149,8 @@ inline V4LayerBodyPre run_pre_attention_tail(
     uint32_t token_id,
     uint32_t pos,
     hipStream_t stream,
-    V4LayerBodyObserver& observer) {
+    V4LayerBodyObserver& observer,
+    bool defer_indexer_select = false) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
     constexpr int HC = 4;
     constexpr int HC_DIM = HC * H;          // 16384
@@ -363,8 +369,9 @@ inline V4LayerBodyPre run_pre_attention_tail(
         }
 
         // The indexer runs on CSA only. HCA attends every committed compressed
-        // row and has no indexer tensors at all.
-        if (layer.spec().attention_kind == V4AttentionKind::CSA) {
+        // row and has no indexer tensors at all. A deferred chunk row is ranked later,
+        // in one batch — see `run_chunk_indexer_select_batch`.
+        if (layer.spec().attention_kind == V4AttentionKind::CSA && !defer_indexer_select) {
             auto region =
                 PhaseProfiler::instance().region("    E5 indexer scores/topk", stream);
             if (committed != 0) {

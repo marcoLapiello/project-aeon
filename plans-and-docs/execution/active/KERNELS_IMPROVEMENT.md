@@ -56,82 +56,72 @@ seen while this plan was written was **not** the engine's; it was the build besi
 | 2 | Batch the chunk loop in the layer body | **Partly** — phase split and router done; `M`-keyed dispatcher and batched KV/position writes open |
 | 3 | WMMA dense GEMM for the dense projections | **Partly** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
 | 4 | Batched causal attention over the chunk | **Done** — tile + split-keys, all classes on by default; WMMA/occupancy tuning open (Area 6) |
-| 4a | Indexer top-k on device | **Done** — cheap: `E5b = 0.13 s`; the *scores* kernel `E5a = 4.3 s` was never batched |
+| 4a | Indexer top-k on device | **Done** — the top-k only (`0.13 s`); the scores it feeds were Area 8 |
 | — | `compose_local_rows` gather | **Done** |
-| 5 | Fuse elementwise/norm over `[T, dim]` | **Open** |
+| 5 | Fuse elementwise/norm over `[T, dim]` | **Open** — next: E2 (`rope + kv write`, `0.73 s`, per-row) |
 | 6 | Tune for gfx1100 | **Open** |
 | 7 | Re-measure and retune supply | **Open** |
-| 8 | Batch the indexer scores over the chunk | **Open** — found `2026-10-01`; `4.3 s`, `18%` of GPU, a per-token single-block launch |
+| 8 | Batch the indexer scores over the chunk | **Done** — `4.47 → 0.07 s`; pre-attention GPU `−59%`, TTFT `29.1 → 25.1 s` |
 
 ## Phase profile
 
 ### Baseline — 2026-10-01
 
-The state the work starts from, on `main` at commit `7295137`, after Areas 1–4.2 and 4a.
-Same pinned invocation as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`,
-`Warm 35 GiB`, `3` staging blocks); `n = 3`, runs 2–3 stable to `<1%`, run 1 a cold start
-excluded. Each step record below carries its own implementation-time before/after; this
-is the one cross-step reference, and it is **replaced, never accumulated** — a superseded
-baseline is deleted, not kept beside the new one. Ledger entries are taken only at the end
-of the plan.
+The current measured state, on `main` after Areas 1–4.2, 4a and 8. Same pinned invocation
+as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`, `Warm 35 GiB`, `3`
+staging blocks); `n = 3`, stable to `<1%`. Each area record below carries its own
+implementation-time before/after; this is the one cross-area reference, and it is
+**replaced, never accumulated** — a superseded baseline is deleted, not kept beside the
+new one. Ledger entries are taken only at the end of the plan.
 
 | Phase | host ms | gpu ms | gpu share |
 | :--- | ---: | ---: | ---: |
-| **attention+norm (per token)** | `1,260` | `11,939` | **`45.7%`** |
-| &nbsp;&nbsp;· F/G hc + norm (nested) | `937` | `3,049` | `11.7%` |
-| **pre-attention (per token)** | `800` | `6,961` | **`26.7%`** |
-| **routed experts (batched)** | `1,075` | `1,472` | `5.6%` |
-| shared expert (per token) | `295` | `1,241` | `4.8%` |
-| routing dispatch | `529` | `542` | `2.1%` |
-| moe post (per token) | `706` | `346` | `1.3%` |
-| commit (per token) | `145` | `365` | `1.4%` |
-| router (batched) | `18,072` | `197` | `0.8%` |
-| **total** | **`23,821`** | **`26,113`** | |
+| **attention+norm (per token)** | `1,290` | `11,871` | **`62.6%`** |
+| &nbsp;&nbsp;· F/G hc + norm (nested) | `955` | `3,000` | `15.8%` |
+| **pre-attention (per token)** | `768` | `2,955` | **`15.6%`** |
+| **routed experts (batched)** | `1,065` | `1,487` | `7.8%` |
+| shared expert (per token) | `234` | `1,172` | `6.2%` |
+| routing dispatch | `495` | `507` | `2.7%` |
+| commit (per token) | `140` | `391` | `2.1%` |
+| moe post (per token) | `472` | `384` | `2.0%` |
+| router (batched) | `14,423` | `190` | `1.0%` |
+| **total** | **`18,886`** | **`18,956`** | |
 
-- **TTFT `28.6 s`** (`42.2 ms/prompt-token`), decode `2.94 tok/s`, prompt `677` tokens.
-- Derived: the **attention tile** is `11,939 − 3,049 = 8,890 ms` (`34.0%` of GPU) — the
-  largest single kernel. `pre-attention`'s `~7.0 s` is `10.3 ms/token`, matching Area 3.
-- The router's `18 s` host line is *not* issuance: its `hipStreamSynchronize` drains the
-  attention backlog queued ahead of it, so it is a barrier reading of GPU-wait. True
-  host issuance is `23,821 − 18,072 ≈ 5.7 s`, so prefill is **GPU-bound**.
-- Supply is fully hidden: `nvme_gib 141.5`, `io_ms 892`, `load_ms 442` against a
-  `~30 s` run — Area 7 is not yet the limiter.
+- **TTFT `25.1 s`** (`37.1 ms/prompt-token`), prompt `677` tokens.
+- Derived: the **attention tile** is `11,871 − 3,000 = 8,871 ms` — now **`47%`** of GPU and
+  the one dominant kernel. `pre-attention` fell to `2,955 ms` when Area 8 batched the
+  indexer scores (was `7,305`).
+- The router's `14 s` host line is *not* issuance: its `hipStreamSynchronize` drains the
+  attention backlog queued ahead of it, a barrier reading of GPU-wait. True host issuance
+  is `18,886 − 14,423 ≈ 4.5 s`, so prefill is **GPU-bound**.
+- Supply is fully hidden: `nvme_gib 141.5`, `io_ms 892`, `load_ms 442` against a `~25 s`
+  run — Area 7 is not yet the limiter.
 
-#### Pre-attention attribution — 2026-10-01
+#### Pre-attention attribution
 
-Pre-attention was one number (`~7 s`); it is now a breakdown, added because the plan had
-no way to say which stage held it. Sub-regions fire once per `(row, stage)` and are
-**sampled at stride `16` and scaled back** — at stride `1` the two event records per
-region cost more than the region measures, which is the profiler's own rule.
+Pre-attention was one number (`~7 s`); the breakdown is what found Area 8, and it is kept
+for the next one. Sub-regions fire once per `(row, stage)` and are **sampled at stride
+`16` and scaled back** — at stride `1` the two event records per region cost more than the
+region measures. The batched indexer region is one launch per chunk, so it is exact.
 
 | Sub-region | gpu ms |
 | :--- | ---: |
-| A hc mix + norm | `1,087` |
-| B x-projections | `33` |
-| C lora norm | `408` |
-| D q-projections | `106` |
-| E pre-attn tail | `5,668` |
-| &nbsp;&nbsp;· E1 q-norm | `339` |
-| &nbsp;&nbsp;· E2 rope + kv write | `692` |
-| &nbsp;&nbsp;· E3 compressor state | `279` |
-| &nbsp;&nbsp;· E3b indexer feed | `231` |
+| A hc mix + norm | `1,130` |
+| B x-projections | `34` |
+| C lora norm | `448` |
+| D q-projections | `108` |
+| E pre-attn tail | `1,230` |
+| &nbsp;&nbsp;· E1 q-norm | `367` |
+| &nbsp;&nbsp;· E2 rope + kv write | `732` |
+| &nbsp;&nbsp;· E3 compressor state | `301` |
+| &nbsp;&nbsp;· E3b indexer feed | `241` |
 | &nbsp;&nbsp;· E4 materialize | `114` |
-| &nbsp;&nbsp;· **E5a indexer scores** | **`4,345`** |
-| &nbsp;&nbsp;· E5b indexer topk | `127` |
-| **pre-attention total** | **`7,304`** |
+| **E5 indexer (batched)** | **`70`** |
+| **pre-attention total** | **`2,955`** |
 
-**Finding — the indexer *scores* kernel, not its top-k.** `E5a = 4.3 s` is `60%` of
-pre-attention and `18%` of all prefill GPU; Area 4a's device top-k (`E5b`) is `0.13 s`,
-so the plan's Area 4a record fixed the cheap half. `E5a` launches
-`dim3(ceil(committed/256))` = **one block** per call (at a `677`-token context,
-`committed = 677/4 = 169`) and runs `21 CSA layers × 677 tokens ≈ 14k` times — the same
-per-row, tiny-grid defect Areas 2–3 batched for the router and the projections, never
-batched here. A/B confirmation (ranking disabled): pre-attention GPU `7,304 → 3,052`
-(`Δ = 4,253`, matching `E5a`) and TTFT `29.1 → 27.1 s`.
-
-Area 4.2's recorded `26,054 ms` GPU / `29.5 s` TTFT match this baseline (`26,113` /
-`28.6`) within run variance, so the intermediate step records below are consistent with a
-fresh run.
+The largest remaining pre-attention term is E2 (`732 ms`: RoPE plus two key-copy
+`hipMemcpy` and a position H2D, per row) — Area 5. The indexer-scores finding that
+produced this table is Area 8.
 
 #### Correctness is intact — the run-config prompt is a timing fixture, not a chat
 
@@ -164,13 +154,13 @@ the correctness signal.
 - The chunk "batch" was serial — pre-attention and attention+norm ran per row; fixed by Areas 3–4.
 - The router made one host sync per row — fixed in Area 2.
 - Small per-row launches (rmsnorm, rope, HC sinkhorn, KV copies, a position H2D per row) scale with T — Area 5 open.
-- The **indexer scores** kernel, not its top-k, is the pre-attention cost: `E5a = 4.3 s` against `E5b = 0.13 s`, `~18%` of prefill GPU. It is a per-token, single-block launch (`21 CSA layers × 677 tokens`), the same per-row defect Areas 2–3 fixed for the router and the projections — Area 8.
+- The **indexer scores** kernel, not its top-k, was the pre-attention cost: `4.3 s` against `0.13 s` — a per-token, single-block launch, the same defect Areas 2–3 fixed for the router and the projections. Batched in Area 8 (`4.3 s → 0.07 s`).
 
 ## Execution plan
 
-Area 1 and Area 4 are done; Area 4a and the compose gather with them; Areas 2–3 are
-partly done; Area 8 is new. Each record below is kept for the decisions in it — the
-status table is authoritative for state.
+Area 1, Area 4, Area 4a and Area 8 are done; the compose gather with them; Areas 2–3 are
+partly done. Each record below is kept for the decisions in it — the status table is
+authoritative for state.
 
 ### Area 1: W4A16 grouped WMMA GEMM for experts — **done**
 
@@ -365,26 +355,37 @@ Gates: `test_v4_real_scale_state` (the real `index_topk = 512` as a strict selec
 
 - Re-measure the swept prefill once Areas 3–5 land. Compute should then be faster than supply. Then tune the lookahead depth and chunk size together so the GPU stays fed.
 
-### Area 8: Batch the indexer scores over the chunk — **open**
+### Area 8: Batch the indexer scores over the chunk — **done**
 
 Found by the `2026-10-01` pre-attention attribution, not by the plan: `v4_indexer_scores_kernel`
-(`E5a`) is `4.3 s` GPU — `60%` of pre-attention and `18%` of all prefill GPU — while the
-top-k it feeds (`E5b`) is `0.13 s`. The plan's Area 4a record fixed the top-k, the cheap
-half, and never batched the scores.
+(`E5a`) was `4.3 s` GPU — `60%` of pre-attention and `18%` of all prefill GPU — against
+`0.13 s` for the top-k it feeds. The defect is the one Areas 2–3 fixed twice:
+`dim3(ceil(committed / 256))` = **one block**, launched once per token per CSA layer
+(`21 × 677 ≈ 14k` times at this context).
 
-The defect is the one Areas 2–3 fixed twice: `E5a` is launched `dim3(ceil(committed/256))`
-= **one block** and runs once per token per CSA layer (`21 × 677 ≈ 14k` times at this
-context). A chunk's `C` rows share the query weights and read the same compressed key
-cache, so the whole chunk is one larger grid with row pitch — the shape `dispatch_router`
-and `project_dense` already take. Expected to move the bulk of `4.3 s` into the launch
-count it removes, the same `~0.75 s`-per-`127`-drains scale Area 2 measured, but the
-ceiling should be higher because the per-call grid is one block rather than a full one.
+The batch is one grid with the row on `blockIdx.y` and a row pitch on every buffer
+(`v4_indexer_scores_batch_kernel`), which is the shape `dispatch_router` and
+`project_dense` already take. The ordering is the whole subtlety: a row's compressed
+entries are materialized **during its own tail** (at ratio boundaries), so the scores can
+only run once the whole chunk's tails have run — and a row ranks only the `committed`
+entries that predate it, so the later rows' entries are never read. The tail therefore
+takes `defer_indexer_select`; decode and every single-row caller keep the default and
+select inline, which is why the layer-body compressed oracle (reading the layer's own
+buffers) is unaffected. The top-k stays per row: cheap, and its candidate count differs
+per row.
 
-Gate: the indexer selection is a strict, order-independent reduction over `committed`
-candidates, so a batched scores kernel must reproduce `test_v4_indexer_oracle` and
-`test_v4_real_scale_state` exactly (the ranking's total order is already pinned), plus
-`test_v4_layer_body_serial_oracle` / `_compressed_oracle`. A per-token replay switch, as
-Areas 1–2 use, lets one process compare both path forms.
+Measured (`n = 3`, `<1%`):
+
+| | before | after |
+| :--- | ---: | ---: |
+| indexer scores + top-k, GPU | `4,472 ms` | **`70 ms`** |
+| pre-attention, GPU | `7,305 ms` | **`2,955 ms`** (`−59%`) |
+| total, GPU | `23,791 ms` | **`18,956 ms`** (`−20%`) |
+| TTFT | `29.1 s` | **`25.1 s`** (`−14%`) |
+
+Gates green: `test_v4_indexer_oracle`, `test_v4_layer_body_compressed_oracle`,
+`test_v4_layer_body_serial_oracle`, `test_v4_layer_body_chunk_oracle` (bit-exact with the
+tile off), `test_v4_real_scale_state` and `test_v4_engine` (end-to-end).
 
 ## Dependencies
 
