@@ -67,15 +67,15 @@ inline void run_pre_attention_mix(
 // The F/G block for a chunk: HC post expansion, HC FFN pre-mix, Sinkhorn, pre-combine
 // and the FFN RMSNorm — the per-row twin of `run_pre_attention_mix_batch`, and the
 // largest per-row term left after Area 5's A. Every stage takes its token on a grid
-// axis (`hc_post`, `hc_project` and `hc_pre_combine` on `blockIdx.y`; the Sinkhorn on
-// `blockIdx.x`), and the two casts are flat over the chunk's contiguous per-token
-// buffers, so the batch is the row count. Decode keeps the inline form in
+// axis (`hc_post`, `hc_project` and `hc_pre_combine` on `blockIdx.y`; the Sinkhorn and
+// the RMSNorm on `blockIdx.x`), and the two casts are flat over the chunk's contiguous
+// per-token buffers, so the batch is the row count. Decode keeps the inline form in
 // `run_layer_body_attention_tail`.
 //
-// The final norm and the padded-row replication stay **per row**: the norm's input
-// `ffn_pre` is compact (pitch `H`) but its output `ffn_norm_act` is a `M_PAD`-row tile
-// (pitch `M_PAD*H`), and `rmsnorm_wave32_kernel` writes at the input pitch, so a single
-// batched launch would have each token overwrite the next tile's row 0.
+// The FFN norm writes into a `M_PAD`-row tile while its input is compact, so it passes
+// `out_stride = M_PAD*H`; the padded rows themselves are left unwritten because nothing
+// reads them — the grouped W13 kernel, the router and the shared expert all read `in_dim
+// = H` from a tile base, i.e. row 0 only.
 inline void run_hc_ffn_batch(
     V4Layer& layer, V4LayerBodyRow& base, int count, hipStream_t stream) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
@@ -97,7 +97,7 @@ inline void run_hc_ffn_batch(
                                    stream>>>(base.d_res_mid_half, base.d_res_mid,
                                              count * HC_DIM);
 
-    // G. HC FFN pre-mix and Sinkhorn.
+    // G. HC FFN pre-mix, Sinkhorn, pre-combine and the FFN norm — one launch each.
     hipLaunchKernelGGL(
         kernel::hc_project_kernel, dim3(HC_MULT3, count), dim3(256), 0, stream,
         base.d_res_mid, layer.d_hc_ffn_fn, base.d_mixes_f, H, HC, 1e-6f);
@@ -108,20 +108,9 @@ inline void run_hc_ffn_batch(
     hipLaunchKernelGGL(
         kernel::hc_pre_combine_kernel, dim3((H / 4 + 255) / 256, count), dim3(256), 0,
         stream, base.d_res_mid, base.d_pre_f, base.d_ffn_pre, H, HC);
-
-    // FFN RMSNorm into row 0 of each token's tile, then the WMMA-compatibility
-    // replication into its padded rows — per row, for the pitch reason above.
-    for (int row = 0; row < count; ++row) {
-        half* pre = base.d_ffn_pre + static_cast<size_t>(row) * H;
-        half* act = base.d_ffn_norm_act + static_cast<size_t>(row) * M_PAD * H;
-        hipLaunchKernelGGL(
-            kernel::rmsnorm_wave32_kernel, dim3(1), dim3(32), 0, stream,
-            pre, layer.d_ffn_norm, act, H, 1e-6f);
-        for (int r = 1; r < M_PAD; ++r) {
-            CHECK_HIP(hipMemcpyAsync(act + r * H, act, H * sizeof(half),
-                                     hipMemcpyDeviceToDevice, stream));
-        }
-    }
+    hipLaunchKernelGGL(
+        kernel::rmsnorm_wave32_kernel, dim3(count), dim3(32), 0, stream,
+        base.d_ffn_pre, layer.d_ffn_norm, base.d_ffn_norm_act, H, 1e-6f, M_PAD * H);
 }
 // its token on a grid axis — the two HC kernels on `blockIdx.y`, the Sinkhorn
 // (`blockIdx.x`) and the RMSNorm (`blockIdx.x`) already do — and the chunk's per-token

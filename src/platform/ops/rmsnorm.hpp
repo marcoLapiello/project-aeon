@@ -27,18 +27,24 @@
 namespace aeon::kernel {
 
 // Weighted RMSNorm: out = x * rsqrt(mean(x^2) + eps) * weight.
+//
+// `out_stride` is the row pitch of `output`, defaulting to `dim` (the input pitch).
+// A caller whose rows are wider than the data they hold — the FFN norm writes row 0 of
+// a 16-row padded tile — passes its own pitch so a batched launch does not have each
+// row overwrite the next tile's row 0.
 __global__ void __launch_bounds__(32) rmsnorm_wave32_kernel(
     const __half* __restrict__ input,
     const __half* __restrict__ weight,
     __half* __restrict__ output,
     int dim,
-    float eps
+    float eps,
+    int out_stride = 0
 ) {
     const int lane = threadIdx.x; // 0..31
     const int row = blockIdx.x;
 
     const __half* in_row = input + row * dim;
-    __half* out_row = output + row * dim;
+    __half* out_row = output + static_cast<size_t>(row) * (out_stride > 0 ? out_stride : dim);
 
     float sum_sq = 0.0f;
     for (int i = lane; i < dim; i += 32) {
