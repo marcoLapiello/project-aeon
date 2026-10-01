@@ -49,7 +49,7 @@ The host has `62.62 GiB` and the pinned config plus the runtime's own allocation
 | 4 | Batched causal attention over the chunk | **Done** — tile + split-keys, all classes on by default; attention variants measured, redesign untried (Area 6) |
 | 4a | Indexer top-k on device | **Done** — the top-k only (`0.13 s`); the scores it feeds were Area 8 |
 | — | `compose_local_rows` gather | **Done** |
-| 5 | Fuse elementwise/norm over `[T, dim]` | **Partly** — E2 (`rope + kv write`) batched; A/C/E1/E3/E3b remain per-row |
+| 5 | Fuse elementwise/norm over `[T, dim]` | **Partly** — E2 (`rope + kv write`), A (`hc mix + norm`), C (`lora norm`) and E1 (`q-norm`) batched; E3/E3b/E4 remain per-row |
 | 6 | Tune for gfx1100 | **Partly** — attention variants measured (WMMA and warp-count neutral/worse); the multi-warp-WMMA-with-LDS-PV redesign untried; expert-shape/kernel sweeps open |
 | 7 | Re-measure and retune supply | **Open** |
 | 8 | Batch the indexer scores over the chunk | **Done** — `4.47 → 0.07 s`; pre-attention GPU `−59%`, TTFT `29.1 → 25.1 s` |
@@ -58,25 +58,25 @@ The host has `62.62 GiB` and the pinned config plus the runtime's own allocation
 
 ### Baseline — 2026-10-01
 
-The current measured state, on `main` after Areas 1–4.2, 4a, 8 and Area 5's E2. Same pinned invocation as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`, `Warm 35 GiB`, `3` staging blocks); `n = 3`, stable to `<1%` (a first run is a cold outlier and is dropped). Each area record below carries its own implementation-time before/after; this is the one cross-area reference, and it is **replaced, never accumulated** — a superseded baseline is deleted, not kept beside the new one. Ledger entries are taken only at the end of the plan.
+The current measured state, on `main` after Areas 1–4.2, 4a, 8 and Area 5's E2, C, E1 and A, and Area 3's shared expert. Same pinned invocation as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`, `Warm 35 GiB`, `3` staging blocks); `n = 3`, stable to `<1%` (a first run is a cold outlier and is dropped). Each area record below carries its own implementation-time before/after; this is the one cross-area reference, and it is **replaced, never accumulated** — a superseded baseline is deleted, not kept beside the new one. Ledger entries are taken only at the end of the plan.
 
 | Phase | host ms | gpu ms | gpu share |
 | :--- | ---: | ---: | ---: |
-| **attention+norm (per token)** | `1,304` | `11,855` | **`64.3%`** |
-| &nbsp;&nbsp;· F/G hc + norm (nested) | `965` | `2,996` | `16.3%` |
-| **pre-attention (per token)** | `529` | `2,429` | **`13.2%`** |
-| **routed experts (batched)** | `1,086` | `1,491` | `8.1%` |
-| shared expert (per token) | `245` | `1,197` | `6.5%` |
-| routing dispatch | `500` | `513` | `2.8%` |
-| commit (per token) | `143` | `383` | `2.1%` |
-| moe post (per token) | `420` | `365` | `2.0%` |
-| router (batched) | `14,087` | `200` | `1.1%` |
-| **total** | **`18,315`** | **`18,433`** | |
+| **attention+norm (per token)** | `1,335` | `11,891` | **`70.9%`** |
+| &nbsp;&nbsp;· F/G hc + norm (nested) | `992` | `3,018` | `18.0%` |
+| **routed experts (batched)** | `224` | `1,712` | `10.2%` |
+| routing dispatch | `1,417` | `1,429` | `8.5%` |
+| **pre-attention (per token)** | `202` | `711` | **`4.2%`** |
+| commit (per token) | `145` | `378` | `2.3%` |
+| moe post (per token) | `341` | `356` | `2.1%` |
+| router (batched) | `12,847` | `171` | `1.0%` |
+| shared expert (batched) | `5` | `118` | `0.7%` |
+| **total** | **`16,515`** | **`16,767`** | |
 
-- **TTFT `25.0 s` with the profiler on, `24.8 s` with it off** (`~36.7 ms/prompt-token`), prompt `677` tokens.
-- Derived: the **attention tile** is `11,855 − 2,996 = 8,859 ms` — **`48%`** of GPU and the one dominant kernel. Everything else is a fraction of it.
-- The router's `14 s` host line is *not* issuance: its `hipStreamSynchronize` drains the attention backlog queued ahead of it, a barrier reading of GPU-wait. True host issuance is `18,315 − 14,087 ≈ 4.2 s`, so prefill is **GPU-bound**, and the GPU is **attention-bound**.
-- Supply is fully hidden: `nvme_gib 141.5`, `io_ms 892`, `load_ms 442` against a `~25 s` run — Area 7 is not yet the limiter.
+- **TTFT `25.1 s` with the profiler on** (`~37.1 ms/prompt-token`), prompt `677` tokens. The isolated stage numbers are the reliable signal; TTFT at `n = 3` is within run-to-run noise of the earlier baselines because the removed work overlaps the attention kernel.
+- Derived: the **attention tile** is `11,891 − 3,018 = 8,873 ms` — **`53%`** of GPU and the one dominant kernel. Its *share* rose while its cost held, because the total fell around it: as the per-row stages batch away, the attention kernel is more of the problem, not less.
+- The router's `12.8 s` host line is *not* issuance: its `hipStreamSynchronize` drains the attention backlog queued ahead of it, a barrier reading of GPU-wait. True host issuance is `16,515 − 12,847 ≈ 3.7 s`, so prefill is **GPU-bound**, and the GPU is **attention-bound**.
+- Supply is hidden but its figures vary with host state this session: `nvme_gib 141.1` is stable, while `load_ms` reads `~1,800–2,600` against the previous baseline's `442` and `routing dispatch` `~1,400` GPU against `513`. Neither phase is touched by the compute work, so the movement is host/supply state on a host that has run many back-to-back sweeps; it wants a re-measure on a quiet host, and it is part of why prefill total moved less than the sum of the removed stages.
 
 #### Pre-attention attribution
 
@@ -84,20 +84,20 @@ Pre-attention was one number (`~7 s`); the breakdown is what found Area 8 and Ar
 
 | Sub-region | gpu ms |
 | :--- | ---: |
-| A hc mix + norm | `1,136` |
-| B x-projections | `34` |
-| C lora norm | `447` |
+| **A hc mix + norm (batched)** | **`18`** |
+| B x-projections | `35` |
+| **C lora norm (batched)** | **`4`** |
 | D q-projections | `108` |
-| E pre-attn tail | `698` |
-| &nbsp;&nbsp;· E1 q-norm | `396` |
-| &nbsp;&nbsp;· E3 compressor state | `332` |
-| &nbsp;&nbsp;· E3b indexer feed | `256` |
-| &nbsp;&nbsp;· E4 materialize | `118` |
+| E pre-attn tail | `541` |
+| &nbsp;&nbsp;· **E1 q-norm (batched)** | **`7`** |
+| &nbsp;&nbsp;· E3 compressor state | `365` |
+| &nbsp;&nbsp;· E3b indexer feed | `291` |
+| &nbsp;&nbsp;· E4 materialize | `127` |
 | **E2 rope + kv write (batched)** | **`3`** |
-| **E5 indexer (batched)** | **`74`** |
-| **pre-attention total** | **`2,429`** |
+| **E5 indexer (batched)** | **`84`** |
+| **pre-attention total** | **`711`** |
 
-The largest remaining pre-attention terms — A (`1,136`), C (`447`), E1 (`396`), E3 (`332`), E3b (`256`) — are all per-row, so batching each is the rest of Area 5. They are untried: Area 5/E2 measured `−0.53 s` GPU for `~0` TTFT, because the removed work overlapped the attention kernel, so an individual stage's TTFT effect is open until the attention term it overlaps is reduced.
+The remaining pre-attention terms — E3 (`365`), E3b (`291`), E4 (`127`) — are the compressor and indexer feed, which advance position-ordered state and fire on ratio boundaries; they are per-row deliberately, so batching them is the harder half of Area 5 that is left. E2, A, C and E1 each measured `~0` TTFT because the removed work overlapped the attention kernel.
 
 ### Decode phase profile — 2026-10-01
 
@@ -352,6 +352,46 @@ Measured (`n = 3`, stable runs):
 
 Gates green: `test_v4_rope_oracle`, `test_v4_layer_body_chunk_oracle` (bit-exact with the
 tile off), `test_v4_layer_body_serial_oracle`, `test_v4_layer_body_compressed_oracle`.
+
+#### Implementation record — C (lora norm) and E1 (q-norm), **done**
+
+Two more per-row stages, batched the same way E2 was.
+
+- **C (`run_pre_attention_lora_norm` → `_batch`).** The two norms between the projection rounds (`qa → qa_norm`, `kv → kv_norm_act`) ran once per row. `rmsnorm_wave32_kernel` already takes its row on `blockIdx.x`, and the chunk's `qa`/`qa_norm` (pitch `Q_LORA`) and `kv`/`kv_norm_act` (pitch `HEAD_DIM`) are contiguous per token, so the batch is just the row count: `dim3(1) → dim3(count)`.
+- **E1 (`run_pre_attention_tail` → `run_chunk_q_norm_batch`).** The per-head weightless query norm ran once per row (`dim3(NUM_HEADS)`); the chunk's `d_q` is one contiguous `count × num_heads × head_dim` block, so flattening it to `count × num_heads` rows of `head_dim` serves every head of every row in one launch. It sits in the tail (it precedes the query RoPE that also writes `d_q`), so it is hoisted to the batched region with a `defer_q_norm` flag — mirroring `defer_rope_kv_write` — and the chunk calls `run_chunk_q_norm_batch` **before** `run_chunk_rope_kv_write_batch`, preserving the tail's order. Decode and single-row callers keep the inline path.
+
+Both are the **same kernels** with a different grid — no arithmetic changed — which is why the chunk oracle stays bit-exact.
+
+Measured (`n = 3`, `<1%` across runs):
+
+| | before | after |
+| :--- | ---: | ---: |
+| C lora norm, GPU | `447 ms` | **`3.3 ms`** |
+| E1 q-norm, GPU | `396 ms` | **`6.8 ms`** |
+| pre-attention, GPU | `2,429 ms` | **`1,761 ms`** (`−27%`) |
+| prefill total, GPU | `18,433 ms` | **`17,931 ms`** (`−2.7%`) |
+| TTFT | `25.0 s` | `25.5 s` (flat, within noise) |
+
+**Read:** `≈843 ms` of GPU removed for two launches, and pre-attention drops `667 ms` — the same shape the earlier batches showed, with the rest of the saving absorbed by the attention kernel's overlap. TTFT stays flat.
+
+Gates green: `test_v4_layer_body_chunk_oracle` (bit-exact: every token, ring, compressed entries, partial ring, final state — across all classes and four schedules), `test_v4_layer_body_serial_oracle`, `test_v4_layer_body_compressed_oracle`.
+
+#### Implementation record — A (hc mix + norm), **done**
+
+The HC pre-mix stage ran four launches per row (`hc_project`, `hc_sinkhorn_normalize`, `hc_pre_combine`, the attention `rmsnorm`) and was, after E1, the largest remaining pre-attention term. The two HC kernels that lacked a token axis got one — `hc_project_kernel` and `hc_pre_combine_kernel` now take the token on `blockIdx.y`; `hc_sinkhorn_normalize_kernel` (`blockIdx.x`) and `rmsnorm_wave32_kernel` (`blockIdx.x`) already had it — so `run_pre_attention_mix_batch` is four launches for the whole chunk. The per-token buffers are contiguous at their vector pitches (`res_in` at `hc_mult*hidden`, `mixes` at `24`, `pre`/`post` at `4`, `comb` at `16`, `x_pre`/`x_norm` at `hidden`), so no pitch is passed and a single-token launch (`blockIdx.y == 0`) is the old behaviour exactly. The `hc_project` redundancy — every one of its 24 mix blocks recomputing the full residual RMS — is untouched; only the per-row launch is gone.
+
+Measured (clean run on a quiet host; a first run was contaminated and discarded):
+
+| | before | after |
+| :--- | ---: | ---: |
+| A hc mix + norm, GPU | `1,114 ms` | **`18 ms`** |
+| pre-attention, GPU | `1,761 ms` | **`711 ms`** (`−60%`) |
+| prefill total, GPU | `17,931 ms` | **`16,767 ms`** (`−6.5%`) |
+| TTFT | `25.5 s` | `25.1 s` (flat, within noise) |
+
+**Read:** the largest single per-row stage in pre-attention, removed for four launches. The `~1.1 s` of GPU is real and, unlike the smaller stages, shows up in the total (`−1.16 s`) because it was large enough to exceed the attention kernel's overlap. TTFT still reads flat — `~0.4 s` inside a `25 s` run of noise.
+
+Gates green: `test_v4_layer_body_chunk_oracle` (bit-exact), `test_v4_layer_body_serial_oracle`, `test_v4_layer_body_compressed_oracle`, `test_v4_hc_oracle`, `test_v4_hc_head_oracle`.
 
 ### Area 6: Tune for gfx1100 — **partly done**
 

@@ -64,6 +64,43 @@ inline void run_pre_attention_mix(
         scratch.d_x_pre, layer.d_attn_norm, scratch.d_x_norm, H, 1e-6f);
 }
 
+// The same HC pre-mix, Sinkhorn and attention RMSNorm for a chunk. Every stage takes
+// its token on a grid axis — the two HC kernels on `blockIdx.y`, the Sinkhorn
+// (`blockIdx.x`) and the RMSNorm (`blockIdx.x`) already do — and the chunk's per-token
+// buffers are contiguous at their vector pitches (`res_in` at `hc_mult*hidden`,
+// `mixes` at `24`, `pre`/`post` at `4`, `comb` at `16`, `x_pre`/`x_norm` at `hidden`),
+// so the batch is the row count on that axis and no pitch is passed. Decode keeps the
+// single-row form above.
+inline void run_pre_attention_mix_batch(
+    V4Layer& layer, V4LayerBodyRow& base, int count, hipStream_t stream) {
+    constexpr int H = kernel::DSV4_HIDDEN_SIZE;
+    constexpr int HC = 4;
+    constexpr int HC_MULT3 = HC * (2 + HC);
+
+    hipLaunchKernelGGL(
+        kernel::hc_project_kernel,
+        dim3(HC_MULT3, count), dim3(256), 0, stream,
+        base.d_res_in, layer.d_hc_attn_fn, base.d_mixes_a,
+        H, HC, 1e-6f);
+
+    hipLaunchKernelGGL(
+        kernel::hc_sinkhorn_normalize_kernel,
+        dim3(count), dim3(32), 0, stream,
+        base.d_mixes_a, layer.d_hc_attn_scale, layer.d_hc_attn_base,
+        base.d_pre_a, base.d_post_a, base.d_comb_a,
+        1e-6f, 1e-6f, 2.0f, 20);
+
+    hipLaunchKernelGGL(
+        kernel::hc_pre_combine_kernel,
+        dim3((H / 4 + 255) / 256, count), dim3(256), 0, stream,
+        base.d_res_in, base.d_pre_a, base.d_x_pre, H, HC);
+
+    hipLaunchKernelGGL(
+        kernel::rmsnorm_wave32_kernel,
+        dim3(count), dim3(32), 0, stream,
+        base.d_x_pre, layer.d_attn_norm, base.d_x_norm, H, 1e-6f);
+}
+
 // Every projection that reads `x_norm`: `wq_a`, `wkv`, and on compressed layers the
 // compressor (and on CSA the indexer) projections.
 inline void run_pre_attention_x_projections(
@@ -114,6 +151,25 @@ inline void run_pre_attention_lora_norm(
         scratch.d_kv, layer.d_kv_norm, scratch.d_kv_norm_act, HEAD_DIM, 1e-6f);
 }
 
+// The same two norms for a chunk, one launch each: `rmsnorm_wave32_kernel` already
+// takes its row on `blockIdx.x`, and the chunk's `qa`/`qa_norm` (pitch `Q_LORA`) and
+// `kv`/`kv_norm_act` (pitch `HEAD_DIM`) are contiguous per token, so the batch is just
+// the row count. Decode keeps the single-row form above.
+inline void run_pre_attention_lora_norm_batch(
+    V4Layer& layer, V4LayerBodyRow& base, int count, hipStream_t stream) {
+    constexpr int Q_LORA = kernel::DSV4_Q_LORA_RANK;
+    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
+
+    hipLaunchKernelGGL(
+        kernel::rmsnorm_wave32_kernel,
+        dim3(count), dim3(32), 0, stream,
+        base.d_qa, layer.d_q_norm, base.d_qa_norm, Q_LORA, 1e-6f);
+    hipLaunchKernelGGL(
+        kernel::rmsnorm_wave32_kernel,
+        dim3(count), dim3(32), 0, stream,
+        base.d_kv, layer.d_kv_norm, base.d_kv_norm_act, HEAD_DIM, 1e-6f);
+}
+
 // The projections that read `qa_norm`: `wq_b`, and the indexer query on CSA.
 inline void run_pre_attention_q_projections(
     V4Layer& layer, V4LayerBodyRow& scratch, int count, hipStream_t stream) {
@@ -144,6 +200,11 @@ inline void run_pre_attention_q_projections(
 // the two identical key/value copies collapse to one. The tail keeps `record_position`
 // — it is host-side and independent of the rotation.
 //
+// `defer_q_norm` moves the per-head weightless query norm out of the tail. It precedes
+// RoPE on the same `d_q`, so the chunk defers both and runs them as two batched launches
+// (`run_chunk_q_norm_batch`, then `run_chunk_rope_kv_write_batch`); the ordering between
+// them is the caller's.
+//
 // On return the token's rotated key is in the local ring (or the chunk buffer), the
 // compressor (and on CSA the indexer) has been fed, and a ratio boundary has materialized
 // its compressed entry. The layer class is read from `layer.spec().attention_kind`: a
@@ -158,7 +219,8 @@ inline V4LayerBodyPre run_pre_attention_tail(
     hipStream_t stream,
     V4LayerBodyObserver& observer,
     bool defer_indexer_select = false,
-    bool defer_rope_kv_write = false) {
+    bool defer_rope_kv_write = false,
+    bool defer_q_norm = false) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
     constexpr int HC = 4;
     constexpr int HC_DIM = HC * H;          // 16384
@@ -171,8 +233,9 @@ inline V4LayerBodyPre run_pre_attention_tail(
     const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
 
     // The per-head norm is WEIGHTLESS: the artifact has no tensor for it, and
-    // upstream's fused q-norm/rope takes no weight argument.
-    {
+    // upstream's fused q-norm/rope takes no weight argument. A chunk defers it to one
+    // batched launch, exactly as it defers the rope that reads its output.
+    if (!defer_q_norm) {
         auto region = PhaseProfiler::instance().region("    E1 q-norm", stream);
         hipLaunchKernelGGL(
             kernel::rmsnorm_unit_wave32_kernel,
@@ -190,7 +253,11 @@ inline V4LayerBodyPre run_pre_attention_tail(
         trace_copy(observer, attention_trace->attention_hc_comb_mix, scratch.d_comb_a, HC * HC);
         trace_copy(observer, attention_trace->attention_precombined_input, scratch.d_x_pre, H);
         trace_copy(observer, attention_trace->attention_normalized_input, scratch.d_x_norm, H);
-        trace_copy(observer, attention_trace->query, scratch.d_q, TOTAL_Q);
+        // Deferred with the RoPE below: the query would be stale, and the chunk path
+        // observes with a null observer, but the guard keeps the invariant local.
+        if (!defer_q_norm) {
+            trace_copy(observer, attention_trace->query, scratch.d_q, TOTAL_Q);
+        }
         trace_copy(observer, attention_trace->local_key, scratch.d_kv_norm_act, HEAD_DIM);
         trace_copy(observer, attention_trace->local_value, scratch.d_kv_norm_act, HEAD_DIM);
         if (layer.spec().attention_kind != V4AttentionKind::Sliding) {

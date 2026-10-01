@@ -167,6 +167,11 @@ __global__ void __launch_bounds__(256) hc_project_kernel(
     float rms_eps
 ) {
     int mix_idx = blockIdx.x;
+    // The token is `blockIdx.y`: a chunk runs one block column per (mix, token), a
+    // single-token launch leaves it at 0. The residual is `[num_tokens, hc_mult,
+    // hidden]` and `mixes` `[num_tokens, 24]`, both contiguous per token, so the
+    // offsets need no pitch argument.
+    int token_idx = blockIdx.y;
     int tid = threadIdx.x;
     int lane = tid & 31;
     int wid = tid >> 5; // 0..7
@@ -176,7 +181,9 @@ __global__ void __launch_bounds__(256) hc_project_kernel(
     __shared__ float s_warp_sqr[8];
     __shared__ float s_warp_dot[8];
 
-    const float4* res4 = reinterpret_cast<const float4*>(residual_in);
+    const float* token_residual = residual_in + static_cast<size_t>(token_idx) * hc_hidden_size;
+    float* token_mixes = mixes + static_cast<size_t>(token_idx) * 24;
+    const float4* res4 = reinterpret_cast<const float4*>(token_residual);
     const float4* fn4 = reinterpret_cast<const float4*>(fn + mix_idx * hc_hidden_size);
     int num_f4 = hc_hidden_size / 4; // 4096
 
@@ -215,7 +222,7 @@ __global__ void __launch_bounds__(256) hc_project_kernel(
 
         if (lane == 0) {
             float rms = rsqrtf((block_sqr / static_cast<float>(hc_hidden_size)) + rms_eps);
-            mixes[mix_idx] = block_dot * rms;
+            token_mixes[mix_idx] = block_dot * rms;
         }
     }
 }
@@ -230,13 +237,22 @@ __global__ void __launch_bounds__(256) hc_pre_combine_kernel(
     int hidden_size,
     int hc_mult
 ) {
+    // Token on `blockIdx.y`, as in `hc_project_kernel`; the block's `x` tiles the
+    // hidden axis. `residual_in` is `[num_tokens, hc_mult, hidden]`, `pre_mix`
+    // `[num_tokens, 4]` and `layer_input` `[num_tokens, hidden]`, all contiguous.
+    int token_idx = blockIdx.y;
+    const float* token_residual =
+        residual_in + static_cast<size_t>(token_idx) * hc_mult * hidden_size;
+    const float* token_pre = pre_mix + static_cast<size_t>(token_idx) * 4;
+    __half* token_out = layer_input + static_cast<size_t>(token_idx) * hidden_size;
+
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int idx = tid * 4;
     const bool valid = idx < hidden_size;
 
     __shared__ float s_pre[4];
     if (threadIdx.x < 4) {
-        s_pre[threadIdx.x] = pre_mix[threadIdx.x];
+        s_pre[threadIdx.x] = token_pre[threadIdx.x];
     }
     __syncthreads();
     if (!valid) return;
@@ -246,10 +262,10 @@ __global__ void __launch_bounds__(256) hc_pre_combine_kernel(
     float p2 = s_pre[2];
     float p3 = s_pre[3];
 
-    const float4* r0 = reinterpret_cast<const float4*>(residual_in + 0 * hidden_size);
-    const float4* r1 = reinterpret_cast<const float4*>(residual_in + 1 * hidden_size);
-    const float4* r2 = reinterpret_cast<const float4*>(residual_in + 2 * hidden_size);
-    const float4* r3 = reinterpret_cast<const float4*>(residual_in + 3 * hidden_size);
+    const float4* r0 = reinterpret_cast<const float4*>(token_residual + 0 * hidden_size);
+    const float4* r1 = reinterpret_cast<const float4*>(token_residual + 1 * hidden_size);
+    const float4* r2 = reinterpret_cast<const float4*>(token_residual + 2 * hidden_size);
+    const float4* r3 = reinterpret_cast<const float4*>(token_residual + 3 * hidden_size);
 
     float4 v0 = r0[tid];
     float4 v1 = r1[tid];
@@ -264,7 +280,7 @@ __global__ void __launch_bounds__(256) hc_pre_combine_kernel(
     half2 h01 = __floats2half2_rn(out0, out1);
     half2 h23 = __floats2half2_rn(out2, out3);
 
-    half2* out_ptr = reinterpret_cast<half2*>(layer_input + idx);
+    half2* out_ptr = reinterpret_cast<half2*>(token_out + idx);
     out_ptr[0] = h01;
     out_ptr[1] = h23;
 }

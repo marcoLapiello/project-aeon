@@ -547,6 +547,28 @@ inline V4LayerBodyPre run_chunk_pre_attention(
 // `PhaseProfiler::set_sample_stride`.
 inline constexpr size_t kTailSampleStride = 16;
 
+// The chunk's per-head weightless query norm, batched out of the tail.
+//
+// The tail ran `rmsnorm_unit_wave32_kernel` once per row over the row's `num_heads`
+// heads (`E1`, `396 ms` of prefill GPU). The chunk's `d_q` is one contiguous
+// `count × num_heads × head_dim` block, so flattening it to `count × num_heads` rows of
+// `head_dim` serves every head of every row in one launch — the kernel takes its row on
+// `blockIdx.x`. It must run **before** `run_chunk_rope_kv_write_batch`, which rotates the
+// same `d_q` in place.
+inline void run_chunk_q_norm_batch(
+    V4Layer& layer,
+    V4LayerBodyBatchScratch& workspace,
+    uint32_t count,
+    hipStream_t stream) {
+    if (count == 0) return;
+    constexpr int NUM_HEADS = static_cast<int>(kernel::DSV4_NUM_HEADS);
+    constexpr int HEAD_DIM = static_cast<int>(kernel::DSV4_HEAD_DIM);
+    auto region = PhaseProfiler::instance().region("  E1 q-norm (batched)", stream);
+    const V4LayerBodyRow base = workspace.row(0);
+    hipLaunchKernelGGL(kernel::rmsnorm_unit_wave32_kernel, dim3(NUM_HEADS * count),
+                       dim3(32), 0, stream, base.d_q, base.d_q, HEAD_DIM, 1e-6f);
+}
+
 // The chunk's query and key RoPE and its key write, batched out of the tail.
 //
 // The tail ran two rope launches (one for the query heads, one for the single key
@@ -662,8 +684,8 @@ inline std::vector<V4LayerBodyPre> run_chunk_pre_attention_batch(
         auto region = PhaseProfiler::instance().region("  A hc mix + norm", stream);
         for (uint32_t row = 0; row < count; ++row) {
             rows[row] = workspace.row(row);
-            run_pre_attention_mix(layer, rows[row], stream);
         }
+        run_pre_attention_mix_batch(layer, rows[0], static_cast<int>(count), stream);
     }
     {
         auto region = PhaseProfiler::instance().region("  B x-projections", stream);
@@ -671,9 +693,7 @@ inline std::vector<V4LayerBodyPre> run_chunk_pre_attention_batch(
     }
     {
         auto region = PhaseProfiler::instance().region("  C lora norm", stream);
-        for (uint32_t row = 0; row < count; ++row) {
-            run_pre_attention_lora_norm(layer, rows[row], stream);
-        }
+        run_pre_attention_lora_norm_batch(layer, rows[0], static_cast<int>(count), stream);
     }
     {
         auto region = PhaseProfiler::instance().region("  D q-projections", stream);
@@ -691,11 +711,14 @@ inline std::vector<V4LayerBodyPre> run_chunk_pre_attention_batch(
             pre[row] = run_pre_attention_tail(layer, rows[row], tables, token_ids[row],
                                               start_position + row, stream, observer,
                                               /*defer_indexer_select=*/true,
-                                              /*defer_rope_kv_write=*/true);
+                                              /*defer_rope_kv_write=*/true,
+                                              /*defer_q_norm=*/true);
         }
         PhaseProfiler::instance().set_sample_stride(1);
         // All rows' keys are in place, so the chunk's rope, key write and indexer are
-        // each one batched launch instead of one per row.
+        // each one batched launch instead of one per row. The q-norm runs first, because
+        // it writes the same `d_q` the rope then rotates.
+        run_chunk_q_norm_batch(layer, workspace, count, stream);
         run_chunk_rope_kv_write_batch(layer, workspace, tables, start_position, count,
                                       stream);
         run_chunk_indexer_select_batch(layer, workspace, start_position, pre, stream);
