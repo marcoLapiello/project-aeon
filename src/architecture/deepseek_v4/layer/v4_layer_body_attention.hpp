@@ -137,6 +137,13 @@ inline void run_pre_attention_q_projections(
 // passes `true` and calls `run_chunk_indexer_select_batch` once the whole tail has run;
 // decode and every single-row caller keep the default and select here.
 //
+// `defer_rope_kv_write` moves the query/key RoPE and the key write out of the tail for
+// the same reason: the chunk's per-row buffers are contiguous, so one batched rope
+// launch serves every row and one copy writes the whole key buffer. The chunk writes
+// its keys to the chunk buffer, not the ring, so both destinations are contiguous and
+// the two identical key/value copies collapse to one. The tail keeps `record_position`
+// — it is host-side and independent of the rotation.
+//
 // On return the token's rotated key is in the local ring (or the chunk buffer), the
 // compressor (and on CSA the indexer) has been fed, and a ratio boundary has materialized
 // its compressed entry. The layer class is read from `layer.spec().attention_kind`: a
@@ -150,7 +157,8 @@ inline V4LayerBodyPre run_pre_attention_tail(
     uint32_t pos,
     hipStream_t stream,
     V4LayerBodyObserver& observer,
-    bool defer_indexer_select = false) {
+    bool defer_indexer_select = false,
+    bool defer_rope_kv_write = false) {
     constexpr int H = kernel::DSV4_HIDDEN_SIZE;
     constexpr int HC = 4;
     constexpr int HC_DIM = HC * H;          // 16384
@@ -228,39 +236,47 @@ inline V4LayerBodyPre run_pre_attention_tail(
         scratch.d_local_position_write = layer.d_local_positions + local_slot;
     }
 
-    auto rope_write_region =
-        PhaseProfiler::instance().region("    E2 rope + kv write", stream);
-    hipLaunchKernelGGL(
-        kernel::v4_forward_rope_at_pos_wave32_kernel,
-        dim3(NUM_HEADS), dim3(32), 0, stream,
-        scratch.d_q, rope.cos, rope.sin, pos,
-        NUM_HEADS, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2);
+    if (!defer_rope_kv_write) {
+        auto rope_write_region =
+            PhaseProfiler::instance().region("    E2 rope + kv write", stream);
+        hipLaunchKernelGGL(
+            kernel::v4_forward_rope_at_pos_wave32_kernel,
+            dim3(NUM_HEADS), dim3(32), 0, stream,
+            scratch.d_q, rope.cos, rope.sin, pos,
+            NUM_HEADS, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2);
 
-    hipLaunchKernelGGL(
-        kernel::v4_forward_rope_at_pos_wave32_kernel,
-        dim3(1), dim3(32), 0, stream,
-        scratch.d_kv_norm_act, rope.cos, rope.sin, pos,
-        1, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2);
+        hipLaunchKernelGGL(
+            kernel::v4_forward_rope_at_pos_wave32_kernel,
+            dim3(1), dim3(32), 0, stream,
+            scratch.d_kv_norm_act, rope.cos, rope.sin, pos,
+            1, HEAD_DIM, kernel::DSV4_NOPE_DIM, kernel::DSV4_ROPE_DIM / 2);
 
-    // Key and value are the *same* row. Both caches are written.
-    CHECK_HIP(hipMemcpyAsync(scratch.d_local_value_write,
-                             scratch.d_kv_norm_act, HEAD_DIM * sizeof(half),
-                             hipMemcpyDeviceToDevice, stream));
-    CHECK_HIP(hipMemcpyAsync(scratch.d_local_key_write,
-                             scratch.d_kv_norm_act, HEAD_DIM * sizeof(half),
-                             hipMemcpyDeviceToDevice, stream));
-    {
-        const int64_t absolute_position = static_cast<int64_t>(pos);
-        CHECK_HIP(hipMemcpyAsync(scratch.d_local_position_write,
-                                 &absolute_position, sizeof(absolute_position),
-                                 hipMemcpyHostToDevice, stream));
+        // Key and value are the *same* row. Both caches are written.
+        CHECK_HIP(hipMemcpyAsync(scratch.d_local_value_write,
+                                 scratch.d_kv_norm_act, HEAD_DIM * sizeof(half),
+                                 hipMemcpyDeviceToDevice, stream));
+        CHECK_HIP(hipMemcpyAsync(scratch.d_local_key_write,
+                                 scratch.d_kv_norm_act, HEAD_DIM * sizeof(half),
+                                 hipMemcpyDeviceToDevice, stream));
+        {
+            const int64_t absolute_position = static_cast<int64_t>(pos);
+            CHECK_HIP(hipMemcpyAsync(scratch.d_local_position_write,
+                                     &absolute_position, sizeof(absolute_position),
+                                     hipMemcpyHostToDevice, stream));
+        }
+        rope_write_region = PhaseProfiler::Region{};
     }
     layer.record_position(pos);
-    rope_write_region = PhaseProfiler::Region{};
 
     if (attention_trace != nullptr) {
-        trace_copy(observer, attention_trace->rotated_query, scratch.d_q, TOTAL_Q);
-        trace_copy(observer, attention_trace->rotated_local_key, scratch.d_kv_norm_act, HEAD_DIM);
+        // A deferred chunk has not rotated the query or key yet, so those two traces
+        // would be stale; the chunk path always observes with a null observer, but the
+        // guard keeps the invariant local.
+        if (!defer_rope_kv_write) {
+            trace_copy(observer, attention_trace->rotated_query, scratch.d_q, TOTAL_Q);
+            trace_copy(observer, attention_trace->rotated_local_key, scratch.d_kv_norm_act,
+                       HEAD_DIM);
+        }
         trace_copy(observer, attention_trace->local_key_cache,
                    layer.d_local_key_cache,
                    static_cast<size_t>(layer.state_layout().local_capacity) * HEAD_DIM);

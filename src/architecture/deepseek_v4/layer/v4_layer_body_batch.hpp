@@ -547,6 +547,52 @@ inline V4LayerBodyPre run_chunk_pre_attention(
 // `PhaseProfiler::set_sample_stride`.
 inline constexpr size_t kTailSampleStride = 16;
 
+// The chunk's query and key RoPE and its key write, batched out of the tail.
+//
+// The tail ran two rope launches (one for the query heads, one for the single key
+// head), two identical key/value D2D copies and a per-row position H2D, once per row —
+// `0.73 s` of prefill GPU at this context. The chunk's per-row buffers are contiguous
+// (`d_q` at pitch `num_heads*head_dim`, `d_kv_norm_act` at `head_dim`), so one
+// `v4_forward_rope_wave32_kernel` launch over `(heads, rows)` serves every row: the
+// kernel indexes the table by `blockIdx.y`, so offsetting the table by the chunk's first
+// position makes row `r` read position `start + r`. The chunk writes both key and value
+// to the same buffer, so the two per-row copies collapse to one bulk copy.
+//
+// The per-row position write is dropped: the chunk's `chunk_positions_` is never read
+// (the composed row-sets carry kernel-computed positions and the commit recomputes the
+// ring slot), so writing it was dead work.
+inline void run_chunk_rope_kv_write_batch(
+    V4Layer& layer,
+    V4LayerBodyBatchScratch& workspace,
+    const V4LayerBodyTables& tables,
+    uint32_t start_position,
+    uint32_t count,
+    hipStream_t stream) {
+    if (count == 0) return;
+    constexpr int HEAD_DIM = static_cast<int>(kernel::DSV4_HEAD_DIM);
+    constexpr int NUM_HEADS = static_cast<int>(kernel::DSV4_NUM_HEADS);
+    constexpr int NOPE_DIM = static_cast<int>(kernel::DSV4_NOPE_DIM);
+    constexpr int HALF_ROPE = static_cast<int>(kernel::DSV4_ROPE_DIM) / 2;
+
+    auto region =
+        PhaseProfiler::instance().region("  E2 rope + kv write (batched)", stream);
+    const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
+    const V4LayerBodyRow base = workspace.row(0);
+    const float* cos = rope.cos + static_cast<size_t>(start_position) * HALF_ROPE;
+    const float* sin = rope.sin + static_cast<size_t>(start_position) * HALF_ROPE;
+
+    hipLaunchKernelGGL(kernel::v4_forward_rope_wave32_kernel, dim3(NUM_HEADS, count),
+                       dim3(32), 0, stream, base.d_q, cos, sin, NUM_HEADS, HEAD_DIM,
+                       NOPE_DIM, HALF_ROPE);
+    hipLaunchKernelGGL(kernel::v4_forward_rope_wave32_kernel, dim3(1, count), dim3(32),
+                       0, stream, base.d_kv_norm_act, cos, sin, 1, HEAD_DIM, NOPE_DIM,
+                       HALF_ROPE);
+
+    CHECK_HIP(hipMemcpyAsync(workspace.chunk_key(0), base.d_kv_norm_act,
+                             static_cast<size_t>(count) * HEAD_DIM * sizeof(half),
+                             hipMemcpyDeviceToDevice, stream));
+}
+
 // One batched indexer scores launch for the whole chunk, then the per-row top-k.
 //
 // `v4_indexer_scores_kernel` was launched once per row with `ceil(committed / 256)` =
@@ -644,11 +690,14 @@ inline std::vector<V4LayerBodyPre> run_chunk_pre_attention_batch(
         for (uint32_t row = 0; row < count; ++row) {
             pre[row] = run_pre_attention_tail(layer, rows[row], tables, token_ids[row],
                                               start_position + row, stream, observer,
-                                              /*defer_indexer_select=*/true);
+                                              /*defer_indexer_select=*/true,
+                                              /*defer_rope_kv_write=*/true);
         }
         PhaseProfiler::instance().set_sample_stride(1);
-        // All rows' keys are in place, so the chunk's indexer is ranked in one scores
-        // launch instead of one per row.
+        // All rows' keys are in place, so the chunk's rope, key write and indexer are
+        // each one batched launch instead of one per row.
+        run_chunk_rope_kv_write_batch(layer, workspace, tables, start_position, count,
+                                      stream);
         run_chunk_indexer_select_batch(layer, workspace, start_position, pre, stream);
     }
     return pre;
