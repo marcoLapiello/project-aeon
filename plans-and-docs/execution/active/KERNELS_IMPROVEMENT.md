@@ -59,7 +59,7 @@ seen while this plan was written was **not** the engine's; it was the build besi
 | 4a | Indexer top-k on device | **Done** — the top-k only (`0.13 s`); the scores it feeds were Area 8 |
 | — | `compose_local_rows` gather | **Done** |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Partly** — E2 (`rope + kv write`) batched; A/C/E1/E3/E3b remain per-row |
-| 6 | Tune for gfx1100 | **Open** |
+| 6 | Tune for gfx1100 | **Partly** — attention scoped and **closed** (WMMA and warp-count both neutral/worse; incumbent optimal); expert-shape/kernel sweeps open |
 | 7 | Re-measure and retune supply | **Open** |
 | 8 | Batch the indexer scores over the chunk | **Done** — `4.47 → 0.07 s`; pre-attention GPU `−59%`, TTFT `29.1 → 25.1 s` |
 
@@ -156,6 +156,7 @@ the correctness signal.
 - The router made one host sync per row — fixed in Area 2.
 - Small per-row launches (rmsnorm, rope, HC sinkhorn, KV copies, a position H2D per row) scale with T — Area 5; E2 batched (`0.73 s → 3 ms`), A/C/E1/E3/E3b remain.
 - The **indexer scores** kernel, not its top-k, was the pre-attention cost: `4.3 s` against `0.13 s` — a per-token, single-block launch, the same defect Areas 2–3 fixed for the router and the projections. Batched in Area 8 (`4.3 s → 0.07 s`).
+- **Attention is at a local optimum.** The production split kernel (warps=4, tile=16) beats every alternative measured — WMMA-QKᵀ (tile 16/256) and split warps=1 — so the `48%` of GPU it holds is not recoverable by tiling or warp tuning as the design stands (Area 6). A synthetic bench showed WMMA `2×` faster and did **not** transfer; the next attempt must use production's tile/union shapes.
 
 ## Execution plan
 
@@ -381,11 +382,53 @@ same way, which is why the next real lever is the attention kernel itself (Area 
 Gates green: `test_v4_rope_oracle`, `test_v4_layer_body_chunk_oracle` (bit-exact with the
 tile off), `test_v4_layer_body_serial_oracle`, `test_v4_layer_body_compressed_oracle`.
 
-### Area 6: Tune for gfx1100 — **open**
+### Area 6: Tune for gfx1100 — **partly done (attention scoped, closed)**
 
 - Sweep the WMMA tile config for the dominant expert shapes: N×K tile, waves per workgroup (4–8), LDS ≤ 64 KiB for 2 workgroups per CU.
 - Give the routed-prefill (short-prompt) path the same grouped kernel. Experts with only 1–3 tokens fall back to the GEMV kernel, picked per expert inside one launch.
-- **Attention**: the split kernel is scalar per element. A single-warp WMMA-QKᵀ build was measured **neutral** (occupancy cancels the matrix cores), so the next attempt must be **multi-warp** WMMA (several warps per block, keys split) before PV can also move to the cores — which needs the `16 × 512` output tile staged in LDS. Tune `kCausalAttentionWarps` (`4`) and the sub-tile (`16`).
+
+#### Implementation record — attention is at a local optimum, **done**
+
+Attention is `48%` of prefill GPU, so Area 6's first target was its kernel. The one-warp
+WMMA-QKᵀ build was recorded as **neutral**; the question was whether **query tiling** (the
+WMMA tile reads the key union once per 16 queries, the split kernel once per query) or a
+**warp-count** change could break the tie. Both were measured on `gfx1100`, at the pinned
+config, one process at a time:
+
+| arm | attention+norm GPU | notes |
+| :--- | ---: | :--- |
+| **split kernel, warps=4, tile=16 (production)** | **`11,855 ms`** | the incumbent |
+| WMMA-QKᵀ, tile=16 | `11,935 ms` | the variant the plan called neutral |
+| WMMA-QKᵀ, tile=256 | `12,049 ms` | wider union, one launch per 256 queries |
+| split kernel, warps=1 | `12,394 ms` | fewer warps, less per-block overhead |
+
+**Nothing beats the incumbent.** The WMMA-QKᵀ path is neutral-to-worse at every tile
+width, and the split kernel's warp count is already at its optimum (4; `1` is worse). The
+tile is the reason: the WMMA kernel's block is always 16 queries (its PV is
+`16 × head_dim` registers), so "tile=256" only enlarges the composed union (`W + tile − 1`
+rows) that every query then masks down to `W` — more wasted compute, not less. The
+occupancy the plan blamed is real but not the whole story; the masked over-read is the
+other half, and they cancel.
+
+**A synthetic bench misled, and that is worth recording.** `tests/bench_attention_ab.cpp`
+(a new tool, kept, no model load) measured WMMA-QKᵀ **2× faster** than split at
+`rows=297, count=256` — but that does **not** transfer: production runs the same arms and
+the WMMA path is neutral. The bench's grid and union (`count` queries in one launch, a
+297-row union) are not production's (16-query tiles, a 128-row sliding union plus a
+compressed block). The lesson for the next attempt: a synthetic attention bench must use
+production's tile and union shapes, or it measures a different question.
+
+**A latent bug fixed.** `dispatch_causal_attention_wmma_qk_fp16` sized its shared memory
+as `16 × tpad × 6` bytes with no guard; above `tpad = 683` (union `≈ 672` rows) the launch
+exceeded the workgroup limit, and `<<<>>>` **drops the error** — the output stayed stale
+rather than failing. The dispatcher now refuses an over-large row-set with a named
+exception. This matters only if the WMMA path is ever wired (it is not), but the silent
+failure was reachable from `bench_attention_ab` and would have been a trap.
+
+The split kernel is now a template on its warp count (`WARPS`, default `4`) so the sweep
+needed no rebuild; production instantiates the default.
+
+Gates green: `test_tiled_causal_attention` (both arms, all cases), `test_v4_layer_body_chunk_oracle`.
 
 ### Area 7: Move the bottleneck back to supply — **open**
 

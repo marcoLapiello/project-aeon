@@ -58,6 +58,11 @@ if(AEON_BUILD_BENCHMARKS)
     # costs at the measured routing distribution. No model load — the routing
     # comes from a recorded profile, so this runs in seconds.
     aeon_add_benchmark(bench_expert_pair_ab SOURCES tests/bench_expert_pair_ab.cpp)
+
+    # The attention A/B that scopes Area 6: the per-query split kernel (warp
+    # sweep) versus the query-tiled WMMA QKᵀ kernel, at the real head count and
+    # head width. No model load — synthetic keys, so it runs in seconds.
+    aeon_add_benchmark(bench_attention_ab SOURCES tests/bench_attention_ab.cpp)
 endif()
 
 # --- Backend kernels and artifact format -------------------------------------

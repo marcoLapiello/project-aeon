@@ -292,7 +292,8 @@ constexpr int kCausalAttentionWarps = 4;
 // Masked or out-of-range indices contribute nothing.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
     !defined(__HIP_DEVICE_COMPILE__)
-__global__ void __launch_bounds__(kCausalAttentionWarps * kCausalAttentionLanes)
+template <int WARPS>
+__global__ void __launch_bounds__(WARPS * kCausalAttentionLanes)
 causal_attention_split_fp16_kernel(
     const __half* __restrict__ q, int q_stride,
     const __half* __restrict__ keys0, int key_stride0,
@@ -311,10 +312,10 @@ causal_attention_split_fp16_kernel(
     const int total_rows = rows0 + rows1_effective;
 
     float* scores = smem;                                        // [total_rows]
-    float* warp_max = scores + total_rows;                       // [kCausalAttentionWarps]
-    float* warp_sum = warp_max + kCausalAttentionWarps;          // [kCausalAttentionWarps]
-    float* warp_out = warp_sum + kCausalAttentionWarps;          // [warps, head_dim]
-    float* global_reduce = warp_out + kCausalAttentionWarps * head_dim; // [2]
+    float* warp_max = scores + total_rows;                       // [WARPS]
+    float* warp_sum = warp_max + WARPS;                          // [WARPS]
+    float* warp_out = warp_sum + WARPS;                          // [WARPS, head_dim]
+    float* global_reduce = warp_out + WARPS * head_dim;          // [2]
 
     const int head = blockIdx.x;
     const int query = blockIdx.y;
@@ -363,8 +364,8 @@ causal_attention_split_fp16_kernel(
                          : keys1 + static_cast<size_t>(block1_row(k - rows0)) * key_stride1;
     };
 
-    // Phase 1: this warp's keys, stride `kCausalAttentionWarps`.
-    for (int k = warp; k < total_rows; k += kCausalAttentionWarps) {
+    // Phase 1: this warp's keys, stride `WARPS`.
+    for (int k = warp; k < total_rows; k += WARPS) {
         int64_t position = 0;
         const bool valid = key_position_at(k, position);
         float dot = 0.0f;
@@ -392,8 +393,8 @@ causal_attention_split_fp16_kernel(
     // would then multiply the count by the wave width. Striding each lane over a
     // disjoint slice of the warp's key list keeps the reduction correct.
     const int warp_keys = total_rows > warp
-        ? (total_rows - warp + kCausalAttentionWarps - 1) / kCausalAttentionWarps : 0;
-    auto warp_key = [&](int j) { return warp + j * kCausalAttentionWarps; };
+        ? (total_rows - warp + WARPS - 1) / WARPS : 0;
+    auto warp_key = [&](int j) { return warp + j * WARPS; };
 
     // Phase 2a: max, reduced within each warp then across the warps.
     float local_max = head_bias;
@@ -409,7 +410,7 @@ causal_attention_split_fp16_kernel(
     if (threadIdx.x == 0) {
         float m = head_bias;
         #pragma unroll
-        for (int w = 0; w < kCausalAttentionWarps; ++w) m = fmaxf(m, warp_max[w]);
+        for (int w = 0; w < WARPS; ++w) m = fmaxf(m, warp_max[w]);
         global_reduce[0] = m;
     }
     __syncthreads();
@@ -432,7 +433,7 @@ causal_attention_split_fp16_kernel(
     if (threadIdx.x == 0) {
         float s = expf(head_bias - maximum);
         #pragma unroll
-        for (int w = 0; w < kCausalAttentionWarps; ++w) s += warp_sum[w];
+        for (int w = 0; w < WARPS; ++w) s += warp_sum[w];
         global_reduce[1] = 1.0f / fmaxf(s, 1e-30f);
     }
     __syncthreads();
@@ -441,7 +442,7 @@ causal_attention_split_fp16_kernel(
     // Phase 3: each warp accumulates its keys into a partial output row, combined after.
     for (int d = lane * slice; d < (lane + 1) * slice; ++d) {
         float acc = 0.0f;
-        for (int k = warp; k < total_rows; k += kCausalAttentionWarps) {
+        for (int k = warp; k < total_rows; k += WARPS) {
             const __half* value_row = value_ptr_at(k);
             if (value_row == nullptr) continue;
             acc += (scores[k] * inverse_denominator) * __half2float(value_row[d]);
@@ -455,13 +456,14 @@ causal_attention_split_fp16_kernel(
     for (int d = lane * slice; d < (lane + 1) * slice; ++d) {
         float acc = 0.0f;
         #pragma unroll
-        for (int w = 0; w < kCausalAttentionWarps; ++w) acc += warp_out[w * head_dim + d];
+        for (int w = 0; w < WARPS; ++w) acc += warp_out[w * head_dim + d];
         out_row[d] = __float2half(acc);
     }
 }
 
 #endif  // gfx11 device pass, or any host pass
 
+template <int WARPS = kCausalAttentionWarps>
 inline void dispatch_causal_attention_split_fp16(
     const __half* q, int q_stride,
     const CausalAttentionBlock& block0,
@@ -501,12 +503,12 @@ inline void dispatch_causal_attention_split_fp16(
     const int64_t* positions1 = block1.positions != nullptr ? block1.positions : block0.positions;
 
     const dim3 grid(num_heads, count);
-    const dim3 block(kCausalAttentionWarps * kCausalAttentionLanes);
+    const dim3 block(WARPS * kCausalAttentionLanes);
     const size_t shared = (static_cast<size_t>(total_rows) +
-                           2 * kCausalAttentionWarps +
-                           static_cast<size_t>(kCausalAttentionWarps) * head_dim + 2) *
+                           2 * WARPS +
+                           static_cast<size_t>(WARPS) * head_dim + 2) *
                           sizeof(float);
-    causal_attention_split_fp16_kernel<<<grid, block, shared, stream>>>(
+    causal_attention_split_fp16_kernel<WARPS><<<grid, block, shared, stream>>>(
         q, q_stride,
         block0.keys, block0.key_stride, block0.values, block0.value_stride,
         block0.positions, block0.rows, block0.window,
@@ -683,8 +685,15 @@ inline void dispatch_causal_attention_wmma_qk_fp16(
     const int64_t* positions1 = block1.positions != nullptr ? block1.positions : block0.positions;
 
     const int tpad = (total_rows + kWmmaTileN - 1) & ~(kWmmaTileN - 1);
-    const dim3 grid(num_heads, (count + kCausalAttentionQueryTile - 1) / kCausalAttentionQueryTile);
+    // The score tile is `16 x tpad` fp32 plus the same again as fp16 probabilities. A
+    // launch past the workgroup's shared-memory limit does not fail loudly — `<<<>>>`
+    // drops the error and the output stays stale — so it is refused here instead.
     const size_t shared = static_cast<size_t>(16) * tpad * (sizeof(float) + sizeof(__half));
+    if (shared > 64 * 1024) {
+        throw std::invalid_argument(
+            "dispatch_causal_attention_wmma_qk_fp16: row-set exceeds LDS; use the split kernel");
+    }
+    const dim3 grid(num_heads, (count + kCausalAttentionQueryTile - 1) / kCausalAttentionQueryTile);
     causal_attention_wmma_qk_fp16_kernel<<<grid, kCausalAttentionLanes, shared, stream>>>(
         q, q_stride,
         block0.keys, block0.key_stride, block0.values, block0.value_stride,

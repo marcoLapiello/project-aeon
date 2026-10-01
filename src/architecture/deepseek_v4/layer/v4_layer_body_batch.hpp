@@ -880,10 +880,6 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
                 // compressed set whole (or not at all, for Sliding).
                 const bool csa = layer.spec().attention_kind == V4AttentionKind::CSA;
                 const bool csa_live = csa && committed > 0;
-                // The split-keys kernel serves all three classes. A WMMA-QKᵀ variant
-                // exists (`run_attention_tile_wmma`) and is correct, but is not used: at
-                // one warp per block it measured the same as this kernel, so the matrix
-                // cores bought nothing and occupancy paid for them. See Step 6.
                 run_attention_tile(
                     layer, views[first].d_q, TOTAL_Q, views[first].d_attn_out, TOTAL_Q,
                     static_cast<int64_t>(start_position + first), static_cast<int>(tile),

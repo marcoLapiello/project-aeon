@@ -96,7 +96,7 @@ inline void run_attention_tile(
         block1.window = 0;                   // causal only; older than the window, by design
     }
 
-    aeon::dispatch_causal_attention_split_fp16(
+    aeon::dispatch_causal_attention_split_fp16<>(
         q, q_stride, block0, block1, per_query_keys, per_query_count,
         query_position_base, 1, out, out_stride,
         count, static_cast<int>(kernel::DSV4_NUM_HEADS), HEAD_DIM,
