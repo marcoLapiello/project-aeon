@@ -34,6 +34,7 @@
 #include "architecture/deepseek_v4/layer/v4_layer_body_types.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer_body_attention.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer_body_moe.hpp"
+#include "infrastructure/profiling/phase_profiler.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -58,13 +59,22 @@ inline V4LayerBodyOutput run_layer_body_attention_tail(
     V4RoutedExpertExecutor& experts,
     V4LayerBodyObserver& observer,
     V4LayerBodyPre pre) {
-    run_layer_body_attention_and_norm(layer, scratch, tables, token_id, pos, stream,
-                                      observer, pre);
-    const V4LayerBodyOutput output =
-        run_layer_body_router(layer, scratch, token_id, pos, stream, observer, pre);
+    {
+        auto phase = PhaseProfiler::instance().region("attention+norm (decode)", stream);
+        run_layer_body_attention_and_norm(layer, scratch, tables, token_id, pos, stream,
+                                          observer, pre);
+    }
+    V4LayerBodyOutput output;
+    {
+        auto phase = PhaseProfiler::instance().region("router (decode)", stream);
+        output = run_layer_body_router(layer, scratch, token_id, pos, stream, observer, pre);
+    }
     experts.on_routing_ready(static_cast<uint32_t>(layer.layer_id), pos,
                              output.topk_indices, output.topk_weights);
-    run_layer_body_moe_and_post(layer, scratch, pos, stream, experts, observer, pre);
+    {
+        auto phase = PhaseProfiler::instance().region("moe (decode)", stream);
+        run_layer_body_moe_and_post(layer, scratch, pos, stream, experts, observer, pre);
+    }
     return output;
 }
 
@@ -86,8 +96,11 @@ inline V4LayerBodyOutput run_layer_body_decoding(
     V4RoutedExpertExecutor& experts,
     V4LayerBodyObserver& observer) {
     V4LayerBodyRow row = decode_layer_body_row(scratch, layer);
-    const V4LayerBodyPre pre = run_layer_body_pre_attention(
-        layer, row, tables, token_id, pos, stream, observer);
+    V4LayerBodyPre pre;
+    {
+        auto phase = PhaseProfiler::instance().region("pre-attention (decode)", stream);
+        pre = run_layer_body_pre_attention(layer, row, tables, token_id, pos, stream, observer);
+    }
     return run_layer_body_attention_tail(
         layer, row, tables, token_id, pos, stream, experts, observer, pre);
 }

@@ -365,6 +365,10 @@ public:
                 if (profiling) {
                     phases.resolve();
                     phases.report(stdout);
+                    // Clear the prefill samples so the decode's phase split is its own
+                    // table; the two use distinct region names, so this is only about
+                    // not resolving the prefill's events a second time.
+                    phases.reset();
                 }
                 if (logits_dump_.is_open()) dump_logits(logits);
                 // TTFT is the moment the *last* prompt token's forward produced a
@@ -386,6 +390,14 @@ public:
 
         const text::GenerationResult generated =
             text::generate_token_ids(prompt, loop_options, prefill_step, decode_step);
+
+        // The decode phase split: one token's regions accumulate over every decoded
+        // token, so the figures are per-run totals and divide by the token count. The
+        // prefill reset above makes this table decode-only.
+        if (PhaseProfiler::instance().enabled()) {
+            PhaseProfiler::instance().resolve();
+            PhaseProfiler::instance().report(stdout);
+        }
 
         reply.token_ids = generated.token_ids;
         reply.stop_reason = generated.stop_reason;

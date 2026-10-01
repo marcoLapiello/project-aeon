@@ -124,6 +124,38 @@ E3b (`256`) — are all per-row. Batching each is the rest of Area 5, but the re
 diminishing: pre-attention is `13%` of GPU and TTFT is attention-bound, so a further
 `1 s` here moves TTFT by little (Area 5/E2 measured `−0.53 s` GPU for `~0 TTFT`).
 
+### Decode phase profile — 2026-10-01
+
+Prefill is GPU-bound and at a local optimum; **decode is where the product metric lives**
+(`3.6 tok/s`), so its phase split is measured the same way. Prefill and decode are separate
+tables — the engine resets the profiler after the prefill report — and the decode regions
+are named `(decode)` so the two never mix. Run: the `first-prompt.txt` instruction, `64`
+tokens, the same Warm/window/chunk config.
+
+| Phase | host ms | gpu ms | gpu share | per token |
+| :--- | ---: | ---: | ---: | ---: |
+| **moe (decode)** | `6,640` | `12,511` | **`79.1%`** | `~195 ms` |
+| **pre-attention (decode)** | `240` | `1,590` | `10.1%` | `~25 ms` |
+| **attention+norm (decode)** | `177` | `1,400` | `8.9%` | `~22 ms` |
+| &nbsp;&nbsp;· E attention kernel (nested) | `11` | `382` | `2.4%` | `~6 ms` |
+| &nbsp;&nbsp;· F/G hc + norm (nested) | `110` | `277` | `1.8%` | `~4 ms` |
+| router (decode) | `8,637` | `315` | `2.0%` | `~5 ms` |
+| **total** | **`15,693`** | **`15,816`** | | `~247 ms` |
+
+**The `moe` region is mostly *wait*, not compute, and the supply counters prove it.** Over
+the same `64` tokens the telemetry records `41.58 GiB` from NVMe and `60.58 GiB` host→VRAM:
+`nvme_wait ≈ 6.5 s`, `h2d_enqueue_to_ready ≈ 12.9 s` — `~202 ms`/token of H2D and `~101 ms`
+of NVMe wait inside a `~247 ms` token. Compute across all four regions is `~3.3 s` of the
+`15.8 s` (`~21%`); the rest is expert supply. The `router`'s `8.6 s` host line is the same
+barrier artifact as in prefill (table shown for completeness, not issuance).
+
+**Conclusion — the decode lever is supply and placement, not a kernel.** This is the
+project status's "decode NVMe wait (`36–63%`) redirects the work from the transfer path to
+residency/placement", now attributable per region. The prefill compute plan is complete for
+its purpose; a decode effort should start from the supply/placement documents
+(`EXPERT_STREAMING_EXECUTION_PLAN`, the host-memory and placement investigations), not from
+another kernel.
+
 #### Correctness is intact — the run-config prompt is a timing fixture, not a chat
 
 A first read of the baseline's reply looks alarming: the prompt is English but the
