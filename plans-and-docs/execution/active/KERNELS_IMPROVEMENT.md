@@ -32,20 +32,11 @@ build/bin/aeon_chat \
 
 ### Host memory discipline
 
-The host has `62.62 GiB`, and the pinned config plus the runtime's own allocation peaks
-near `52 GiB` — about `98%` of the allowance (M47). Any further host allocation aborts
-the load, so the way a run fails here is memory pressure, not the engine. The pressure
-seen while this plan was written was **not** the engine's; it was the build beside it:
+The host has `62.62 GiB` and the pinned config plus the runtime's own allocation peaks near `52 GiB` — about `98%` of the allowance (M47) — so the way a run fails here is memory pressure, not the engine. The pressure seen while this plan was written was **not** the engine's; it was the build beside it:
 
-- **Never build next to a measurement.** `cmake --build … -j$(nproc)` spawns `64`
-  `clang++` on heavyweight HIP template headers, each transiently holding `1–3 GiB`, so
-  the parallel maximum is tens of GiB and the compiler's pages do not return instantly.
-  Build and measure **serialised**, with a small job count (`-j8`).
-- **VS Code is `~2.6 GiB`** across its processes. The `buffer/cache` column is
-  reclaimable file cache, not pressure — read `available`, not `used`.
-- **Do not shrink `--warm-gib` to dodge pressure.** The Warm tier is part of the pinned
-  config and its size *is* a performance variable, so lowering it voids the comparison.
-  Free host memory instead of changing the config.
+- **Never build next to a measurement.** `cmake --build … -j$(nproc)` spawns `64` `clang++` on heavyweight HIP template headers, each transiently holding `1–3 GiB`, so the parallel maximum is tens of GiB and the compiler's pages do not return instantly. Build and measure **serialised**, with a small job count (`-j8`).
+- **VS Code is `~2.6 GiB`.** The `buffer/cache` column is reclaimable file cache, not pressure — read `available`, not `used`.
+- **Do not shrink `--warm-gib` to dodge pressure.** The Warm tier is part of the pinned config and its size *is* a performance variable, so lowering it voids the comparison. Free host memory instead of changing the config.
 - **One `aeon_chat` process at a time.** Two concurrent runs do not fit.
 
 ## Status
@@ -55,11 +46,11 @@ seen while this plan was written was **not** the engine's; it was the build besi
 | 1 | Grouped WMMA expert GEMM (W4A16) | **Done** — enabled in production |
 | 2 | Batch the chunk loop in the layer body | **Partly** — phase split and router done; `M`-keyed dispatcher and batched KV/position writes open |
 | 3 | WMMA dense GEMM for the dense projections | **Partly** — pre-attention projections batched; shared expert, `v4_grouped_wo`, HC and dispatcher-on-`M` open |
-| 4 | Batched causal attention over the chunk | **Done** — tile + split-keys, all classes on by default; WMMA/occupancy tuning open (Area 6) |
+| 4 | Batched causal attention over the chunk | **Done** — tile + split-keys, all classes on by default; attention variants measured, redesign untried (Area 6) |
 | 4a | Indexer top-k on device | **Done** — the top-k only (`0.13 s`); the scores it feeds were Area 8 |
 | — | `compose_local_rows` gather | **Done** |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Partly** — E2 (`rope + kv write`) batched; A/C/E1/E3/E3b remain per-row |
-| 6 | Tune for gfx1100 | **Partly** — attention scoped and **closed** (WMMA and warp-count both neutral/worse; incumbent optimal); expert-shape/kernel sweeps open |
+| 6 | Tune for gfx1100 | **Partly** — attention variants measured (WMMA and warp-count neutral/worse); the multi-warp-WMMA-with-LDS-PV redesign untried; expert-shape/kernel sweeps open |
 | 7 | Re-measure and retune supply | **Open** |
 | 8 | Batch the indexer scores over the chunk | **Done** — `4.47 → 0.07 s`; pre-attention GPU `−59%`, TTFT `29.1 → 25.1 s` |
 
@@ -67,12 +58,7 @@ seen while this plan was written was **not** the engine's; it was the build besi
 
 ### Baseline — 2026-10-01
 
-The current measured state, on `main` after Areas 1–4.2, 4a, 8 and Area 5's E2. Same pinned invocation
-as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`, `Warm 35 GiB`, `3`
-staging blocks); `n = 3`, stable to `<1%` (a first run is a cold outlier and is dropped).
-Each area record below carries its own implementation-time before/after; this is the one
-cross-area reference, and it is **replaced, never accumulated** — a superseded baseline is
-deleted, not kept beside the new one. Ledger entries are taken only at the end of the plan.
+The current measured state, on `main` after Areas 1–4.2, 4a, 8 and Area 5's E2. Same pinned invocation as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`, `Warm 35 GiB`, `3` staging blocks); `n = 3`, stable to `<1%` (a first run is a cold outlier and is dropped). Each area record below carries its own implementation-time before/after; this is the one cross-area reference, and it is **replaced, never accumulated** — a superseded baseline is deleted, not kept beside the new one. Ledger entries are taken only at the end of the plan.
 
 | Phase | host ms | gpu ms | gpu share |
 | :--- | ---: | ---: | ---: |
@@ -87,22 +73,14 @@ deleted, not kept beside the new one. Ledger entries are taken only at the end o
 | router (batched) | `14,087` | `200` | `1.1%` |
 | **total** | **`18,315`** | **`18,433`** | |
 
-- **TTFT `25.0 s` with the profiler on, `24.8 s` with it off** (`~36.7 ms/prompt-token`),
-  prompt `677` tokens.
-- Derived: the **attention tile** is `11,855 − 2,996 = 8,859 ms` — **`48%`** of GPU and the
-  one dominant kernel. Everything else is now a fraction of it.
-- The router's `14 s` host line is *not* issuance: its `hipStreamSynchronize` drains the
-  attention backlog queued ahead of it, a barrier reading of GPU-wait. True host issuance
-  is `18,315 − 14,087 ≈ 4.2 s`, so prefill is **GPU-bound**, and the GPU is **attention-bound**.
-- Supply is fully hidden: `nvme_gib 141.5`, `io_ms 892`, `load_ms 442` against a `~25 s`
-  run — Area 7 is not yet the limiter.
+- **TTFT `25.0 s` with the profiler on, `24.8 s` with it off** (`~36.7 ms/prompt-token`), prompt `677` tokens.
+- Derived: the **attention tile** is `11,855 − 2,996 = 8,859 ms` — **`48%`** of GPU and the one dominant kernel. Everything else is a fraction of it.
+- The router's `14 s` host line is *not* issuance: its `hipStreamSynchronize` drains the attention backlog queued ahead of it, a barrier reading of GPU-wait. True host issuance is `18,315 − 14,087 ≈ 4.2 s`, so prefill is **GPU-bound**, and the GPU is **attention-bound**.
+- Supply is fully hidden: `nvme_gib 141.5`, `io_ms 892`, `load_ms 442` against a `~25 s` run — Area 7 is not yet the limiter.
 
 #### Pre-attention attribution
 
-Pre-attention was one number (`~7 s`); the breakdown is what found Area 8 and Area 5's E2.
-Sub-regions fire once per `(row, stage)` and are **sampled at stride `16` and scaled back**
-— at stride `1` the two event records per region cost more than the region measures. The
-batched regions (E2, E5) are one launch per chunk and so are exact.
+Pre-attention was one number (`~7 s`); the breakdown is what found Area 8 and Area 5's E2. Sub-regions fire once per `(row, stage)` and are **sampled at stride `16` and scaled back** — at stride `1` the two event records per region cost more than the region measures. The batched regions (E2, E5) are one launch per chunk and so are exact.
 
 | Sub-region | gpu ms |
 | :--- | ---: |
@@ -119,18 +97,11 @@ batched regions (E2, E5) are one launch per chunk and so are exact.
 | **E5 indexer (batched)** | **`74`** |
 | **pre-attention total** | **`2,429`** |
 
-The largest remaining pre-attention terms — A (`1,136`), C (`447`), E1 (`396`), E3 (`332`),
-E3b (`256`) — are all per-row. Batching each is the rest of Area 5, but the returns are
-diminishing: pre-attention is `13%` of GPU and TTFT is attention-bound, so a further
-`1 s` here moves TTFT by little (Area 5/E2 measured `−0.53 s` GPU for `~0 TTFT`).
+The largest remaining pre-attention terms — A (`1,136`), C (`447`), E1 (`396`), E3 (`332`), E3b (`256`) — are all per-row, so batching each is the rest of Area 5. They are untried: Area 5/E2 measured `−0.53 s` GPU for `~0` TTFT, because the removed work overlapped the attention kernel, so an individual stage's TTFT effect is open until the attention term it overlaps is reduced.
 
 ### Decode phase profile — 2026-10-01
 
-Prefill is GPU-bound and at a local optimum; **decode is where the product metric lives**
-(`3.6 tok/s`), so its phase split is measured the same way. Prefill and decode are separate
-tables — the engine resets the profiler after the prefill report — and the decode regions
-are named `(decode)` so the two never mix. Run: the `first-prompt.txt` instruction, `64`
-tokens, the same Warm/window/chunk config.
+Decode carries the product metric (`3.6 tok/s`), so its phase split is measured the same way as prefill's. The two are separate tables — the engine resets the profiler after the prefill report — and the decode regions are named `(decode)` so they never mix. Run: the `first-prompt.txt` instruction, `64` tokens, the same Warm/window/chunk config.
 
 | Phase | host ms | gpu ms | gpu share | per token |
 | :--- | ---: | ---: | ---: | ---: |
@@ -142,45 +113,20 @@ tokens, the same Warm/window/chunk config.
 | router (decode) | `8,637` | `315` | `2.0%` | `~5 ms` |
 | **total** | **`15,693`** | **`15,816`** | | `~247 ms` |
 
-**The `moe` region is mostly *wait*, not compute, and the supply counters prove it.** Over
-the same `64` tokens the telemetry records `41.58 GiB` from NVMe and `60.58 GiB` host→VRAM:
-`nvme_wait ≈ 6.5 s`, `h2d_enqueue_to_ready ≈ 12.9 s` — `~202 ms`/token of H2D and `~101 ms`
-of NVMe wait inside a `~247 ms` token. Compute across all four regions is `~3.3 s` of the
-`15.8 s` (`~21%`); the rest is expert supply. The `router`'s `8.6 s` host line is the same
-barrier artifact as in prefill (table shown for completeness, not issuance).
+**The `moe` region is mostly *wait*, not compute, and the supply counters show it.** Over the same `64` tokens the telemetry records `41.58 GiB` from NVMe and `60.58 GiB` host→VRAM: `nvme_wait ≈ 6.5 s`, `h2d_enqueue_to_ready ≈ 12.9 s` — `~202 ms`/token of H2D and `~101 ms` of NVMe wait inside a `~247 ms` token. Compute across all four regions is `~3.3 s` of the `15.8 s` (`~21%`). The `router`'s `8.6 s` host line is the same barrier artifact as in prefill (shown for completeness, not issuance).
 
-**Conclusion — the decode lever is supply and placement, not a kernel.** This is the
-project status's "decode NVMe wait (`36–63%`) redirects the work from the transfer path to
-residency/placement", now attributable per region. The prefill compute plan is complete for
-its purpose; a decode effort should start from the supply/placement documents
-(`EXPERT_STREAMING_EXECUTION_PLAN`, the host-memory and placement investigations), not from
-another kernel.
+**Read: decode's compute share is `~21%`; the rest is expert supply.** That matches the project status's "decode NVMe wait (`36–63%`) redirects the work from the transfer path to residency/placement", now attributable per region. A decode effort would therefore start from the supply/placement documents (`EXPERT_STREAMING_EXECUTION_PLAN`, the host-memory and placement investigations); it does **not** close the prefill compute areas above.
 
 #### Correctness is intact — the run-config prompt is a timing fixture, not a chat
 
-A first read of the baseline's reply looks alarming: the prompt is English but the
-answer is Chinese. It is **not** a regression, and the confusion is worth recording so
-it is not re-raised:
+A first read of the baseline's reply looks alarming: the prompt is English but the answer is Chinese. It is **not** a regression, recorded so it is not re-raised:
 
-- `prefill-corpus.txt` is a **raw English text blob with no instruction** — a prompt
-  token-count fixture selected for the profile, not a question. Given that alone the
-  model emits Chinese *commentary on the passage*, which is this model family's default
-  for instruction-less input.
-- Any instruction restores English: appending `"Question: In one sentence, what is
-  this passage about?"` to the same corpus answers in English and on topic; the
-  unrelated `first-prompt.txt` (`"Explain in simple terms how a hot and warm expert
-  cache can reduce inference latency."`) answers in fluent English; `"What is the
-  capital of France?"` answers `"The capital of France is Paris."`.
-- The two default-on new paths do **not** move the output: with `attention_tile_enabled`
-  and `moe_grouped_batch_enabled` toggled in all four combinations the corpus reply is
-  byte-identical.
-- The gates agree: `test_v4_layer_body_chunk_oracle`, `test_v4_prefill_window`,
-  `test_v4_routed_prefill` and `test_v4_engine` (end-to-end) all pass at this commit.
+- `prefill-corpus.txt` is a **raw English text blob with no instruction** — a prompt token-count fixture selected for the profile, not a question. Given that alone the model emits Chinese *commentary on the passage*, this model family's default for instruction-less input.
+- Any instruction restores English: appending `"Question: In one sentence, what is this passage about?"` to the same corpus answers in English and on topic; the unrelated `first-prompt.txt` (`"Explain in simple terms how a hot and warm expert cache can reduce inference latency."`) answers in fluent English; `"What is the capital of France?"` answers `"The capital of France is Paris."`.
+- The two default-on new paths do **not** move the output: with `attention_tile_enabled` and `moe_grouped_batch_enabled` toggled in all four combinations the corpus reply is byte-identical.
+- The gates agree: `test_v4_layer_body_chunk_oracle`, `test_v4_prefill_window`, `test_v4_routed_prefill` and `test_v4_engine` (end-to-end) all pass at this commit.
 
-**Conclusion:** correctness is a sound baseline value; the chinese output is an artifact
-of the fixture. Correctness must be measured with an instructed prompt (M47 used the
-corpus *plus an instruction*), which is why the run-config invocation alone can never be
-the correctness signal.
+**Conclusion:** correctness is sound; the Chinese output is an artifact of the fixture. Correctness must be measured with an instructed prompt (M47 used the corpus *plus an instruction*), which is why the run-config invocation alone is not the correctness signal.
 
 ## Findings
 
@@ -188,7 +134,7 @@ the correctness signal.
 - The router made one host sync per row — fixed in Area 2.
 - Small per-row launches (rmsnorm, rope, HC sinkhorn, KV copies, a position H2D per row) scale with T — Area 5; E2 batched (`0.73 s → 3 ms`), A/C/E1/E3/E3b remain.
 - The **indexer scores** kernel, not its top-k, was the pre-attention cost: `4.3 s` against `0.13 s` — a per-token, single-block launch, the same defect Areas 2–3 fixed for the router and the projections. Batched in Area 8 (`4.3 s → 0.07 s`).
-- **Attention is at a local optimum.** The production split kernel (warps=4, tile=16) beats every alternative measured — WMMA-QKᵀ (tile 16/256) and split warps=1 — so the `48%` of GPU it holds is not recoverable by tiling or warp tuning as the design stands (Area 6). A synthetic bench showed WMMA `2×` faster and did **not** transfer; the next attempt must use production's tile/union shapes.
+- **Attention variants were measured and none beat the incumbent.** The production split kernel (warps=4, tile=16) was faster than WMMA-QKᵀ (tile 16/256) and split warps=1 in the runs in Area 6, so the `48%` of GPU it holds was not reduced by tiling or warp tuning **as tested**; the multi-warp-WMMA-with-LDS-PV redesign is the untried variant. A synthetic bench showed WMMA `2×` faster and did not transfer; a next bench must use production's tile/union shapes.
 
 ## Execution plan
 
@@ -344,7 +290,7 @@ Two bugs the independent gate caught, not self-consistency: a warp-stride-only s
 | `test_v4_prefill_window` | `4/10` (pre-existing red) | **`10/0`** — greedy `320`, rel `2.6%` |
 | `test_v4_routed_prefill` | `20/1` (pre-existing red) | **`20/0`** — greedy `320`, rel `0.1%` |
 
-**Still open:** the WMMA tile and warp-count tuning (`warp = 4`, `tile = 16`, both unmeasured) — Area 6.
+**Still open:** the multi-warp-WMMA-with-LDS-PV redesign; Area 6's record measured the tiling and warp-count levers around it.
 
 #### WMMA QKᵀ — built, gated, **not shipped**
 
@@ -381,20 +327,7 @@ Gates: `test_v4_real_scale_state` (the real `index_topk = 512` as a strict selec
 
 #### Implementation record — E2 (rope + kv write), **done**
 
-The tail ran two `v4_forward_rope_at_pos_wave32_kernel` launches (query heads, then the
-single key head), two identical key/value `hipMemcpyAsync` and a per-row position H2D,
-per row: `0.73 s` of GPU, the largest per-row term. The chunk's per-row buffers are
-contiguous (`d_q` at pitch `num_heads*head_dim`, `d_kv_norm_act` at `head_dim`), and the
-G2 `v4_forward_rope_wave32_kernel` already indexes the table by `blockIdx.y`, so the whole
-chunk is one `(heads, rows)` launch with the table **offset by the chunk's first position**
-— row `r` reads position `start + r` with no new kernel. The chunk writes key and value to
-the *same* buffer, so the two per-row copies collapse to one bulk copy. The per-row
-position write is dropped: `chunk_positions_` is never read (the composed row-sets carry
-kernel-computed positions and the commit recomputes the ring slot).
-
-The tail takes a `defer_rope_kv_write` flag, mirroring `defer_indexer_select`; decode and
-single-row callers keep the inline path, so the scalar and compressed oracles are
-unchanged.
+The tail ran two `v4_forward_rope_at_pos_wave32_kernel` launches (query heads, then the single key head), two identical key/value `hipMemcpyAsync` and a per-row position H2D, per row: `0.73 s` of GPU, the largest per-row term. The chunk's per-row buffers are contiguous (`d_q` at pitch `num_heads*head_dim`, `d_kv_norm_act` at `head_dim`), and the G2 `v4_forward_rope_wave32_kernel` already indexes the table by `blockIdx.y`, so the whole chunk is one `(heads, rows)` launch with the table **offset by the chunk's first position** — row `r` reads position `start + r` with no new kernel. The chunk writes key and value to the *same* buffer, so the two per-row copies collapse to one bulk copy. The per-row position write is dropped: `chunk_positions_` is never read (the composed row-sets carry kernel-computed positions and the commit recomputes the ring slot). The tail takes a `defer_rope_kv_write` flag, mirroring `defer_indexer_select`; decode and single-row callers keep the inline path, so the scalar and compressed oracles are unchanged.
 
 Measured (`n = 3`, stable runs):
 
@@ -405,27 +338,19 @@ Measured (`n = 3`, stable runs):
 | total, GPU | `18,956 ms` | **`18,433 ms`** (`−2.8%`) |
 | TTFT | `25.1 s` | `25.0 s` (flat) |
 
-**The honest reading:** the GPU saving is real (`−0.53 s`) but TTFT is **flat** — the
-removed work was already overlapped behind the attention kernel, which is now `48%` of
-GPU. Pre-attention batching has reached the point Area 4a's record described: it removes
-the cost but not the bottleneck. Further Area 5 stages (A, C, E1, E3, E3b) will behave the
-same way, which is why the next real lever is the attention kernel itself (Area 6).
+**Read:** the GPU saving is real (`−0.53 s`) but TTFT is **flat** — the removed work overlapped the attention kernel, which is `48%` of GPU. Same shape as Area 4a's result: it removes the cost but not the bottleneck. The remaining Area 5 stages (A, C, E1, E3, E3b) are untried; whether they move TTFT depends on the attention term they overlap.
 
 Gates green: `test_v4_rope_oracle`, `test_v4_layer_body_chunk_oracle` (bit-exact with the
 tile off), `test_v4_layer_body_serial_oracle`, `test_v4_layer_body_compressed_oracle`.
 
-### Area 6: Tune for gfx1100 — **partly done (attention scoped, closed)**
+### Area 6: Tune for gfx1100 — **partly done**
 
 - Sweep the WMMA tile config for the dominant expert shapes: N×K tile, waves per workgroup (4–8), LDS ≤ 64 KiB for 2 workgroups per CU.
 - Give the routed-prefill (short-prompt) path the same grouped kernel. Experts with only 1–3 tokens fall back to the GEMV kernel, picked per expert inside one launch.
 
-#### Implementation record — attention is at a local optimum, **done**
+#### Implementation record — attention variants, measured
 
-Attention is `48%` of prefill GPU, so Area 6's first target was its kernel. The one-warp
-WMMA-QKᵀ build was recorded as **neutral**; the question was whether **query tiling** (the
-WMMA tile reads the key union once per 16 queries, the split kernel once per query) or a
-**warp-count** change could break the tie. Both were measured on `gfx1100`, at the pinned
-config, one process at a time:
+Attention is `48%` of prefill GPU, so Area 6's first target was its kernel. The one-warp WMMA-QKᵀ build was recorded **neutral**; the question was whether **query tiling** (the WMMA tile reads the key union once per 16 queries, the split kernel once per query) or a **warp-count** change could break the tie. Both were measured on `gfx1100`, at the pinned config, one process at a time:
 
 | arm | attention+norm GPU | notes |
 | :--- | ---: | :--- |
@@ -434,33 +359,13 @@ config, one process at a time:
 | WMMA-QKᵀ, tile=256 | `12,049 ms` | wider union, one launch per 256 queries |
 | split kernel, warps=1 | `12,394 ms` | fewer warps, less per-block overhead |
 
-**Nothing beats the incumbent.** The WMMA-QKᵀ path is neutral-to-worse at every tile
-width, and the split kernel's warp count is already at its optimum (4; `1` is worse). The
-tile is the reason: the WMMA kernel's block is always 16 queries (its PV is
-`16 × head_dim` registers), so "tile=256" only enlarges the composed union (`W + tile − 1`
-rows) that every query then masks down to `W` — more wasted compute, not less. The
-occupancy the plan blamed is real but not the whole story; the masked over-read is the
-other half, and they cancel.
+**No tested variant beat the incumbent.** The WMMA-QKᵀ path is neutral-to-worse at every tile width, and the split kernel's warp count is already best at `4` (`1` is worse). The tile is why: the WMMA kernel's block is always 16 queries (its PV is `16 × head_dim` registers), so "tile=256" only enlarges the composed union (`W + tile − 1` rows) that every query then masks down to `W` — more wasted compute, not less. Occupancy and that masked over-read cancel; a **multi-warp WMMA with the PV tile in LDS** is what would have to beat them, and it is untried.
 
-**A synthetic bench misled, and that is worth recording.** `tests/bench_attention_ab.cpp`
-(a new tool, kept, no model load) measured WMMA-QKᵀ **2× faster** than split at
-`rows=297, count=256` — but that does **not** transfer: production runs the same arms and
-the WMMA path is neutral. The bench's grid and union (`count` queries in one launch, a
-297-row union) are not production's (16-query tiles, a 128-row sliding union plus a
-compressed block). The lesson for the next attempt: a synthetic attention bench must use
-production's tile and union shapes, or it measures a different question.
+**A synthetic bench did not transfer, and that is worth recording.** `tests/bench_attention_ab.cpp` (a new tool, kept, no model load) measured WMMA-QKᵀ **2× faster** than split at `rows=297, count=256`, but production runs the same arms and is neutral. The bench's grid and union (`count` queries in one launch, a 297-row union) are not production's (16-query tiles, a 128-row sliding union plus a compressed block). A synthetic attention bench must use production's tile and union shapes, or it measures a different question.
 
-**A latent bug fixed.** `dispatch_causal_attention_wmma_qk_fp16` sized its shared memory
-as `16 × tpad × 6` bytes with no guard; above `tpad = 683` (union `≈ 672` rows) the launch
-exceeded the workgroup limit, and `<<<>>>` **drops the error** — the output stayed stale
-rather than failing. The dispatcher now refuses an over-large row-set with a named
-exception. This matters only if the WMMA path is ever wired (it is not), but the silent
-failure was reachable from `bench_attention_ab` and would have been a trap.
+**A latent bug fixed.** `dispatch_causal_attention_wmma_qk_fp16` sized its shared memory as `16 × tpad × 6` bytes with no guard; above `tpad = 683` (union `≈ 672` rows) the launch exceeded the workgroup limit and `<<<>>>` **drops the error**, leaving stale output rather than failing. The dispatcher now refuses an over-large row-set with a named exception. It matters only if the WMMA path is ever wired, but the silent failure was reachable from `bench_attention_ab`.
 
-The split kernel is now a template on its warp count (`WARPS`, default `4`) so the sweep
-needed no rebuild; production instantiates the default.
-
-Gates green: `test_tiled_causal_attention` (both arms, all cases), `test_v4_layer_body_chunk_oracle`.
+The split kernel is now a template on its warp count (`WARPS`, default `4`) so the sweep needs no rebuild; production instantiates the default. Gates green: `test_tiled_causal_attention` (both arms, all cases), `test_v4_layer_body_chunk_oracle`.
 
 ### Area 7: Move the bottleneck back to supply — **open**
 
@@ -468,22 +373,9 @@ Gates green: `test_tiled_causal_attention` (both arms, all cases), `test_v4_laye
 
 ### Area 8: Batch the indexer scores over the chunk — **done**
 
-Found by the `2026-10-01` pre-attention attribution, not by the plan: `v4_indexer_scores_kernel`
-(`E5a`) was `4.3 s` GPU — `60%` of pre-attention and `18%` of all prefill GPU — against
-`0.13 s` for the top-k it feeds. The defect is the one Areas 2–3 fixed twice:
-`dim3(ceil(committed / 256))` = **one block**, launched once per token per CSA layer
-(`21 × 677 ≈ 14k` times at this context).
+Found by the `2026-10-01` pre-attention attribution, not by the plan: `v4_indexer_scores_kernel` (`E5a`) was `4.3 s` GPU — `60%` of pre-attention and `18%` of all prefill GPU — against `0.13 s` for the top-k it feeds. The defect is the one Areas 2–3 fixed twice: `dim3(ceil(committed / 256))` = **one block**, launched once per token per CSA layer (`21 × 677 ≈ 14k` times at this context).
 
-The batch is one grid with the row on `blockIdx.y` and a row pitch on every buffer
-(`v4_indexer_scores_batch_kernel`), which is the shape `dispatch_router` and
-`project_dense` already take. The ordering is the whole subtlety: a row's compressed
-entries are materialized **during its own tail** (at ratio boundaries), so the scores can
-only run once the whole chunk's tails have run — and a row ranks only the `committed`
-entries that predate it, so the later rows' entries are never read. The tail therefore
-takes `defer_indexer_select`; decode and every single-row caller keep the default and
-select inline, which is why the layer-body compressed oracle (reading the layer's own
-buffers) is unaffected. The top-k stays per row: cheap, and its candidate count differs
-per row.
+The batch is one grid with the row on `blockIdx.y` and a row pitch on every buffer (`v4_indexer_scores_batch_kernel`), the shape `dispatch_router` and `project_dense` already take. The ordering is the whole subtlety: a row's compressed entries are materialized **during its own tail** (at ratio boundaries), so the scores run only once the whole chunk's tails have run — and a row ranks only the `committed` entries that predate it, so the later rows' entries are never read. The tail therefore takes `defer_indexer_select`; decode and every single-row caller keep the default and select inline, which is why the layer-body compressed oracle is unaffected. The top-k stays per row: cheap, and its candidate count differs per row.
 
 Measured (`n = 3`, `<1%`):
 
