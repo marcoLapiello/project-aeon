@@ -27,7 +27,7 @@
 // fp32 stages, ~5e-4 (one fp16 ulp) on the stages that store fp16.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 

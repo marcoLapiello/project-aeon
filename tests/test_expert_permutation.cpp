@@ -24,7 +24,7 @@
 // small expert count where every expert appears.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "platform/ops/expert_permutation.hpp"
 
 #include <hip/hip_runtime.h>

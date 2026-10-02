@@ -35,7 +35,7 @@
 //     145 GB container for a path already certified.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"

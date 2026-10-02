@@ -10,7 +10,7 @@
 
 #include "platform/dense_gemm.hpp"
 #include "platform/ops/gemv.hpp"
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>

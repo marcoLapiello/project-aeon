@@ -25,7 +25,7 @@
 // rule at all, so this gate never relied on it.)
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"

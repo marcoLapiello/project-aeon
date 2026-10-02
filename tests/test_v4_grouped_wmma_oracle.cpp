@@ -24,7 +24,7 @@
 // two routed slots per token so the two indexings cannot coincide.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
 #include "architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp"

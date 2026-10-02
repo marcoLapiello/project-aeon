@@ -1,7 +1,7 @@
 #include "infrastructure/artifact/aeon_loader.hpp"
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/spec/v4_memory_geometry.hpp"
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "infrastructure/expert/residency/expert_registry.hpp"
 #include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/spec/v4_model_contract.hpp"

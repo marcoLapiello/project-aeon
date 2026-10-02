@@ -49,7 +49,7 @@
 // decode-position error, which is the defect it exists to catch.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/runtime/v4_engine.hpp"

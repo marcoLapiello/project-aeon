@@ -25,7 +25,7 @@
 // loose bound by two orders of magnitude.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "architecture/deepseek_v4/kernels/v4_rope.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 

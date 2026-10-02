@@ -18,7 +18,7 @@
 // fragment is also checked across successive MMA accumulates, not just one.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "platform/rdna3/wmma.hpp"
 
 #include <hip/hip_fp16.h>

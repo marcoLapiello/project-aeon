@@ -59,7 +59,7 @@
 // sink-in-the-max, and it is stated rather than papered over.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"

@@ -23,7 +23,7 @@
 // and re-proving it would add no information.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "platform/ops/gemv.hpp"
 #include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"

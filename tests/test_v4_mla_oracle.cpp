@@ -28,7 +28,7 @@
 // fp32 accumulation over 1024–4096 terms.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "platform/ops/gemv.hpp"
 #include "platform/ops/rmsnorm.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"

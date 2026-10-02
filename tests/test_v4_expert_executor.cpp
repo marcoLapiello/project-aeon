@@ -81,7 +81,7 @@
 //     the graph is assembled.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/moe/v4_expert_executor.hpp"

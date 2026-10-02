@@ -28,7 +28,7 @@
 #include "infrastructure/memory/memory_budget.hpp"
 #include "infrastructure/profiling/phase_profiler.hpp"
 #include "architecture/deepseek_v4/runtime/v4_engine.hpp"
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -289,7 +289,7 @@ void print_layer_outcomes(const aeon::core::V4Engine& engine) {
     }
 }
 
-// Decode routing reuse-distance curve (routing study Phase 1): the ideal-LRU hit
+// Decode routing reuse-distance curve: the ideal-LRU hit
 // rate at each capacity next to the measured Hot hit rate and the Belady-OPT
 // bound. A gap between measured and ideal-LRU means the recency policy is leaving
 // locality uncaptured; the ideal-LRU-to-OPT gap is the headroom only a non-recency

@@ -1,4 +1,4 @@
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp"
 

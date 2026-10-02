@@ -67,7 +67,7 @@
 //   C. non-vacuity — the composition is shown load-bearing before B is trusted
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
 #include "architecture/deepseek_v4/runtime/v4_model_host.hpp"

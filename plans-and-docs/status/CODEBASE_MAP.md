@@ -42,7 +42,7 @@ format descriptor), `expert/` (the tier state and loader, plus the neutral ports
 The production-facing implementation is:
 
 - `src/architecture/deepseek_v4/spec/config.hpp` - DeepSeek-V4 model configuration.
-- `src/platform/rdna3/device.hpp` - RDNA3/HIP device selection and GPU utilities.
+- `src/platform/device.hpp` - HIP device selection (arch-neutral).
 - `src/architecture/deepseek_v4/runtime/v4_engine.hpp` - the text binding: tokenizer + prompt encoder + generation loop + graph.
 - `src/architecture/deepseek_v4/runtime/v4_graph.hpp` - the ordered forward pass (embed, 43 layers, head, LM head).
 - `src/architecture/deepseek_v4/runtime/v4_model_host.hpp` - what is resident: the whole assembly. It now delegates the layer-major prefill working set to `v4_prefill_workspace.hpp` (`V4PrefillWorkspace`; its residual carry is the neutral `infrastructure/prefill/prefill_carry.hpp`), the direct expert I/O to `infrastructure/expert/transport/expert_direct_io.hpp` (`ExpertDirectIO`), the tier's bulk load and restore to `infrastructure/expert/expert_tier_loader.hpp` (`ExpertTierLoader`), the Warm/staging boundary to `infrastructure/expert/storage/host_partition.hpp` (`HostPartition`), and the prefill lifecycle and sweep to `infrastructure/prefill/prefill_controller.hpp` (`PrefillController`), keeping its own API unchanged.

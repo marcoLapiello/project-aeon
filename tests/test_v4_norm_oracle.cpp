@@ -23,7 +23,7 @@
 // allows 2e-3 relative, measured against a floor of `1e-3 * max|output|`.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "platform/ops/rmsnorm.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 

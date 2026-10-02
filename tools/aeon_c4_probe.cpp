@@ -52,7 +52,7 @@
 
 #define _GNU_SOURCE 1
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include "infrastructure/io/direct_io_reader.hpp"
 

@@ -49,7 +49,7 @@
 // is not what this gate certifies.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"

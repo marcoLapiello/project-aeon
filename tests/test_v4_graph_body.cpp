@@ -55,7 +55,7 @@
 //   * **The sampler, the text binding, the observer, and tiering under load.**
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"

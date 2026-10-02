@@ -1,4 +1,4 @@
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include <algorithm>
 #include <iostream>

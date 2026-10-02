@@ -71,7 +71,7 @@
 #include "infrastructure/prefill/prefill_sweep.hpp"
 #include "infrastructure/expert/transport/supply_telemetry.hpp"
 #include "infrastructure/hip_check.hpp"
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 
 #include <algorithm>
 #include <cstdint>

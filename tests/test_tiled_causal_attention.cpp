@@ -23,7 +23,7 @@
 // fp16 output, exactly as the scalar gate judges.
 // -----------------------------------------------------------------------------
 
-#include "platform/rdna3/device.hpp"
+#include "platform/device.hpp"
 #include "platform/tiled_causal_attention.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 
