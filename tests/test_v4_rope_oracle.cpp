@@ -370,7 +370,7 @@ int main() {
                      aeon::reference::compare(oracle_rotate(h_vec, kTokens, kHeads, ref_sliding, false),
                                               widen(got)),
                      kFp16Abs, kFp16Rel);
-        // Trap 27: the first 448 dims of every head must be bit-identical.
+        // The first 448 dims of every head must be bit-identical.
         ok &= check("forward: nope region untouched (sliding)",
                     nope_region_intact(h_vec_orig, got, kTokens, kHeads),
                     "dims [0," + std::to_string(kNopeDim) + ") bit-identical");

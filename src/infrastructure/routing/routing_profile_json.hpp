@@ -288,23 +288,6 @@ inline uint64_t fnv1a_bytes(const void* data, size_t size, uint64_t hash = 14695
     return hash;
 }
 
-inline uint64_t fnv1a_file(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        return 0;
-    }
-    uint64_t hash = 1469598103934665603ULL;
-    std::array<char, 8192> buffer{};
-    while (input) {
-        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        const std::streamsize count = input.gcount();
-        if (count > 0) {
-            hash = fnv1a_bytes(buffer.data(), static_cast<size_t>(count), hash);
-        }
-    }
-    return hash;
-}
-
 inline std::string read_text(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {

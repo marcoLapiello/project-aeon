@@ -2,7 +2,7 @@
 // Gate: the G2 tiled causal attention primitive, versus an independent fp64
 // reference.
 //
-// The kernel under test is `causal_attention_fp16_wave32_kernel`: one launch for a
+// The kernels under test are the split-keys and head-group kernels: one launch for a
 // whole tile of queries, each attending one or two shared key blocks masked to its own
 // causal (and window) past. It is compared against
 // `aeon::reference::attention_scores_sink`, the certified fp64 reference that
@@ -168,8 +168,8 @@ int main() {
         }
 
         CHECK_HIP(hipMemset(d_out, 0, h_q.size() * sizeof(__half)));
-        aeon::dispatch_causal_attention_fp16(
-            d_q, q_stride, block0, block1, query_position_base, 1, d_out, out_stride,
+        aeon::dispatch_causal_attention_split_fp16<>(
+            d_q, q_stride, block0, block1, nullptr, 0, query_position_base, 1, d_out, out_stride,
             count, static_cast<int>(kHeads), static_cast<int>(kHeadDim),
             bias, static_cast<float>(kScale), 0);
         CHECK_HIP(hipGetLastError());
@@ -281,9 +281,8 @@ int main() {
         ok &= compare_all("D", got, block0, block1, query_positions, sink_d, widen(h_qd));
     }
 
-    // --- E. the split-keys kernel == the same reference ----------------------
-    // Multi-warp: each warp scans part of the key range, combined in shared memory.
-    std::printf("--- E. split-keys kernel, sliding window ---\n");
+    // --- E. the head-group kernel == the same reference ---------------------
+    std::printf("--- E. head-group kernel ---\n");
     {
         const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
         auto run_split = [&](bool grouped, const HostBlock& host0, const HostBlock& host1,
@@ -321,12 +320,8 @@ int main() {
         };
         const int64_t q_base = static_cast<int64_t>(kKeys - kQueries);
         const int count = static_cast<int>(kQueries);
-        ok &= compare_all("E", run_split(false, block0, {}, nullptr, 0, q_base, count, d_sink),
-                          block0, {}, h_query_positions, sink_d, q_d);
-
-        // H. Heads as the WMMA M axis: window + sink, full causal over several key
-        // blocks, a null bias, and two blocks sharing one softmax.
-        std::printf("--- H. head-group WMMA kernel ---\n");
+        // Window + sink, full causal over several key blocks, a null bias, and two
+        // blocks sharing one softmax.
         ok &= compare_all("H window", run_split(true, block0, {}, nullptr, 0, q_base, count, d_sink),
                           block0, {}, h_query_positions, sink_d, q_d);
         const HostBlock causal{0, static_cast<int>(kKeys), 0};
@@ -349,7 +344,6 @@ int main() {
     {
         constexpr int kSelect = 40;
         const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
-        const HostBlock block1{0, static_cast<int>(kKeys), 0};
         std::vector<int32_t> h_select(static_cast<size_t>(kQueries) * kSelect);
         for (size_t r = 0; r < kQueries; ++r) {
             for (int j = 0; j < kSelect; ++j) {
@@ -432,48 +426,6 @@ int main() {
         ok &= all;
         }
         CHECK_HIP(hipFree(d_select));
-    }
-
-    // --- G. the WMMA QKᵀ kernel, shared-key tile ------------------------------
-    // 16 queries per block (here 12, so the tile's tail is masked), QKᵀ on the matrix
-    // cores, the same window + sink. Shared-key only, so a single block 0.
-    std::printf("--- G. WMMA QKᵀ kernel, sliding window ---\n");
-    {
-        const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
-        auto run_wmma = [&](const HostBlock& host0, const HostBlock& host1,
-                            int64_t q_base, int count, const float* bias) {
-            CausalAttentionBlock b0;
-            b0.keys = d_k + host0.first * kHeadDim;
-            b0.values = b0.keys;
-            b0.positions = d_kpos + host0.first;
-            b0.rows = host0.rows;
-            b0.key_stride = key_stride;
-            b0.value_stride = key_stride;
-            b0.window = static_cast<int>(host0.window);
-            CausalAttentionBlock b1;
-            if (host1.rows > 0) {
-                b1.keys = d_k + host1.first * kHeadDim;
-                b1.values = b1.keys;
-                b1.positions = d_kpos + host1.first;
-                b1.rows = host1.rows;
-                b1.key_stride = key_stride;
-                b1.value_stride = key_stride;
-                b1.window = static_cast<int>(host1.window);
-            }
-            CHECK_HIP(hipMemset(d_out, 0, h_q.size() * sizeof(__half)));
-            aeon::dispatch_causal_attention_wmma_qk_fp16(
-                d_q, q_stride, b0, b1, q_base, 1, d_out, out_stride,
-                count, static_cast<int>(kHeads), static_cast<int>(kHeadDim),
-                bias, static_cast<float>(kScale), 0);
-            CHECK_HIP(hipGetLastError());
-            CHECK_HIP(hipDeviceSynchronize());
-            std::vector<__half> out(h_q.size());
-            CHECK_HIP(hipMemcpy(out.data(), d_out, out.size() * sizeof(__half), hipMemcpyDeviceToHost));
-            return widen(out);
-        };
-        ok &= compare_all("G", run_wmma(block0, {}, static_cast<int64_t>(kKeys - kQueries),
-                                        static_cast<int>(kQueries), d_sink),
-                          block0, {}, h_query_positions, sink_d, q_d);
     }
 
     std::cout << (ok ? "[Tier-1 tiled causal attention] PASS\n"

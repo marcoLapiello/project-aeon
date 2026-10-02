@@ -1,6 +1,6 @@
 // -----------------------------------------------------------------------------
 // Tier-1 gate: routed expert — fused INT4 dequantization, matmul, and clamped
-// SwiGLU (Steps 2.10.2 / 2.10.3) — versus an independent fp64 oracle.
+// SwiGLU — versus an independent fp64 oracle.
 //
 // This is the largest op in the graph and the one with the most ways to be
 // silently wrong, so the gate is split by *rule* rather than by kernel:

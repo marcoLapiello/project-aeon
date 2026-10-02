@@ -329,7 +329,7 @@ int main() {
     GateExpertExecutor executor;
     executor.scratch = &scratch;
     executor.stream = 0;
-    // Trap 38: the atomic accumulation's order is the scheduler's, so a byte-exact
+    // The atomic accumulation's order is the scheduler's, so a byte-exact
     // comparison between two runs would be meaningless without a fixed order. This
     // gate requires the deterministic path, and says so here.
     executor.deterministic = true;

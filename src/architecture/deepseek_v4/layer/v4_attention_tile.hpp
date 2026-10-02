@@ -3,18 +3,15 @@
 // -----------------------------------------------------------------------------
 // G4 binding: the DSV4 tiled causal attention over a chunk's rows.
 //
-// Binds the G2 tile primitive (`platform/tiled_causal_attention.hpp`) to the model:
+// Binds the G2 head-group primitive (`platform/tiled_causal_attention.hpp`) to the model:
 // it supplies the full-head scale, the per-head attention sink, and the layer class's
-// key sets, and it names no WMMA, lane or tile detail. The two key blocks are exactly
-// what the primitive was given for:
+// key sets, and it names no WMMA, lane or tile detail. The two key blocks are:
 //
 //   * **Sliding** — one block, the local union (the sliding window).
 //   * **HCA** — two: the local union, plus **every committed compressed row** with
 //     window `0` (causal only), because HCA attends the whole compressed set and its
 //     per-position causality is enforced by the mask, not by a top-k.
-//   * **CSA** — deliberately unsupported. Its indexer selects a *different* top-k per
-//     query, so there is no shared compressed block to tile; it keeps the scalar path
-//     until 4.2b.
+//   * **CSA** — one local block plus the indexer's per-query top-k as an index block.
 //
 // The local union is a whole tile's row-set, composed once by the caller. Each query
 // masks into its own window, which `tests/test_v4_tiled_attention_oracle.cpp` pins as
@@ -27,15 +24,6 @@
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"
 
 namespace aeon::core {
-
-// Whether this layer's attention can be served by one tiled launch. All three classes
-// now can: the shared-key classes (`Sliding`, `HCA`) pass the compressed set whole, and
-// `CSA` passes its indexer's per-query selection as an index block.
-inline bool attention_tile_supported(const V4Layer& layer) {
-    const V4AttentionKind kind = layer.spec().attention_kind;
-    return kind == V4AttentionKind::Sliding || kind == V4AttentionKind::HCA ||
-           kind == V4AttentionKind::CSA;
-}
 
 // Switch for the tiled attention, in the chunk path and in decode. It defaults to **on**.
 // Setting it false replays the per-token scalar kernel, which is slower and exists so a
@@ -97,46 +85,6 @@ inline void run_attention_tile(
     aeon::dispatch_causal_attention_head_group_fp16<>(
         q, q_stride, block0, block1, per_query_keys, per_query_count,
         query_position_base, 1, out, out_stride,
-        count, static_cast<int>(kernel::DSV4_NUM_HEADS), HEAD_DIM,
-        layer.d_attn_sink, kernel::DSV4_ATTN_SCALE, stream);
-}
-
-// The same launch, but QKᵀ on the matrix cores. Only for the shared-key classes
-// (`Sliding`, `HCA`): a `CSA` layer's per-query top-k has no key tile to share across the
-// query tile, so it stays on the split-keys kernel above.
-inline void run_attention_tile_wmma(
-    const V4Layer& layer,
-    const half* q, int q_stride,
-    half* out, int out_stride,
-    int64_t query_position_base,
-    int count,
-    const half* local_keys, const int64_t* local_positions, int local_rows,
-    uint32_t committed,
-    hipStream_t stream) {
-    constexpr int HEAD_DIM = kernel::DSV4_HEAD_DIM;
-
-    CausalAttentionBlock block0;
-    block0.keys = local_keys;
-    block0.values = local_keys;
-    block0.positions = local_positions;
-    block0.rows = local_rows;
-    block0.key_stride = HEAD_DIM;
-    block0.value_stride = HEAD_DIM;
-    block0.window = static_cast<int>(layer.local_cache_capacity());
-
-    CausalAttentionBlock block1;
-    if (layer.spec().attention_kind == V4AttentionKind::HCA && committed > 0) {
-        block1.keys = layer.d_compressed_key_cache;
-        block1.values = layer.d_compressed_value_cache;
-        block1.positions = layer.d_compressed_positions;
-        block1.rows = static_cast<int>(committed);
-        block1.key_stride = HEAD_DIM;
-        block1.value_stride = HEAD_DIM;
-        block1.window = 0;
-    }
-
-    aeon::dispatch_causal_attention_wmma_qk_fp16(
-        q, q_stride, block0, block1, query_position_base, 1, out, out_stride,
         count, static_cast<int>(kernel::DSV4_NUM_HEADS), HEAD_DIM,
         layer.d_attn_sink, kernel::DSV4_ATTN_SCALE, stream);
 }

@@ -1005,7 +1005,7 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
             views[row] = workspace.row(row);
         }
 
-        if (attention_tile_enabled() && attention_tile_supported(layer)) {
+        if (attention_tile_enabled()) {
             // One attention launch for the whole chunk, then the per-token tail. The
             // kernel compacts each query's own window out of the union, so a wide union
             // costs nothing, and the full chunk is what fills the grid.

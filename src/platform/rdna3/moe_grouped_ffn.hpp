@@ -38,7 +38,7 @@
 //
 // The slab is single-buffered. Double-buffering it (stage block n+1 while block n
 // multiplies) was built and measured slower: the slab costs LDS per wave, and the
-// occupancy lost outweighs the latency hidden. See the plan for the measurement.
+// occupancy lost outweighs the latency hidden (`6.2 → 8.8 ms` on the gate half).
 //
 // Partially filled M tiles (an expert whose token count is not a multiple of 16) are
 // padded by repeating a resident token's row and masked at the store, rather than

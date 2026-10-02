@@ -3,14 +3,13 @@
 //
 // ## What question this answers
 //
-// Step 1 of the kernel plan replaces the per-token expert GEMVs with a grouped
-// WMMA GEMM on the theory that it is "the largest gain". That theory has a
+// A grouped WMMA GEMM replaces the per-token expert GEMVs on the theory that it is
+// "the largest gain". That theory has a
 // premise — that a chunk's tokens-per-expert is high enough for the M dimension to
 // amortise the weight read — and the premise is not obvious: with 256 routed
 // experts and 6 slots, a chunk of a few hundred tokens is a few hundred draws over
-// a few hundred distinct experts, i.e. a handful of tokens each. So the plan's
-// Step 6 asks for the chunk size to be chosen so the mean reaches 16, and this
-// file measures whether it does and what that buys.
+// a few hundred distinct experts, i.e. a handful of tokens each. This file measures
+// whether the mean reaches 16 tokens per expert and what that buys.
 //
 // ## The two quantities, and why they are not the same measurement
 //
@@ -28,7 +27,7 @@
 //     kernel gives each workgroup one (N tile, M tile) pair and loops K inside it, so
 //     an expert holding 80 tokens is re-dequantized six times.
 //   * **grouped, if the slab were reused across token tiles** — one expert read per
-//     distinct expert, which is what the plan's Step 1 asks for.
+//     distinct expert.
 //
 // Reporting only the third would overstate the kernel; reporting only the second
 // would hide the target. Both are shown, so the remaining work is a number rather
@@ -156,7 +155,7 @@ struct Permutation {
     // The kernel walks K inside a fixed (N tile, M window) workgroup, so an expert
     // spanning `ceil(count / (16 * window_tiles))` windows has its weight slab
     // dequantized that many times. A window large enough to hold the expert makes it
-    // one read, which is the target; the plan's per-K-tile reuse is exactly this
+    // one read, which is the target; per-K-tile reuse is exactly this
     // quantity reaching `distinct`. This is what keeps the ideal figure from
     // standing in for the measured one.
     long expert_reads(int window_tiles) const {
@@ -771,7 +770,7 @@ int main(int argc, char** argv) {
 
             // The grouped arm reads each expert once per M window it spans; a window
             // large enough to hold the expert makes it one read, which is the target
-            // the plan's per-K-tile reuse names.
+            // the per-K-tile reuse targets.
             const double grouped_bytes =
                 static_cast<double>(permutation.expert_reads(window_tiles)) * expert_bytes;
             const double ideal_bytes = static_cast<double>(distinct) * expert_bytes;

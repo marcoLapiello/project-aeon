@@ -65,7 +65,7 @@ constexpr double kLimit = 10.0;
 //
 // Every dequantized weight is a 4-bit integer times a power-of-two scale, so it is
 // exactly representable in fp16 — the *only* device rounding in the whole pair is
-// the `hidden` store. That is why the composed bound can sit at the plan's ε
+// the `hidden` store. That is why the composed bound can sit at the stated ε
 // instead of being loosened to absorb a chain of roundings: a value materially
 // above it means the arithmetic is wrong, not that it drifted.
 constexpr double kHiddenTol = 8e-3;

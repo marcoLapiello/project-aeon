@@ -108,15 +108,6 @@ std::vector<uint8_t> read_bytes(const void* source, size_t bytes) {
     return host;
 }
 
-size_t differing_bytes(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
-    if (a.size() != b.size()) return a.size() + b.size();
-    size_t differing = 0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i] != b[i]) ++differing;
-    }
-    return differing;
-}
-
 } // namespace
 
 int main(int argc, char** argv) {

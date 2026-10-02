@@ -25,16 +25,4 @@ inline AeonArtifactSpec make_current_swizzled_artifact_spec() {
     return AeonArtifactSpec{};
 }
 
-inline bool is_current_swizzled_artifact_spec(const AeonArtifactSpec& artifact) noexcept {
-    const auto current = make_current_swizzled_artifact_spec();
-    return artifact.dense_filename == current.dense_filename &&
-           artifact.experts_filename == current.experts_filename &&
-           artifact.index_filename == current.index_filename &&
-           artifact.expected_dense_version == current.expected_dense_version &&
-           artifact.expert_format_kind == current.expert_format_kind &&
-           artifact.expected_expert_version == current.expected_expert_version &&
-           artifact.expert_sector_size == current.expert_sector_size &&
-           artifact.expected_expert_payload_bytes == current.expected_expert_payload_bytes;
-}
-
 } // namespace aeon::core

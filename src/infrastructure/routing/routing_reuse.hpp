@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// Decode routing reuse-distance profiler (Phase 1 of the routing study).
+// Decode routing reuse-distance profiler.
 //
 // The question this answers is not "does routing concentrate in aggregate" —
 // that is what `RoutingCounter`/`RoutingProfile` already measure — but **"is

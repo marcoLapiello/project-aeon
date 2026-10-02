@@ -530,7 +530,7 @@ int main() {
     executor.loader = nullptr;
     executor.scratch = &scratch;
     executor.stream = 0;
-    // Trap 38: a loop gate must state which MoE accumulation it requires. This
+    // A loop gate must state which MoE accumulation it requires. This
     // one is state-shaped rather than arithmetic-shaped, but a nondeterministic
     // accumulation would still make the *captured* state unreproducible between
     // runs, and the bit-identical comparisons in section C are only meaningful

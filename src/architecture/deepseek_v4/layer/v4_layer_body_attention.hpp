@@ -67,7 +67,7 @@ inline void run_pre_attention_mix(
 
 // The F/G block for a chunk: HC post expansion, HC FFN pre-mix, Sinkhorn, pre-combine
 // and the FFN RMSNorm — the per-row twin of `run_pre_attention_mix_batch`, and the
-// largest per-row term left after Area 5's A. Every stage takes its token on a grid
+// largest per-row term left after the pre-attention mix. Every stage takes its token on a grid
 // axis (`hc_post`, `hc_project` and `hc_pre_combine` on `blockIdx.y`; the Sinkhorn and
 // the RMSNorm on `blockIdx.x`), and the two casts are flat over the chunk's contiguous
 // per-token buffers, so the batch is the row count. Decode keeps the inline form in

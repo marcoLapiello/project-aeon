@@ -99,7 +99,7 @@ struct ExpertTierState {
         LayerBatchSupply* supply{nullptr};
     };
 
-    // Steps 10–12 of the assembly: the Hot pool, the pinned region and the staging
+    // The Hot pool, the pinned region and the staging
     // corridor, the Warm/staging partition, the residency registry, the direct reader
     // and the batched Hot/Warm preload — in the one order they must happen.
     //

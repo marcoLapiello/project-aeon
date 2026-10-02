@@ -139,7 +139,7 @@ struct AeonRuntimeConfig {
     // evictions allowed in flight before the rest are dropped with `queue_pressure`.
     uint64_t demotion_queue_capacity{0};
 
-    // Phase 1 of the routing study: profile decode routing reuse distances. Off by
+    // Profile decode routing reuse distances. Off by
     // default; when on, the host enables the profiler and `aeon_chat` prints an
     // ideal-LRU hit-rate curve next to the measured Hot hit rate.
     bool profile_routing_reuse{false};

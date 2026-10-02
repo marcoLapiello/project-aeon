@@ -533,7 +533,7 @@ public:
     }
     uint64_t supply_h2d_bytes() const noexcept { return tier_.telemetry.lifetime_h2d_bytes(); }
 
-    // Routing reuse-distance profiling (Phase 1 of the routing study): a separate
+    // Routing reuse-distance profiling: a separate
     // module with its own switch, not part of the supply telemetry.
     bool routing_reuse_enabled() const noexcept {
         return tier_.reuse_profiler.enabled();

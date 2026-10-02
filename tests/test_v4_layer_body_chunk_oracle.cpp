@@ -757,8 +757,7 @@ int main() {
     // C3. Tiled attention (all three classes) vs the per-token attention
     // -------------------------------------------------------------------
     // The tile reorders the same arithmetic over a shared row-set, so it is compared
-    // at an fp16 tolerance, not bit-exact — the bar Steps 2–3 moved their chunk
-    // comparisons to.
+    // at an fp16 tolerance, not bit-exact.
     std::cout << "\n--- C3. tiled attention vs per-token (fp16 tolerance) ---\n";
     {
         std::vector<uint32_t> tiled_plan;
@@ -766,10 +765,6 @@ int main() {
         tiled_plan.push_back(2);
         constexpr double kTol = 2e-2;
         for (size_t li = 0; li < stack.size(); ++li) {
-            if (!aeon::core::attention_tile_supported(stack[li].device)) {
-                std::printf("  [%s] CSA keeps the scalar path — skipped\n", stack[li].label);
-                continue;
-            }
             reset_all();
             aeon::core::attention_tile_enabled() = false;
             const std::vector<TokenRecord> reference = run_layer_schedule(
