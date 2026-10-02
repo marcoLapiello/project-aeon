@@ -25,9 +25,8 @@ namespace aeon::core {
 
 class ExpertRegistry {
 public:
-    // How a prefill obtains VRAM for its loads. Both policies share the same marks,
-    // restore set, sparing release, and restoring end; only the no-free-slot case
-    // differs.
+    // How a prefill obtains VRAM for its loads. Both policies share the same marks
+    // and sparing release; only the no-free-slot case differs.
     enum class PrefillAlloc : uint8_t {
         // The sweep: whole-layer loads in layer order. Allocation is free-list only,
         // because the sweep's order decides what is dead and a preserved resident is
@@ -52,9 +51,6 @@ public:
     // edit rather than a reallocation or a catalog re-map. Equals `host_capacity`
     // until the first move.
     uint32_t host_capacity_usable{0};
-    // Warm residents surrendered to the corridor by a boundary move, for re-admission
-    // at `prefill_end` (see `host_restore_set`).
-    std::vector<uint32_t> host_restore_set_;
 
     std::vector<ExpertCatalogEntry> catalog;
     std::vector<int32_t> vram_slots;
@@ -131,7 +127,6 @@ public:
         host_slots.assign(host_capacity, -1);
         host_slot_reservations.assign(host_capacity, 0);
         host_capacity_usable = host_capacity;
-        host_restore_set_.clear();
         free_host_slots.clear();
         for (uint32_t slot = host_capacity; slot-- > 0;) {
             free_host_slots.push_back(slot);
@@ -671,23 +666,12 @@ public:
 
     // ---- the Warm/staging partition ------------------------------------------
     //
-    // Definitions live in `warm_partition.hpp`; the movable boundary and the
-    // borrow/restore semantics are documented there.
+    // Definitions live in `warm_partition.hpp`; the movable boundary is documented there.
     uint32_t usable_host_capacity() const noexcept;
-    const std::vector<uint32_t>& host_restore_set() const noexcept;
-    void clear_host_restore_set() noexcept;
-    int32_t take_free_host_slot();
-    void admit_warm(uint32_t gid, uint32_t slot);
     void grow_host_capacity(uint32_t usable);
     void shrink_host_capacity(uint32_t usable);
     uint32_t release_host_tail(uint32_t keep);
 
-    // The Hot residents the last prefill drained at entry, in drain order
-    // (worst-LRU first). The caller reloads them through the normal cold path after
-    // `end_prefill_stream()`, so decode resumes on the pre-prefill set. Empty when
-    // the prefill preserved the whole pool, and overwritten by the next
-    // `begin_prefill_stream`.
-    const std::vector<uint32_t>& restore_set() const noexcept { return restore_set_; }
     uint32_t preserved_resident_count() const noexcept {
         uint32_t count = 0;
         for (const auto& entry : catalog) {
@@ -1066,9 +1050,6 @@ private:
     bool prefill_stream_{false};
     // How a prefill load with no free slot is answered. See `PrefillAlloc`.
     PrefillAlloc prefill_alloc_{PrefillAlloc::FreeListOnly};
-    // The Hot residents drained at `begin_prefill_stream`, for the caller to reload
-    // after `end_prefill_stream`. See `restore_set()`.
-    std::vector<uint32_t> restore_set_;
     std::vector<int32_t> shadow_slot_of_expert_;
     std::list<uint32_t> shadow_lru_;
 };

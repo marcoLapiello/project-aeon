@@ -37,53 +37,6 @@ namespace aeon::core {
 // How many region slots the Warm tier may use right now.
 inline uint32_t ExpertRegistry::usable_host_capacity() const noexcept { return host_capacity_usable; }
 
-// The Warm residents a boundary move surrendered to the corridor, in the order
-// they were released. The caller re-admits them at `prefill_end` so a window
-// leaves the Warm tier **as it found it** — the frozen-prefill guarantee, and the
-// reason a move is a borrow rather than a loss. Cleared by `clear_host_restore_set`
-// once they have been restored.
-inline const std::vector<uint32_t>& ExpertRegistry::host_restore_set() const noexcept { return host_restore_set_; }
-
-inline void ExpertRegistry::clear_host_restore_set() noexcept { host_restore_set_.clear(); }
-
-// Take a free region slot for a Warm re-admission, or -1 when none is free.
-inline int32_t ExpertRegistry::take_free_host_slot() {
-    if (free_host_slots.empty()) return -1;
-    const int32_t slot = static_cast<int32_t>(free_host_slots.back());
-    free_host_slots.pop_back();
-    return slot;
-}
-
-// Give `gid` Warm ownership of `slot`. The caller has already filled the slot's
-// payload, so this is the bookkeeping half of a re-admission: owner, slot map, and
-// LRU. Rejects an expert that is not Cold — an entry that still holds a residency
-// would end up with two, which is the one thing the tier model forbids.
-inline void ExpertRegistry::admit_warm(uint32_t gid, uint32_t slot) {
-        if (gid >= catalog.size()) {
-            throw std::out_of_range("ExpertRegistry: re-admitted expert is out of range");
-        }
-        if (slot >= host_capacity_usable) {
-            throw std::out_of_range("ExpertRegistry: re-admission slot is outside Warm");
-        }
-        auto& entry = catalog[gid];
-        if (entry.owner != ExpertTier::COLD_NVME || entry.slot_idx != -1) {
-            throw std::logic_error(
-                "ExpertRegistry: re-admitting expert " + std::to_string(gid) +
-                " that still holds a residency (owner=" +
-                std::to_string(static_cast<int>(entry.owner)) +
-                ", slot=" + std::to_string(entry.slot_idx) + ")");
-        }
-        if (host_slots[slot] >= 0 || host_slot_reservations[slot] != 0) {
-            throw std::logic_error("ExpertRegistry: re-admission slot is already in use");
-        }
-        entry.owner = ExpertTier::WARM_HOST;
-        entry.slot_idx = static_cast<int32_t>(slot);
-        entry.slot_state = ExpertSlotState::ACTIVE;
-        host_slots[slot] = static_cast<int32_t>(gid);
-        push_lru_front(entry, warm_host_lru);
-        checked_validate();
-    }
-
 // Move the boundary **upward**: return slots to the Warm free list. Callers do
 // this when a prefill window ends. Slots that were never surrendered are already
 // in the list, so only the newly recovered range is added.
@@ -154,9 +107,6 @@ inline uint32_t ExpertRegistry::release_host_tail(uint32_t keep) {
             entry.owner = ExpertTier::COLD_NVME;
             entry.slot_idx = -1;
             entry.slot_state = ExpertSlotState::UNALLOCATED;
-            // Remembered so the caller can put them back: the corridor's borrow must
-            // not cost Warm its cache, only the re-read.
-            host_restore_set_.push_back(static_cast<uint32_t>(gid));
             ++released;
         }
         checked_validate();

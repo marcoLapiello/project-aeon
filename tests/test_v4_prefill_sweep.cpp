@@ -11,10 +11,10 @@
 //   B. WARM PRESERVED. Warm's resident set is identical before and after the whole
 //      swept window, because the sweep allocates Hot from the free list only and
 //      releases by layer; it never promotes from Warm and never demotes into it.
-//   C. RESTORED ON EXIT. The window hands decode back the set it had before the
-//      pass: the preserved residents never left, and the drained set is reloaded
-//      through the normal cold path. No shadow survives (decode admits single
-//      ownership), no lease leaks, and the registry invariants hold throughout.
+//   C. CLEAN EXIT. The preserved residents never left, and the drained Hot slots and
+//      the borrowed Warm slots are handed to decode empty (decode fills free slots
+//      before it evicts). No shadow survives (decode admits single ownership), no
+//      lease leaks, and the registry invariants hold throughout.
 //   D. NON-VACUOUS AND CORRECT. Every layer is visited exactly once and its missing
 //      experts streamed once (`streamed + preserved == layers x experts_per_layer`),
 //      the lookahead holds more than one layer's worth (so it is a sliding window,
@@ -129,6 +129,9 @@ int main() {
     std::printf("  the prefill sweep: bounded drain, layer order, restore\n");
     std::printf("================================================================================\n");
     aeon::core::select_compute_device(true);
+    // The tiled attention and grouped experts reorder sums; bit-exactness is only a residency check on the scalar path.
+    aeon::core::attention_tile_enabled() = false;
+    aeon::core::moe_grouped_batch_enabled() = false;
 
     aeon::core::AeonRuntimeConfig runtime;
     runtime.context_size = kContext;
@@ -184,21 +187,8 @@ int main() {
     host.prefill_begin(kWindow);
     const bool streaming = host.registry().prefill_streaming();
     const uint32_t hot_after_drain = host.prefill_sweep().hot_after_drain();
-    const std::vector<uint32_t> drained = host.registry().restore_set();
     const std::set<uint32_t> preserved = hot_set(host);
-    // The set the drain actually saw at the switch point: what it preserved, plus
-    // what it freed (which the window must hand back). Referenced from the drain
-    // itself rather than a pre-switch capture, because the switch reaps in-flight
-    // transfers before it drains, so a pre-switch capture would differ by whatever
-    // the reap settled.
-    std::set<uint32_t> switch_hot = preserved;
-    switch_hot.insert(drained.begin(), drained.end());
-    bool preserved_disjoint_from_drained = true;
-    for (uint32_t gid : drained) {
-        if (preserved.find(gid) != preserved.end()) {
-            preserved_disjoint_from_drained = false;
-        }
-    }
+    const size_t drained = host.registry().vram_capacity - preserved.size();
     // Warm's baseline for the *sweep* is taken after the switch, not before it, for
     // the same settling reason.
     const std::set<uint32_t> warm_before = warm_set(host);
@@ -222,16 +212,9 @@ int main() {
         ? 2u * per_layer
         : per_layer;
     assert_that("B: the drain was bounded to the pass's need",
-                drained.size() == expected_drain && hot_after_drain > 0,
-                std::to_string(drained.size()) + " drained, " +
+                drained == expected_drain && hot_after_drain > 0,
+                std::to_string(drained) + " drained, " +
                     std::to_string(hot_after_drain) + " preserved");
-    assert_that("B: preserved and drained partition the switch-point pool",
-                preserved_disjoint_from_drained &&
-                    static_cast<size_t>(hot_after_drain) + drained.size() ==
-                        vram_capacity,
-                std::to_string(hot_after_drain) + " preserved + " +
-                    std::to_string(drained.size()) + " drained = " +
-                    std::to_string(vram_capacity));
     assert_that("B: no shadow existed to survive the switch", shadows_before_switch == 0,
                 std::to_string(shadows_before_switch) + " decode-era shadows");
 
@@ -249,35 +232,27 @@ int main() {
                 host.prefill_sweep().frontier_depth() > 1,
                 std::to_string(host.prefill_sweep().frontier_depth()) + " layers deep");
 
-    assert_that("C: the Hot set is restored to its switch-point set",
-                hot_after == switch_hot,
-                std::to_string(hot_after.size()) + " Hot, expected " +
-                    std::to_string(switch_hot.size()));
+    assert_that("C: Hot leaves the window holding exactly the preserved set",
+                hot_after == preserved &&
+                    host.registry().free_vram_slot_count() == drained,
+                std::to_string(hot_after.size()) + " Hot, " +
+                    std::to_string(host.registry().free_vram_slot_count()) + " free");
     assert_that("C: no shadow survives the window",
                 host.registry().shadow_resident_count() == 0,
                 std::to_string(host.registry().shadow_resident_count()) + " shadows");
     assert_that("C: streaming mode was left", !host.registry().prefill_streaming(),
                 "unfrozen");
-    // The window **borrows** part of the Warm pool for its corridor: `prefill_begin`
-    // hands the swept partition's difference to the staging arena (they share one
-    // pinned region) and `prefill_end` hands it back and re-admits those experts
-    // (`registry.host_restore_set`). So the thing to assert is exactly that:
-    // **everything the borrow took was returned**. Comparing whole Warm sets would
-    // instead measure decode's in-flight traffic — a promotion completing as the switch
-    // reaps leaves Warm, a demotion completing enters it — which is why the symmetric
-    // `warm_before_switch` delta is reported rather than asserted.
-    std::set<uint32_t> borrowed;
+    // The window borrows part of Warm for its corridor and hands those slots back
+    // empty; every resident it did not borrow must survive the window.
+    size_t borrowed = 0;
     for (uint32_t gid : warm_before_switch) {
-        if (warm_before.find(gid) == warm_before.end()) borrowed.insert(gid);
+        if (warm_before.find(gid) == warm_before.end()) ++borrowed;
     }
-    size_t warm_not_returned = 0;
-    for (uint32_t gid : borrowed) {
-        if (warm_after.find(gid) == warm_after.end()) ++warm_not_returned;
-    }
-    assert_that("B: the corridor's Warm borrow was fully returned",
-                warm_not_returned == 0,
-                std::to_string(borrowed.size()) + " borrowed, " +
-                    std::to_string(warm_not_returned) + " not returned");
+    assert_that("B: Warm kept every resident the corridor did not borrow",
+                warm_after == warm_before,
+                std::to_string(borrowed) + " borrowed, " +
+                    std::to_string(set_difference_size(warm_before, warm_after)) +
+                    " differing");
     (void)switch_drift;  // reported for context; the borrow above is the assertion
     assert_that("C: no lease leaked", host.outstanding_expert_leases() == 0,
                 std::to_string(host.outstanding_expert_leases()) + " outstanding");

@@ -691,7 +691,7 @@ int main() {
     // The engine's prompt is one layer-major window, and the sweep is a **config**
     // decision rather than a hidden threshold: with `prefill_sweep` on and a prompt
     // at least the gate long it bounds its drain to what the pass needs, streams whole
-    // layer sets in computation order, and restores the pool on exit; below the gate,
+    // layer sets in computation order, and keeps the preserved residents on exit; below the gate,
     // or with the sweep off, none of that happens. The assertion therefore runs in
     // both directions.
     //

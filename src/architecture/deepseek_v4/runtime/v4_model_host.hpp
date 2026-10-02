@@ -600,49 +600,6 @@ public:
 
     void prefill_end() { prefill_controller_.end(); }
 
-    // Re-admit the Warm residents a boundary move surrendered. `release_host_tail`
-    // recorded them; each is read back into a free Warm slot through the same blocking
-    // `O_DIRECT` path the startup preload uses, so the tier ends the window as it began
-    // it. The cost is the re-read and nothing else — the corridor's rent, which a
-    // smaller `--staging-blocks` declines to pay.
-    void restore_prefill_warm(const ExpertFormatDescriptor& format) {
-        const std::vector<uint32_t> restore = tier_.registry.host_restore_set();
-        if (restore.empty()) return;
-        const uint32_t per_layer = tier_.registry.experts_per_layer;
-        const size_t batch = std::max<size_t>(
-            1, tier_.direct_io.submission_capacity() / ExpertDirectIO::requests_per_fragment(format));
-        // Advance a single cursor rather than stepping `start` by a whole batch: a batch
-        // that runs out of room must **stop**, not skip the experts it could not place.
-        // (Stepping the outer loop by `batch` after an inner break silently dropped the
-        // remainder of that batch, which is a restoration gap, not a capacity limit.)
-        size_t cursor = 0;
-        while (cursor < restore.size()) {
-            std::vector<std::pair<uint32_t, uint32_t>> expert_ids;
-            std::vector<uint8_t*> destinations;
-            while (cursor < restore.size() && expert_ids.size() < batch) {
-                const uint32_t gid = restore[cursor++];
-                const int32_t slot = tier_.registry.take_free_host_slot();
-                if (slot < 0) {
-                    // The tier is full. Concurrent decode residency took the room the
-                    // borrowed expert would need — the pool is a fixed size, so an
-                    // admission during the window displaces a restoration. The
-                    // remainder stay Cold and are re-read on demand, which is the same
-                    // cost as the borrow itself.
-                    cursor = restore.size();
-                    break;
-                }
-                tier_.registry.admit_warm(gid, static_cast<uint32_t>(slot));
-                expert_ids.emplace_back(gid / per_layer, gid % per_layer);
-                destinations.push_back(
-                    tier_.host_pool.get_expert_slot_ptr(static_cast<uint32_t>(slot)));
-            }
-            if (!expert_ids.empty()) {
-                tier_.direct_io.read_blocking(loader_, expert_ids, destinations);
-            }
-        }
-        tier_.registry.clear_host_restore_set();
-    }
-
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
     // streamed, and the deepest frontier the lookahead reached.
     const PrefillSweep& prefill_sweep() const noexcept { return prefill_controller_.sweep(); }
@@ -829,9 +786,7 @@ private:
             : std::max<uint32_t>(
                   1, (static_cast<uint32_t>(config_.n_routed_experts) * 3u) / 4u);
         prefill_controller_.bind(PrefillController::Services{
-            &streams_, &supply_, executor_.get(), &tier_.registry, &tier_.host_partition,
-            [this] { restore_prefill_warm(loader_.expert_format()); },
-            [this] { tier_.bulk_loader.restore_residents(loader_.expert_format()); }});
+            &streams_, &supply_, executor_.get(), &tier_.registry, &tier_.host_partition});
         prefill_controller_.configure(runtime_cfg.prefill_sweep, sweep_min_tokens);
         // Let the per-token hook pump the swept lookahead's copies. The executor does
         // not know about the sweep, so it gets a callback; the sweep ignores the call

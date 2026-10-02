@@ -51,7 +51,7 @@ The host has `62.62 GiB` and the pinned config plus the runtime's own allocation
 | — | `compose_local_rows` gather | **Done** |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Partly** — E2, A, C, E1 and all of F/G (incl. the FFN norm and the dead replication) batched; E3/E3b/E4 (compressor/indexer feed) remain per-row |
 | 6 | Tune for gfx1100 | **Partly** — attention closed by the head-group kernel; expert-shape/kernel sweeps open |
-| 7 | Re-measure and retune supply | **Open** — prefill is NVMe-bound (timeline below); next: the restore off the TTFT path |
+| 7 | Re-measure and retune supply | **Partly** — end-of-prefill restore removed (TTFT `25.3 → 20.8 s`); prefill is NVMe-bound at the drive's ceiling |
 | 8 | Batch the indexer scores over the chunk | **Done** — `4.47 → 0.07 s`; pre-attention GPU `−59%`, TTFT `29.1 → 25.1 s` |
 
 ## Phase profile
@@ -473,7 +473,7 @@ The split kernel is now a template on its warp count (`WARPS`, default `4`) so t
 ### Area 7: Move the bottleneck back to supply — **open**
 
 - Measured (baseline timeline): compute is now faster than supply, and the sweep's NVMe reads are already minimal — `8,896` experts (`117.3 GiB`) `= 11,008 − 1,886` Warm-sourced `− 226` preserved Hot, at `~5.8 GiB/s` (the drive's ceiling). No resident is re-streamed; the `nvme_gib` printed beside the sweep was the **whole run's** NVMe (prefill + decode) and is now `run_nvme_gib`. The levers left:
-  - the end-of-prefill restore (`512` drained Hot + `756` Warm slots the staging arena borrowed, re-read blocking) sits before the first token: skipping it measured TTFT `25.3 → 20.9 s` with decode `3.56 → 3.49 tok/s` (noise) — move it off the TTFT path rather than drop it;
+  - **the end-of-prefill restore is removed**, with the registry state that existed only for it. Decode already takes free slots first (Hot fills from demand within ~2 tokens; Warm refills from Hot→Warm demotions at no NVMe cost), so the blocking re-read bought nothing. A/B, pinned config, `256` decoded tokens, one process at a time: TTFT `25.29 → 20.83 s`; decode `4.05 → 4.05 tok/s`; decode Warm/cold hits `19,897/8,348 → 19,770/8,483`. Warm is frozen *during* the prefill; its content after it is decode's to rebuild;
   - the staging arena's Warm borrow costs its experts twice (read in the sweep, re-read in the restore).
 
 ### Area 8: Batch the indexer scores over the chunk — **done**

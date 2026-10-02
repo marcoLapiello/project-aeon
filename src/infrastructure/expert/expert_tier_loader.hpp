@@ -1,15 +1,13 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// The expert tier's bulk load and restore.
+// The expert tier's bulk load.
 //
-// Three routines that read whole expert payloads from the artifact with batched
+// Two routines that read whole expert payloads from the artifact with batched
 // `O_DIRECT` and place them in the tier's pools:
 //
 //   * `preload_hot`  — every Hot VRAM resident, once, at load;
-//   * `preload_warm` — every Warm host resident, once, at load;
-//   * `restore_residents` — the Hot residents a prefill drained, at the window
-//     boundary, through the normal cold path (reserve → read → publish → release).
+//   * `preload_warm` — every Warm host resident, once, at load.
 //
 // None of it is model-specific: it moves fixed-size payloads into slots the
 // `ExpertRegistry` names, and it knows only the container's format and the pools.
@@ -118,57 +116,6 @@ public:
                 destinations.push_back(services_.host_pool->get_expert_slot_ptr(slot));
             }
             services_.direct_io->read_blocking(*services_.source, expert_ids, destinations);
-        }
-    }
-
-    // Reloads the Hot residents a prefill drained, so the pool returns to the set it
-    // held before the pass. The gids come from the registry's `restore_set()`; each is
-    // admitted through the normal cold path — reserve a slot, read the payload, publish
-    // it — which is the same machinery decode uses, so nothing here is a second code
-    // path. It runs at a boundary (the prefill has already ended), so its blocking
-    // reads are off the hot path, and it is batched exactly like `preload_hot`.
-    void restore_residents(const ExpertFormatDescriptor& format) {
-        const std::vector<uint32_t> restore = services_.registry->restore_set();
-        if (restore.empty()) return;
-        const uint32_t per_layer = services_.registry->experts_per_layer;
-        const size_t batch = std::max<size_t>(
-            1, services_.direct_io->submission_capacity() /
-                   ExpertDirectIO::requests_per_fragment(format));
-        for (size_t start = 0; start < restore.size(); start += batch) {
-            const size_t end = std::min(restore.size(), start + batch);
-            std::vector<uint32_t> operation_ids;
-            std::vector<int32_t> slots;
-            std::vector<std::pair<uint32_t, uint32_t>> expert_ids;
-            std::vector<aeon::io::AlignedBuffer> buffers;
-            operation_ids.reserve(end - start);
-            for (size_t i = start; i < end; ++i) {
-                const uint32_t gid = restore[i];
-                const auto request = services_.registry->reserve_request_by_gid(
-                    gid, 0, *services_.demotion_queue_capacity);
-                if (request.kind != ExpertRequestKind::COLD_MISS || request.vram_slot < 0) {
-                    throw std::runtime_error(
-                        "ExpertTierLoader: a drained prefill resident was not cold at restore");
-                }
-                operation_ids.push_back(request.operation_id);
-                slots.push_back(request.vram_slot);
-                expert_ids.emplace_back(gid / per_layer, gid % per_layer);
-                buffers.emplace_back(format.payload_bytes, format.sector_size);
-            }
-            std::vector<uint8_t*> destinations;
-            destinations.reserve(buffers.size());
-            for (auto& buffer : buffers) {
-                destinations.push_back(static_cast<uint8_t*>(buffer.data()));
-            }
-            services_.direct_io->read_blocking(*services_.source, expert_ids, destinations);
-            for (size_t i = 0; i < slots.size(); ++i) {
-                services_.payload_pool->upload_from_host_expert(
-                    static_cast<uint32_t>(slots[i]), destinations[i], services_.compute);
-            }
-            CHECK_HIP(hipStreamSynchronize(services_.compute));
-            for (size_t i = 0; i < operation_ids.size(); ++i) {
-                services_.registry->complete_request(operation_ids[i]);
-                services_.registry->release_lease(restore[start + i]);
-            }
         }
     }
 

@@ -140,8 +140,8 @@ public:
     // (`2E`). So it frees `2E` when `H >= 2E`, else `E` — the worst-LRU residents
     // first — and leaves the remainder **preserved** (the registry marks it). An
     // `H < E` pool is infeasible and never reaches here. Freeing only what the pass
-    // needs is what lets decode's set survive the prefill; whatever is genuinely
-    // freed is recorded as the registry's restore set and reloaded at the end.
+    // needs is what lets decode's set survive the prefill; the freed slots are handed
+    // to decode empty at the end.
     //
     // Layer 0's reads are **issued here, not waited for**: `before_layer(0)` — which
     // the driver calls immediately after — materializes them. Nothing is gained in

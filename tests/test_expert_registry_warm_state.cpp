@@ -215,12 +215,12 @@ int main() {
     }
     assert(rejected_zero_hot);
 
-    // --- Prefill restore infrastructure (Prefill Supply Strategy plan, Step 1) ---
+    // --- Bounded prefill drain ---
     //
     // The pool holds 8 Hot residents out of 16 experts across 4 layers. A prefill
     // that drains only 4 preserves the other 4; the per-layer release must spare the
     // preserved ones and return the prefill-admitted ones, and ending must leave the
-    // marks cleared and the drained set exposed for the caller to reload.
+    // marks cleared and the drained slots free.
     {
         std::vector<uint32_t> pre_fill_hot;
         {
@@ -238,15 +238,10 @@ int main() {
             assert(prefill.invariants_hold());
             assert(prefill.published_hot_slots() == 4);
             assert(prefill.free_vram_slot_count() == 4);
-            assert(prefill.restore_set().size() == 4);
             assert(prefill.preserved_resident_count() == 4);
             for (const auto& entry : prefill.catalog) {
                 if (entry.resident_at_prefill_begin) {
                     assert(entry.owner == aeon::core::ExpertTier::HOT_VRAM);
-                    const bool drained =
-                        std::find(prefill.restore_set().begin(), prefill.restore_set().end(),
-                                  entry.global_expert_id) != prefill.restore_set().end();
-                    assert(!drained);
                 }
             }
 
@@ -278,7 +273,7 @@ int main() {
             assert(prefill.invariants_hold());
             assert(prefill.preserved_resident_count() == 0);
 
-            // Exactly the preserved residents remain, and the drained set is exposed.
+            // Exactly the preserved residents remain; the drained slots are free.
             std::vector<uint32_t> hot_after;
             for (const auto& entry : prefill.catalog) {
                 if (entry.owner == aeon::core::ExpertTier::HOT_VRAM) {
@@ -286,26 +281,11 @@ int main() {
                 }
             }
             assert(hot_after.size() == 4);
+            assert(prefill.free_vram_slot_count() == 4);
             for (const uint32_t gid : hot_after) {
                 assert(std::find(pre_fill_hot.begin(), pre_fill_hot.end(), gid) !=
                        pre_fill_hot.end());
             }
-
-            // The caller reloads the drained set through the normal cold path; the
-            // pre-prefill set is then resident again, byte-for-byte the same set.
-            for (const uint32_t gid : prefill.restore_set()) {
-                admit(gid);
-            }
-            std::vector<uint32_t> restored;
-            for (const auto& entry : prefill.catalog) {
-                if (entry.owner == aeon::core::ExpertTier::HOT_VRAM) {
-                    restored.push_back(entry.global_expert_id);
-                }
-            }
-            std::sort(restored.begin(), restored.end());
-            std::vector<uint32_t> expected = pre_fill_hot;
-            std::sort(expected.begin(), expected.end());
-            assert(restored == expected);
             assert(prefill.invariants_hold());
         }
 
@@ -317,7 +297,7 @@ int main() {
             assert(full.invariants_hold());
             assert(full.published_hot_slots() == 0);
             assert(full.preserved_resident_count() == 0);
-            assert(full.restore_set().size() == 8);
+            assert(full.free_vram_slot_count() == 8);
             for (uint32_t layer = 0; layer < 4; ++layer) {
                 full.release_layer(layer);
             }

@@ -34,7 +34,7 @@ namespace aeon::core {
 //
 //   begin_prefill_stream()  marks every Hot resident present at entry, then
 //                           drains only the worst-LRU residents the pass needs
-//                           (up to `drain_slots`) into a restore set; the marked
+//                           (up to `drain_slots`); the marked
 //                           remainder is **preserved**. Warm and its LRU ranking
 //                           are untouched for the whole pass;
 //   release_layer(L)        returns one computed layer's prefill-admitted set
@@ -43,8 +43,7 @@ namespace aeon::core {
 //   end_prefill_stream()    requires that no prefill-admitted resident is left,
 //                           which the per-layer release guarantees by
 //                           construction, and clears the mode so decode resumes
-//                           on the preserved set plus the caller's reload of
-//                           `restore_set()`.
+//                           on the preserved set, with the drained slots free.
 //
 // Both modes are still expressed over the same catalog, so `invariants_hold()`
 // checks the switch as tightly as it checks a decode step.
@@ -56,8 +55,7 @@ namespace aeon::core {
 // **worst-LRU** residents are drained first (the most-recently-used are the ones
 // worth keeping) and the rest are **preserved**. The default covers the whole
 // pool, which is the original full drain; a strategy that needs only a bounded
-// working set passes its own figure and keeps the remainder resident. Whatever
-// is drained is recorded in `restore_set()` for the caller to reload at the end.
+// working set passes its own figure and keeps the remainder resident.
 //
 // `alloc` chooses how a load with no free slot is answered: the sweep's
 // free-list-only policy, or the routed bank's release-based eviction.
@@ -91,8 +89,7 @@ inline void ExpertRegistry::begin_prefill_stream(uint32_t drain_slots, PrefillAl
         shadow_slot_of_expert_.assign(total_experts, -1);
         std::fill(vram_slot_reservations.begin(), vram_slot_reservations.end(), 0);
 
-        // Drain the worst-LRU residents, up to `drain_slots`, into the restore set.
-        restore_set_.clear();
+        // Drain the worst-LRU residents, up to `drain_slots`.
         uint32_t remaining = std::min<uint32_t>(
             drain_slots, static_cast<uint32_t>(hot_vram_lru.size()));
         while (remaining > 0) {
@@ -109,7 +106,6 @@ inline void ExpertRegistry::begin_prefill_stream(uint32_t drain_slots, PrefillAl
             entry.owner = ExpertTier::COLD_NVME;
             entry.slot_idx = -1;
             entry.slot_state = ExpertSlotState::UNALLOCATED;
-            restore_set_.push_back(gid);
             --remaining;
         }
 
@@ -152,9 +148,6 @@ inline void ExpertRegistry::end_prefill_stream() {
         for (auto& entry : catalog) {
             entry.resident_at_prefill_begin = false;
         }
-        // `restore_set_` is deliberately left intact: the caller reloads the drained
-        // experts through the normal cold path before decode resumes, and the next
-        // `begin_prefill_stream` overwrites it.
         validate_invariants();
     }
 

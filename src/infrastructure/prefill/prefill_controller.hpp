@@ -34,14 +34,13 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
-#include <functional>
 #include <vector>
 
 namespace aeon::core {
 
 class PrefillController {
 public:
-    // The collaborators the lifecycle edits, plus the two host-side restore steps.
+    // The collaborators the lifecycle edits.
     // The executor is nullable (a budget with no Hot slot leaves the graph
     // unbuildable but constructible, and the lifecycle still runs).
     struct Services {
@@ -50,11 +49,6 @@ public:
         ExpertLeaseHolder* executor{nullptr};
         ExpertRegistry* registry{nullptr};
         HostPartition* partition{nullptr};
-        // Re-admit the Warm residents a boundary move surrendered, and the Hot
-        // residents a prefill drain freed. Injected because both use the host's
-        // blocking `O_DIRECT` restore path, which is not prefill policy.
-        std::function<void()> restore_warm;
-        std::function<void()> restore_residents;
     };
 
     void bind(const Services& services) { services_ = services; }
@@ -186,14 +180,9 @@ public:
                                        services_.partition->staging_decode_slots(),
                                        services_.registry->experts_per_layer,
                                        outstanding_leases());
-            // Put the Warm residents the move surrendered **back**. Without this the
-            // borrow would cost Warm its cache, and the frozen-prefill guarantee —
-            // Warm identical before and after — would not hold across the move.
-            if (services_.restore_warm) services_.restore_warm();
         }
-        // Then the Hot residents the prefill drain freed, so decode resumes on the set
-        // the pool held before the pass. A no-op when no drain ran.
-        if (services_.restore_residents) services_.restore_residents();
+        // The drained Hot slots and the borrowed Warm slots return empty: decode fills
+        // free slots before it evicts, so re-reading them here only delayed the first token.
         // `prefill_active_`/`sweep_active_` deliberately stay set: they record the
         // strategy the window chose, for the gates that read the choice afterwards.
         // `begin` re-decides both for the next window.

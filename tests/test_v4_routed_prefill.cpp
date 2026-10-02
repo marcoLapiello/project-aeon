@@ -7,9 +7,9 @@
 //   A. ROUTED, NOT SWEPT. With the sweep enabled and a window below the gate, the
 //      window selects the routed strategy — `prefill_sweep_engaged()` is false while
 //      a prefill supply is active.
-//   B. BOUNDED DRAIN, SHARED RESTORE. It frees one layer's worth (`E`) of the
-//      worst-LRU residents and preserves the rest, then restores the freed set on
-//      exit, exactly as the sweep does (the shared registry machinery).
+//   B. BOUNDED DRAIN. It frees one layer's worth (`E`) of the worst-LRU residents
+//      and preserves the rest, and hands the freed slots to decode empty, exactly as
+//      the sweep does (the shared registry machinery).
 //   C. THE BANK'S CEILING. Each layer reads at most one layer's set from NVMe — the
 //      union is fetched once and held to the layer boundary — and, below the gate,
 //      strictly less than a whole layer, which is what makes the routed strategy the
@@ -210,15 +210,8 @@ int main(int argc, char** argv) {
     const std::set<uint32_t> warm_before_switch = warm_set(host);
     host.prefill_begin(kWindow);
     const bool prefill_active = host.registry().prefill_streaming();
-    const std::vector<uint32_t> drained = host.registry().restore_set();    const std::set<uint32_t> preserved = hot_set(host);
-    std::set<uint32_t> switch_hot = preserved;
-    switch_hot.insert(drained.begin(), drained.end());
-    bool preserved_disjoint_from_drained = true;
-    for (uint32_t gid : drained) {
-        if (preserved.find(gid) != preserved.end()) {
-            preserved_disjoint_from_drained = false;
-        }
-    }
+    const std::set<uint32_t> preserved = hot_set(host);
+    const size_t drained = host.registry().vram_capacity - preserved.size();
     const std::set<uint32_t> warm_before = warm_set(host);
 
     // ---- run the window (the bank is already active) -------------------------
@@ -292,14 +285,8 @@ int main(int argc, char** argv) {
             per_layer < host.registry().vram_capacity ? per_layer
                                                       : host.registry().vram_capacity;
         assert_that("B: the drain freed one layer's worth (or the whole floor pool)",
-                    drained.size() == expected_drain,
-                    std::to_string(drained.size()) + " drained of " +
-                        std::to_string(host.registry().vram_capacity));
-        assert_that("B: preserved and drained partition the switch-point pool",
-                    preserved_disjoint_from_drained &&
-                        preserved.size() + drained.size() == host.registry().vram_capacity,
-                    std::to_string(preserved.size()) + " preserved + " +
-                        std::to_string(drained.size()) + " drained = " +
+                    drained == expected_drain,
+                    std::to_string(drained) + " drained of " +
                         std::to_string(host.registry().vram_capacity));
     }
 
@@ -421,40 +408,25 @@ int main(int argc, char** argv) {
                     nvme_experts < 0.8 * layer_sets,
                     std::to_string(nvme_experts) + " experts, a sweep reads " +
                         std::to_string(layer_sets));
-        assert_that("B: the Hot set is restored to its switch-point set",
-                    hot_after == switch_hot,
-                    std::to_string(hot_after.size()) + " Hot, expected " +
-                        std::to_string(switch_hot.size()));
+        assert_that("B: Hot leaves the window holding exactly the preserved set",
+                    hot_after == preserved,
+                    std::to_string(hot_after.size()) + " Hot, " +
+                        std::to_string(preserved.size()) + " preserved");
     }
-    // The window **borrows** part of the Warm pool for its corridor when the sweep is
-    // enabled (they share one pinned region): `prefill_begin` cuts the boundary to the
-    // window's shape, `prefill_end` cuts it back and re-admits the surrendered experts
-    // (`registry.host_restore_set`). So the thing to assert is exactly that:
-    // **everything the borrow took was returned**. Comparing whole Warm sets would
-    // instead measure decode's in-flight traffic — a promotion completing as the switch
-    // reaps leaves Warm, a demotion completing enters it — which is why the symmetric
-    // `warm_before_switch` delta is reported rather than asserted.
-    std::set<uint32_t> borrowed;
+    // The window borrows part of Warm for its corridor and hands those slots back
+    // empty; every resident it did not borrow must survive the window.
+    size_t borrowed = 0;
     for (uint32_t gid : warm_before_switch) {
-        if (warm_before.find(gid) == warm_before.end()) borrowed.insert(gid);
+        if (warm_before.find(gid) == warm_before.end()) ++borrowed;
     }
-    size_t warm_not_returned = 0;
-    for (uint32_t gid : borrowed) {
-        if (warm_after.find(gid) == warm_after.end()) ++warm_not_returned;
+    size_t warm_lost = 0;
+    for (uint32_t gid : warm_before) {
+        if (warm_after.find(gid) == warm_after.end()) ++warm_lost;
     }
-    size_t warm_gained = 0;
-    for (uint32_t gid : warm_after) {
-        if (warm_before_switch.find(gid) == warm_before_switch.end()) ++warm_gained;
-    }
-    // The pool is a fixed size, so an admission the *window* did not make — a decode
-    // demotion completing, say — consumes room a borrowed expert would need. The
-    // borrow must therefore be returned **up to** what concurrent traffic displaced,
-    // which is the exact, honest form of "the corridor gave the pool back".
-    assert_that("D: the corridor's Warm borrow was returned", 
-                warm_not_returned <= warm_gained,
-                std::to_string(borrowed.size()) + " borrowed, " +
-                    std::to_string(warm_not_returned) + " not returned, " +
-                    std::to_string(warm_gained) + " displaced by concurrent traffic");
+    assert_that("D: Warm kept every resident the corridor did not borrow",
+                warm_lost == 0,
+                std::to_string(borrowed) + " borrowed, " + std::to_string(warm_lost) +
+                    " lost");
     assert_that("D: no shadow survived the window",
                 host.registry().shadow_resident_count() == 0,
                 std::to_string(host.registry().shadow_resident_count()) + " shadows");
