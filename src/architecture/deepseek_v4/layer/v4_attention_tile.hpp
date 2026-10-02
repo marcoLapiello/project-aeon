@@ -37,12 +37,10 @@ inline bool attention_tile_supported(const V4Layer& layer) {
            kind == V4AttentionKind::CSA;
 }
 
-// Switch for the chunk path's attention. It defaults to **on**: the tiled split-keys
-// path is the production path for all three classes. Setting it false replays the
-// per-token scalar kernel, which is slower and exists so a gate can compare the two in
-// one process (the bit-exact chunk-vs-serial gates run with it off, since the tile is a
-// reorder; the parity gate runs with it on). Decode never consults it — a single token
-// goes through `run_layer_body_attention_kernel`'s scalar launch either way.
+// Switch for the tiled attention, in the chunk path and in decode. It defaults to **on**.
+// Setting it false replays the per-token scalar kernel, which is slower and exists so a
+// gate can compare the two in one process (the bit-exact chunk-vs-serial gates run with
+// it off, since the tile is a reorder; the parity gate runs with it on).
 inline bool& attention_tile_enabled() {
     static bool enabled = true;
     return enabled;
@@ -96,7 +94,7 @@ inline void run_attention_tile(
         block1.window = 0;                   // causal only; older than the window, by design
     }
 
-    aeon::dispatch_causal_attention_split_fp16<>(
+    aeon::dispatch_causal_attention_head_group_fp16<>(
         q, q_stride, block0, block1, per_query_keys, per_query_count,
         query_position_base, 1, out, out_stride,
         count, static_cast<int>(kernel::DSV4_NUM_HEADS), HEAD_DIM,

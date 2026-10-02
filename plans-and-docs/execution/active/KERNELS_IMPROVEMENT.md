@@ -46,36 +46,41 @@ The host has `62.62 GiB` and the pinned config plus the runtime's own allocation
 | 1 | Grouped WMMA expert GEMM (W4A16) | **Done** — enabled in production |
 | 2 | Batch the chunk loop in the layer body | **Partly** — phase split and router done; `M`-keyed dispatcher and batched KV/position writes open |
 | 3 | WMMA dense GEMM for the dense projections | **Partly** — pre-attention projections and the shared expert batched; `v4_grouped_wo`, HC and dispatcher-on-`M` open |
-| 4 | Batched causal attention over the chunk | **Done** — tile + split-keys, all classes on by default; attention variants measured, redesign untried (Area 6) |
+| 4 | Batched causal attention over the chunk | **Done** — head-group WMMA kernel (heads as the M axis) on by default: attention+norm `8,730 → 226 ms` GPU |
 | 4a | Indexer top-k on device | **Done** — the top-k only (`0.13 s`); the scores it feeds were Area 8 |
 | — | `compose_local_rows` gather | **Done** |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Partly** — E2, A, C, E1 and all of F/G (incl. the FFN norm and the dead replication) batched; E3/E3b/E4 (compressor/indexer feed) remain per-row |
-| 6 | Tune for gfx1100 | **Partly** — attention variants measured (WMMA and warp-count neutral/worse); the multi-warp-WMMA-with-LDS-PV redesign untried; expert-shape/kernel sweeps open |
-| 7 | Re-measure and retune supply | **Open** |
+| 6 | Tune for gfx1100 | **Partly** — attention closed by the head-group kernel; expert-shape/kernel sweeps open |
+| 7 | Re-measure and retune supply | **Open** — prefill is NVMe-bound (timeline below); next: resident experts re-streamed, restore on the TTFT path |
 | 8 | Batch the indexer scores over the chunk | **Done** — `4.47 → 0.07 s`; pre-attention GPU `−59%`, TTFT `29.1 → 25.1 s` |
 
 ## Phase profile
 
-### Baseline — 2026-10-01
+### Baseline — 2026-10-02
 
-The current measured state, on `main` after Areas 1–4.2, 4a, 8 and Area 5's E2, A, C, E1, F/G and the F/G residual, and Area 3's shared expert. Same pinned invocation as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`, `Warm 35 GiB`, `3` staging blocks); a clean run after a contaminated one is discarded. Each area record below carries its own implementation-time before/after; this is the one cross-area reference, and it is **replaced, never accumulated** — a superseded baseline is deleted, not kept beside the new one. Ledger entries are taken only at the end of the plan.
+The current measured state, on `main` after Areas 1–4 (incl. the head-group attention kernel), 4a, 8 and Area 5's E2, A, C, E1, F/G and the F/G residual, and Area 3's shared expert. Same pinned invocation as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`, `Warm 35 GiB`, `3` staging blocks); a clean run after a contaminated one is discarded. Each area record below carries its own implementation-time before/after; this is the one cross-area reference, and it is **replaced, never accumulated** — a superseded baseline is deleted, not kept beside the new one. Ledger entries are taken only at the end of the plan.
 
 | Phase | host ms | gpu ms | gpu share |
 | :--- | ---: | ---: | ---: |
-| **attention+norm (per token)** | `150` | `8,730` | **`64.5%`** |
-| **routed experts (batched)** | `223` | `1,715` | `12.7%` |
-| routing dispatch | `1,462` | `1,476` | `10.9%` |
-| **pre-attention (per token)** | `190` | `693` | **`5.1%`** |
-| commit (per token) | `140` | `380` | `2.8%` |
-| moe post (per token) | `294` | `354` | `2.6%` |
-| shared expert (batched) | `4` | `118` | `0.9%` |
-| router (batched) | `10,790` | `76` | `0.6%` |
-| **total** | **`13,269`** | **`13,548`** | |
+| **routed experts (batched)** | `1,061` | `2,457` | `40.9%` |
+| routing dispatch | `1,590` | `1,601` | `26.7%` |
+| **pre-attention (per token)** | `201` | `663` | `11.0%` |
+| **attention+norm (per token)** | `8` | `226` | `3.8%` |
+| &nbsp;&nbsp;· attention kernel (batched) | `1` | `21` | `0.3%` |
+| router (batched) | `2,176` | `71` | `1.2%` |
+| **total** | **`5,735`** | **`6,003`** | |
 
-- **TTFT `25.2 s` with the profiler on** (`~37.3 ms/prompt-token`), prompt `677` tokens. The isolated stage numbers are the reliable signal; TTFT stays within run-to-run noise because the removed work overlaps the attention kernel.
-- Derived: the **attention tile** is `8,730 ms` minus the small per-row inverse-RoPE/output-projection and the now-batched F/G — i.e. almost all of the phase — **`~62%`** of GPU and the one dominant kernel. Its *share* keeps rising as the totals fall around it.
-- The router's `10.8 s` host line is *not* issuance: its `hipStreamSynchronize` drains the attention backlog queued ahead of it, a barrier reading of GPU-wait. True host issuance is `13,269 − 10,790 ≈ 2.5 s`, so prefill is **GPU-bound**, and the GPU is **attention-bound**.
-- Supply is hidden but its figures vary with host state this session: `nvme_gib 141.1` is stable, while `load_ms` reads `~1,800–2,600` against the previous baseline's `442` and `routing dispatch` up to `~2,000` GPU against `513`. Several runs this session were discarded as contaminated (the tell is a phase the change cannot touch moving `2–4×`, e.g. the shared expert or an unchanged batched kernel). A quiet-host re-measure is owed.
+- **TTFT `25.3 s`**, prompt `677` tokens — flat against the `25.2 s` before the attention kernel, although prefill GPU fell `13.5 → 6.0 s`. The wall timeline (`[Prefill timeline]`, printed under `--phase-profile`) explains it:
+
+| Wall segment | ms | What |
+| :--- | ---: | :--- |
+| layer loop: load wait | `12,427` | waiting for the layer's experts from NVMe |
+| layer loop: issue + GPU wait | `8,254` | the bodies, overlapped with the next layer's load |
+| end (`prefill_end`) | `4,468` | Warm refill of the borrowed staging slots + Hot restore |
+| begin + head | `118` | |
+| **total** | **`25,303`** | |
+
+- **Prefill is NVMe-bound, and was before this plan's last areas.** The layer loop streams `142.7 GiB` in `~20.2 s` — `~7 GiB/s`, the drive's ceiling. The old `13.5 s` GPU already fit inside it; the earlier "GPU-bound" read came from the router's barrier line and was wrong. Compute savings now only grow `load wait`; TTFT moves only with supply (Area 7).
 
 #### Pre-attention attribution
 
@@ -133,7 +138,8 @@ A first read of the baseline's reply looks alarming: the prompt is English but t
 - The router made one host sync per row — fixed in Area 2.
 - Small per-row launches (rmsnorm, rope, HC sinkhorn, KV copies, a position H2D per row) scale with T — Area 5; E2 batched (`0.73 s → 3 ms`), A/C/E1/E3/E3b remain.
 - The **indexer scores** kernel, not its top-k, was the pre-attention cost: `4.3 s` against `0.13 s` — a per-token, single-block launch, the same defect Areas 2–3 fixed for the router and the projections. Batched in Area 8 (`4.3 s → 0.07 s`).
-- **Attention variants were measured and none beat the incumbent.** The production split kernel (warps=4, tile=16) was faster than WMMA-QKᵀ (tile 16/256) and split warps=1 in the runs in Area 6, so the `48%` of GPU it holds was not reduced by tiling or warp tuning **as tested**; the multi-warp-WMMA-with-LDS-PV redesign is the untried variant. A synthetic bench showed WMMA `2×` faster and did not transfer; a next bench must use production's tile/union shapes.
+- **Attention: query tiling was the wrong axis.** Tiling and warp tuning of the query-tiled kernels were neutral (Area 6); putting the **heads** on the WMMA M axis (one shared KV head, so every key row serves 16 heads) cut the kernel `~8.5 s → 21 ms`.
+- **TTFT is a supply metric for this prompt.** It includes the end-of-prefill Warm/Hot restore (`4.5 s`) and the NVMe stream (`~20 s`); read the `[Prefill timeline]`, not TTFT, for compute changes.
 
 ## Execution plan
 
@@ -299,7 +305,18 @@ Two bugs the independent gate caught, not self-consistency: a warp-stride-only s
 | `test_v4_prefill_window` | `4/10` (pre-existing red) | **`10/0`** — greedy `320`, rel `2.6%` |
 | `test_v4_routed_prefill` | `20/1` (pre-existing red) | **`20/0`** — greedy `320`, rel `0.1%` |
 
-**Still open:** the multi-warp-WMMA-with-LDS-PV redesign; Area 6's record measured the tiling and warp-count levers around it.
+#### 4.3 — heads as the WMMA M axis, **done**
+
+The query-tiled kernels read each key row once per head. DSV4 has one shared KV head, so `head_group_attention.hpp` (G2) gives a block `(query, 16 heads)`: `S = Q[16 heads]·Kᵀ` and `O = P·V` are both WMMA tiles, the valid keys (window or index selection) are compacted first, and an online softmax consumes them in blocks of `WARPS × 16` keys. Same contract as the split kernel, which stays as the fallback for shapes it does not instantiate.
+
+| | split kernel | head-group |
+| :--- | ---: | ---: |
+| attention kernel, GPU | `~8,500 ms` | **`21 ms`** |
+| attention+norm, GPU | `8,730 ms` | **`226 ms`** |
+| prefill total, GPU | `13,548 ms` | **`6,003 ms`** |
+| TTFT | `25.2 s` | `25.3 s` (NVMe-bound, see the baseline) |
+
+Gates green: `test_tiled_causal_attention`, `test_v4_layer_body_chunk_oracle`; the corpus reply is unchanged in kind.
 
 #### WMMA QKᵀ — built, gated, **not shipped**
 
@@ -455,7 +472,9 @@ The split kernel is now a template on its warp count (`WARPS`, default `4`) so t
 
 ### Area 7: Move the bottleneck back to supply — **open**
 
-- Re-measure the swept prefill once Areas 3–5 land. Compute should then be faster than supply. Then tune the lookahead depth and chunk size together so the GPU stays fed.
+- Measured (baseline timeline): compute is now faster than supply. Lookahead depth cannot help — the drive is at its ceiling — so the levers are fewer bytes and less work on the TTFT path:
+  - experts already resident in Hot/Warm must not be re-streamed from NVMe (`10,782` streamed while `1,886` were also served from Warm);
+  - the `4.5 s` end-of-prefill restore sits before the first token.
 
 ### Area 8: Batch the indexer scores over the chunk — **done**
 

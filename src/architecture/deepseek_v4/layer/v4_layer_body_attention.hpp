@@ -13,6 +13,7 @@
 
 #include "architecture/deepseek_v4/layer/v4_layer_body_types.hpp"
 #include "architecture/deepseek_v4/layer/v4_dense_projection.hpp"
+#include "architecture/deepseek_v4/layer/v4_attention_tile.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "platform/ops/cast.hpp"
 #include "infrastructure/profiling/phase_profiler.hpp"
@@ -657,7 +658,15 @@ inline void run_layer_body_attention_kernel(
 
     auto attention_region =
         PhaseProfiler::instance().region("  E attention kernel", stream);
-    if (layer.spec().attention_kind == V4AttentionKind::Sliding) {
+    if (attention_tile_enabled() && scratch.d_composed_keys == nullptr) {
+        const bool csa_live = layer.spec().attention_kind == V4AttentionKind::CSA &&
+                              pre.committed > 0;
+        run_attention_tile(
+            layer, scratch.d_q, TOTAL_Q, scratch.d_attn_out, TOTAL_Q, absolute_position, 1,
+            layer.d_local_key_cache, layer.d_local_positions, local_rows, pre.committed,
+            csa_live ? scratch.d_indexer_topk_indices : nullptr,
+            csa_live ? static_cast<int>(layer.state_layout().index_topk) : 0, stream);
+    } else if (layer.spec().attention_kind == V4AttentionKind::Sliding) {
         hipLaunchKernelGGL(
             kernel::v4_cached_sliding_window_attn_wave32_kernel,
             dim3(NUM_HEADS), dim3(32), 0, stream,

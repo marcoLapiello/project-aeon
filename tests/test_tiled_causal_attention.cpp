@@ -51,9 +51,9 @@ namespace {
 using aeon::CausalAttentionBlock;
 using aeon::reference::ErrorStats;
 
-constexpr size_t  kHeads   = 8;      // the real DSV4 head count is 64; 8 exercises >1 block per query
+constexpr size_t  kHeads   = 24;     // two 16-head groups, the second partial
 constexpr size_t  kHeadDim = 512;    // the real width, because the scale is 1/sqrt(head_dim)
-constexpr size_t  kKeys    = 40;     // the shared key sequence
+constexpr size_t  kKeys    = 300;    // long enough for several online-softmax key blocks
 constexpr size_t  kQueries = 12;     // queries, at the tail of the sequence (single-block cases)
 constexpr int64_t kWindow  = 8;      // small, so a query's window is a strict sub-range
 constexpr double  kScale   = 0.04419417382415922; // 1 / sqrt(512)
@@ -286,7 +286,7 @@ int main() {
     std::printf("--- E. split-keys kernel, sliding window ---\n");
     {
         const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
-        auto run_split = [&](const HostBlock& host0, const HostBlock& host1,
+        auto run_split = [&](bool grouped, const HostBlock& host0, const HostBlock& host1,
                              const int32_t* d_per_query, int per_query_count,
                              int64_t q_base, int count, const float* bias) {
             CausalAttentionBlock b0;
@@ -308,7 +308,8 @@ int main() {
                 b1.window = static_cast<int>(host1.window);
             }
             CHECK_HIP(hipMemset(d_out, 0, h_q.size() * sizeof(__half)));
-            aeon::dispatch_causal_attention_split_fp16(
+            (grouped ? aeon::dispatch_causal_attention_head_group_fp16<>
+                     : aeon::dispatch_causal_attention_split_fp16<>)(
                 d_q, q_stride, b0, b1, d_per_query, per_query_count, q_base, 1,
                 d_out, out_stride, count, static_cast<int>(kHeads),
                 static_cast<int>(kHeadDim), bias, static_cast<float>(kScale), 0);
@@ -318,10 +319,26 @@ int main() {
             CHECK_HIP(hipMemcpy(out.data(), d_out, out.size() * sizeof(__half), hipMemcpyDeviceToHost));
             return widen(out);
         };
-        ok &= compare_all("E", run_split(block0, {}, nullptr, 0,
-                                         static_cast<int64_t>(kKeys - kQueries),
-                                         static_cast<int>(kQueries), d_sink),
+        const int64_t q_base = static_cast<int64_t>(kKeys - kQueries);
+        const int count = static_cast<int>(kQueries);
+        ok &= compare_all("E", run_split(false, block0, {}, nullptr, 0, q_base, count, d_sink),
                           block0, {}, h_query_positions, sink_d, q_d);
+
+        // H. Heads as the WMMA M axis: window + sink, full causal over several key
+        // blocks, a null bias, and two blocks sharing one softmax.
+        std::printf("--- H. head-group WMMA kernel ---\n");
+        ok &= compare_all("H window", run_split(true, block0, {}, nullptr, 0, q_base, count, d_sink),
+                          block0, {}, h_query_positions, sink_d, q_d);
+        const HostBlock causal{0, static_cast<int>(kKeys), 0};
+        ok &= compare_all("H causal", run_split(true, causal, {}, nullptr, 0, q_base, count, d_sink),
+                          causal, {}, h_query_positions, sink_d, q_d);
+        std::vector<double> inert(kHeads, -1000.0);
+        ok &= compare_all("H nobias", run_split(true, block0, {}, nullptr, 0, q_base, count, nullptr),
+                          block0, {}, h_query_positions, inert, q_d);
+        const HostBlock recent{150, 150, 64};
+        const HostBlock older{0, 150, 0};
+        ok &= compare_all("H two", run_split(true, recent, older, nullptr, 0, q_base, count, d_sink),
+                          recent, older, h_query_positions, sink_d, q_d);
     }
 
     // --- F. per-query compressed selection (CSA-style) -----------------------
@@ -330,13 +347,15 @@ int main() {
     // layer needs, and the reference reads the selected rows per query.
     std::printf("--- F. per-query compressed selection ---\n");
     {
-        constexpr int kSelect = 6;
+        constexpr int kSelect = 40;
         const HostBlock block0{0, static_cast<int>(kKeys), kWindow};
         const HostBlock block1{0, static_cast<int>(kKeys), 0};
         std::vector<int32_t> h_select(static_cast<size_t>(kQueries) * kSelect);
         for (size_t r = 0; r < kQueries; ++r) {
             for (int j = 0; j < kSelect; ++j) {
-                h_select[r * kSelect + j] = static_cast<int32_t>((r * 2 + j) % kKeys);
+                // Every fifth slot is a masked `-1`, the indexer's padding.
+                h_select[r * kSelect + j] = j % 5 == 4
+                    ? -1 : static_cast<int32_t>((r * 7 + j * 13) % kKeys);
             }
         }
         int32_t* d_select = nullptr;
@@ -361,8 +380,10 @@ int main() {
         b1.value_stride = key_stride;
         b1.window = 0;
 
+        for (const bool grouped : {false, true}) {
         CHECK_HIP(hipMemset(d_out, 0, h_q.size() * sizeof(__half)));
-        aeon::dispatch_causal_attention_split_fp16(
+        (grouped ? aeon::dispatch_causal_attention_head_group_fp16<>
+                 : aeon::dispatch_causal_attention_split_fp16<>)(
             d_q, q_stride, b0, b1, d_select, kSelect,
             static_cast<int64_t>(kKeys - kQueries), 1, d_out, out_stride,
             static_cast<int>(kQueries), static_cast<int>(kHeads),
@@ -372,7 +393,6 @@ int main() {
         std::vector<__half> out(h_q.size());
         CHECK_HIP(hipMemcpy(out.data(), d_out, out.size() * sizeof(__half), hipMemcpyDeviceToHost));
         const std::vector<double> got = widen(out);
-        CHECK_HIP(hipFree(d_select));
 
         bool all = true;
         for (size_t r = 0; r < kQueries; ++r) {
@@ -388,6 +408,7 @@ int main() {
             }
             for (int j = 0; j < kSelect; ++j) {
                 const int row = h_select[r * kSelect + j];
+                if (row < 0) continue;
                 const int64_t position = h_key_positions[row];
                 if (position <= query_position) {
                     rows.insert(rows.end(), k_d.begin() + static_cast<size_t>(row) * kHeadDim,
@@ -404,11 +425,13 @@ int main() {
                 const std::vector<double> slice(got.begin() + (r * kHeads + h) * kHeadDim,
                                                 got.begin() + (r * kHeads + h + 1) * kHeadDim);
                 char label[96];
-                std::snprintf(label, sizeof(label), "F q%zu h%zu", r, h);
+                std::snprintf(label, sizeof(label), "%s q%zu h%zu", grouped ? "F grouped" : "F", r, h);
                 if (!report(label, want, slice)) all = false;
             }
         }
         ok &= all;
+        }
+        CHECK_HIP(hipFree(d_select));
     }
 
     // --- G. the WMMA QKᵀ kernel, shared-key tile ------------------------------

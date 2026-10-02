@@ -10,9 +10,10 @@
 // -----------------------------------------------------------------------------
 
 #if defined(AEON_ARCH_RDNA3)
-#include "platform/rdna3/tiled_causal_attention.hpp"
+#include "platform/rdna3/head_group_attention.hpp"
 namespace aeon {
 using rdna3::CausalAttentionBlock;
+using rdna3::dispatch_causal_attention_head_group_fp16;
 using rdna3::dispatch_causal_attention_fp16;
 using rdna3::dispatch_causal_attention_split_fp16;
 using rdna3::dispatch_causal_attention_wmma_qk_fp16;

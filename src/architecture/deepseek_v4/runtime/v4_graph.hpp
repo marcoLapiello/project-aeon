@@ -38,12 +38,15 @@
 #include "platform/ops/rmsnorm.hpp"
 #include "platform/ops/cast.hpp"
 #include "infrastructure/hip_check.hpp"
+#include "infrastructure/profiling/phase_profiler.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -285,6 +288,16 @@ public:
         const uint32_t hc_dim = static_cast<uint32_t>(host_.config().hc_mult) *
                                 static_cast<uint32_t>(host_.config().hidden_size);
 
+        using TimelineClock = std::chrono::steady_clock;
+        const bool timeline = PhaseProfiler::instance().enabled();
+        double t_begin = 0, t_load = 0, t_issue = 0, t_gpu = 0, t_after = 0, t_end = 0;
+        auto mark = TimelineClock::now();
+        auto lap = [&](double& bucket) {
+            const auto now = TimelineClock::now();
+            bucket += std::chrono::duration<double, std::milli>(now - mark).count();
+            mark = now;
+        };
+
         host_.ensure_prefill_carry(count);
         embed_window(token_ids, count, stream);
 
@@ -297,6 +310,7 @@ public:
         // cached supply instead. Both are the same layer-major window — only the expert
         // supply differs. The window length `count` is what the gate reads.
         host_.prefill_begin(count);
+        lap(t_begin);
 
         for (uint32_t layer = 0; layer < layers; ++layer) {
             // The layer's whole set must be resident before its body runs: the
@@ -304,6 +318,7 @@ public:
             // and the sweep loaded the set in layer order precisely because it is
             // the whole layer rather than a prediction.
             host_.prefill_before_layer(layer);
+            lap(t_load);
             host_.ensure_batch_scratch(layer, workspace_tokens);
             V4LayerBodyBatchScratch& workspace = host_.batch_scratch();
 
@@ -319,20 +334,34 @@ public:
             // The layer boundary, which the state forces rather than a policy choosing
             // it: anything wider would lease the whole model. A lease grants no ordering,
             // so handing it back needs a compute-stream boundary here.
+            lap(t_issue);
             CHECK_HIP(hipStreamSynchronize(stream));
+            lap(t_gpu);
             host_.release_expert_leases();
             // The layer is dead the moment it retires — a window visits each layer
             // once — so the sweep releases its whole set and refills the room from
             // the next layers in order. LRU has nothing to rank here.
             host_.prefill_after_layer(layer);
+            lap(t_after);
         }
 
         host_.prefill_end();
+        lap(t_end);
 
         // The head reads the last position's residual, which is where the serial
         // path leaves it too (`scratch().d_res_in`).
         copy_carry_row_to_scratch(count - 1, hc_dim, stream);
-        return head_stage(stream);
+        const half* logits = head_stage(stream);
+        if (timeline) {
+            CHECK_HIP(hipStreamSynchronize(stream));
+            double t_head = 0;
+            lap(t_head);
+            std::printf("[Prefill timeline] begin=%.0f load_wait=%.0f issue=%.0f gpu_wait=%.0f "
+                        "after_layer=%.0f end=%.0f head=%.0f total=%.0f ms\n",
+                        t_begin, t_load, t_issue, t_gpu, t_after, t_end, t_head,
+                        t_begin + t_load + t_issue + t_gpu + t_after + t_end + t_head);
+        }
+        return logits;
     }
 
     // --- read access, for the gate and for whatever runs above -----------------

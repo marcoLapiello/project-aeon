@@ -41,6 +41,7 @@
 
 #include "architecture/deepseek_v4/layer/v4_layer_body.hpp"
 #include "architecture/deepseek_v4/layer/v4_attention_tile.hpp"
+#include "architecture/deepseek_v4/layer/v4_dense_projection.hpp"
 #include "infrastructure/profiling/phase_profiler.hpp"
 
 #include <hip/hip_runtime.h>
@@ -615,6 +616,58 @@ inline void run_chunk_rope_kv_write_batch(
                              hipMemcpyDeviceToDevice, stream));
 }
 
+// The attention output tail for the whole chunk: inverse RoPE, the grouped `wo_a` and
+// `wo_b`. Per row these were GEMVs re-reading `128 MiB` of projection weights per token,
+// the largest term of the attention phase; as GEMMs each weight is read once per chunk.
+// Below `kDenseGemmMinTokens` the per-token kernels run unchanged, so short chunks stay
+// bit-identical to serial.
+inline void run_chunk_attention_output_batch(
+    V4Layer& layer,
+    V4LayerBodyBatchScratch& workspace,
+    const V4LayerBodyTables& tables,
+    uint32_t start_position,
+    uint32_t count,
+    hipStream_t stream) {
+    if (count == 0) return;
+    constexpr int H = static_cast<int>(kernel::DSV4_HIDDEN_SIZE);
+    constexpr int HEAD_DIM = static_cast<int>(kernel::DSV4_HEAD_DIM);
+    constexpr int NUM_HEADS = static_cast<int>(kernel::DSV4_NUM_HEADS);
+    constexpr int TOTAL_Q = NUM_HEADS * HEAD_DIM;
+    constexpr int NOPE_DIM = static_cast<int>(kernel::DSV4_NOPE_DIM);
+    constexpr int HALF_ROPE = static_cast<int>(kernel::DSV4_ROPE_DIM) / 2;
+    constexpr int O_LORA = static_cast<int>(kernel::DSV4_O_LORA_RANK);
+    constexpr int O_GROUPS = static_cast<int>(kernel::DSV4_O_GROUPS);
+    constexpr int GROUP_DIM = static_cast<int>(kernel::DSV4_GROUP_HEADS_DIM);
+    constexpr int TOT_LORA = static_cast<int>(kernel::DSV4_TOTAL_O_LORA_DIM);
+
+    auto region =
+        PhaseProfiler::instance().region("  attention output (batched)", stream);
+    const V4LayerBodyTables::View rope = tables.for_layer(layer.spec().attention_kind);
+    const V4LayerBodyRow base = workspace.row(0);
+    hipLaunchKernelGGL(kernel::v4_inverse_rope_wave32_kernel, dim3(NUM_HEADS, count),
+                       dim3(32), 0, stream, base.d_attn_out,
+                       rope.cos + static_cast<size_t>(start_position) * HALF_ROPE,
+                       rope.sin + static_cast<size_t>(start_position) * HALF_ROPE,
+                       NUM_HEADS, HEAD_DIM, NOPE_DIM, HALF_ROPE);
+
+    const int tokens = static_cast<int>(count);
+    if (tokens >= kDenseGemmMinTokens) {
+        for (int g = 0; g < O_GROUPS; ++g) {
+            dispatch_dense_gemm_fp16(
+                base.d_attn_out + static_cast<size_t>(g) * GROUP_DIM,
+                layer.d_wo_a + static_cast<size_t>(g) * O_LORA * GROUP_DIM,
+                base.d_z_lora + static_cast<size_t>(g) * O_LORA,
+                tokens, GROUP_DIM, O_LORA, TOTAL_Q, TOT_LORA, stream);
+        }
+    } else {
+        hipLaunchKernelGGL(kernel::v4_grouped_wo_a_wave32_kernel,
+                           dim3(O_LORA, O_GROUPS, count), dim3(32), 0, stream,
+                           base.d_attn_out, layer.d_wo_a, base.d_z_lora, tokens);
+    }
+    project_dense(base.d_z_lora, layer.d_wo_b, base.d_attn_proj,
+                  tokens, TOT_LORA, H, TOT_LORA, H, stream);
+}
+
 // One batched indexer scores launch for the whole chunk, then the per-row top-k.
 //
 // `v4_indexer_scores_kernel` was launched once per row with `ceil(committed / 256)` =
@@ -953,12 +1006,12 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
         }
 
         if (attention_tile_enabled() && attention_tile_supported(layer)) {
-            // One batched attention launch per sub-tile, then the per-token tail. The
-            // sub-tile keeps the composed union tight: every query scans the whole
-            // union masked to its own window, so a larger tile re-reads more masked
-            // keys. Sliding and HCA share their compressed keys; CSA does not (its
-            // indexer top-k is per query) and keeps the per-token path below.
-            constexpr uint32_t kTile = 16;
+            // One attention launch for the whole chunk, then the per-token tail. The
+            // kernel compacts each query's own window out of the union, so a wide union
+            // costs nothing, and the full chunk is what fills the grid.
+            const uint32_t kTile = count;
+            auto kernel_region =
+                PhaseProfiler::instance().region("  E attention kernel (batched)", stream);
             constexpr int TOTAL_Q = static_cast<int>(kernel::DSV4_NUM_HEADS) *
                                     static_cast<int>(kernel::DSV4_HEAD_DIM);
             const uint32_t committed = pre[count - 1].committed;
@@ -997,10 +1050,18 @@ inline std::vector<V4LayerBodyOutput> run_layer_body_chunk(
         // of the per-row tail is what makes each of its stages a single launch. It is
         // shared by both attention paths, so the tile-off path — the one the chunk
         // oracle compares bit-exact against serial — exercises the same batched code.
-        for (uint32_t row = 0; row < count; ++row) {
-            run_layer_body_attention_tail(layer, views[row], tables, start_position + row,
-                                          stream, observer, pre[row],
-                                          /*defer_hc_ffn=*/true);
+        // A traced row keeps the per-row tail, whose intermediate copies the trace records.
+        const bool traced = std::any_of(pre.begin(), pre.begin() + count,
+                                        [](const V4LayerBodyPre& p) { return p.trace != nullptr; });
+        if (traced) {
+            for (uint32_t row = 0; row < count; ++row) {
+                run_layer_body_attention_tail(layer, views[row], tables, start_position + row,
+                                              stream, observer, pre[row],
+                                              /*defer_hc_ffn=*/true);
+            }
+        } else {
+            run_chunk_attention_output_batch(layer, workspace, tables, start_position, count,
+                                             stream);
         }
         run_hc_ffn_batch(layer, views[0], count, stream);
     }
