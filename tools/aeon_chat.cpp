@@ -449,7 +449,7 @@ int main(int argc, char** argv) {
                       << " io_ms=" << (engine.host().sweep_io_ns() / 1000000)
                       << " submit_ms=" << (engine.host().direct_io_submit_ns() / 1000000)
                       << " sqes=" << engine.host().direct_io_requests_submitted()
-                      << " nvme_gib="
+                      << " run_nvme_gib="
                       << (engine.host().supply_bytes_from_nvme() / (1024.0 * 1024 * 1024))
                       << "\n";
         }

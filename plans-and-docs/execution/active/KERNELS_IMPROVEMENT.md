@@ -51,7 +51,7 @@ The host has `62.62 GiB` and the pinned config plus the runtime's own allocation
 | — | `compose_local_rows` gather | **Done** |
 | 5 | Fuse elementwise/norm over `[T, dim]` | **Partly** — E2, A, C, E1 and all of F/G (incl. the FFN norm and the dead replication) batched; E3/E3b/E4 (compressor/indexer feed) remain per-row |
 | 6 | Tune for gfx1100 | **Partly** — attention closed by the head-group kernel; expert-shape/kernel sweeps open |
-| 7 | Re-measure and retune supply | **Open** — prefill is NVMe-bound (timeline below); next: resident experts re-streamed, restore on the TTFT path |
+| 7 | Re-measure and retune supply | **Open** — prefill is NVMe-bound (timeline below); next: the restore off the TTFT path |
 | 8 | Batch the indexer scores over the chunk | **Done** — `4.47 → 0.07 s`; pre-attention GPU `−59%`, TTFT `29.1 → 25.1 s` |
 
 ## Phase profile
@@ -472,9 +472,9 @@ The split kernel is now a template on its warp count (`WARPS`, default `4`) so t
 
 ### Area 7: Move the bottleneck back to supply — **open**
 
-- Measured (baseline timeline): compute is now faster than supply. Lookahead depth cannot help — the drive is at its ceiling — so the levers are fewer bytes and less work on the TTFT path:
-  - experts already resident in Hot/Warm must not be re-streamed from NVMe (`10,782` streamed while `1,886` were also served from Warm);
-  - the `4.5 s` end-of-prefill restore sits before the first token.
+- Measured (baseline timeline): compute is now faster than supply, and the sweep's NVMe reads are already minimal — `8,896` experts (`117.3 GiB`) `= 11,008 − 1,886` Warm-sourced `− 226` preserved Hot, at `~5.8 GiB/s` (the drive's ceiling). No resident is re-streamed; the `nvme_gib` printed beside the sweep was the **whole run's** NVMe (prefill + decode) and is now `run_nvme_gib`. The levers left:
+  - the end-of-prefill restore (`512` drained Hot + `756` Warm slots the staging arena borrowed, re-read blocking) sits before the first token: skipping it measured TTFT `25.3 → 20.9 s` with decode `3.56 → 3.49 tok/s` (noise) — move it off the TTFT path rather than drop it;
+  - the staging arena's Warm borrow costs its experts twice (read in the sweep, re-read in the restore).
 
 ### Area 8: Batch the indexer scores over the chunk — **done**
 
