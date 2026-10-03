@@ -59,9 +59,14 @@ public:
     // physical slots come from the registry's own `vram_slots` rather than being
     // re-derived from the round-robin order.
     void preload_hot(const ExpertFormatDescriptor& format) {
-        const size_t batch = std::max<size_t>(
-            1, services_.direct_io->submission_capacity() /
-                   ExpertDirectIO::requests_per_fragment(format));
+        // Each expert in a batch holds its own host buffer until the upload, and the ring
+        // depth follows the staging depth, so an uncapped batch is gigabytes of transient RAM
+        // on top of the pinned Warm region.
+        constexpr size_t kMaxHostBatchExperts = 64;
+        const size_t batch = std::clamp<size_t>(
+            services_.direct_io->submission_capacity() /
+                ExpertDirectIO::requests_per_fragment(format),
+            1, kMaxHostBatchExperts);
         for (uint32_t start = 0; start < services_.budget->hot_vram_slots;
              start += static_cast<uint32_t>(batch)) {
             const uint32_t end = std::min<uint32_t>(
