@@ -4,6 +4,8 @@
 
 **Scope of this document:** the single write-up that fixes the goals, the requirements, and the in-scope / out-of-scope boundary for the near-term work: **prefix reuse** in the engine and the **server** built on top of it.
 
+**See also:** [Server reference analysis](../../analysis/current/SERVER_REFERENCE_ANALYSIS.md) — the reference server whose transport shell G5 draws on, and where the reusable layer ends.
+
 ---
 
 ## 1. What we are building
