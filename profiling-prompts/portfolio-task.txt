@@ -1,0 +1,1 @@
+Create a modern portfolio website for a web designer in a single HTML file. Include a hero section, selected projects, an about section, services, testimonials and a contact form. Use inline CSS and a little JavaScript, make it responsive, and give it a polished, contemporary look.
