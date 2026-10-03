@@ -45,6 +45,8 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
    - **G4 Model architecture — `src/architecture/`**: what the model computes (attention, Hyper-Connections, MLA, router, RoPE, tokenizer).
 
    Dependencies point one way: `G4 → G3/G2`, `G1 → G3/G2`; G2 and G3 depend on nothing above them. Put code where the *change reason* matches, and cross a boundary only through a neutral seam (an interface or a scalar/shape parameter the caller supplies) — never by pulling a lower group's model types upward. A move, split or rename is its own behaviour-preserving step, with no "while I'm here" edits.
+7. **Don't missread the documents as source of truth**: analysis and execution documents can and probably *will* become stale in time, they are consistent in the moment they are being written or executed but they get superseeded as the project evolves. The implementation or the analysis described in a document from yesterday could be potentially no longer consistent with what the code reality of today is, this means -> the code is the only final authoritative entity, never assume an analysis or an execution plan as the source of truth
+
 
 ### Development Process & Git Conventions
 
