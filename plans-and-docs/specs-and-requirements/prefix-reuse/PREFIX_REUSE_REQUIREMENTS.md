@@ -2,11 +2,9 @@
 
 **Status:** requirements. This document states *what* is to be built and *why it matters* — outcomes, not procedure. It owns the requirements and the scope boundary; it does not own the implementation sequence (that lives in an execution plan) or measured results (those live in the Performance & Accuracy Ledger).
 
-**Scope of this document:** the engine-side capability that makes a live conversation stop paying the full-prompt cost on every turn — **prefix reuse**. This is an engine concern and is deliberately independent of any server: it is validated at the engine level, and the CLI and the tests drive it as well as any network surface would (see the [server requirements](../server/SERVER_REQUIREMENTS.md)).
+**Scope of this document:** the engine-side capability that makes a live conversation stop paying the full-prompt cost on every turn — **prefix reuse**. It is an engine concern, validated at the engine level.
 
 **See also:** [Prefix reuse reference analysis](../../analysis/current/PREFIX_REUSE_REFERENCE_ANALYSIS.md) — the DSV4 reference for this seam, including the reply-boundary decision that shapes R1–R4. [Session state and swap analysis](../../analysis/current/SESSION_STATE_AND_SWAP_ANALYSIS.md) — the deferred session-storage capability this sits in front of.
-
-**Requirement ids** (R1–R6) are preserved from the document this was split out of, so the reference analyses keep resolving.
 
 ---
 
@@ -46,14 +44,12 @@ For a fixed conversation, sampling setting, and seed, the run is reproducible. F
 - The validity check for reuse, and the replay fallback that keeps R2 true when it fails.
 - The non-token inputs as part of session identity (R4).
 - The accommodation of the resident state inside the memory budget, with the resulting context/pool trade made explicit (R5).
-- The **neutral conversation seam** the engine exposes — a conversation in, decoded text streamed out, with neutral scalars — so that any driver (the tests, the CLI, the server) uses the one definition of "a conversation", and no driver needs model knowledge.
 - The conversation as the engine's unit of work.
 
 ---
 
 ## 4. Out of scope
 
-- **The server** — transport, queuing, the external contract. It is a separate concern with its own document ([server requirements](../server/SERVER_REQUIREMENTS.md)); prefix reuse requires no server to exist.
 - **Session storage / persistence** — writing session state to SSD and reloading it. On restart, or on switching conversations, the answer is a fresh prefill. This is a separate capability with its own design, deliberately deferred.
 - **Prefix matching across sessions** — radix trees, block tables, cache keys, eviction, sharing a system prompt or forking a child session from a parent prefix. Deferred; with a single live session there is nothing to match.
 - **Continuous batching** — multiple sequences stepping together through the graph. The engine is single-sequence by design.
@@ -67,22 +63,11 @@ For a fixed conversation, sampling setting, and seed, the run is reproducible. F
 
 It makes **one long conversation usable**: a multi-turn chat or an agent loop stops paying the full-prompt cost on every turn, which is the difference between an interactive product and a ~20-second pause per message.
 
-It does **not** survive a restart without a fresh prefill, and it does **not** switch between conversations without one — those are the things session storage would add, knowingly left for later. It does **not** by itself give the capability a network interface; that is the server's job.
+It does **not** survive a restart without a fresh prefill, and it does **not** switch between conversations without one — those are the things session storage would add, knowingly left for later.
 
 ---
 
-## 6. Relation to the server — independent
-
-Prefix reuse and the server are **two separate concerns**, each usable without the other:
-
-- **The server can be built with no prefix reuse.** Over a stateless engine, every turn prefills from scratch and the server still works correctly — it is merely slower per turn.
-- **Prefix reuse can be built with no server.** It is validated at the engine level; the tests and the CLI exercise a multi-turn conversation directly.
-
-They meet only at the **neutral conversation seam**: the server drives whatever the engine exposes, whether or not that engine reuses resident state. This is why the two have separate requirement documents and separate execution plans.
-
----
-
-## 7. Deferred, and named so it is not an implicit "later"
+## 6. Deferred, and named so it is not an implicit "later"
 
 | Deferred | Why | Revisits when |
 | :--- | :--- | :--- |

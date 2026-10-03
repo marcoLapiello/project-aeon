@@ -23,7 +23,7 @@ Three design rules in the header are worth copying verbatim into our plan:
 
 - **A record, not a counter.** The reusable length must not be derived from the caller's bookkeeping (`prompt_count + generated - 1`) — "that invariant differs per engine … and getting it wrong does not crash: it silently answers from a state that belongs to a different conversation." The ids are recorded **where they are fed**, and the record is the only description of the state anyone consults. This is exactly the "the session aggregate must carry the token prefix" point from [SESSION_STATE_AND_SWAP_ANALYSIS.md](SESSION_STATE_AND_SWAP_ANALYSIS.md) §3.
 - **`kv_prefix_grow` must preserve the record.** When the state buffers grow (a longer prompt), the record has to grow with them, or reuse can never fire in the one case it exists for — a conversation whose prompt lengthens every turn.
-- **Failure is not an error.** If `kv_prefix_alloc` fails, the record is empty, `kv_prefix_reuse` returns `0`, and "every request prefills in full … this is an optimisation and must never be the reason a turn fails." That is our R6/R11 discipline, applied to the reuse path itself.
+- **Failure is not an error.** If `kv_prefix_alloc` fails, the record is empty, `kv_prefix_reuse` returns `0`, and "every request prefills in full … this is an optimisation and must never be the reason a turn fails." That is the R6 discipline, applied to the reuse path itself.
 
 ---
 
@@ -80,6 +80,7 @@ Each implements the same mechanism; each owns one thing colibri does not.
 | **llama.cpp** — reuse only when asked | [server-context.cpp](../../../../aeon-references/llama.cpp/tools/server/server-context.cpp) | `if (slot.task->params.cache_prompt)` (3216) | Reuse is a per-request policy, not automatic. Worth mirroring as a seam parameter. |
 | **ds4** — verified byte-prefix match | [ds4_kvstore.c](../../../../aeon-references/ds4/ds4_kvstore.c) | `ds4_kvstore_byte_prefix_match` (`memcmp`), `ds4_kvstore_find_text_prefix` | The **verify, never assume** shape of R3, at byte granularity, plus a hash check of the cached text before trusting the payload. |
 | **ds4** — token history vs re-tokenized text | [ds4_kvstore.c](../../../../aeon-references/ds4/ds4_kvstore.c) | `ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix` | The exact remedy for the reply-boundary problem: keep the **exact token history** the state was built from, and tokenize only the text suffix of the new prompt. Confirms §3's divergence is real and gives the reconstitution rule. |
+| **ds4** — live continuation | [ds4_server.c](../../../../aeon-references/ds4/ds4_server.c) | `anthropic_prepare_live_continuation`, `anthropic_live_has_call_id` | Detects a tool-result tail and continues the live session rather than re-prefilling — the agent case handled at the transport. |
 | **ds4** — live continuation | [ds4_server.c](../../../../aeon-references/ds4/ds4_server.c) | `anthropic_prepare_live_continuation`, `anthropic_live_has_call_id` | Detects a tool-result tail and continues the live session rather than re-prefilling — the agent case handled at the transport. |
 
 The two llama.cpp rows together are the important secondary idea: **reuse is a start position**, and it is opt-in per request. That maps one-to-one onto our existing `forward_window` signature and the neutrality of the seam.
