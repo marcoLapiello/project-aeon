@@ -71,6 +71,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `supply-split` | Exposed-load split (io wait / H2D enqueue / H2D drain) for prefill and decode | M45 |
 | `supply-corridor` | Deep swept corridors (`3E`+): read-wave serialization, corridor sizing, Warm borrow | M46 |
 | `e2e-post-relocation` | Post-reorganisation e2e vs the pre-relocation baseline (TTFT, decode, bytes) | M47 |
+| `prefill-kernel-throughput` | Prefill GPU-compute reduction and the phase collapses (end-to-end, phase profile) | M48 |
 
 ## 4. Milestone cards
 
@@ -376,3 +377,27 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: coherent thinking-mode reply (truncated at the cap); `registry.invariants_hold = true`, `outstanding_leases = 0`, `forced_drains = 0`, `staging_in_use = 0`; budget `[FEASIBLE / APPROVED]`. No code change — this run is the check that the module split, the G1–G4 relocation and the comment pass left the numbers untouched.
 - **Conclusion / next gate**: **No regression.** Prefill is `121.4 ms/prompt-token`, matching the ledger's `~120` target and M43 run 3's `123.2`; decode `3.16 tok/s` sits inside the recorded spread (`3.04–3.64` across M28/M43). The relocation commits were separately audited **path-only** (every rename's content diff, after `#include`/comment lines, is empty), so the reorganisation is performance- and behaviour-neutral. **Caveat:** the run is at the host ceiling — `98%` of the RAM allowance — and will fail on a host without headroom rather than in the engine; that fragility is the open host-memory investigation, not this milestone.
 - **Evidence**: `build/bin/aeon_chat` at `b272cd4`, `/tmp/telemetry_m47.jsonl`, `plans-and-docs/status/CODEBASE_MAP.md`
+
+### M48: The kernel improvement campaign — prefill GPU compute more than halved, supply now the bound
+- **Run**: `2026-09-29` to `2026-10-02`; branch `main`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `aeon_chat --phase-profile --diagnostic`
+- **Class / comparison key**: `E2E / prefill-kernel-throughput`
+- **Platform**: `baseline`, Device 0 only, single NVMe; context `32768`, `W = 4096`, `C = 256`, Warm `35 GiB`, `3` staging blocks
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: `profiling-prompts/prefill-corpus.txt` trimmed to ≈`677` prompt tokens, the plan's pinned invocation; phase profile `n = 1` per run, a contaminated run discarded and rerun. The per-area A/Bs (each its own before/after) live in the plan; this card records the end state and the largest collapses only.
+- **Metrics**:
+
+  | Metric | before | after |
+  | :--- | ---: | ---: |
+  | prefill total, GPU | `13,548 ms` | **`6,003 ms`** |
+  | prefill total, host | — | `5,735 ms` |
+  | attention + norm, GPU | `8,730 ms` | **`226 ms`** |
+  | pre-attention, GPU | `7,305 ms` | **`711 ms`** |
+  | · indexer scores + top-k, GPU | `4,472 ms` | **`70 ms`** |
+  | · shared expert, GPU | `1,197 ms` | **`118 ms`** |
+  | TTFT (`677` tok, `C = 256`) | `25.29 s` | **`20.83 s`** |
+  | decode | `4.05 tok/s` | `4.05 tok/s` |
+
+  Each `before` is the plan's own measurement at that area (a mid-campaign baseline), not one pre-plan run — the phases moved in sequence and the plan owns the detail. Decode's phase split: `moe 79.1%` / `pre-attention 10.1%` / `attention+norm 8.9%` of GPU, `~21%` compute in a `~247 ms` token, i.e. supply-bound (`3.6–4.05 tok/s` across the plan's runs).
+- **Correctness / service**: the enabled paths are default-on and gated — `test_v4_layer_body_chunk_oracle` (bit-exact with the tile off), `test_v4_prefill_window` `10/0`, `test_v4_routed_prefill` `20/0`, `test_v4_engine` `38/0`. The corpus reply is byte-identical across all four on/off combinations of the tiled-attention and grouped-batch paths; the two new paths do not move the output. Decode Warm/cold hits `19,770/8,483` over `256` tokens.
+- **Conclusion / next gate**: **Prefill GPU compute fell `2.26×` (`13.5 → 6.0 s`) and now hides inside the `~20 s` NVMe read** (`142.7 GiB` at `~7 GiB/s`, the drive's ceiling), so TTFT responds only to supply; the `4.5 s` TTFT gain is the end-of-prefill restore removed (Area 7), not compute. Prefill is supply-bound and decode is unchanged and supply-bound. The next lever is supply/placement and the chunk/window ceiling, not kernels.
+- **Evidence**: [KERNELS_IMPROVEMENT.md](../execution/active/KERNELS_IMPROVEMENT.md) (per-area A/Bs), [PREFILL_CHUNK_WINDOW_SCALING_ANALYSIS.md](../analysis/current/PREFILL_CHUNK_WINDOW_SCALING_ANALYSIS.md), `aeon_chat --phase-profile`

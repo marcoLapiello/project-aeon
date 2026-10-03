@@ -58,7 +58,7 @@ The host has `62.62 GiB` and the pinned config plus the runtime's own allocation
 
 ### Baseline — 2026-10-02
 
-The current measured state, on `main` after Areas 1–4 (incl. the head-group attention kernel), 4a, 8 and Area 5's E2, A, C, E1, F/G and the F/G residual, and Area 3's shared expert. Same pinned invocation as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`, `Warm 35 GiB`, `3` staging blocks); a clean run after a contaminated one is discarded. Each area record below carries its own implementation-time before/after; this is the one cross-area reference, and it is **replaced, never accumulated** — a superseded baseline is deleted, not kept beside the new one. Ledger entries are taken only at the end of the plan.
+The current measured state, on `main` after Areas 1–4 (incl. the head-group attention kernel), 4a, 8, Area 5's E2, A, C, E1, F/G and the F/G residual, Area 3's shared expert, and Area 7's end-of-prefill restore removal. Same pinned invocation as **Run configuration** (`677`-token prompt, `W=4096`, `C=256`, `Warm 35 GiB`, `3` staging blocks); a clean run after a contaminated one is discarded. Each area record below carries its own implementation-time before/after; this is the one cross-area reference, and it is **replaced, never accumulated** — a superseded baseline is deleted, not kept beside the new one. Ledger entries are taken only at the end of the plan.
 
 | Phase | host ms | gpu ms | gpu share |
 | :--- | ---: | ---: | ---: |
@@ -70,15 +70,15 @@ The current measured state, on `main` after Areas 1–4 (incl. the head-group at
 | router (batched) | `2,176` | `71` | `1.2%` |
 | **total** | **`5,735`** | **`6,003`** | |
 
-- **TTFT `25.3 s`**, prompt `677` tokens — flat against the `25.2 s` before the attention kernel, although prefill GPU fell `13.5 → 6.0 s`. The wall timeline (`[Prefill timeline]`, printed under `--phase-profile`) explains it:
+- **TTFT `20.8 s`**, prompt `677` tokens — the `4.5 s` below the earlier `25.3 s` is entirely Area 7's removal of the end-of-prefill Hot restore (the `end (prefill_end)` segment below); prefill GPU fell `13.5 → 6.0 s` across the plan. The wall timeline (`[Prefill timeline]`, printed under `--phase-profile`) explains it:
 
 | Wall segment | ms | What |
 | :--- | ---: | :--- |
 | layer loop: load wait | `12,427` | waiting for the layer's experts from NVMe |
 | layer loop: issue + GPU wait | `8,254` | the bodies, overlapped with the next layer's load |
-| end (`prefill_end`) | `4,468` | Warm refill of the borrowed staging slots + Hot restore |
+| end (`prefill_end`) | `~0` | **was `4,468`** — the Hot restore, removed by Area 7; its `4.46 s` is the whole TTFT delta |
 | begin + head | `118` | |
-| **total** | **`25,303`** | |
+| **total** | **`~20,835`** | |
 
 - **Prefill is NVMe-bound, and was before this plan's last areas.** The layer loop streams `142.7 GiB` in `~20.2 s` — `~7 GiB/s`, the drive's ceiling. The old `13.5 s` GPU already fit inside it; the earlier "GPU-bound" read came from the router's barrier line and was wrong. Compute savings now only grow `load wait`; TTFT moves only with supply (Area 7).
 
@@ -153,7 +153,7 @@ Grouped W13+activation and W2 over a token→expert permutation, as one **fused*
 
 #### Implementation record
 
-_Built `2026-09-29`. Synthetic microbenchmarks, recorded here rather than in the [Performance & Accuracy Ledger](../status/PERFORMANCE_LEDGER.md), which holds end-to-end runs only._
+_Built `2026-09-29`. Synthetic microbenchmarks, recorded here rather than in the [Performance & Accuracy Ledger](../../status/PERFORMANCE_LEDGER.md), which holds end-to-end runs only._
 
 Built, smallest verified piece first:
 
@@ -474,7 +474,8 @@ The split kernel is now a template on its warp count (`WARPS`, default `4`) so t
 
 - Measured (baseline timeline): compute is now faster than supply, and the sweep's NVMe reads are already minimal — `8,896` experts (`117.3 GiB`) `= 11,008 − 1,886` Warm-sourced `− 226` preserved Hot, at `~5.8 GiB/s` (the drive's ceiling). No resident is re-streamed; the `nvme_gib` printed beside the sweep was the **whole run's** NVMe (prefill + decode) and is now `run_nvme_gib`. The levers left:
   - **the end-of-prefill restore is removed**, with the registry state that existed only for it. Decode already takes free slots first (Hot fills from demand within ~2 tokens; Warm refills from Hot→Warm demotions at no NVMe cost), so the blocking re-read bought nothing. A/B, pinned config, `256` decoded tokens, one process at a time: TTFT `25.29 → 20.83 s`; decode `4.05 → 4.05 tok/s`; decode Warm/cold hits `19,897/8,348 → 19,770/8,483`. Warm is frozen *during* the prefill; its content after it is decode's to rebuild;
-  - the staging arena's Warm borrow costs its experts twice (read in the sweep, re-read in the restore).
+  - the staging arena's Warm borrow costs its experts twice (read in the sweep, re-read in the restore);
+  - **the compute is now small enough to spend on a longer prompt, and the ceiling is well-defined.** The read is per *window*, not per token, so throughput rises with prompt length at a flat TTFT until compute meets the read; a wider window/chunk buys that throughput at a VRAM cost (chunk scratch + residual carry) that a decode-time return would give back. [Prefill chunk/window scaling](../../analysis/current/PREFILL_CHUNK_WINDOW_SCALING_ANALYSIS.md) states the ceiling, the two `256` caps that wall it, and the scratch/residual lifetime.
 
 ### Area 8: Batch the indexer scores over the chunk — **done**
 

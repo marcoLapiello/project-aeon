@@ -2,6 +2,8 @@
 
 *Status: complete (Steps 1–7, 2026-09-23). Opened 2026-09-23. Refines Step 6–7 of [EXPERT_STREAMING_EXECUTION_PLAN.md](../active/EXPERT_STREAMING_EXECUTION_PLAN.md); supersedes the supply proposals of [PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md](../../analysis/historical/PREFILL_SUPPLY_AND_MULTIGPU_SCALING_ANALYSIS.md) §5.3, §8, §9.4, §9.6 (its multi-GPU material is out of scope here). Measurement is ledger [M44](../../status/PERFORMANCE_LEDGER.md).*
 
+> **Retired 2026-10-02 — the Hot-pool restore was removed, and it was the wrong call.** The end-of-prefill restore this plan built (re-reading the drained `restore_set_` back into VRAM at `prefill_end`) was retired by [KERNELS_IMPROVEMENT.md](../active/KERNELS_IMPROVEMENT.md) Area 7: it was a blocking re-read on the prefill's critical path that bought nothing, because decode fills free Hot slots from demand within its first tokens rather than evicting. A/B on the pinned config: **TTFT `25.29 → 20.83 s`, decode `4.05 → 4.05 tok/s`** — the restore cost `4.5 s` of TTFT and delivered no decode benefit. The registry's *entry marking and preserved-resident sparing* (§3 items 1–3) remain, because a preserved resident must still be spared by the per-layer release; it is only the **re-admission at exit** (§3 item 4) that is gone. The mechanism below is the record of what was built, not of what ships.
+
 **Subject.** One layer-major batched prefill, two expert-supply strategies chosen by a visible prompt-length gate, and a Hot-pool **restore** that both strategies share.
 
 **Scope.** The supply strategy inside the layer-major window and the registry state that backs it. Numerics are certified elsewhere and are not re-opened; the storage layer's own targets, session/prefix state, and KV precision are not this plan's. Measurements go to the [Performance Ledger](../../status/PERFORMANCE_LEDGER.md).
@@ -205,7 +207,7 @@ The default stays `3 E / 4` (`192`), deliberately above both measured crossovers
 | **The minimum viable pool is a contract** | Adding a mode that needs more than `E` slots without stating it as a new floor and rejecting the boot below it. |
 | **No hidden thresholds** | Any eligibility rule that cannot be read from configuration and reported. |
 | **Correctness gates first** | Exercising the routed or swept supply on a path not already proven byte-identical to serial. |
-| **Restore is a requirement, not an optimization** | Shipping a prefill that leaves Hot different from how it was found. |
+| **Restore is a requirement, not an optimization** | **Retired** — the reverse proved true: the restore was an optimization that cost TTFT and bought nothing (see the banner). Shipping a prefill that leaves Hot different from how it was found is now the *intended* behaviour. |
 | **A preserved resident must be released by nobody** | The per-layer release freeing a `resident_at_prefill_begin` expert. |
 | **Warm is frozen; a shadow is not ownership** | Promotion/demotion during prefill, or a shadow surviving past `prefill_end()`. |
 | **Anti-circularity** | Grading a mode against an oracle derived from that mode's own helpers. |
@@ -216,7 +218,7 @@ The default stays `3 E / 4` (`192`), deliberately above both measured crossovers
 
 | Item | State | Detail |
 | :--- | :--- | :--- |
-| **Restore overlap** | deferred | The restore read (`restore_set_` × payload) is on the prefill's critical path; overlapping it with the first decode layer is a later optimization, not part of the mechanism. |
-| **LFU restore source** | future | The restored set is the pre-prefill set; under LFU the frequency ranking will make it the correct set to restore. No work now. |
+| **Restore overlap** | **retired** | Moot: the restore itself was removed (Area 7). There is no read to overlap. |
+| **LFU restore source** | **retired** | Moot: there is no restore to source from (Area 7). Under an LFU policy decode would rebuild its Hot set from its own frequency ranking, not from a prefill-time snapshot. |
 | **Routed bank width** | closed | Always `E`; there is no lookahead in the routed strategy. |
 | **Multi-GPU** | out of scope | Not this plan's subject. |
