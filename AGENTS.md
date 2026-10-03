@@ -38,13 +38,14 @@ Update a reference checkout with `git -C <directory> pull --ff-only` and record 
 5. **Comment Discipline**: A comment explains *why* — the constraint, hazard, or measurement behind the code — never *what* the code already says.
    - **Never cite a planning artifact.** No plan, step, stage, tier, gate, trap/item number, milestone, or ledger id. Explain the concept directly; the reference is noise and goes stale immediately.
    - **Delete stale comments**, and compact the rest to the fewest lines that keep the reasoning.
-6. **Concern Separation (G1–G4)**: A file belongs to exactly one group and changes for exactly one reason.
+6. **Concern Separation (G1–G5)**: A file belongs to exactly one group and changes for exactly one reason.
    - **G1 Engine — `src/infrastructure/`**: our strategy (budget, cache/supply policy, prefill, sampling, streams, text loop). Model-agnostic.
    - **G2 GPU architecture — `src/platform/`**: how an op executes on a specific GPU (wave width, lane mapping, tile shape, intrinsics).
    - **G3 Weight format — `src/backend/`**: how weights are stored and decoded.
    - **G4 Model architecture — `src/architecture/`**: what the model computes (attention, Hyper-Connections, MLA, router, RoPE, tokenizer).
+   - **G5 Serving — outside `src/`**: the production interface a real user drives — transport, request queue and access policy, streaming, cancellation, the external contract. It is the only user-facing surface; `tools/aeon_chat.cpp` is a developer harness for end-to-end runs, not production.
 
-   Dependencies point one way: `G4 → G3/G2`, `G1 → G3/G2`; G2 and G3 depend on nothing above them. Put code where the *change reason* matches, and cross a boundary only through a neutral seam (an interface or a scalar/shape parameter the caller supplies) — never by pulling a lower group's model types upward. A move, split or rename is its own behaviour-preserving step, with no "while I'm here" edits.
+   Dependencies point one way: `G4 → G3/G2`, `G1 → G3/G2`; G2 and G3 depend on nothing above them. **G5 sits above the engine and depends on it through a neutral conversation seam only** — never on G3/G4 types (no model, format or kernel knowledge), and the engine never depends on G5. Session semantics (extend-vs-replay, residency, what a session holds) are G1's and reach G5 only through that seam; G5 owns lifetime, queuing and transport, never the model state. Put code where the *change reason* matches, and cross a boundary only through a neutral seam (an interface or a scalar/shape parameter the caller supplies) — never by pulling a lower group's model types upward. A move, split or rename is its own behaviour-preserving step, with no "while I'm here" edits.
 7. **Don't missread the documents as source of truth**: analysis and execution documents can and probably *will* become stale in time, they are consistent in the moment they are being written or executed but they get superseeded as the project evolves. The implementation or the analysis described in a document from yesterday could be potentially no longer consistent with what the code reality of today is, this means -> the code is the only final authoritative entity, never assume an analysis or an execution plan as the source of truth
 
 
