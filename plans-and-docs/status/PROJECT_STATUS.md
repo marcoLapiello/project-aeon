@@ -69,6 +69,7 @@ Directions explicitly defined as future — researched or discussed, not yet adm
 
 | Direction | Why it waits | Detail |
 | :--- | :--- | :--- |
+| Full tool-call support (agent clients) | requirements settled, no execution plan yet; the server returns the model's DSML tool-call block as `content` today | [TOOL_CALLS_REQUIREMENTS.md](../specs-and-requirements/tool-calls/TOOL_CALLS_REQUIREMENTS.md) — read the model's `<｜DSML｜tool_calls>` block back into structured OpenAI `tool_calls`, non-streaming and streamed, without leaking markup into `content` and without breaking prefix reuse across a tool turn |
 | Backend generalization: the factory and a second backend | its remaining stages are **contingent on a second backend existing**, and the plan's own non-goal forbids the shared abstraction before two concrete backends demonstrate it | [BACKEND_GENERALIZATION_EXECUTION_PLAN.md](../execution/active/BACKEND_GENERALIZATION_EXECUTION_PLAN.md) — the descriptor, manifest, backend selection, dense binding and source boundaries are already implemented |
 | Prefix matcher (block table, cache key, radix search, eviction) | needs an assembled graph and a fork workload | composition plan §9; session analysis |
 | MTP / DSpark draft head (`num_nextn_predict_layers=1`) | speculative decoding, not the base forward pass | composition plan §9; pipeline plan §Tier 0.2e |

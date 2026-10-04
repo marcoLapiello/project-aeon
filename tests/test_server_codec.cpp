@@ -134,6 +134,29 @@ int main() {
         expect(parsed.request.thinking, "thinking via chat_template_kwargs.enable_thinking");
     }
     {
+        // The spelling qwen / sglang / vLLM actually send: top-level.
+        const auto parsed = parse_chat_request(
+            R"({"messages":[{"role":"user","content":"x"}],"enable_thinking":true})");
+        expect(parsed.request.thinking, "thinking via top-level enable_thinking (qwen)");
+    }
+    {
+        const auto parsed = parse_chat_request(
+            R"({"messages":[{"role":"user","content":"x"}],"thinking":{"type":"enabled"}})");
+        expect(parsed.request.thinking, "thinking via top-level thinking:{type:enabled}");
+    }
+    {
+        const auto parsed = parse_chat_request(
+            R"({"messages":[{"role":"user","content":"x"}],"enable_thinking":true,"reasoning_effort":"none"})");
+        expect(!parsed.request.thinking && parsed.request.reasoning_effort.empty(),
+               "reasoning_effort:none overrides a top-level enable_thinking");
+    }
+    {
+        const auto parsed = parse_chat_request(
+            R"({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"high"})");
+        expect(parsed.request.thinking && parsed.request.reasoning_effort == "high",
+               "reasoning_effort:high enables thinking");
+    }
+    {
         const auto parsed = parse_chat_request(
             R"({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"medium"})");
         expect(parsed.request.reasoning_effort == "low", "medium maps to low");

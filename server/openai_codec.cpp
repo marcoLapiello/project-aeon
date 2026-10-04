@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <ctime>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -153,14 +154,38 @@ ParsedRequest parse_chat_request(std::string_view body) {
     }
 
     // --- thinking -----------------------------------------------------------
+    // There is no single "OpenAI" field for the thinking toggle: vLLM reads
+    // `chat_template_kwargs.enable_thinking`, vLLM/sglang/qwen send a top-level
+    // `enable_thinking`, DeepSeek's own API uses `thinking: {"type": ...}`, and
+    // OpenAI's `reasoning_effort` implies it. Be liberal and accept all of them —
+    // a client must not need one vendor's spelling to get the behaviour it asked
+    // for. An explicit enable from any spelling turns thinking on; an explicit
+    // disable or `reasoning_effort: "none"` turns it off; `reasoning_effort` is
+    // evaluated last so it is authoritative when present.
     bool thinking = false;
+    const auto read_toggle = [](const JsonValue* value) -> std::optional<bool> {
+        if (value == nullptr || value->is_null()) return std::nullopt;
+        if (value->is_bool()) return value->as_bool();
+        if (value->is_object()) {  // DeepSeek's `thinking: {"type": "enabled"}`
+            if (const JsonValue* type = value->find("type");
+                type != nullptr && type->is_string()) {
+                if (type->as_string() == "enabled") return true;
+                if (type->as_string() == "disabled") return false;
+            }
+        }
+        return std::nullopt;
+    };
     if (const JsonValue* kwargs = document.find("chat_template_kwargs");
         kwargs != nullptr && kwargs->is_object()) {
         for (const char* key : {"thinking", "enable_thinking"}) {
-            if (const JsonValue* value = kwargs->find(key);
-                value != nullptr && value->is_bool()) {
-                thinking = value->as_bool();
+            if (auto toggle = read_toggle(kwargs->find(key)); toggle.has_value()) {
+                thinking = *toggle;
             }
+        }
+    }
+    for (const char* key : {"enable_thinking", "thinking"}) {
+        if (auto toggle = read_toggle(document.find(key)); toggle.has_value()) {
+            thinking = *toggle;
         }
     }
     std::string effort;
@@ -172,8 +197,11 @@ ParsedRequest parse_chat_request(std::string_view body) {
             thinking = false;
             effort.clear();
         } else if (effort == "minimal" || effort == "medium") {
+            thinking = true;
             effort = "low";
-        } else if (effort != "low" && effort != "high" && effort != "max") {
+        } else if (effort == "low" || effort == "high" || effort == "max") {
+            thinking = true;
+        } else {
             fail(400, "invalid_request_error",
                  "`reasoning_effort` must be one of low|high|max");
         }

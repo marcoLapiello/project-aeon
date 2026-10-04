@@ -78,5 +78,5 @@ It does **not** serve many users at once — a second conversation waits its tur
 | Multiple concurrent resident sessions | continuous batching territory; the engine is single-sequence by design | the queue proves to be the actual bottleneck |
 | Session storage / persistence | a separate capability; the server does not require it | concurrent conversations or restart recovery are actually needed |
 | A second transport (e.g. gRPC) or auth | not needed for the single-user product shape | a real deployment needs it |
-| Response-side DSML → OpenAI `tool_calls` parsing | the model emits a `<｜DSML｜tool_calls>` text block; the server returns it verbatim in `content` today. Parsing it is harder while streaming | an agent client waits on a structured `tool_calls` field |
+| Response-side DSML → OpenAI `tool_calls` parsing | the model emits a `<｜DSML｜tool_calls>` text block; the server returns it verbatim in `content` today. Parsing it is harder while streaming. Requirements now written: [TOOL_CALLS_REQUIREMENTS.md](../tool-calls/TOOL_CALLS_REQUIREMENTS.md) | an agent client waits on a structured `tool_calls` field |
 | `stop` strings | a stop string changes the output, so accepting it and ignoring it would be a lie; it is rejected as `unsupported_parameter` | truncation on the server side is needed |
