@@ -88,6 +88,78 @@ int main() {
 
     assert(std::string(aeon::text::stop_reason_name(aeon::text::StopReason::Eos)) == "eos");
     assert(std::string(aeon::text::stop_reason_name(aeon::text::StopReason::ContextLimit)) == "context_limit");
+    assert(std::string(aeon::text::stop_reason_name(aeon::text::StopReason::Cancelled)) == "cancelled");
+
+    // --- the streaming hook: every sampled token, in order, EOS included --------
+    {
+        std::vector<uint32_t> seen;
+        uint32_t calls = 0;
+        aeon::text::GenerationOptions options;
+        options.max_new_tokens = 4;
+        options.eos_token_id = 99;
+        options.on_token = [&seen](uint32_t id) { seen.push_back(id); };
+        const auto result = aeon::text::generate_token_ids(
+            {10, 11}, options,
+            [&calls](uint32_t, uint32_t, bool) {
+                ++calls;
+                return calls == 2 ? 50u : (calls == 3 ? 99u : 42u);
+            }
+        );
+        // Same generation as the first block: [50, 99], stopping on EOS.
+        assert(result.token_ids == std::vector<uint32_t>({50, 99}));
+        assert(result.stop_reason == aeon::text::StopReason::Eos);
+        // The hook saw exactly the ids appended, EOS included.
+        assert(seen == result.token_ids);
+    }
+
+    // --- cancel after the first token: Cancelled, exactly one id ---------------
+    {
+        bool cancel = false;
+        aeon::text::GenerationOptions options;
+        options.max_new_tokens = 8;
+        options.eos_token_id = 99;
+        options.on_token = [&cancel](uint32_t) { cancel = true; };
+        options.cancelled = [&cancel]() { return cancel; };
+        uint32_t calls = 0;
+        const auto result = aeon::text::generate_token_ids(
+            {10, 11}, options,
+            [&calls](uint32_t, uint32_t, bool) { ++calls; return 42u; }
+        );
+        assert(result.stop_reason == aeon::text::StopReason::Cancelled);
+        assert(result.token_ids.size() == 1);
+        // Only the prefill ran — the decode step was never entered.
+        assert(calls == 2);
+    }
+
+    // --- cancel set only after EOS still reports Eos ---------------------------
+    {
+        bool cancel = false;
+        aeon::text::GenerationOptions options;
+        options.max_new_tokens = 8;
+        options.eos_token_id = 99;
+        options.on_token = [&cancel](uint32_t id) { if (id == 99) cancel = true; };
+        options.cancelled = [&cancel]() { return cancel; };
+        const auto result = aeon::text::generate_token_ids(
+            {10, 11}, options,
+            [](uint32_t, uint32_t, bool) { return 99u; }
+        );
+        assert(result.stop_reason == aeon::text::StopReason::Eos);
+        assert(result.token_ids == std::vector<uint32_t>({99}));
+    }
+
+    // --- empty hooks reproduce the unhooked results ----------------------------
+    {
+        aeon::text::GenerationOptions options;
+        options.max_new_tokens = 3;
+        options.eos_token_id = 99;
+        const auto result = aeon::text::generate_token_ids(
+            {10, 11}, options,
+            [](uint32_t, uint32_t, bool) { return 7u; }
+        );
+        assert(result.token_ids == std::vector<uint32_t>({7, 7, 7}));
+        assert(result.stop_reason == aeon::text::StopReason::MaxNewTokens);
+    }
+
     std::cout << "[PASS] EOS-aware generation loop and stop reasons" << std::endl;
     return 0;
 }

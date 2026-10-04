@@ -248,6 +248,10 @@ public:
     // graph directly and must not leave a stale record behind.
     void end_session() noexcept { session_.clear(); }
 
+    // How many tokens the resident state already covers. Zero when there is no live
+    // session. Read by a serving layer's `/status` without touching the device.
+    uint32_t resident_tokens() const noexcept { return session_.size(); }
+
     bool ready() const noexcept { return graph_ != nullptr && sampler_ != nullptr; }
     bool policy_loaded() const noexcept { return policy_loaded_; }
     const V4GenerationPolicy& policy() const noexcept { return policy_; }
@@ -417,6 +421,11 @@ public:
                 // the whole prompt.
                 try {
                     for (uint32_t offset = start; offset < count; offset += window) {
+                        // A cancel between windows is honoured here; a cancel inside
+                        // one window cannot be, so the worst case is one window.
+                        if (generation.cancelled && generation.cancelled()) {
+                            throw text::GenerationCancelled{};
+                        }
                         const uint32_t span = std::min(window, count - offset);
                         logits = graph_->forward_window(
                             tokens.data() + offset, offset, span, std::min(chunk, span),
@@ -426,6 +435,10 @@ public:
                             session_.feed(offset + k, tokens[offset + k]);
                         }
                     }
+                } catch (const text::GenerationCancelled&) {
+                    // The windows that ran are fed and recorded, so state and record
+                    // still agree; a later turn may reuse them. Do not clear.
+                    throw;
                 } catch (...) {
                     // The state is partially advanced and no longer matches the record,
                     // so the record must not be trusted by a later turn.
@@ -462,9 +475,16 @@ public:
                 return next;
             };
 
-        const text::GenerationResult generated =
-            text::generate_token_ids(prompt, loop_options, prefill_step, decode_step);
-
+        text::GenerationResult generated;
+        try {
+            generated = text::generate_token_ids(prompt, loop_options, prefill_step, decode_step);
+        } catch (const text::GenerationCancelled&) {
+            // Prefill was cancelled between windows: nothing was sampled and the
+            // state matches the record, so the reply carries no tokens and a later
+            // turn may still reuse the state.
+            reply.stop_reason = text::StopReason::Cancelled;
+            return reply;
+        }
         // The decode phase split: one token's regions accumulate over every decoded
         // token, so the figures are per-run totals and divide by the token count. The
         // prefill reset above makes this table decode-only.

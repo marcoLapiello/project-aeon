@@ -11,8 +11,15 @@ enum class StopReason {
     Eos,
     MaxNewTokens,
     ContextLimit,
+    Cancelled,
     Error,
 };
+
+// Thrown by a prefill step that honours `GenerationOptions::cancelled` between
+// its windows. The window boundary is the finest cancellation the prefill can
+// offer: a cancel *inside* one window cannot be honoured, so the worst case is one
+// window's worth of work before the loop notices.
+struct GenerationCancelled {};
 
 struct GenerationOptions {
     uint32_t max_new_tokens{256};
@@ -20,6 +27,15 @@ struct GenerationOptions {
     uint32_t context_limit{0};
     bool stop_on_eos{true};
     bool thinking_mode{false};
+
+    // Called for every sampled token, EOS included, right after it is appended —
+    // the streaming seam. Empty means "not interested"; the loop then does exactly
+    // what it did before.
+    std::function<void(uint32_t)> on_token;
+
+    // Polled before each decode step (and once after the first token) to stop a run
+    // early. Empty means "never cancelled".
+    std::function<bool()> cancelled;
 };
 
 struct GenerationResult {

@@ -25,7 +25,7 @@ The server accepts a conversation (messages plus the non-token inputs of the eng
 Tokens reach the client as they are generated. The client sees the reply being produced, not a final blob after a multi-second wait. First-token latency matters as much as total latency.
 
 **R3 — One conversation at a time, by design; a second one queues.**
-Exactly one live conversation is served at a time. A second conversation that arrives while one is live is **queued**, not refused. The queue is a fairness and turn-taking policy; when a queued conversation's turn arrives, it is served. Nothing is silently interleaved, and a queued request never corrupts the live session. The queue is the seam a future multi-session scheduler would grow from; single-session is a deliberate design choice, not a limitation to be worked around in this campaign.
+Exactly one live conversation is served at a time. A second conversation that arrives while one is live is **queued**, not refused. The queue is a fairness and turn-taking policy; when a queued conversation's turn arrives, it is served. Nothing is silently interleaved, and a queued request never corrupts the live session. The queue is the seam a future multi-session scheduler would grow from; single-session is a deliberate design choice, not a limitation to be worked around in this campaign. The live conversation is the engine's resident session: the server holds no conversation id, and a *different* conversation served between two turns of the first replaces the resident state, so the first replays rather than reusing when its turn returns — correct, just not free.
 
 **R4 — Cancellation.**
 A generation in flight can be stopped by the client. Cancellation leaves the server and the engine in a well-defined state, and does not corrupt the live session.
@@ -78,3 +78,5 @@ It does **not** serve many users at once — a second conversation waits its tur
 | Multiple concurrent resident sessions | continuous batching territory; the engine is single-sequence by design | the queue proves to be the actual bottleneck |
 | Session storage / persistence | a separate capability; the server does not require it | concurrent conversations or restart recovery are actually needed |
 | A second transport (e.g. gRPC) or auth | not needed for the single-user product shape | a real deployment needs it |
+| Response-side DSML → OpenAI `tool_calls` parsing | the model emits a `<｜DSML｜tool_calls>` text block; the server returns it verbatim in `content` today. Parsing it is harder while streaming | an agent client waits on a structured `tool_calls` field |
+| `stop` strings | a stop string changes the output, so accepting it and ignoring it would be a lie; it is rejected as `unsupported_parameter` | truncation on the server side is needed |

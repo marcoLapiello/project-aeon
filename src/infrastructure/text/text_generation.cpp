@@ -44,15 +44,28 @@ GenerationResult generate_token_ids(
     // loop's only interest is the token it hands back.
     uint32_t next_token = prefill(prompt);
     result.token_ids.push_back(next_token);
+    if (options.on_token) options.on_token(next_token);
+    // EOS is checked before cancellation, so a generation that finished is never
+    // reported as cancelled. The last sampled token is deliberately left unfed by
+    // the engine's step, which is what keeps a cancelled state reusable.
     if (options.stop_on_eos && next_token == options.eos_token_id) {
         result.stop_reason = StopReason::Eos;
         return result;
     }
+    if (options.cancelled && options.cancelled()) {
+        result.stop_reason = StopReason::Cancelled;
+        return result;
+    }
 
     for (uint32_t generated = 1; generated < available_tokens; ++generated) {
+        if (options.cancelled && options.cancelled()) {
+            result.stop_reason = StopReason::Cancelled;
+            return result;
+        }
         const uint32_t position = static_cast<uint32_t>(prompt.size()) + generated - 1;
         next_token = decode(next_token, position, false);
         result.token_ids.push_back(next_token);
+        if (options.on_token) options.on_token(next_token);
         if (options.stop_on_eos && next_token == options.eos_token_id) {
             result.stop_reason = StopReason::Eos;
             return result;
@@ -92,6 +105,8 @@ const char* stop_reason_name(StopReason reason) {
         return "max_new_tokens";
     case StopReason::ContextLimit:
         return "context_limit";
+    case StopReason::Cancelled:
+        return "cancelled";
     case StopReason::Error:
         return "error";
     }

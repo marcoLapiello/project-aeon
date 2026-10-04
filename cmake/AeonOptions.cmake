@@ -8,6 +8,10 @@ option(AEON_BUILD_BENCHMARKS
     "Build the infrastructure and backend benchmark targets."
     ON)
 
+option(AEON_BUILD_SERVER
+    "Build the G5 serving layer and its aeon_serve binary."
+    ON)
+
 # Worker threads for the oracle gates that opt into host OpenMP
 # (`aeon_add_test(... OPENMP)`). Those gates alternate between fp64 oracle work,
 # which spreads cleanly over cores, and device work that does not.

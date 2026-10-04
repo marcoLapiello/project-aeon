@@ -15,3 +15,4 @@ include(AeonToolchain)
 include(AeonHelpers)
 
 include(AeonInfrastructure)
+include(AeonServer)

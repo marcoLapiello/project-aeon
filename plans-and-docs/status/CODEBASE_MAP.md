@@ -79,7 +79,24 @@ access remains available inside the loader for native `.aeon` ownership and
 validation. The bounded Hot/Warm/Cold path is implemented. See
 [PHASE_2_EXECUTION_PLAN.md](../execution/completed/PHASE_2_EXECUTION_PLAN.md) for the storage and kernel work.
 
-## Active validation (default `ctest` — 50 tests)
+## Serving layer (G5)
+
+The production interface a real user drives lives outside `src/` and depends on the engine only through the neutral seam `src/infrastructure/session/conversation.hpp` (`session::ConversationEngine`). It links **no** HIP runtime — `scripts/check_server_layering.sh` enforces that `server/**` includes nothing beyond the seam, `infrastructure/text/text_generation.hpp`, `infrastructure/json.hpp`, its own headers and the vendored HTTP library.
+
+- `server/conversation_service.{hpp,cpp}` and `server/job_stream.hpp` - the queue, the single worker thread that owns the engine, and the per-job event stream. One job runs at a time, FIFO; a second queues. `snapshot()` is readable from any thread without waiting on the engine.
+- `server/openai_codec.{hpp,cpp}` - `/v1/chat/completions` parsing and response writing (streamed chunks, the single object, the error object). `tools` and `response_format` pass through as raw source text.
+- `server/json_span.hpp` - top-level raw-member extraction that preserves key order for the passthrough members.
+- `server/json_write.hpp` - `json_escape` and a small order-preserving writer.
+- `server/http_server.{hpp,cpp}` - the vendored-transport shell over the service, with SSE streaming, queued keep-alives and cancel-on-disconnect.
+- `third_party/cpp-httplib/` - the vendored HTTP library (`aeon_httplib`), no OpenSSL/zlib.
+- `src/infrastructure/session/conversation.hpp` - the neutral seam (G1): messages, tools as raw JSON, decoded text deltas with a channel, and the engine interface.
+- `src/infrastructure/text/utf8_chunker.hpp` - the streamed-delta UTF-8 holdback (G1).
+- `src/architecture/deepseek_v4/text/dsv4_stream_decoder.hpp` - token ids to reasoning/content deltas, split at the thinking marker (G4).
+- `src/architecture/deepseek_v4/runtime/v4_conversation.hpp` - the engine as the seam, including the exact-token history the prompt encoder's `preencoded_ids` consumes (G4).
+- `tools/aeon_serve.cpp` - the composition root: the only place the engine and the serving layer meet.
+- `tools/engine_cli.hpp` - the engine-setup flags `aeon_serve` shares.
+
+## Active validation (default `ctest` — 57 tests)
 
 These targets are built and run on every branch. They validate the artifact format,
 the storage tiers, the W4A16 kernels, the text front end, the kept model-side
@@ -91,7 +108,13 @@ graph rewrite's P1–P4 gates.
 - `tests/test_dynamic_expert_pool.cpp`
 - `tests/test_model_direct_io.cpp`
 - `tests/test_dsv4_tokenizer.cpp`
+- `tests/test_dsv4_stream_decoder.cpp`
 - `tests/test_text_generation.cpp`
+- `tests/test_utf8_chunker.cpp`
+- `tests/test_v4_conversation.cpp`
+- `tests/test_server_service.cpp`
+- `tests/test_server_codec.cpp`
+- `tests/test_server_http.cpp`
 - `tests/test_swiglu_clamp.cpp`
 - `tests/test_hc_sinkhorn.cpp`
 - `tests/test_moe_router.cpp`

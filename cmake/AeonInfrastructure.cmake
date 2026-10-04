@@ -112,6 +112,16 @@ if(AEON_BUILD_TESTS)
             tests/test_text_generation.cpp
             src/infrastructure/text/text_generation.cpp)
 
+    # UTF-8 holdback for streamed deltas (header-only, CPU-side).
+    aeon_add_test(test_utf8_chunker SOURCES tests/test_utf8_chunker.cpp)
+
+    # Stream decoder: token ids -> reasoning/content deltas, split at the thinking
+    # marker, versus the batch decode oracle (CPU-side).
+    aeon_add_test(test_dsv4_stream_decoder
+        SOURCES
+            tests/test_dsv4_stream_decoder.cpp
+            src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp)
+
     # Prefix record: the reuse verdict logic, pure and CPU-only (no sources).
     aeon_add_test(test_prefix_record SOURCES tests/test_prefix_record.cpp)
 endif()
@@ -561,6 +571,17 @@ if(AEON_BUILD_TESTS)
     aeon_add_test(test_v4_prefix_reuse
         SOURCES
             tests/test_v4_prefix_reuse.cpp
+            src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
+            src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp
+            src/infrastructure/text/text_generation.cpp
+        TIMEOUT 1800)
+
+    # The serving seam: the streaming adapter must match the batch path, cancel at
+    # the right granularity, split reasoning from content, validate requests before
+    # touching state, and leave the supply invariants intact.
+    aeon_add_test(test_v4_conversation
+        SOURCES
+            tests/test_v4_conversation.cpp
             src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
             src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp
             src/infrastructure/text/text_generation.cpp

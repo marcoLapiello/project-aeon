@@ -244,7 +244,8 @@ private:
             return -1;
         }
 
-        void append_unicode_escape(std::string& result) {
+        // Reads the four hex digits of a `\uXXXX` escape (the `\u` already consumed).
+        uint32_t read_hex4() {
             if (position_ + 4 > text_.size()) fail("truncated unicode escape");
             uint32_t codepoint = 0;
             for (int index = 0; index < 4; ++index) {
@@ -252,16 +253,48 @@ private:
                 if (digit < 0) fail("invalid unicode escape");
                 codepoint = (codepoint << 4) | static_cast<uint32_t>(digit);
             }
+            return codepoint;
+        }
+
+        static void append_code_point(std::string& out, uint32_t codepoint) {
             if (codepoint <= 0x7f) {
-                result.push_back(static_cast<char>(codepoint));
+                out.push_back(static_cast<char>(codepoint));
             } else if (codepoint <= 0x7ff) {
-                result.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
-                result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+                out.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
+                out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+            } else if (codepoint <= 0xffff) {
+                out.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
+                out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+                out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
             } else {
-                result.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
-                result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
-                result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+                out.push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
+                out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
+                out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+                out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
             }
+        }
+
+        void append_unicode_escape(std::string& result) {
+            uint32_t codepoint = read_hex4();
+            // A high surrogate must be followed by a low surrogate (a second `\u`
+            // escape); the pair is one code point above the BMP. Encoded separately
+            // it would be a lone surrogate, which is not valid UTF-8 and would be
+            // rejected by anything that re-encodes the string — so a stray surrogate
+            // becomes U+FFFD and the output stays valid.
+            if (codepoint >= 0xd800 && codepoint <= 0xdbff && position_ + 1 < text_.size() &&
+                text_[position_] == '\\' && text_[position_ + 1] == 'u') {
+                const size_t saved = position_;
+                position_ += 2;
+                const uint32_t low = read_hex4();
+                if (low >= 0xdc00 && low <= 0xdfff) {
+                    codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+                } else {
+                    position_ = saved;  // leave the second escape for its own turn
+                    codepoint = 0xfffd;
+                }
+            }
+            if (codepoint >= 0xd800 && codepoint <= 0xdfff) codepoint = 0xfffd;
+            append_code_point(result, codepoint);
         }
 
         JsonValue parse_array() {
