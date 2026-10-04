@@ -74,6 +74,21 @@ struct Dsv4PromptMessage {
     std::string task;                               // classification task, optional
     bool wo_eos{false};                             // assistant: omit the trailing eos
     bool mask{false};                               // preserved through merging, not rendered
+
+    // The exact ids this assistant message's body contributes, in place of
+    // re-tokenizing `reasoning_content` + `content` + `tool_calls`.
+    //
+    // A caller that generated the previous turn sets this to the ids the engine
+    // produced for it (minus the trailing EOS, which the template re-adds). The
+    // next prompt then contains the very tokens the resident state was fed, so
+    // prefix reuse's strict token-prefix compare cannot diverge at the reply
+    // boundary. Without it the reply is decoded to text and re-encoded, and BPE
+    // does not invert that round-trip, so a divergence lands *inside* the resident
+    // region and forces a full replay.
+    //
+    // Honoured by `encode_tokens` only; `encode` still renders the text, so a
+    // diagnostic string stays readable. Empty means "render as usual".
+    std::vector<uint32_t> preencoded_ids;
 };
 
 struct Dsv4PromptOptions {
@@ -99,10 +114,28 @@ public:
                        const Dsv4PromptOptions& options) const;
 
     // Convenience: encode, then tokenize with the artifact tokenizer.
+    //
+    // For an assistant message carrying `preencoded_ids`, the ids are spliced in
+    // verbatim instead of tokenizing that message's text, so a caller can feed a
+    // live conversation forward without a detokenize/retokenize round-trip. When
+    // no message carries ids this is exactly `tokenizer_.encode(encode(...))`.
     std::vector<uint32_t> encode_tokens(const std::vector<Dsv4PromptMessage>& messages,
                                         const Dsv4PromptOptions& options) const;
 
 private:
+    // One rendered piece of the prompt. `text` is what `encode` concatenates;
+    // `ids`, when non-empty, is the exact token span `encode_tokens` emits for this
+    // piece instead of tokenizing `text`. Contiguous text merges into one segment,
+    // so a conversation with no exact ids is a single segment and tokenizes exactly
+    // as before; the only segment boundaries are around an exact-id body, which is
+    // always flanked by added tokens (the assistant marker before, the EOS after).
+    struct Segment {
+        std::string text;
+        std::vector<uint32_t> ids;
+    };
+    std::vector<Segment> render_segments(const std::vector<Dsv4PromptMessage>& messages,
+                                         const Dsv4PromptOptions& options) const;
+
     const Dsv4Tokenizer& tokenizer_;
 };
 

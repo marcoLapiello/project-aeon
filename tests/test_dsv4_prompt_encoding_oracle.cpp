@@ -15,6 +15,7 @@
 
 #include "architecture/deepseek_v4/text/dsv4_prompt_encoder.hpp"
 #include "architecture/deepseek_v4/text/dsv4_prompt_json.hpp"
+#include "architecture/deepseek_v4/text/dsv4_computation_key.hpp"
 #include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
 
 #include <algorithm>
@@ -209,6 +210,134 @@ int main() {
 
         std::cout << "\n  " << matched << "/" << kVectorCount << " vectors byte-identical."
                   << std::endl;
+
+        // The computation key is the cheap, model-agnostic half of prefix-reuse R4:
+        // the non-token inputs that alter the graph. Every one of them, flipped
+        // alone against a fixed conversation, must change the key; message prose must
+        // not, because the token compare already covers text.
+        std::cout << "\n[computation key]\n";
+        {
+            Dsv4PromptMessage system_message;
+            system_message.role = Dsv4Role::System;
+            system_message.content = "You are a helpful assistant.";
+
+            Dsv4PromptMessage user;
+            user.role = Dsv4Role::User;
+            user.content = "Hello there.";
+
+            const std::vector<Dsv4PromptMessage> base = {system_message, user};
+            Dsv4PromptOptions base_options;  // Chat, drop_thinking on, low, bos on
+            const std::string base_key =
+                aeon::text::dsv4_computation_key(base, base_options);
+
+            auto key_changes = [&](const char* label,
+                                   const std::vector<Dsv4PromptMessage>& messages,
+                                   const Dsv4PromptOptions& options) {
+                const bool differs =
+                    aeon::text::dsv4_computation_key(messages, options) != base_key;
+                std::cout << "  key changes on " << label << ": "
+                          << (differs ? "PASS" : "FAIL") << std::endl;
+                if (!differs) any_failed = true;
+            };
+
+            {
+                Dsv4PromptOptions options = base_options;
+                options.thinking_mode = Dsv4ThinkingMode::Thinking;
+                key_changes("thinking_mode", base, options);
+            }
+            {
+                // No tools in the base, so the option is the effective value.
+                Dsv4PromptOptions options = base_options;
+                options.drop_thinking = false;
+                key_changes("drop_thinking", base, options);
+            }
+            {
+                Dsv4PromptOptions options = base_options;
+                options.reasoning_effort = "high";
+                key_changes("reasoning_effort", base, options);
+            }
+            {
+                Dsv4PromptOptions options = base_options;
+                options.add_default_bos_token = false;
+                key_changes("add_default_bos_token", base, options);
+            }
+            {
+                std::vector<Dsv4PromptMessage> messages = base;
+                Dsv4ToolDefinition tool;
+                tool.function_json =
+                    "{\"name\": \"get_weather\", \"description\": \"d\", \"parameters\": {}}";
+                messages.front().tools.push_back(std::move(tool));
+                key_changes("declared tools", messages, base_options);
+            }
+            {
+                std::vector<Dsv4PromptMessage> messages = base;
+                messages.front().response_format_json = "{\"type\": \"json_object\"}";
+                key_changes("response_format", messages, base_options);
+            }
+            {
+                std::vector<Dsv4PromptMessage> messages = base;
+                messages.back().content = "A completely different question.";
+                const bool unchanged =
+                    aeon::text::dsv4_computation_key(messages, base_options) == base_key;
+                std::cout << "  key unchanged by user text: "
+                          << (unchanged ? "PASS" : "FAIL") << std::endl;
+                if (!unchanged) any_failed = true;
+            }
+        }
+
+        // Exact-token history: an assistant body supplied as ids must be spliced
+        // verbatim, and injecting the ids the text itself would have produced must
+        // be a no-op. This is the seam that lets a live conversation feed forward
+        // without a detokenize/retokenize round-trip at the reply boundary.
+        std::cout << "\n[exact-token history]\n";
+        {
+            Dsv4PromptOptions chat;
+            chat.thinking_mode = Dsv4ThinkingMode::Chat;
+
+            auto user = [](const std::string& text) {
+                Dsv4PromptMessage m; m.role = Dsv4Role::User; m.content = text; return m;
+            };
+            auto assistant = [](const std::string& text) {
+                Dsv4PromptMessage m; m.role = Dsv4Role::Assistant; m.content = text; return m;
+            };
+
+            std::vector<Dsv4PromptMessage> conversation = {
+                user("Hi"), assistant("Hello there"), user("Bye"),
+            };
+            const std::vector<uint32_t> no_ids = encoder.encode_tokens(conversation, chat);
+            const std::vector<uint32_t> prefix = encoder.encode_tokens({user("Hi")}, chat);
+            const std::vector<uint32_t> body = tokenizer.encode("Hello there");
+
+            // Equivalence: with no ids, the segment splice is the whole-string
+            // tokenization — the refactor is behaviour-preserving.
+            const bool equivalent = no_ids ==
+                tokenizer.encode(encoder.encode(conversation, chat));
+            std::cout << "  encode_tokens == tokenize(encode): "
+                      << (equivalent ? "PASS" : "FAIL") << std::endl;
+            if (!equivalent) any_failed = true;
+
+            conversation[1].preencoded_ids = body;
+            const bool no_op = encoder.encode_tokens(conversation, chat) == no_ids;
+            std::cout << "  injecting the text's own ids is a no-op: "
+                      << (no_op ? "PASS" : "FAIL") << std::endl;
+            if (!no_op) any_failed = true;
+
+            const std::vector<uint32_t> foreign = {7, 8, 9};
+            conversation[1].preencoded_ids = foreign;
+            const std::vector<uint32_t> injected = encoder.encode_tokens(conversation, chat);
+            const bool prefix_kept = injected.size() >= prefix.size() &&
+                std::equal(prefix.begin(), prefix.end(), injected.begin());
+            const bool ids_placed = injected.size() >= prefix.size() + foreign.size() &&
+                std::equal(foreign.begin(), foreign.end(), injected.begin() + prefix.size());
+            const bool tail_kept =
+                injected.size() == no_ids.size() - body.size() + foreign.size() &&
+                std::equal(injected.begin() + prefix.size() + foreign.size(), injected.end(),
+                           no_ids.begin() + prefix.size() + body.size());
+            const bool replaced = prefix_kept && ids_placed && tail_kept;
+            std::cout << "  foreign ids replace exactly the body span: "
+                      << (replaced ? "PASS" : "FAIL") << std::endl;
+            if (!replaced) any_failed = true;
+        }
 
         if (any_failed) {
             std::cout << "\n[FAIL] prompt encoding does not match the artifact oracle" << std::endl;

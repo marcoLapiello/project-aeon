@@ -313,8 +313,8 @@ std::string render_tools(const std::vector<Dsv4ToolDefinition>& tools, const Tok
 
 } // namespace
 
-std::string Dsv4PromptEncoder::encode(const std::vector<Dsv4PromptMessage>& messages,
-                                      const Dsv4PromptOptions& options) const {
+std::vector<Dsv4PromptEncoder::Segment> Dsv4PromptEncoder::render_segments(
+    const std::vector<Dsv4PromptMessage>& messages, const Dsv4PromptOptions& options) const {
     const Tokens tokens = resolve_tokens(tokenizer_);
 
     if (options.reasoning_effort != "low" && options.reasoning_effort != "high" &&
@@ -328,8 +328,20 @@ std::string Dsv4PromptEncoder::encode(const std::vector<Dsv4PromptMessage>& mess
     std::vector<Dsv4PromptMessage> ordered = merged;
     sort_tool_results(merged, ordered);
 
-    std::string prompt;
-    if (options.add_default_bos_token) prompt += tokens.bos;
+    // Contiguous text merges into one segment, so a conversation with no exact ids
+    // is a single segment and `encode_tokens` tokenizes it exactly as the whole
+    // string. The only boundaries are around an exact-id body, always flanked by
+    // added tokens (the assistant marker before it, the EOS after).
+    std::vector<Segment> segments;
+    const auto emit_text = [&segments](std::string text) {
+        if (text.empty()) return;
+        if (!segments.empty() && segments.back().ids.empty()) {
+            segments.back().text += text;
+        } else {
+            segments.push_back(Segment{std::move(text), {}});
+        }
+    };
+    if (options.add_default_bos_token) emit_text(tokens.bos);
 
     // Any declared tools force thinking to be kept: dropping reasoning while a tool
     // schema is present silently changes the prefix.
@@ -438,13 +450,23 @@ std::string Dsv4PromptEncoder::encode(const std::vector<Dsv4PromptMessage>& mess
                     }
                 }
 
-                piece += thinking_part + message.content + tool_call_content;
+                const std::string body = thinking_part + message.content + tool_call_content;
+                if (!message.preencoded_ids.empty()) {
+                    // Exact-token history: emit the caller's ids verbatim as the body
+                    // instead of re-tokenizing the reply text, which BPE does not
+                    // invert. The template's EOS is its own text segment after; the
+                    // rendered body is still carried in `.text` for `encode`.
+                    segments.push_back(Segment{body, message.preencoded_ids});
+                    if (!message.wo_eos) emit_text(tokens.eos);
+                    break;
+                }
+                piece += body;
                 if (!message.wo_eos) piece += tokens.eos;
                 break;
             }
         }
 
-        prompt += piece;
+        emit_text(std::move(piece));
 
         // Transition tokens are emitted only when the next message continues the
         // generation-adjacent sequence.
@@ -456,30 +478,47 @@ std::string Dsv4PromptEncoder::encode(const std::vector<Dsv4PromptMessage>& mess
         if (!message.task.empty()) {
             const std::string token = tokenizer_.added_token_text(tokens.task_token(message.task));
             if (message.task != "action") {
-                prompt += token;
+                emit_text(token);
             } else {
-                prompt += tokens.assistant;
-                prompt += thinking ? tokens.thinking_start : tokens.thinking_end;
-                prompt += token;
+                emit_text(tokens.assistant);
+                emit_text(thinking ? tokens.thinking_start : tokens.thinking_end);
+                emit_text(token);
             }
         } else if (is_user_like(message)) {
-            prompt += tokens.assistant;
+            emit_text(tokens.assistant);
             if (!effective_drop_thinking && thinking) {
-                prompt += tokens.thinking_start;
+                emit_text(tokens.thinking_start);
             } else if (effective_drop_thinking && thinking && position >= last_user_index) {
-                prompt += tokens.thinking_start;
+                emit_text(tokens.thinking_start);
             } else {
-                prompt += tokens.thinking_end;
+                emit_text(tokens.thinking_end);
             }
         }
     }
 
+    return segments;
+}
+
+std::string Dsv4PromptEncoder::encode(const std::vector<Dsv4PromptMessage>& messages,
+                                      const Dsv4PromptOptions& options) const {
+    std::string prompt;
+    for (const Segment& segment : render_segments(messages, options)) prompt += segment.text;
     return prompt;
 }
 
 std::vector<uint32_t> Dsv4PromptEncoder::encode_tokens(
     const std::vector<Dsv4PromptMessage>& messages, const Dsv4PromptOptions& options) const {
-    return tokenizer_.encode(encode(messages, options));
+    const std::vector<Segment> segments = render_segments(messages, options);
+    std::vector<uint32_t> out;
+    for (const Segment& segment : segments) {
+        if (!segment.ids.empty()) {
+            out.insert(out.end(), segment.ids.begin(), segment.ids.end());
+        } else {
+            const std::vector<uint32_t> part = tokenizer_.encode(segment.text);
+            out.insert(out.end(), part.begin(), part.end());
+        }
+    }
+    return out;
 }
 
 } // namespace aeon::text

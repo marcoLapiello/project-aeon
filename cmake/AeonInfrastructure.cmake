@@ -111,6 +111,9 @@ if(AEON_BUILD_TESTS)
         SOURCES
             tests/test_text_generation.cpp
             src/infrastructure/text/text_generation.cpp)
+
+    # Prefix record: the reuse verdict logic, pure and CPU-only (no sources).
+    aeon_add_test(test_prefix_record SOURCES tests/test_prefix_record.cpp)
 endif()
 
 # --- Expert supply and telemetry ---------------------------------------------
@@ -545,6 +548,19 @@ if(AEON_BUILD_TESTS)
     aeon_add_test(test_v4_engine
         SOURCES
             tests/test_v4_engine.cpp
+            src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
+            src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp
+            src/infrastructure/text/text_generation.cpp
+        TIMEOUT 1800)
+
+    # Prefix reuse: a continuation must equal a from-scratch run at token
+    # granularity, only the addition is prefilled, a rejected reuse replays
+    # correctly, every non-token input invalidates, the context bound is refused
+    # up front, and the whole thing is deterministic and inspectable. The
+    # from-scratch run is the independent oracle; it shares no reuse code.
+    aeon_add_test(test_v4_prefix_reuse
+        SOURCES
+            tests/test_v4_prefix_reuse.cpp
             src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
             src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp
             src/infrastructure/text/text_generation.cpp

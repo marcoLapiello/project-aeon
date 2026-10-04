@@ -1,7 +1,7 @@
 # Prefix Reuse Execution Plan
 
 **Date:** 2026-10-03
-**Status:** Open; nothing implemented
+**Status:** Completed 2026-10-04. The engine session seam is built and gated, and the exact-token history seam (Step 9) makes the text path reuse deterministically. Ledger M49.
 **Scope:** The engine-side session seam: one live conversation keeps its model state resident and each turn prefills only what it added.
 **Requirements:** [PREFIX_REUSE_REQUIREMENTS.md](../../specs-and-requirements/prefix-reuse/PREFIX_REUSE_REQUIREMENTS.md) (R1–R6). **Reference:** [PREFIX_REUSE_REFERENCE_ANALYSIS.md](../../analysis/current/PREFIX_REUSE_REFERENCE_ANALYSIS.md).
 
@@ -180,6 +180,53 @@ Outcomes, in order of cost; pick from the data, then record it:
 - **Move this plan** to `plans-and-docs/execution/completed/`.
 - Fix the stale comment in `dsv4_prompt_encoder.hpp` ("a separately encoded `context` prefix is intentionally not implemented") only if it is inconsistent after Step 3.
 
+### Step 9 — The exact-token history seam (G4) — added after Step 7's measurement
+
+**Why this exists.** Step 7 measured that the *text* path cannot reuse: a reply is decoded
+to text and re-encoded to build the next turn, and BPE does not invert that round-trip
+(`encode(decode(ids)) != ids`, measured: 8 generated tokens re-encoded to 9). The strict
+token-prefix compare then diverges *inside* the resident region and forces a full replay —
+so the multi-turn feature, as a client would experience it, worked only by chance. The fix
+is not to loosen the compare but to stop round-tripping: hand the engine back the ids it
+produced.
+
+**The seam.** A message may carry the exact ids its body contributes, so the encoder emits
+them verbatim instead of tokenizing its text:
+
+- `Dsv4PromptMessage::preencoded_ids` — when non-empty on an assistant message, the encoder
+  emits these ids as the message body, in place of rendering `reasoning_content + content +
+  tool_calls`. The template's EOS still follows. The caller sets it to `reply.token_ids`
+  minus the trailing EOS (the model's output in thinking mode already contains reasoning +
+  `</think>` + content, so the whole body is exactly the generated ids).
+- `Dsv4PromptEncoder` split into `render_segments` (returns text pieces + optional exact ids)
+  with `encode` (concatenates text — unchanged, byte-exact) and `encode_tokens` (splices the
+  ids for pieces that carry them). With no ids the prompt is a single text segment and
+  tokenizes exactly as before; the only segment boundaries are around an exact-id body,
+  always flanked by added tokens (the assistant marker before, the EOS after), which BPE
+  never merges across.
+
+**No engine change.** `V4Engine::generate` already takes ids; the caller now builds the
+prompt from ids, so `plan` sees an exact prefix by construction. `chat` is unaffected
+(no caller sets the field yet except the harness).
+
+**Gates.**
+- `test_dsv4_prompt_encoding_oracle` gains an `[exact-token history]` section: the segment
+  splice equals whole-string tokenization with no ids; injecting a message's own text-ids is
+  a no-op; foreign ids replace exactly the body span. The four byte-exact vectors are
+  unchanged.
+- `test_v4_prefix_reuse` gains section I: turn 2 is built through the encoder with
+  `preencoded_ids = r1.token_ids[:-1]` and must report `Reused` and match a cold run.
+- `aeon_chat`'s follow-up loop sets `preencoded_ids`, so the harness now reuses on the text
+  path. Measured (`scripts/prefix_reuse_ab.sh`, context `4096`, 3 turns): continuation
+  `reused=112/191`, `prefilled=48/28`; TTFT turn 2 `7.8 s` vs `14.1 s` from scratch, turn 3
+  `6.4 s` vs `24.1 s`. Ledger M49 updated.
+
+**Thinking mode.** With `drop_thinking` on (the encoder default) an earlier assistant body
+is stripped/rewritten, which conflicts with a verbatim id body; the id-history path is for
+chat mode and for thinking mode with `drop_thinking = false`. A tool-call body is likewise
+carried whole in the ids. Both are the same "one constant in the caller" the server adapter
+already owns.
+
 ---
 
 ## 5. Order and dependencies
@@ -202,12 +249,14 @@ Steps 1, 2 and 3a are independent and can land in any order. Nothing before Step
 | :--- | :--- | :--- |
 | create | `src/infrastructure/session/prefix_record.hpp` | G1 |
 | create | `src/architecture/deepseek_v4/text/dsv4_computation_key.hpp` | G4 |
+| edit | `src/architecture/deepseek_v4/text/dsv4_prompt_encoder.hpp` (`preencoded_ids`, `Segment`, `render_segments`) | G4 |
+| edit | `src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp` (segment splice) | G4 |
 | edit | `src/architecture/deepseek_v4/runtime/v4_engine.hpp` | G4 |
 | edit | `src/architecture/deepseek_v4/runtime/v4_model_host.hpp` (epoch only) | G4 |
 | edit | `tools/aeon_chat.cpp` | harness |
 | edit | `cmake/AeonInfrastructure.cmake` (two tests) | build |
 | create | `tests/test_prefix_record.cpp`, `tests/test_v4_prefix_reuse.cpp` | tests |
-| edit | `tests/test_dsv4_prompt_encoding_oracle.cpp` (key section) | tests |
+| edit | `tests/test_dsv4_prompt_encoding_oracle.cpp` (key + exact-token-history sections) | tests |
 | create | `scripts/prefix_reuse_ab.sh` | scripts |
 | edit | requirements, `PROJECT_STATUS.md`, `PERFORMANCE_LEDGER.md` | docs |
 

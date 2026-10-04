@@ -57,6 +57,8 @@ struct Options {
     bool verbose{false};
     bool greedy{false};
     bool has_temperature{false};
+    bool prefix_reuse{true};
+    std::vector<std::string> follow_ups;
     float temperature{1.0f};
     float top_p{1.0f};
     uint64_t seed{0};
@@ -82,6 +84,9 @@ void print_usage(const char* executable) {
         << "  --tokenizer <path>       Native tokenizer artifact (default: <model-dir>/tokenizer.aeon)\n"
         << "  --system <text>          Optional system message\n"
         << "  --prompt <text>          One user prompt (required)\n"
+        << "  --follow-up <text>       A follow-up user turn; repeatable. Each turn after the\n"
+        << "                           first reuses the resident prefix state when allowed.\n"
+        << "  --no-prefix-reuse        Run the same script with prefix reuse disabled (an A/B)\n"
         << "  --thinking               Use explicit DSV4 thinking mode\n"
         << "  --max-new-tokens <n>     Maximum generated tokens (default: 256)\n"
         << "  --until-eos              Generate until EOS or context capacity\n"
@@ -168,6 +173,10 @@ Options parse_options(int argc, char** argv) {
             options.system_prompt = require_value(argc, argv, index, "--system");
         } else if (argument == "--prompt") {
             options.prompt = require_value(argc, argv, index, "--prompt");
+        } else if (argument == "--follow-up") {
+            options.follow_ups.push_back(require_value(argc, argv, index, "--follow-up"));
+        } else if (argument == "--no-prefix-reuse") {
+            options.prefix_reuse = false;
         } else if (argument == "--thinking") {
             options.thinking_mode = true;
         } else if (argument == "--until-eos") {
@@ -323,6 +332,25 @@ std::vector<aeon::text::Dsv4PromptMessage> build_messages(const Options& options
     return messages;
 }
 
+// The assistant turn a follow-up is appended after. `content` is the visible
+// reply; `reasoning_content` carries the thinking block when there is one, so the
+// thinking-mode template sees the same shape it rendered.
+aeon::text::Dsv4PromptMessage assistant_message(const std::string& visible,
+                                                const std::string& reasoning) {
+    aeon::text::Dsv4PromptMessage message;
+    message.role = aeon::text::Dsv4Role::Assistant;
+    message.content = visible;
+    message.reasoning_content = reasoning;
+    return message;
+}
+
+aeon::text::Dsv4PromptMessage follow_up_user_message(const std::string& text) {
+    aeon::text::Dsv4PromptMessage message;
+    message.role = aeon::text::Dsv4Role::User;
+    message.content = text;
+    return message;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -420,14 +448,71 @@ int main(int argc, char** argv) {
         generation_options.context_limit = options.context_size;
         generation_options.thinking_mode = options.thinking_mode;
 
-        const auto messages = build_messages(options);
-        const aeon::core::V4Reply reply =
-            engine.chat(messages, prompt_options, generation_options, sampling);
+        auto messages = build_messages(options);
 
-        const std::string visible =
-            aeon::core::V4Engine::strip_thinking(reply.text, engine.tokenizer());
+        // The first turn is always cold; each follow-up reuses the resident prefix
+        // unless `--no-prefix-reuse` was given. `visible` and `reply` end up holding
+        // the last turn's, which is what the diagnostic block below reports.
+        aeon::core::V4Reply reply;
+        std::string visible;
+        const uint32_t total_turns = 1 + static_cast<uint32_t>(options.follow_ups.size());
+        for (uint32_t turn = 1; turn <= total_turns; ++turn) {
+            const bool reuse = turn > 1 && options.prefix_reuse;
+            reply = engine.chat(messages, prompt_options, generation_options, sampling, reuse);
 
-        print_invariants(engine);
+            std::cout << "[Reuse] turn=" << turn
+                      << " verdict="
+                      << aeon::session::PrefixRecord::verdict_name(reply.reuse_verdict)
+                      << " reused=" << reply.reused_tokens
+                      << " prefilled=" << reply.prefilled_tokens
+                      << " prompt=" << reply.prompt_tokens
+                      << " ttft_ms=" << std::fixed << std::setprecision(2) << reply.ttft_ms
+                      << "\n";
+            print_invariants(engine);
+
+            // Split the reply for the next assistant turn: the thinking block, when
+            // closed, precedes the visible reply.
+            const std::string thinking_end =
+                engine.tokenizer().decode({engine.tokenizer().thinking_end_token_id()});
+            std::string reasoning;
+            std::string turn_visible = reply.text;
+            if (!thinking_end.empty()) {
+                const size_t position = reply.text.rfind(thinking_end);
+                if (position != std::string::npos) {
+                    reasoning = reply.text.substr(0, position);
+                    turn_visible = reply.text.substr(position + thinking_end.size());
+                }
+            }
+            visible = turn_visible;
+
+            if (options.diagnostic) {
+                std::vector<uint32_t> visible_ids = reply.token_ids;
+                if (!visible_ids.empty() &&
+                    visible_ids.back() == engine.tokenizer().eos_token_id()) {
+                    visible_ids.pop_back();
+                }
+                const std::vector<uint32_t> reencoded = engine.tokenizer().encode(turn_visible);
+                std::cout << "[Retokenize] turn=" << turn
+                          << " exact=" << (reencoded == visible_ids ? "true" : "false")
+                          << " generated=" << visible_ids.size()
+                          << " reencoded=" << reencoded.size() << "\n";
+            }
+
+            if (turn <= options.follow_ups.size()) {
+                aeon::text::Dsv4PromptMessage assistant = assistant_message(turn_visible, reasoning);
+                // Exact-token history: hand the engine back the ids it produced for
+                // this turn, so the next prompt's prefix is what the resident state
+                // was fed rather than a re-tokenization of the reply text (which BPE
+                // does not invert, and which would force a full replay).
+                assistant.preencoded_ids = reply.token_ids;
+                if (!assistant.preencoded_ids.empty() &&
+                    assistant.preencoded_ids.back() == engine.tokenizer().eos_token_id()) {
+                    assistant.preencoded_ids.pop_back();
+                }
+                messages.push_back(std::move(assistant));
+                messages.push_back(follow_up_user_message(options.follow_ups[turn - 1]));
+            }
+        }
 
         // The sweep's work, **after** the run: it reads zero before one. The window is
         // a *bound*, so `layer_loads / layers` is the number of layer-major passes the

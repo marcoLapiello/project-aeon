@@ -26,12 +26,23 @@
 // Position is the engine's and is not derived: `forward_token` takes an absolute
 // position, and the engine bounds generation by `host().context_capacity()` rather
 // than computing one by wrapping or clamping.
+//
+// The engine also owns a **session**: the resident layer state produced by the
+// preceding turns plus a `session::PrefixRecord` describing it. `generate` /
+// `chat` with `reuse_prefix = true` verify the new prompt extends that record and
+// prefill only the addition; with it false (the default) each call is a cold run
+// and the record is rebuilt. A caller that reaches past the engine to
+// `graph().forward_*` or `host().reset_generation_state()` is outside this
+// contract — it must call `end_session()` before a reuse, and a reset it performs
+// is caught by the host state epoch.
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
 #include "architecture/deepseek_v4/runtime/v4_model_host.hpp"
 #include "infrastructure/sampler.hpp"
+#include "infrastructure/session/prefix_record.hpp"
+#include "architecture/deepseek_v4/text/dsv4_computation_key.hpp"
 #include "architecture/deepseek_v4/text/dsv4_prompt_encoder.hpp"
 #include "architecture/deepseek_v4/text/dsv4_tokenizer.hpp"
 #include "infrastructure/json.hpp"
@@ -124,6 +135,14 @@ struct V4Reply {
     // The number of tokens the rendered conversation produced.
     uint32_t prompt_tokens{0};
 
+    // Prefix-reuse accounting: how many leading prompt tokens the resident state
+    // already covered, how many were prefilled this turn, and the verdict that
+    // decided it. `reused_tokens + prefilled_tokens == prompt_tokens`. On a
+    // stateless call these are 0 / prompt_tokens / `Cold`.
+    uint32_t reused_tokens{0};
+    uint32_t prefilled_tokens{0};
+    session::ReuseVerdict reuse_verdict{session::ReuseVerdict::Cold};
+
     // Time to first token, and the mean per-token time over the decode steps.
     double ttft_ms{0.0};
     double decode_tokens_per_second{0.0};
@@ -215,12 +234,19 @@ public:
     }
 
     void free() noexcept {
+        session_.clear();
         if (logits_dump_.is_open()) logits_dump_.close();
         sampler_.reset();
         encoder_.reset();
         graph_.reset();
         host_.free();
     }
+
+    // Forget the resident-state description without touching the device state. The
+    // next `generate` without reuse resets the state and rebuilds the record; the
+    // next with reuse replans against an empty record. For a caller that drives the
+    // graph directly and must not leave a stale record behind.
+    void end_session() noexcept { session_.clear(); }
 
     bool ready() const noexcept { return graph_ != nullptr && sampler_ != nullptr; }
     bool policy_loaded() const noexcept { return policy_loaded_; }
@@ -238,9 +264,12 @@ public:
 
     // --- the binding ---------------------------------------------------------
 
-    // One token in, one token out, at an absolute position.
+    // One token in, one token out, at an absolute position. Feeds the session
+    // record at the same site it feeds the graph, so the record cannot describe a
+    // token the state never saw.
     uint32_t advance(uint32_t token_id, uint32_t position) {
         const half* logits = graph_->forward_token(token_id, position, host_.streams().compute);
+        session_.feed(position, token_id);
         if (logits_dump_.is_open()) dump_logits(logits);
         return sampler_->select(logits, host_.streams().compute);
     }
@@ -278,39 +307,62 @@ public:
 
     // --- the run -------------------------------------------------------------
 
-    // Render the conversation, then generate. Stateless across calls: the layer
-    // state is reset and the sampler reseeded first, so two calls with the same
-    // arguments produce the same reply.
+    // The token-level entry: a rendered prompt in, a reply out. Everything above
+    // it — the encoder, the message shape — is the caller's. This is the neutral
+    // conversation seam a serving layer drives once it owns a session, and the
+    // entry the prefix-reuse gate needs (a prompt built from ids).
     //
     // `generation` supplies the token cap and the stop policy; the EOS id comes
     // from the tokenizer. `sampling` is the artifact's policy unless overridden.
-    V4Reply chat(const std::vector<text::Dsv4PromptMessage>& messages,
-                 const text::Dsv4PromptOptions& prompt_options,
-                 const text::GenerationOptions& generation,
-                 const SamplerConfig& sampling) {
+    V4Reply generate(const std::vector<uint32_t>& prompt,
+                     const text::GenerationOptions& generation,
+                     const SamplerConfig& sampling,
+                     bool reuse_prefix = false,
+                     const std::string& computation_key = {}) {
         if (!ready()) {
-            throw std::logic_error("V4Engine::chat: the engine was not initialized");
+            throw std::logic_error("V4Engine::generate: the engine was not initialized");
         }
-        if (messages.empty()) {
-            throw std::invalid_argument("V4Engine::chat: the conversation is empty");
-        }
-
-        const std::vector<uint32_t> prompt = encoder_->encode_tokens(messages, prompt_options);
         if (prompt.empty()) {
-            throw std::runtime_error("V4Engine::chat: the rendered prompt has no tokens");
+            throw std::runtime_error("V4Engine::generate: the prompt has no tokens");
         }
 
         const uint32_t capacity = host_.context_capacity();
         if (prompt.size() >= capacity) {
             throw std::runtime_error(
-                "V4Engine::chat: the rendered prompt is " +
+                "V4Engine::generate: the prompt is " +
                 std::to_string(prompt.size()) + " tokens, which leaves no room to generate "
                 "inside a context of " + std::to_string(capacity));
         }
 
-        host_.reset_generation_state();
+        // Decide whether the resident state already covers a prefix of this prompt.
+        // When reuse is not requested this is a cold run and the record is rebuilt,
+        // so the stateless behaviour is exactly preserved. The capacity refusal above
+        // runs first, so a refused turn leaves the session untouched.
+        session::ReuseDecision decision;
+        if (reuse_prefix) {
+            decision = session_.plan(prompt, computation_key);
+            if (decision.verdict == session::ReuseVerdict::Reused &&
+                session_epoch_ != host_.state_epoch()) {
+                // The device state was reset out from under the record (a direct
+                // `host().reset_generation_state()`), so the record describes a state
+                // the engine no longer holds.
+                decision.verdict = session::ReuseVerdict::StaleState;
+                decision.start = 0;
+            }
+        }
+
+        const uint32_t start = decision.start;
+        if (start == 0) {
+            host_.reset_generation_state();
+            // The record is rebuilt under this run's key, so the next turn compares
+            // against the state actually held — including after a rejected reuse.
+            session_.begin(computation_key);
+            session_epoch_ = host_.state_epoch();
+        }
+
         // `set_config` validates and seeds the generator, so installing the config
-        // is also the reseed.
+        // is also the reseed. Unconditional: a reused turn is still reproducible
+        // from the seed regardless of what was kept.
         sampler_->set_config(sampling);
 
         text::GenerationOptions loop_options = generation;
@@ -322,6 +374,9 @@ public:
 
         V4Reply reply;
         reply.prompt_tokens = static_cast<uint32_t>(prompt.size());
+        reply.reused_tokens = start;
+        reply.prefilled_tokens = static_cast<uint32_t>(prompt.size()) - start;
+        reply.reuse_verdict = decision.verdict;
 
         // Prefill and decode are two strategies, so they are two steps and not one
         // with a flag:
@@ -334,12 +389,17 @@ public:
         //
         // The loop is still `text::generate_token_ids`; this only adds the prefill
         // step it is handed.
+        //
+        // The tail is what this turn actually prefills; on a cold run it is the whole
+        // prompt. Sizing the window and chunk from the tail (not the prompt) keeps a
+        // small addition on the cheap path.
+        const uint32_t tail = static_cast<uint32_t>(prompt.size()) - start;
         double first_token_ms = 0.0;
         Clock::time_point decode_started{};
         const auto started = Clock::now();
 
-        const uint32_t window = prefill_window_for(static_cast<uint32_t>(prompt.size()));
-        const uint32_t chunk = prefill_chunk_for(static_cast<uint32_t>(prompt.size()));
+        const uint32_t window = prefill_window_for(tail);
+        const uint32_t chunk = prefill_chunk_for(tail);
 
         const text::PromptPrefill prefill_step =
             [&](const std::vector<uint32_t>& tokens) -> uint32_t {
@@ -352,11 +412,25 @@ public:
                 PhaseProfiler& phases = PhaseProfiler::instance();
                 const bool profiling = phases.enabled();
                 if (profiling) phases.reset();
-                for (uint32_t offset = 0; offset < count; offset += window) {
-                    const uint32_t span = std::min(window, count - offset);
-                    logits = graph_->forward_window(
-                        tokens.data() + offset, offset, span, std::min(chunk, span),
-                        host_.streams().compute);
+                // Only the tail from `start` is prefilled; the resident state already
+                // holds the first `start` tokens. On a cold run `start` is 0 and this is
+                // the whole prompt.
+                try {
+                    for (uint32_t offset = start; offset < count; offset += window) {
+                        const uint32_t span = std::min(window, count - offset);
+                        logits = graph_->forward_window(
+                            tokens.data() + offset, offset, span, std::min(chunk, span),
+                            host_.streams().compute);
+                        // The window succeeded, so its tokens are now in the state.
+                        for (uint32_t k = 0; k < span; ++k) {
+                            session_.feed(offset + k, tokens[offset + k]);
+                        }
+                    }
+                } catch (...) {
+                    // The state is partially advanced and no longer matches the record,
+                    // so the record must not be trusted by a later turn.
+                    session_.clear();
+                    throw;
                 }
                 // The phase breakdown is a per-prompt aggregate, so it is read and
                 // printed once here rather than per window. `resolve` synchronizes
@@ -421,6 +495,25 @@ public:
         return reply;
     }
 
+    // Render the conversation, then generate. The render is the only thing `chat`
+    // adds to `generate`, so a token-level caller and a message-level caller take
+    // the exact same path from the prompt onward.
+    V4Reply chat(const std::vector<text::Dsv4PromptMessage>& messages,
+                 const text::Dsv4PromptOptions& prompt_options,
+                 const text::GenerationOptions& generation,
+                 const SamplerConfig& sampling,
+                 bool reuse_prefix = false) {
+        if (!ready()) {
+            throw std::logic_error("V4Engine::chat: the engine was not initialized");
+        }
+        if (messages.empty()) {
+            throw std::invalid_argument("V4Engine::chat: the conversation is empty");
+        }
+        const std::vector<uint32_t> prompt = encoder_->encode_tokens(messages, prompt_options);
+        return generate(prompt, generation, sampling, reuse_prefix,
+                        dsv4_computation_key(messages, prompt_options));
+    }
+
     // The common case: one user turn, the artifact's own sampling policy.
     V4Reply chat(const std::string& user_text,
                  const text::Dsv4PromptOptions& prompt_options,
@@ -469,6 +562,12 @@ private:
     text::Dsv4Tokenizer tokenizer_{};
     std::unique_ptr<text::Dsv4PromptEncoder> encoder_{};
     std::unique_ptr<Sampler> sampler_{};
+
+    // The resident-state description and the host state epoch it was built against.
+    // `session_epoch_` is the value of `host_.state_epoch()` at the last cold start,
+    // so a direct `reset_generation_state()` between turns is detected as stale.
+    session::PrefixRecord session_{};
+    uint64_t session_epoch_{0};
 };
 
 }  // namespace aeon::core

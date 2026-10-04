@@ -669,11 +669,21 @@ public:
     // The start of a new sequence. Every layer's ring sentinels, counters and
     // committed-entry positions go back to what a freshly allocated layer holds,
     // so a second conversation cannot read the first one's context.
+    //
+    // The epoch is bumped here so a caller that keeps a description of the state
+    // (the engine's prefix record) can tell that the state it described is gone.
     void reset_generation_state() {
         for (auto& layer : layers_) {
             layer.reset_generation_state();
         }
+        ++state_epoch_;
     }
+
+    // How many times the generation state has been reset. A monotonically
+    // increasing counter rather than a flag, because the interesting question is
+    // "is this the same generation the record was built against", not "has it ever
+    // been reset".
+    uint64_t state_epoch() const noexcept { return state_epoch_; }
 
 private:
     // Reaches a compute-stream boundary on every stream that can carry expert
@@ -816,6 +826,9 @@ private:
     size_t last_released_dense_bytes_{0};
     bool freeze_warm_during_prefill_{false};
     bool supply_phase_prefill_{false};
+    // Bumped by `reset_generation_state`; the engine's prefix record compares it to
+    // tell whether the state it described has been reset underneath it.
+    uint64_t state_epoch_{0};
 
     DeviceStreams streams_;
     V4ModelResources resources_;
