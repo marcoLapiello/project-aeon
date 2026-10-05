@@ -83,6 +83,20 @@ if(AEON_BUILD_TESTS)
     # Fused W2 weighted accumulation (silicon).
     aeon_add_test(test_aeon_moe_fused_w2 SOURCES tests/test_aeon_moe_fused_w2.cpp)
 
+    # Multi-GPU feasibility: the routed W2 consumed as independently swizzled
+    # K-shards equals the whole-expert consumption, and the grouped-WMMA feed is
+    # bit-unperturbed by the split (silicon).
+    aeon_add_test(test_w2_shard_equivalence SOURCES tests/test_w2_shard_equivalence.cpp)
+
+    # Multi-GPU feasibility: the full routed expert pair (W13 N-shard + W2
+    # K-shard) through the real grouped-WMMA kernels equals the whole expert
+    # (silicon).
+    aeon_add_test(test_expert_shard_equivalence SOURCES tests/test_expert_shard_equivalence.cpp)
+
+    # Multi-GPU feasibility: attention shards by head, the MQA KV latent is
+    # replicated, and the group mixing reduces exactly (silicon).
+    aeon_add_test(test_attention_shard_equivalence SOURCES tests/test_attention_shard_equivalence.cpp)
+
     # Native `.aeon` loader.
     aeon_add_test(test_aeon_loader SOURCES tests/test_aeon_loader.cpp)
 
