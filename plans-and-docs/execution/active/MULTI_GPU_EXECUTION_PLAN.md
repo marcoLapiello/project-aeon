@@ -1,7 +1,7 @@
 # Multi-GPU Execution Plan
 
 **Date:** 2026-10-05
-**Status:** Active — Phase A complete (Steps 0–6), Phase B next.
+**Status:** Active — Phases A and B complete (Steps 0–10), Phase C next.
 **Scope:** One model instance across the host's GPUs: explicit device selection, a VRAM utilization fraction, pipeline parallelism, the partition-aware artifact, tensor parallelism, and their composition — single-stream throughout.
 **Requirements:** [MULTI_GPU_REQUIREMENTS.md](../../specs-and-requirements/multi-gpu/MULTI_GPU_REQUIREMENTS.md) (R1–R13). **Feasibility evidence:** `tests/test_expert_shard_equivalence.cpp`, `tests/test_w2_shard_equivalence.cpp`, `tests/test_attention_shard_equivalence.cpp`.
 
@@ -112,18 +112,20 @@ Two commits, because a split is its own step.
 
 ### Phase B — Pipeline parallelism
 
-#### Step 7 — A tier over a layer range (G1)
+**Complete.** Landed in `6b5c76c` (Step 7), `14ebb8c` (Step 8), `bcb024b` (Step 9) and `c15e1a3` (Step 10). A pipeline runs one stage per device and hands the residual across the boundary with a copy, so `topology_equivalence.sh --exact` is byte-identical to the single-device baseline at `pp = 1, 2, 4` on both prompts. Ledger M51 records the `pp ∈ {1, 2, 4}` measurement.
+
+#### Step 7 — A tier over a layer range (G1) — ✅ done
 - `ExpertTierState::Params`: add `uint32_t first_layer` and pass the stage's `count` as `num_layers`. The registry stays local-indexed.
 - `moe/v4_expert_supply.hpp` and `expert_tier_loader.hpp` translate local to global layer at the one place the artifact is addressed (`loader.get_expert_location(first_layer + layer, expert)`). The routing profiler and telemetry record global layers.
 - **Gate:** extend `test_v4_expert_tiering` with a tier over `[20, 43)`: preload, Hot/Warm/Cold hits and demotion all address the correct global payloads, and `first_layer = 0` is unchanged.
 
-#### Step 8 — Per-stage geometry and budget (G4 + G1, R13 per device)
+#### Step 8 — Per-stage geometry and budget (G4 + G1, R13 per device) — ✅ done
 - `spec/v4_memory_geometry.hpp::make_v4_memory_geometry(config, LayerRange)` and `V4ModelContract::uploaded_dense_bytes(config, LayerRange, bool has_head)`: dense and KV for the stage's layers, plus RoPE on every stage and the head on the last.
 - `MemoryBudgetEngine`: evaluate once per stage on that stage's device. The host region per stage is D2's share. Refuse when a share cannot hold that stage's corridor peak, with the message "stage k: … lower `--staging-blocks` or raise `--warm-gib`".
 - `V4ModelHost` holds `std::vector<MemoryBudgetReport>` and prints one line per stage.
 - **Gate:** add per-stage cases to `test_memory_budget_fraction`. Check that the stage geometries sum to the whole: the `pp = 1` result is unchanged.
 
-#### Step 9 — Stage handoff (G4 runtime + G1 peer access)
+#### Step 9 — Stage handoff (G4 runtime + G1 peer access) — ✅ done
 - **Create** `src/infrastructure/parallel/peer_access.hpp` with `enable_peer_access(const std::vector<int>&)`. It calls `hipDeviceEnablePeerAccess` where `hipDeviceCanAccessPeer` allows. There is no refusal: `hipMemcpyPeerAsync` stays correct without peer access, just slower, which keeps the code rig-agnostic (R10).
 - `V4ModelHost::initialize`: build `pp` stages, each on its device and layer range, and lift the `pp > 1` refusal.
 - `runtime/v4_graph.hpp`:
@@ -133,7 +135,7 @@ Two commits, because a split is its own step.
 - Telemetry: when `pp > 1`, each stage writes `<path>.stage<k>`.
 - **Gate:** `topology_equivalence.sh --exact --pipeline-parallel 2` and `--pipeline-parallel 4`, **bit-identical** to the single-device baseline on both prompts. Run `test_v4_prefix_reuse` and `test_v4_engine` with `AEON_TEST_DEVICE_IDS=a,b` and a PP=2 arm (skip below 2 devices).
 
-#### Step 10 — Measure PP (ledger)
+#### Step 10 — Measure PP (ledger) — ✅ done
 New ledger card for `pp ∈ {1, 2, 4}` on fixed prompts. Record the aggregate Hot slots, the Hot/Warm/Cold hit split, Cold bytes per layer, prefill tok/s, decode tok/s, and the default-fraction slot delta from Step 5 (R11). Update the status row.
 
 ### Phase C — The partition-aware artifact
