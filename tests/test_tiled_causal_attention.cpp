@@ -24,6 +24,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "platform/tiled_causal_attention.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 
@@ -95,7 +96,7 @@ struct HostBlock {
 
 int main() {
     std::cout << "[Gate] Tier-1 primitive: tiled causal attention vs fp64 reference\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
     aeon::reference::Rng gen(0x7A1EDCA7ull);

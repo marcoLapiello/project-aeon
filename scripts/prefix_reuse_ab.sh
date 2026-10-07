@@ -51,6 +51,7 @@ run_arm() {
     --prompt "$PROMPT" \
     --follow-up "$FOLLOW1" \
     --follow-up "$FOLLOW2" \
+    --device-ids "${AEON_DEVICE_IDS:-0}" \
     "$@" 2>/dev/null | grep '^\[Reuse\]' | sed "s/^/$label /"
 }
 

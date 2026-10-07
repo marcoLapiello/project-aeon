@@ -28,6 +28,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 
@@ -116,7 +117,7 @@ double stochastic_deviation(const std::vector<double>& C, size_t hc_mult) {
 
 int main() {
     std::cout << "[Gate] Tier-1 primitive: Hyper-Connections (project, Sinkhorn, post) vs fp64 reference\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
 

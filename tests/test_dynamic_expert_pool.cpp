@@ -2,6 +2,7 @@
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/spec/v4_memory_geometry.hpp"
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "infrastructure/expert/residency/expert_registry.hpp"
 #include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/spec/v4_model_contract.hpp"
@@ -18,7 +19,7 @@ int main() {
     std::cout << "================================================================================" << std::endl;
 
     // 1. Device selection
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     // 2. Load model configuration
     std::string aeon_model_dir = "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon";

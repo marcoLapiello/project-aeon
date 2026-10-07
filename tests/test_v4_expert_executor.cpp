@@ -82,6 +82,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/moe/v4_expert_executor.hpp"
@@ -467,7 +468,7 @@ int main() {
     std::printf("================================================================================"
                 "================\n");
 
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     Harness h;
     h.configure_stack();
 

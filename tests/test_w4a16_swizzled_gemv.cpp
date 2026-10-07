@@ -1,4 +1,5 @@
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzled_gemv.hpp"
 
@@ -129,7 +130,7 @@ void verify_shape(const ShapeCase& shape) {
 } // namespace
 
 int main() {
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     verify_shape<4, 8>({"W1/W3", 2048, 4096, aeon::kCfgW13});
     verify_shape<8, 4>({"W2", 4096, 2048, aeon::kCfgW2});
     std::cout << "[PASS] Swizzled W4A16 GEMV matches the source-layout CPU reference" << std::endl;

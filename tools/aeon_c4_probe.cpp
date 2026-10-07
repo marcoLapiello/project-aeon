@@ -46,8 +46,8 @@
 //   BOUNCES         content correct, cost ≈ the bounce control.         C4 useless.
 //   DIRECT          content correct, cost ≈ the disk bound.             C4 works.
 //
-// Usage: aeon_c4_probe [file] [megabytes]
-//   Defaults: the swizzled expert container, 256 MiB.
+// Usage: aeon_c4_probe [--device-id N] [file] [megabytes]
+//   Defaults: device 0, the swizzled expert container, 256 MiB.
 // -----------------------------------------------------------------------------
 
 #define _GNU_SOURCE 1
@@ -135,13 +135,28 @@ ssize_t pread_exact(int fd, void* dst, size_t bytes, off_t offset) {
 } // namespace
 
 int main(int argc, char** argv) {
+    int device_id = 0;
+    std::vector<std::string> positionals;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--device-id") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "c4_probe: missing value for --device-id\n");
+                return 1;
+            }
+            device_id = std::atoi(argv[++i]);
+        } else {
+            positionals.push_back(arg);
+        }
+    }
     const std::string file =
-        (argc > 1 && argv[1][0] != '\0')
-            ? argv[1]
+        (!positionals.empty() && !positionals[0].empty())
+            ? positionals[0]
             : std::string("models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon/"
                           "model_experts_swizzled.aeon");
-    size_t bytes = (argc > 2 ? static_cast<size_t>(std::strtoull(argv[2], nullptr, 10))
-                             : 256ULL) * 1024ULL * 1024ULL;
+    size_t bytes = (positionals.size() > 1
+                        ? static_cast<size_t>(std::strtoull(positionals[1].c_str(), nullptr, 10))
+                        : 256ULL) * 1024ULL * 1024ULL;
     bytes = (bytes + kSector - 1) / kSector * kSector;
 
     std::printf(
@@ -165,7 +180,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- [0] device -----------------------------------------------------------
-    aeon::core::select_compute_device(true);
+    aeon::core::select_device(device_id, true);
     (void)::hsa_init();
 
     // ---- [1] VRAM + dma-buf export + mmap -------------------------------------

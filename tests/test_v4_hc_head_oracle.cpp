@@ -60,6 +60,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
@@ -269,7 +270,7 @@ int run() {
     std::printf("  Hyper-Connections head reduction vs an independent fp64 reference\n");
     std::printf("================================================================================\n");
 
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     aeon::core::AeonModelLoader loader;
     loader.open_model("models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon");
     g_loader = &loader;

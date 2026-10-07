@@ -66,6 +66,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
@@ -206,7 +207,7 @@ int main(int argc, char** argv) {
         return env != nullptr ? static_cast<uint32_t>(std::atoi(env)) : kDefaultDecode;
     }();
 
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     aeon::core::AeonRuntimeConfig runtime;
     runtime.context_size = kContext;

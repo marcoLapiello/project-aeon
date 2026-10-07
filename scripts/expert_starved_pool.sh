@@ -37,6 +37,7 @@ common=(
   --context-size "$CONTEXT"
   --max-new-tokens "$TOKENS"
   --diagnostic
+  --device-ids "${AEON_DEVICE_IDS:-0}"
 )
 
 # The uncapped reference: same as tier-invariance Run A.

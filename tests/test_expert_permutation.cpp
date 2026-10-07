@@ -25,6 +25,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "platform/ops/expert_permutation.hpp"
 
 #include <hip/hip_runtime.h>
@@ -200,7 +201,7 @@ bool check_case(const char* label, int token_count, int slots, int expert_count,
 
 int main() {
     std::cout << "[Gate] token -> expert permutation, versus independent invariants\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
     // A one-token chunk: the minimum the grouped path ever dispatches.

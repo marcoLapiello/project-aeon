@@ -28,6 +28,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
@@ -96,7 +97,7 @@ int main() {
     std::printf("================================================================================\n");
     std::printf("  Warm is preserved across a prefill\n");
     std::printf("================================================================================\n");
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     aeon::core::AeonRuntimeConfig runtime;
     runtime.context_size = kContext;

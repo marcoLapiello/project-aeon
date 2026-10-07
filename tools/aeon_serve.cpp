@@ -53,6 +53,13 @@ void print_usage(const char* executable) {
         << "  --prefill-sweep-min-tokens <n>\n"
         << "                           Prompt length at or above which the sweep supplies experts\n"
         << "  --staging-blocks <n>     Swept-prefill staging arena in layer-blocks (default: 2)\n"
+        << "  --device-ids <list>      Comma-separated device ids in stage-major order\n"
+        << "                           (default: 0 .. tp*pp-1)\n"
+        << "  --tensor-parallel <n>    Tensor-parallel degree tp (default: 1)\n"
+        << "  --pipeline-parallel <n>  Pipeline-parallel degree pp (default: 1)\n"
+        << "  --gpu-memory-utilization <f>\n"
+        << "                           Fraction of each device's total VRAM the budget\n"
+        << "                           may plan against, in (0, 0.99] (default: 0.95)\n"
         << "  --verbose                Print the memory budget and residency summary\n"
         << "  --host <addr>            Bind address (default: 127.0.0.1)\n"
         << "  --port <n>               Bind port (default: 8080, 0 = kernel-chosen)\n"
@@ -95,8 +102,6 @@ ServeOptions parse_options(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const ServeOptions options = parse_options(argc, argv);
-
-        aeon::core::select_compute_device(true);
 
         aeon::server::ConversationService service(options.max_queue);
         aeon::server::HttpOptions http_options;

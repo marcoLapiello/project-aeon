@@ -56,6 +56,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
@@ -326,7 +327,7 @@ int main() {
     std::printf("================================================================================\n");
     std::printf("  the 43-layer driver: embedding -> 43 x run_layer -> head\n");
     std::printf("================================================================================\n");
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     const auto gate_start = Clock::now();
 

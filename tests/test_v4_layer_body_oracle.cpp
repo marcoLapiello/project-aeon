@@ -35,6 +35,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"
@@ -87,7 +88,7 @@ const std::array<uint32_t, kTokens> kTokenIds = {1000, 42, 7777, 1780, 90125, 13
 
 int main() {
     std::cout << "[Gate] Tier-2: one full Sliding-class layer body\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
 

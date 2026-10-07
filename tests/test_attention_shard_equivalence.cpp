@@ -25,6 +25,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention_kernels.hpp"
 #include "architecture/deepseek_v4/kernels/v4_grouped_wo.hpp"
 
@@ -86,7 +87,7 @@ bool report(const char* label, double max_abs, double tolerance) {
 
 int main() {
     std::cout << "[Gate] Multi-GPU feasibility: attention / KV placement under sharding\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     std::vector<half> q(static_cast<std::size_t>(kTokens) * kHeads * kHeadDim);
     std::vector<half> k(static_cast<std::size_t>(kTokens) * kHeadDim);

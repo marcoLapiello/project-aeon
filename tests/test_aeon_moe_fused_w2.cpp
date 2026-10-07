@@ -1,4 +1,5 @@
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp"
 
@@ -68,7 +69,7 @@ void make_weights(
 } // namespace
 
 int main() {
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     const std::size_t packed_words = static_cast<std::size_t>(N) * K / 8;
     const std::size_t scale_count = static_cast<std::size_t>(N) * GROUPS;
     std::vector<half> host_hidden(EXPERTS * K);

@@ -42,6 +42,7 @@ common=(
   --max-new-tokens "$TOKENS"
   --diagnostic
   --warm-gib "$WARM_GIB"
+  --device-ids "${AEON_DEVICE_IDS:-0}"
 )
 
 run() {

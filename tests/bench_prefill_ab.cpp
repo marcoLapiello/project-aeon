@@ -58,6 +58,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
@@ -142,7 +143,7 @@ int main(int argc, char** argv) {
     const uint64_t warm_gib = argc > 4 ? static_cast<uint64_t>(std::atoi(argv[4])) : 0;
     const std::string prompt_file = argc > 5 ? argv[5] : kPromptFile;
 
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     aeon::core::AeonRuntimeConfig runtime;
     runtime.context_size = kContext;

@@ -68,6 +68,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
 #include "architecture/deepseek_v4/runtime/v4_model_host.hpp"
@@ -253,7 +254,7 @@ int main() {
     std::printf(
         "================================================================================\n");
 
-    aeon::core::select_compute_device(false);
+    aeon::test::select_test_device(false);
 
     aeon::core::AeonModelLoader loader;
     loader.open_model("models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon");

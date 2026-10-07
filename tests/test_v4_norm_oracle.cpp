@@ -24,6 +24,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "platform/ops/rmsnorm.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 
@@ -102,7 +103,7 @@ bool oracle_self_check() {
 
 int main() {
     std::cout << "[Gate] Tier-1 primitive: Wave32 RMSNorm vs independent fp64 reference\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     constexpr int kRows = 4;
     constexpr int kDim = 4096;

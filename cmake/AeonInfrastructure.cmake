@@ -138,12 +138,24 @@ if(AEON_BUILD_TESTS)
 
     # Prefix record: the reuse verdict logic, pure and CPU-only (no sources).
     aeon_add_test(test_prefix_record SOURCES tests/test_prefix_record.cpp)
+
+    # Parallel topology: device mapping, the layer split, and every refusal. Pure
+    # and CPU-only — the visible-device count is an argument, not a HIP query. The
+    # flag parse cases reuse the shared engine CLI parser, which needs the source
+    # root on the include path.
+    aeon_add_test(test_parallel_topology SOURCES tests/test_parallel_topology.cpp)
+    target_include_directories(test_parallel_topology PRIVATE ${CMAKE_SOURCE_DIR})
 endif()
 
 # --- Expert supply and telemetry ---------------------------------------------
 if(AEON_BUILD_TESTS)
     # Dynamic memory budget and global hot pool.
     aeon_add_test(test_dynamic_expert_pool SOURCES tests/test_dynamic_expert_pool.cpp)
+
+    # The VRAM utilization fraction and the per-device refusal, with the device's
+    # memory injected so every accept/refuse boundary runs on the host (no GPU).
+    aeon_add_test(test_memory_budget_fraction
+        SOURCES tests/test_memory_budget_fraction.cpp)
 
     # Persistent Warm ownership, pending transfers, and leases.
     aeon_add_test(test_expert_registry_warm_state SOURCES tests/test_expert_registry_warm_state.cpp)
@@ -623,6 +635,9 @@ aeon_add_executable(aeon_chat
         src/architecture/deepseek_v4/text/dsv4_tokenizer.cpp
         src/architecture/deepseek_v4/text/dsv4_prompt_encoder.cpp
         src/infrastructure/text/text_generation.cpp)
+# The parallel-topology flags are parsed by the shared `tools/engine_cli.hpp`, so
+# the source root must be on the include path.
+target_include_directories(aeon_chat PRIVATE ${CMAKE_SOURCE_DIR})
 
 # --- Kept model-side components ----------------------------------------------
 # These validate components the rewrite keeps, against references written

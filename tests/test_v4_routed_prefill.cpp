@@ -24,6 +24,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
@@ -114,7 +115,7 @@ int main(int argc, char** argv) {
     std::printf("================================================================================\n");
     std::printf("  the routed bank: cached prefill below the sweep's gate\n");
     std::printf("================================================================================\n");
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     // Optional cap on the Hot pool, so the floor configuration (`H == E`, where the
     // drain is the whole pool and nothing can be preserved) is exercised too. Zero

@@ -12,6 +12,12 @@ option(AEON_BUILD_SERVER
     "Build the G5 serving layer and its aeon_serve binary."
     ON)
 
+# Device ids the device-using gates run on, as a `parse_device_ids` list. Defaults
+# to one device (0); a CI run pins a headless GPU here (`AEON_TEST_DEVICE_IDS=2`) and
+# a multi-device gate reads the whole list. Exported to CTest by `aeon_add_test`.
+set(AEON_TEST_DEVICE_IDS "0" CACHE STRING
+    "Device ids the device-using gates run on (comma-separated).")
+
 # Worker threads for the oracle gates that opt into host OpenMP
 # (`aeon_add_test(... OPENMP)`). Those gates alternate between fp64 oracle work,
 # which spreads cleanly over cores, and device work that does not.

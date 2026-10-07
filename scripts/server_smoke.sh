@@ -46,6 +46,7 @@ field() { python3 -c "import sys,json;d=json.load(sys.stdin);print(eval('d'+sys.
 
 echo "[server-smoke] starting aeon_serve on ${BASE} (context ${CONTEXT})"
 "$BIN" --model-dir "$MODEL_DIR" --context-size "$CONTEXT" --port "$PORT" \
+  --device-ids "${AEON_DEVICE_IDS:-0}" \
   --no-warm-preload >"$LOG" 2>&1 &
 SERVER_PID=$!
 

@@ -11,6 +11,7 @@
 #include "platform/dense_gemm.hpp"
 #include "platform/ops/gemv.hpp"
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -153,7 +154,7 @@ bool run_case(const Shape& s) {
 
 int main() {
     std::cout << "[Gate] dense fp16 WMMA GEMM vs definition (double)\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     const Shape shapes[] = {
         {"single token", 1, 4096, 1024, 4096, 1024},

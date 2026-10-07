@@ -57,6 +57,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"
@@ -262,7 +263,7 @@ bool same_continuation(const std::string& label, const std::vector<TokenRecord>&
 
 int main() {
     std::cout << "[Gate] state restore is byte-exact\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     bool ok = true;
 
     aeon::core::AeonModelLoader loader;

@@ -24,6 +24,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "platform/ops/gemv.hpp"
 #include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"
@@ -102,7 +103,7 @@ bool check(const char* label, bool ok, const std::string& detail) {
 
 int main() {
     std::cout << "[Gate] Tier-1 primitive: shared expert (dense fp16 FFN)\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
     aeon::reference::Rng gen(0x5A4E2D17ull);

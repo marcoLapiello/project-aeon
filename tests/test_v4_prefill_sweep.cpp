@@ -24,6 +24,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "infrastructure/memory/memory_budget.hpp"
 #include "architecture/deepseek_v4/runtime/v4_graph.hpp"
@@ -128,7 +129,7 @@ int main() {
     std::printf("================================================================================\n");
     std::printf("  the prefill sweep: bounded drain, layer order, restore\n");
     std::printf("================================================================================\n");
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     // The tiled attention and grouped experts reorder sums; bit-exactness is only a residency check on the scalar path.
     aeon::core::attention_tile_enabled() = false;
     aeon::core::moe_grouped_batch_enabled() = false;

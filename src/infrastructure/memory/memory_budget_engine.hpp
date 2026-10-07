@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -30,13 +31,22 @@
 
 namespace aeon::core {
 
+// The device memory a budget is evaluated against, injected rather than queried so
+// the evaluation is pure and a host test can drive every accept/refuse boundary.
+struct DeviceMemoryInfo {
+    int device{-1};
+    size_t free_bytes{0};
+    size_t total_bytes{0};
+};
+
 class MemoryBudgetEngine {
 public:
     static MemoryBudgetReport evaluate(
         const AeonRuntimeConfig& runtime_cfg,
         const ModelMemoryGeometry& geometry,
         size_t dense_weights_bytes,
-        const ExpertFormatDescriptor& expert_format
+        const ExpertFormatDescriptor& expert_format,
+        const DeviceMemoryInfo& memory
     ) {
         MemoryBudgetReport report;
 
@@ -60,21 +70,29 @@ public:
         }
         report.expert_payload_bytes = expert_format.payload_bytes;
 
-        // 1. Query physical GPU memory
-        size_t free_vram = 0, total_vram = 0;
-        hipError_t err = hipMemGetInfo(&free_vram, &total_vram);
-        if (err != hipSuccess) {
-            report.is_feasible = false;
-            report.rejection_reason = std::string("hipMemGetInfo failed: ") + hipGetErrorString(err);
+        // 1. Size against a **fraction of the device's total**, never its free
+        // memory. Planning against free memory silently shrinks the Hot pool when
+        // anything else touches the card (a display server, another job) and makes
+        // the same configuration mean different things on different days; the
+        // fraction is an explicit, portable margin, and a device whose free memory is
+        // below the allowance is refused by name instead.
+        report.device_index = memory.device;
+        report.gpu_memory_utilization = runtime_cfg.gpu_memory_utilization;
+        report.total_vram_bytes = memory.total_bytes;
+        report.free_vram_bytes  = memory.free_bytes;
+        const size_t usable_vram = static_cast<size_t>(std::floor(
+            runtime_cfg.gpu_memory_utilization * static_cast<double>(memory.total_bytes)));
+        report.usable_vram_bytes = usable_vram;
+        if (usable_vram > memory.free_bytes) {
+            std::ostringstream err_oss;
+            err_oss << "device " << memory.device << ": "
+                    << (double)memory.free_bytes / (1024 * 1024 * 1024) << " GiB free < "
+                    << (double)usable_vram / (1024 * 1024 * 1024)
+                    << " GiB allowance at utilization " << runtime_cfg.gpu_memory_utilization
+                    << " \u2014 lower --gpu-memory-utilization or free the device";
+            report.rejection_reason = err_oss.str();
             return report;
         }
-
-        report.total_vram_bytes = total_vram;
-        report.free_vram_bytes  = free_vram;
-        // Plan against what this process can actually allocate. `total_vram` is the
-        // card's nominal capacity; `free_vram` is what is left for us, and the
-        // smaller of the two is the only defensible planning basis.
-        report.usable_vram_bytes = std::min(free_vram, total_vram);
 
         // 2. Query physical Host memory
         struct sysinfo si;
@@ -141,7 +159,6 @@ public:
         report.vram_scratch_bytes = report.vram_decode_scratch_bytes +
                                     report.vram_batch_scratch_bytes +
                                     report.vram_prefill_carry_bytes;
-        report.vram_headroom_bytes = VRAM_HEADROOM_SAFETY_BYTES;
 
         // Minimum active experts needed for execution:
         // 2 * num_experts_per_tok to guarantee compute + prefetch buffering without stalling
@@ -153,12 +170,11 @@ public:
         size_t baseline_vram_needed = report.vram_dense_bytes +
                                       report.vram_kv_bytes +
                                       report.vram_scratch_bytes +
-                                      report.vram_headroom_bytes +
                                       report.vram_min_active_bytes;
 
         // Calculate max viable context size for this GPU using the same layout.
         const size_t non_attention_required = report.vram_dense_bytes + report.vram_scratch_bytes +
-                                               report.vram_headroom_bytes + report.vram_min_active_bytes;
+                                               report.vram_min_active_bytes;
         if (report.usable_vram_bytes > non_attention_required) {
             size_t low = 0;
             size_t high = static_cast<size_t>(geometry.max_position_embeddings);
@@ -181,8 +197,8 @@ public:
             err_oss << "VRAM capacity exceeded: Required baseline "
                     << (double)baseline_vram_needed / (1024 * 1024 * 1024) << " GB, but only "
                     << (double)report.usable_vram_bytes / (1024 * 1024 * 1024) << " GB is usable"
-                    << " (of " << (double)total_vram / (1024 * 1024 * 1024)
-                    << " GB total, " << (double)free_vram / (1024 * 1024 * 1024) << " GB free).";
+                    << " (of " << (double)report.total_vram_bytes / (1024 * 1024 * 1024)
+                    << " GB total, " << (double)report.free_vram_bytes / (1024 * 1024 * 1024) << " GB free).";
             report.rejection_reason = err_oss.str();
             return report;
         }
@@ -190,8 +206,7 @@ public:
         // Hot VRAM expert-pool capacity from what remains.
         size_t remaining_for_experts = report.usable_vram_bytes - (report.vram_dense_bytes +
                                                      report.vram_kv_bytes +
-                                                     report.vram_scratch_bytes +
-                                                     report.vram_headroom_bytes);
+                                                     report.vram_scratch_bytes);
         report.vram_available_for_experts = remaining_for_experts;
         report.hot_vram_slots = static_cast<uint32_t>(
             remaining_for_experts / expert_format.payload_bytes);
@@ -289,6 +304,28 @@ public:
 
         report.is_feasible = true;
         return report;
+    }
+
+    // The HIP-querying wrapper: it reads the **current** device's free/total memory
+    // (the caller has already selected the device) and records its index. Kept thin
+    // so the evaluation above stays pure and testable.
+    static MemoryBudgetReport evaluate(
+        const AeonRuntimeConfig& runtime_cfg,
+        const ModelMemoryGeometry& geometry,
+        size_t dense_weights_bytes,
+        const ExpertFormatDescriptor& expert_format
+    ) {
+        DeviceMemoryInfo memory;
+        (void)hipGetDevice(&memory.device);
+        const hipError_t err = hipMemGetInfo(&memory.free_bytes, &memory.total_bytes);
+        if (err != hipSuccess) {
+            MemoryBudgetReport report;
+            report.is_feasible = false;
+            report.rejection_reason =
+                std::string("hipMemGetInfo failed: ") + hipGetErrorString(err);
+            return report;
+        }
+        return evaluate(runtime_cfg, geometry, dense_weights_bytes, expert_format, memory);
     }
 
     static MemoryBudgetReport evaluate(

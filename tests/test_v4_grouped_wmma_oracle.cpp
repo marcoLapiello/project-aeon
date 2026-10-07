@@ -25,6 +25,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
 #include "architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp"
@@ -88,7 +89,7 @@ bool report(const char* label, const std::vector<double>& want,
 
 int main() {
     std::cout << "[Gate] Tier-1: grouped W4A16 WMMA expert pair (permuted, batched)\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     reference::Rng rng(0x9A17ED0Bull);
 

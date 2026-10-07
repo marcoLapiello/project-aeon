@@ -1,4 +1,5 @@
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/kernels/hc_sinkhorn.hpp"
 #include <algorithm>
 #include <iostream>
@@ -16,7 +17,7 @@
 
 int main() {
     std::cout << "[Test] Hyper-Connections Sinkhorn & Post-Expansion on Silicon..." << std::endl;
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     const int num_tokens = 4;
     const int hidden_size = 4096;

@@ -19,6 +19,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 
@@ -103,7 +104,7 @@ bool same_selection(const std::vector<int32_t>& a, const std::vector<int32_t>& b
 
 int main() {
     std::cout << "[Gate] Tier-1 primitive: lightning indexer + top-k (+ Hadamard measurement)\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
 

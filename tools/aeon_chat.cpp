@@ -29,6 +29,7 @@
 #include "infrastructure/profiling/phase_profiler.hpp"
 #include "architecture/deepseek_v4/runtime/v4_engine.hpp"
 #include "platform/device.hpp"
+#include "tools/engine_cli.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -74,6 +75,9 @@ struct Options {
     uint32_t prefill_chunk{64};
     uint32_t prefill_sweep_min_tokens{0};
     uint32_t staging_blocks{2};
+    // The parallel-topology flags are parsed by the shared engine CLI parser rather
+    // than a second copy here, so the two binaries cannot disagree on them.
+    aeon::tools::EngineCli engine_cli;
 };
 
 void print_usage(const char* executable) {
@@ -110,6 +114,13 @@ void print_usage(const char* executable) {
         << "  --prefill-sweep-min-tokens <n>\n"
         << "                           Prompt length at or above which the sweep supplies\n"
         << "                           experts; below it, the routed cache (0 = 3E/4)\n"
+        << "  --device-ids <list>      Comma-separated device ids in stage-major order\n"
+        << "                           (default: 0 .. tp*pp-1)\n"
+        << "  --tensor-parallel <n>    Tensor-parallel degree tp (default: 1)\n"
+        << "  --pipeline-parallel <n>  Pipeline-parallel degree pp (default: 1)\n"
+        << "  --gpu-memory-utilization <f>\n"
+        << "                           Fraction of each device's total VRAM the budget\n"
+        << "                           may plan against, in (0, 0.99] (default: 0.95)\n"
         << "  --profile-routing        Print the decode routing reuse-distance (ideal-LRU) curve\n"
         << "  --phase-profile          Print the prefill chunk's per-phase host/GPU time split\n"
         << "  --validate-registry      Audit the registry after every expert operation (slow; debug)\n"
@@ -165,6 +176,9 @@ Options parse_options(int argc, char** argv) {
         if (argument == "--help") {
             print_usage(argv[0]);
             std::exit(0);
+        } else if (aeon::tools::parse_engine_parallel_flag(
+                       options.engine_cli, argc, argv, index)) {
+            // The parallel-topology flags are consumed by the shared parser.
         } else if (argument == "--model-dir") {
             options.model_dir = require_value(argc, argv, index, "--model-dir");
         } else if (argument == "--tokenizer") {
@@ -357,8 +371,6 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
 
-        aeon::core::select_compute_device(true);
-
         aeon::core::V4EngineOptions engine_options;
         engine_options.model_dir = options.model_dir;
         engine_options.tokenizer_path = options.tokenizer_path;
@@ -380,6 +392,11 @@ int main(int argc, char** argv) {
         engine_options.runtime.prefill_chunk = options.prefill_chunk;
         engine_options.runtime.prefill_sweep_min_tokens = options.prefill_sweep_min_tokens;
         engine_options.runtime.prefill_sweep_staging_blocks = options.staging_blocks;
+        engine_options.runtime.parallel.device_ids = options.engine_cli.device_ids;
+        engine_options.runtime.parallel.tensor_parallel = options.engine_cli.tensor_parallel;
+        engine_options.runtime.parallel.pipeline_parallel = options.engine_cli.pipeline_parallel;
+        engine_options.runtime.gpu_memory_utilization =
+            options.engine_cli.gpu_memory_utilization;
 
         // The phase profiler is a process-wide sink the layer body writes into, so
         // enabling it is a single switch here rather than a parameter threaded

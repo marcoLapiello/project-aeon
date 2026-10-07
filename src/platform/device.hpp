@@ -1,57 +1,85 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// Explicit device selection.
+//
+// The device is chosen by an **index the caller supplies**, never by a heuristic.
+// A prior version inspected each device's PCI bus and skipped the one driving a
+// display on one particular rig — a rule that is unknowable on another machine and
+// silently wrong when the display moves. Portability here means the topology is
+// expressed as data (`--device-ids`) and resolved against what the runtime actually
+// sees.
+//
+// `DeviceScope` sets a device for a region and restores the previous one on exit,
+// which is what lets a per-rank object (a stream set, a pool) be constructed under
+// its own device without leaking that choice to the code that builds the next one.
+// -----------------------------------------------------------------------------
+
 #include <hip/hip_runtime.h>
+
 #include <iostream>
-#include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 namespace aeon::core {
 
-// Automatically selects a high-performance compute GPU that is NOT driving a display.
-inline int select_compute_device(bool verbose = true) {
-    // If HIP_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES is set, device 0 is already isolated
-    const char* hip_vis = std::getenv("HIP_VISIBLE_DEVICES");
-    const char* cuda_vis = std::getenv("CUDA_VISIBLE_DEVICES");
-    if (hip_vis != nullptr || cuda_vis != nullptr) {
-        (void)hipSetDevice(0);
-        if (verbose) {
-            std::cout << "[Aeon Device] Using device 0 under isolated visibility ("
-                      << (hip_vis ? "HIP_VISIBLE_DEVICES" : "CUDA_VISIBLE_DEVICES")
-                      << "=" << (hip_vis ? hip_vis : cuda_vis) << ")" << std::endl;
-        }
-        return 0;
-    }
-
+// Validate `index` against the visible devices, make it current, and (optionally)
+// print the name and PCI address. Throws a named error rather than falling back:
+// a caller that asked for a device that is not there wants to know.
+inline int select_device(int index, bool verbose = true) {
     int device_count = 0;
-    hipError_t err = hipGetDeviceCount(&device_count);
-    if (err != hipSuccess || device_count <= 0) {
-        std::cerr << "[Aeon Device] Warning: Failed to get device count or no devices found." << std::endl;
-        (void)hipSetDevice(0);
-        return 0;
+    const hipError_t count_error = hipGetDeviceCount(&device_count);
+    if (count_error != hipSuccess) {
+        throw std::runtime_error(std::string("select_device: hipGetDeviceCount: ") +
+                                 hipGetErrorString(count_error));
     }
-
-    // Inspect each device to skip the display GPU.
-    // On this host, PCI bus 0x46 is driving the active desktop monitor (DP-10).
-    // Devices with PCI bus 0x43 or 0x63 are dedicated headless compute GPUs.
-    int chosen_dev = 0;
-    for (int dev = 0; dev < device_count; ++dev) {
-        hipDeviceProp_t props;
-        if (hipGetDeviceProperties(&props, dev) == hipSuccess) {
-            if (props.pciBusID != 0x46) {
-                chosen_dev = dev;
-                break;
-            }
+    if (device_count <= 0) {
+        throw std::runtime_error("select_device: no HIP devices are visible");
+    }
+    if (index < 0 || index >= device_count) {
+        throw std::runtime_error(
+            "select_device: device index " + std::to_string(index) +
+            " is out of range for " + std::to_string(device_count) + " visible devices");
+    }
+    const hipError_t set_error = hipSetDevice(index);
+    if (set_error != hipSuccess) {
+        throw std::runtime_error("select_device: hipSetDevice(" + std::to_string(index) +
+                                 "): " + hipGetErrorString(set_error));
+    }
+    if (verbose) {
+        hipDeviceProp_t props{};
+        if (hipGetDeviceProperties(&props, index) == hipSuccess) {
+            std::cout << "[Aeon Device] Using GPU [" << index << "]: " << props.name
+                      << " (PCI Bus 0x" << std::hex << props.pciBusID << std::dec << ")"
+                      << std::endl;
         }
     }
-
-    (void)hipSetDevice(chosen_dev);
-    if (verbose) {
-        hipDeviceProp_t props;
-        (void)hipGetDeviceProperties(&props, chosen_dev);
-        std::cout << "[Aeon Device] Selected headless compute GPU [" << chosen_dev << "]: "
-                  << props.name << " (PCI Bus 0x" << std::hex << props.pciBusID << std::dec
-                  << ") — display GPU bypassed." << std::endl;
-    }
-    return chosen_dev;
+    return index;
 }
 
+// RAII device scope: the current device is captured on construction, `index` is
+// made current, and the previous one is restored on destruction. The restore is
+// best-effort (a destructor cannot throw), but the set is validated so a mistaken
+// index is a loud failure rather than a silent run on the wrong device.
+class DeviceScope {
+public:
+    explicit DeviceScope(int index) {
+        if (hipGetDevice(&previous_) != hipSuccess) previous_ = 0;
+        const hipError_t error = hipSetDevice(index);
+        if (error != hipSuccess) {
+            throw std::runtime_error("DeviceScope: hipSetDevice(" + std::to_string(index) +
+                                     "): " + hipGetErrorString(error));
+        }
+    }
+
+    ~DeviceScope() { (void)hipSetDevice(previous_); }
+
+    DeviceScope(const DeviceScope&) = delete;
+    DeviceScope& operator=(const DeviceScope&) = delete;
+
+private:
+    int previous_{0};
+};
+
 } // namespace aeon::core
+

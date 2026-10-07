@@ -10,6 +10,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/runtime/v4_conversation.hpp"
 #include "architecture/deepseek_v4/runtime/v4_engine.hpp"
@@ -93,7 +94,7 @@ int main() {
     std::printf("================================================================================\n");
     std::printf("  DSV4 conversation adapter\n");
     std::printf("================================================================================\n");
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     V4EngineOptions engine_options;
     engine_options.model_dir = kModelDir;

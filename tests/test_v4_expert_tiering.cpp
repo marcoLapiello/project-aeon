@@ -94,6 +94,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "infrastructure/artifact/aeon_loader.hpp"
 #include "infrastructure/expert/storage/expert_format.hpp"
@@ -363,7 +364,7 @@ struct TieringGate {
         std::printf("================================================================================"
                     "================\n");
 
-        aeon::core::select_compute_device(true);
+        aeon::test::select_test_device(true);
         configure_stack();
 
         const auto& format = loader.expert_format();

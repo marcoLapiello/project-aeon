@@ -1,5 +1,6 @@
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <iostream>
@@ -109,7 +110,7 @@ void cpu_swiglu_clamp(const __half* gate, const __half* up, __half* out, int n, 
 
 int main() {
     std::cout << "[Test] Wave32 RMSNorm and Clamped SwiGLU Kernel Validation..." << std::endl;
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     const int num_tokens = 4;
     const int hidden_dim = 4096;

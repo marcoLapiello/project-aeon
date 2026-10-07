@@ -98,6 +98,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"
@@ -190,7 +191,7 @@ constexpr double kTol = 4e-3;
 
 int main() {
     std::cout << "[Gate] Tier-2: serial multi-token decode across compressor boundaries\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     bool ok = true;
 
     aeon::core::AeonModelLoader loader;

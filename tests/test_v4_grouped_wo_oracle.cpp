@@ -31,6 +31,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "platform/ops/gemv.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
@@ -113,7 +114,7 @@ bool bit_identical(const std::vector<__half>& a, const std::vector<__half>& b,
 
 int main() {
     std::cout << "[Gate] Tier-1 primitive: grouped output projection (wo_a + wo_b)\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
 

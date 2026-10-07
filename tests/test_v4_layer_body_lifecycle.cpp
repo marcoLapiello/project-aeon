@@ -91,6 +91,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"
@@ -366,7 +367,7 @@ bool entries_equal(const std::vector<__half>& a, const std::vector<__half>& b,
 
 int main() {
     std::cout << "[Gate] long-context lifecycle (ring reuse, capacity)\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     bool ok = true;
     uint32_t checks = 0;
     uint32_t failures = 0;

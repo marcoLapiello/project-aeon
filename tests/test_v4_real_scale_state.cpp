@@ -67,6 +67,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"
@@ -207,7 +208,7 @@ size_t compare_snapshot(const std::string& label, const V4LayerStateSnapshot& wa
 
 int main() {
     std::cout << "[Gate] real-scale state — window 128 and index_topk 512 together\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     bool ok = true;
 
     aeon::core::AeonModelLoader loader;

@@ -19,6 +19,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "platform/rdna3/wmma.hpp"
 
 #include <hip/hip_fp16.h>
@@ -161,7 +162,7 @@ bool run_case(const char* name, int k_tiles) {
 
 int main() {
     std::cout << "[Gate] RDNA3 primitive: Wave32 FP16 WMMA fragment lane map\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
     ok &= run_case("16x16x16, single K tile", 1);

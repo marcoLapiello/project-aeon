@@ -17,6 +17,7 @@
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/expert/transport/prefetch_staging.hpp"
+#include "infrastructure/parallel/parallel_topology.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -26,7 +27,6 @@
 namespace aeon::core {
 
 // Constant safety margins & architectural parameters
-constexpr size_t VRAM_HEADROOM_SAFETY_BYTES = 300ULL * 1024ULL * 1024ULL; // 300 MB
 // Host RAM the engine will never plan to use, held back for the OS and for this
 // process's own non-expert footprint (the graph, the tokenizer, the pinned
 // transport staging arena, and whatever the dense container still holds in page
@@ -214,6 +214,17 @@ struct AeonRuntimeConfig {
     // are refused at load. Each block is `E x payload_bytes` of **non-reclaimable
     // pinned** host memory — `3.44 GiB` per block at `E = 256`.
     uint32_t prefill_sweep_staging_blocks{2};
+
+    // The parallel topology: the device ids and the two degrees of freedom. The
+    // degenerate `{{}, 1, 1}` is one device. The model host resolves it against the
+    // visible devices and the artifact's declared max tensor-parallel degree.
+    ParallelTopologyConfig parallel;
+
+    // The fraction of each device's **total** VRAM the budget is allowed to plan
+    // against. Replaces a fixed headroom subtraction: `usable = floor(fraction *
+    // total)`, and a device whose free memory is below that allowance is refused by
+    // name rather than silently shrunk.
+    double gpu_memory_utilization{0.95};
 };
 
 // The staging arena's slot count, shared by the budget report and the arena's own

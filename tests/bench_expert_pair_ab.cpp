@@ -62,6 +62,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
 #include "backend/swizzled_w4a16/kernels/swizzled_w4a16_feed.hpp"
 #include "architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp"
@@ -634,7 +635,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[Bench] Expert pair A/B: GEMV pair vs grouped WMMA pair\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     const std::vector<double> distribution = load_layer_distribution(profile, 0);
     std::printf("  routing: %s (layer 0, prefill)\n", profile.c_str());

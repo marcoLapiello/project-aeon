@@ -50,6 +50,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "platform/ops/moe_accumulate.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w13.hpp"
@@ -212,7 +213,7 @@ int run_gate() {
     std::printf("  Routed-expert accumulation — fixed-order fp32 vs the fp16 read-modify-write\n");
     std::printf("================================================================================\n");
 
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     aeon::core::AeonModelLoader loader;
     loader.open_model("models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon");
 

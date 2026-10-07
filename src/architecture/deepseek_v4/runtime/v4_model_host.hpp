@@ -43,6 +43,8 @@
 // -----------------------------------------------------------------------------
 
 #include "architecture/deepseek_v4/spec/config.hpp"
+#include "infrastructure/parallel/device_context.hpp"
+#include "infrastructure/parallel/parallel_topology.hpp"
 #include "infrastructure/memory/memory_budget.hpp"
 #include "infrastructure/device_streams.hpp"
 #include "architecture/deepseek_v4/moe/v4_expert_executor.hpp"
@@ -107,8 +109,12 @@ public:
         free();
         verbose_ = verbose;
 
-        select_compute_device(verbose_);
-        streams_ = DeviceStreams::create();
+        // A topology with more than one rank or stage is not wired yet — the
+        // per-stage host, the handoff and the collectives do not exist — so it is a
+        // named refusal rather than a silent single-device run.
+        if (runtime_cfg.parallel.tensor_parallel * runtime_cfg.parallel.pipeline_parallel > 1) {
+            throw std::runtime_error("V4ModelHost: multi-GPU topology not yet supported");
+        }
 
         loader_.open_model(model_dir);
         const auto& expert_format = loader_.expert_format();
@@ -121,6 +127,18 @@ public:
         config_ = DeepSeekV4Config::load_from_json(model_dir + "/config.json");
         layer_specs_ = V4ModelSpec::resolve_layers(config_);
         V4ModelContract::validate(config_, loader_);
+
+        // The topology is resolved once, here, and every device the host touches is
+        // reached through it rather than by a heuristic. `artifact_max_tp` is 1 until
+        // the artifact declares otherwise; at one rank and one stage this validates
+        // the device id and selects stage 0 / rank 0's device.
+        int visible_devices = 0;
+        CHECK_HIP(hipGetDeviceCount(&visible_devices));
+        topology_ = ParallelTopology::resolve(
+            runtime_cfg.parallel, visible_devices, /*artifact_max_tp=*/1u,
+            static_cast<uint32_t>(config_.num_hidden_layers));
+        select_device(topology_.device(0, 0), verbose_);
+        context_ = DeviceContext::create(topology_.device(0, 0));
 
         // The budget is sized against the bytes the graph actually **uploads**, not
         // the container's file size: `embed.weight` stays host-side and the unused
@@ -232,7 +250,7 @@ public:
         resources_.free();
         scratch_.free();
         prefill_workspace_.free();
-        streams_.destroy();
+        context_.destroy();
         loader_.close_all();
         layer_specs_.clear();
         budget_ = MemoryBudgetReport{};
@@ -336,7 +354,11 @@ public:
         return prefill_workspace_.prefill_carry_tokens();
     }
 
-    const DeviceStreams& streams() const noexcept { return streams_; }
+    const DeviceStreams& streams() const noexcept { return context_.streams; }
+
+    // The resolved parallel topology: one device in the degenerate case. The host
+    // owns every device and layer-range decision through it.
+    const ParallelTopology& topology() const noexcept { return topology_; }
 
     V4Layer& layer(uint32_t layer_id) { return layers_.at(layer_id); }
     const V4Layer& layer(uint32_t layer_id) const { return layers_.at(layer_id); }
@@ -690,10 +712,10 @@ private:
     // traffic. Used by the prefill sweep's switch: entering it frees the whole Hot
     // pool, so no upload or demotion may still be reading or writing a slot.
     void drain_expert_streams() {
-        CHECK_HIP(hipStreamSynchronize(streams_.compute));
-        if (streams_.sdma != nullptr) { CHECK_HIP(hipStreamSynchronize(streams_.sdma)); }
-        if (streams_.sdma_cold != nullptr) { CHECK_HIP(hipStreamSynchronize(streams_.sdma_cold)); }
-        if (streams_.demotion != nullptr) { CHECK_HIP(hipStreamSynchronize(streams_.demotion)); }
+        CHECK_HIP(hipStreamSynchronize(context_.streams.compute));
+        if (context_.streams.sdma != nullptr) { CHECK_HIP(hipStreamSynchronize(context_.streams.sdma)); }
+        if (context_.streams.sdma_cold != nullptr) { CHECK_HIP(hipStreamSynchronize(context_.streams.sdma_cold)); }
+        if (context_.streams.demotion != nullptr) { CHECK_HIP(hipStreamSynchronize(context_.streams.demotion)); }
     }
 
     uint32_t count_kind(V4AttentionKind kind) const noexcept {
@@ -727,7 +749,7 @@ private:
             static_cast<uint32_t>(config_.num_hidden_layers),
             static_cast<uint32_t>(config_.n_routed_experts),
             static_cast<uint32_t>(config_.num_experts_per_tok),
-            streams_.compute, &prefill_controller_.sweep(), &supply_});
+            context_.streams.compute, &prefill_controller_.sweep(), &supply_});
 
         // The tiered supply, on the four shared streams.
         supply_.configure(
@@ -740,7 +762,7 @@ private:
             tier_.direct_io.reader(),
             tier_.direct_io.completions(),
             tier_.direct_io.next_id(),
-            streams_.compute, streams_.sdma, streams_.sdma_cold, streams_.demotion,
+            context_.streams.compute, context_.streams.sdma, context_.streams.sdma_cold, context_.streams.demotion,
             format.payload_bytes,
             runtime_cfg.demotion_queue_capacity > 0
                 ? runtime_cfg.demotion_queue_capacity
@@ -775,7 +797,7 @@ private:
             tier_.reuse_profiler.reset(tier_.registry.total_experts);
         }
         executor_ = std::make_unique<V4TieredExpertExecutor>(
-            supply_, vram_pool(), *tier_.staging, tier_.registry, expert_scratch_, streams_,
+            supply_, vram_pool(), *tier_.staging, tier_.registry, expert_scratch_, context_.streams,
             tier_.telemetry, runtime_cfg.profile_routing_reuse ? &tier_.reuse_profiler : nullptr,
             config_.swiglu_limit);
 
@@ -796,7 +818,7 @@ private:
             : std::max<uint32_t>(
                   1, (static_cast<uint32_t>(config_.n_routed_experts) * 3u) / 4u);
         prefill_controller_.bind(PrefillController::Services{
-            &streams_, &supply_, executor_.get(), &tier_.registry, &tier_.host_partition});
+            &context_.streams, &supply_, executor_.get(), &tier_.registry, &tier_.host_partition});
         prefill_controller_.configure(runtime_cfg.prefill_sweep, sweep_min_tokens);
         // Let the per-token hook pump the swept lookahead's copies. The executor does
         // not know about the sweep, so it gets a callback; the sweep ignores the call
@@ -830,7 +852,8 @@ private:
     // tell whether the state it described has been reset underneath it.
     uint64_t state_epoch_{0};
 
-    DeviceStreams streams_;
+    DeviceContext context_;
+    ParallelTopology topology_;
     V4ModelResources resources_;
     V4ActivationScratch scratch_;
     std::vector<V4Layer> layers_;

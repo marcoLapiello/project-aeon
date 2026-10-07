@@ -36,6 +36,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/layer/v4_layer.hpp"
@@ -640,7 +641,7 @@ bool run_class(const ClassRun& run, aeon::core::AeonModelLoader& loader,
 
 int main() {
     std::cout << "[Gate] Tier-2: compressed layer classes (CSA, HCA)\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     aeon::core::AeonModelLoader loader;
     loader.open_model(kModelDir);

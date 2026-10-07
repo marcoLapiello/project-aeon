@@ -31,14 +31,19 @@ namespace aeon::core {
 struct MemoryBudgetReport {
     bool is_feasible{false};
     std::string rejection_reason;
+    // Which device this report was evaluated for, and the fraction of its total
+    // VRAM the allowance was taken from. Reported so a per-device budget is
+    // identifiable rather than an anonymous figure.
+    int device_index{-1};
+    double gpu_memory_utilization{0.0};
     // Hardware limits
     size_t total_vram_bytes{0};
     size_t free_vram_bytes{0};
 
-    // What the budget is actually sized against: `min(free_vram, total_vram)`.
-    // Planning against `total_vram` ignores VRAM another process already holds,
-    // which on a card running a display server (or shared with another job) is
-    // memory the engine cannot have.
+    // What the budget is actually sized against: `floor(gpu_memory_utilization *
+    // total_vram)`. The fraction is the margin a driver and a display need; the
+    // alternative — plan against `free_vram` — would silently shrink on a busy card
+    // instead of refusing by name.
     size_t usable_vram_bytes{0};
     size_t total_host_ram_bytes{0};
     size_t max_allowed_host_ram_bytes{0};
@@ -64,7 +69,6 @@ struct MemoryBudgetReport {
     // separately from the batch-scratch allowance it is summed with, so the window's
     // cost is visible rather than folded into a single scratch figure.
     size_t vram_prefill_carry_bytes{0};
-    size_t vram_headroom_bytes{VRAM_HEADROOM_SAFETY_BYTES};
     size_t vram_min_active_bytes{0};
     size_t vram_available_for_experts{0};
 
@@ -112,6 +116,8 @@ struct MemoryBudgetReport {
 
         oss << "--------------------------------------------------------------------------------\n"
             << "  Hardware Environment:\n"
+            << "    - Device Index         : " << device_index << "\n"
+            << "    - GPU Memory Util.     : " << gpu_memory_utilization << "\n"
             << "    - Total VRAM           : " << (double)total_vram_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Free VRAM (at init)  : " << (double)free_vram_bytes / (1024 * 1024 * 1024) << " GB\n"
             << "    - Usable VRAM (planned): " << (double)usable_vram_bytes / (1024 * 1024 * 1024) << " GB\n"
@@ -132,7 +138,7 @@ struct MemoryBudgetReport {
             << " MB + batch allowance " << (double)vram_batch_scratch_bytes / (1024 * 1024)
             << " MB + residual carry " << (double)vram_prefill_carry_bytes / (1024 * 1024)
             << " MB; the two allowances are checked against the real allocations at load)\n"
-            << "    - Safety Headroom      : " << (double)vram_headroom_bytes / (1024 * 1024) << " MB (Fixed OS/GTT buffer)\n"
+            << "    - Safety Headroom      : removed (utilization fraction, above)\n"
             << "    - Active Experts Min   : " << (double)vram_min_active_bytes / (1024 * 1024) << " MB\n"
             << "    - Available for Hot Pool: " << (double)vram_available_for_experts / (1024 * 1024 * 1024) << " GB\n"
             << "--------------------------------------------------------------------------------\n"

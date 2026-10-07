@@ -33,6 +33,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_moe_fused_w2.hpp"
 #include "backend/swizzled_w4a16/kernels/swizzled_w4a16_feed.hpp"
@@ -436,7 +437,7 @@ bool verify_feed_unperturbed() {
 } // namespace
 
 int main() {
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
     std::cout << "[Gate] Multi-GPU feasibility: routed W2 K-shard equivalence" << std::endl;
 
     const bool contribution_ok = verify_contribution_equivalence();

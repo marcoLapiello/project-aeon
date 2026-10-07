@@ -31,6 +31,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/kernels/moe_router.hpp"
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
@@ -172,7 +173,7 @@ const int32_t kRealTokenIds[] = {
 
 int main() {
     std::cout << "[Gate] Tier-1 primitive: MoE router (top-k + hash)\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
     aeon::reference::Rng gen(0x1207E8C0ull);

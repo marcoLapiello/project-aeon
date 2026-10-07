@@ -26,6 +26,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/kernels/v4_swiglu_clamp.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "backend/swizzled_w4a16/core/swizzled_expert_format.hpp"
@@ -109,7 +110,7 @@ double peak_of(const std::vector<double>& v) {
 
 int main() {
     std::cout << "[Gate] Tier-1 primitive: routed expert (dequant + matmul + clamped SwiGLU)\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
     aeon::reference::Rng gen(0x0E7E1217ull);

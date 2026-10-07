@@ -31,6 +31,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
 #include "architecture/deepseek_v4/kernels/moe_grouped_dispatch.hpp"
 #include "backend/swizzled_w4a16/kernels/aeon_w4a16_swizzle.hpp"
@@ -533,7 +534,7 @@ bool verify_multi_expert_topology() {
 
 int main() {
     std::cout << "[Gate] Multi-GPU feasibility: routed expert pair under sharding\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     reference::Rng rng(0x5EED1234ull);
 

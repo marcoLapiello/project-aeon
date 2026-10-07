@@ -29,6 +29,7 @@
 // -----------------------------------------------------------------------------
 
 #include "platform/device.hpp"
+#include "test_device.hpp"
 #include "architecture/deepseek_v4/kernels/v4_attention.hpp"
 #include "architecture/deepseek_v4/kernels/v4_rope.hpp"
 #include "architecture/deepseek_v4/reference/dsv4_oracle.hpp"
@@ -104,7 +105,7 @@ struct Spec {
 
 int main() {
     std::cout << "[Gate] Tier-1 primitive: compressor + APE vs independent fp64 reference\n";
-    aeon::core::select_compute_device(true);
+    aeon::test::select_test_device(true);
 
     bool ok = true;
 
