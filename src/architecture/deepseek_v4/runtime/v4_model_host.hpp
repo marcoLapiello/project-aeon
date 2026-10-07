@@ -45,6 +45,7 @@
 #include "architecture/deepseek_v4/spec/config.hpp"
 #include "infrastructure/parallel/device_context.hpp"
 #include "infrastructure/parallel/parallel_topology.hpp"
+#include "infrastructure/parallel/peer_access.hpp"
 #include "infrastructure/memory/memory_budget.hpp"
 #include "infrastructure/device_streams.hpp"
 #include "architecture/deepseek_v4/runtime/v4_stage_host.hpp"
@@ -90,11 +91,12 @@ public:
         free();
         verbose_ = verbose;
 
-        // A topology with more than one rank or stage is not wired yet — the
-        // per-stage host, the handoff and the collectives do not exist — so it is a
-        // named refusal rather than a silent single-device run.
-        if (runtime_cfg.parallel.tensor_parallel * runtime_cfg.parallel.pipeline_parallel > 1) {
-            throw std::runtime_error("V4ModelHost: multi-GPU topology not yet supported");
+        // Tensor parallelism is not wired yet — the rank-sharded artifact, the
+        // collective and the split layer body do not exist — so it is a named refusal
+        // rather than a silent single-rank run. Pipeline parallelism is supported: one
+        // stage per device, a peer copy of the residual at the boundary.
+        if (runtime_cfg.parallel.tensor_parallel > 1) {
+            throw std::runtime_error("V4ModelHost: tensor parallelism not yet supported");
         }
 
         loader_.open_model(model_dir);
@@ -118,6 +120,19 @@ public:
         topology_ = ParallelTopology::resolve(
             runtime_cfg.parallel, visible_devices, /*artifact_max_tp=*/1u,
             static_cast<uint32_t>(config_.num_hidden_layers));
+
+        // A pipeline copies a token's residual from one stage's device to the next. Peer
+        // access makes that copy direct where the hardware allows it; where it does not,
+        // `hipMemcpyPeerAsync` still produces the same bytes through a staged path, so
+        // this is best-effort and never a refusal.
+        if (topology_.pp() > 1) {
+            std::vector<int> stage_devices;
+            stage_devices.reserve(topology_.pp());
+            for (uint32_t stage = 0; stage < topology_.pp(); ++stage) {
+                stage_devices.push_back(topology_.device(stage, 0));
+            }
+            enable_peer_access(stage_devices, verbose_);
+        }
 
         // The budget is sized against the bytes the graph actually **uploads**, not
         // the container's file size: `embed.weight` stays host-side and the unused
@@ -191,7 +206,7 @@ public:
             stages_.back()->initialize(
                 topology_.stage_layers(stage), topology_.device(stage, 0),
                 V4StageParams{&loader_, &config_, &layer_specs_, &budgets_[stage], &runtime_cfg,
-                              context_capacity_, verbose_});
+                              context_capacity_, verbose_, stage});
         }
 
         // Every dense tensor the contract enumerates has been uploaded by this point,
@@ -342,6 +357,22 @@ public:
 
     const DeviceStreams& streams() const noexcept { return stage().streams(); }
 
+    // The stream the embedding and stage 0 run on, and the stream the head and the
+    // logits read back on. They are the same stream at one stage; a pipeline puts the
+    // head on the last device, so a sampler must read the last stage's stream.
+    hipStream_t embed_stream() const noexcept { return stages_.front()->streams().compute; }
+    hipStream_t head_stream() const noexcept { return stages_.back()->streams().compute; }
+    // The device the head runs on — the last stage's. The sampler's device workspace
+    // and logits readback must live there, not on the first stage's device.
+    int head_device() const noexcept { return stages_.back()->device_index(); }
+
+    // The stages, by index. A stage is one device and one contiguous layer range.
+    uint32_t stage_count() const noexcept { return static_cast<uint32_t>(stages_.size()); }
+    V4StageHost& stage(uint32_t index) { return *stages_.at(index); }
+    const V4StageHost& stage(uint32_t index) const { return *stages_.at(index); }
+    V4StageHost& stage_of(uint32_t layer_id) { return stage_of_layer(layer_id); }
+    const V4StageHost& stage_of(uint32_t layer_id) const { return stage_of_layer(layer_id); }
+
     // The resolved parallel topology: one device in the degenerate case. The host
     // owns every device and layer-range decision through it.
     const ParallelTopology& topology() const noexcept { return topology_; }
@@ -366,7 +397,12 @@ public:
     // must not acquire a dependency on the storage system to run a layer.
     V4RoutedExpertExecutor& executor() { return stage().executor(); }
 
-    bool experts_ready() const noexcept { return stage().experts_ready(); }
+    bool experts_ready() const noexcept {
+        for (const auto& stage : stages_) {
+            if (!stage->experts_ready()) return false;
+        }
+        return !stages_.empty();
+    }
 
     // The token boundary. The graph calls this once per token, after the head and
     // before the caller reads the logits back — a lease grants no ordering, so it must
@@ -374,12 +410,24 @@ public:
     // readback is the compute-stream boundary that makes the release safe. Exposed here
     // rather than on the seam because releasing is a property of the concrete tiered
     // executor, not of the interface the body sees.
-    void release_expert_leases() { stage().release_expert_leases(); }
+    void release_expert_leases() {
+        // Every stage holds its own leases; releasing only the first would leave a
+        // later stage's slot frozen for the next dispatch.
+        for (auto& stage : stages_) {
+            stage->release_expert_leases();
+        }
+    }
 
     // Leases still held by the tiered executor. A gate asserts this is 0 at the
     // end of a run: every lease must be handed back by the token boundary, or a
     // slot stays frozen and the next dispatch's victim selection starves.
-    size_t outstanding_expert_leases() const noexcept { return stage().outstanding_expert_leases(); }
+    size_t outstanding_expert_leases() const noexcept {
+        size_t total = 0;
+        for (const auto& stage : stages_) {
+            total += stage->outstanding_expert_leases();
+        }
+        return total;
+    }
 
     // Times the emergency drain in `ensure_pool_headroom` fired, from the supply
     // telemetry. Zero whenever the pool can hold a token's `6 x 43` leases, which is
@@ -456,7 +504,13 @@ public:
     // shadow copy first (`reap` is event-query only, no CPU synchronization) so the idle
     // residencies are visible before they are released; a copy that is still genuinely
     // in flight is reclaimed by eviction when it settles.
-    void set_supply_phase(bool prefill) { stage().set_supply_phase(prefill); }
+    void set_supply_phase(bool prefill) {
+        // The phase transition drains each stage's own streams and moves its own
+        // partition, so every stage must see it, not just the first.
+        for (auto& stage : stages_) {
+            stage->set_supply_phase(prefill);
+        }
+    }
 
     // Frozen-prefill state, for a gate: whether the registry is in frozen mode and
     // how many Warm-owned experts currently hold an extra VRAM copy.
@@ -499,7 +553,11 @@ public:
     }
 
     // One generated token's worth of decode accounting. A no-op when the sink is off.
-    void record_supply_decode_token() { stage().record_supply_decode_token(); }
+    void record_supply_decode_token() {
+        for (auto& stage : stages_) {
+            stage->record_supply_decode_token();
+        }
+    }
 
     // Host read access, for building an oracle: `embed.weight` is reached through
     // `resources().host_embed_table` (a pointer into the container), while

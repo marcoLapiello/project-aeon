@@ -54,7 +54,8 @@ public:
     void initialize(
         const AeonModelLoader& loader,
         uint32_t max_seq_len,
-        const DeepSeekV4Config& config
+        const DeepSeekV4Config& config,
+        bool has_head = true
     ) {
         free();
 
@@ -74,6 +75,12 @@ public:
             "compressed");
 
         host_embed_table = loader.get_data_ptr<half>("embed.weight");
+
+        // The head end — the LM head, the final RMSNorm and the Hyper-Connections head —
+        // lives only on the stage that produces the logits. Uploading it on every stage
+        // would reserve the same ~1 GiB of VRAM per device, which is why the per-stage
+        // budget excludes it everywhere but the last stage and this must match.
+        if (!has_head) return;
 
         const auto& head_t = loader.get_tensor("head.weight");
         check_hip(hipMalloc(&d_lm_head, head_t.byte_size), "hipMalloc(LM head)");

@@ -218,7 +218,14 @@ public:
                 std::to_string(tokenizer_.vocab_size()) +
                 ") is not the model's (" + std::to_string(vocab) + ")");
         }
-        sampler_ = std::make_unique<Sampler>(vocab);
+        // The sampler's device workspace (the argmax reduction buffers) is allocated
+        // on the device that is current here, and the logits it reads live on the head
+        // stage's device. Build it there so the reduction runs on the stream that wrote
+        // them.
+        {
+            DeviceScope sampler_scope(host_.head_device());
+            sampler_ = std::make_unique<Sampler>(vocab);
+        }
 
         // The artifact's own policy, if it ships one. Absent is not an error — a
         // checkpoint without `generation_config.json` gets the deterministic
@@ -275,7 +282,8 @@ public:
         const half* logits = graph_->forward_token(token_id, position, host_.streams().compute);
         session_.feed(position, token_id);
         if (logits_dump_.is_open()) dump_logits(logits);
-        return sampler_->select(logits, host_.streams().compute);
+        DeviceScope head_scope(host_.head_device());
+        return sampler_->select(logits, host_.head_stream());
     }
 
     // Appends one position's raw fp16 logits to the dump, if one is open. Ordered
@@ -283,10 +291,11 @@ public:
     void dump_logits(const half* logits) {
         const uint32_t vocab = static_cast<uint32_t>(host_.config().vocab_size);
         logits_host_.resize(vocab);
+        DeviceScope head_scope(host_.head_device());
         (void)hipMemcpyAsync(logits_host_.data(), logits,
                              static_cast<size_t>(vocab) * sizeof(half),
-                             hipMemcpyDeviceToHost, host_.streams().compute);
-        (void)hipStreamSynchronize(host_.streams().compute);
+                             hipMemcpyDeviceToHost, host_.head_stream());
+        (void)hipStreamSynchronize(host_.head_stream());
         logits_dump_.write(reinterpret_cast<const char*>(logits_host_.data()),
                            static_cast<std::streamsize>(vocab) * sizeof(half));
     }
@@ -464,7 +473,8 @@ public:
                 // the decode rate would report a rate the decode never ran.
                 first_token_ms = elapsed_ms(started);
                 decode_started = Clock::now();
-                return sampler_->select(logits, host_.streams().compute);
+                DeviceScope head_scope(host_.head_device());
+                return sampler_->select(logits, host_.head_stream());
             };
 
         const text::TokenStep decode_step =

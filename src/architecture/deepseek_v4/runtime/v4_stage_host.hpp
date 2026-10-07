@@ -63,6 +63,10 @@ struct V4StageParams {
     const AeonRuntimeConfig* runtime_cfg{nullptr};
     uint32_t context_capacity{0};
     bool verbose{false};
+    // The stage's index in the pipeline, used to give each stage its own telemetry
+    // sink (`<path>.stage<k>`) so a pipeline's per-stage traffic is not merged into
+    // one file.
+    uint32_t stage_index{0};
 };
 
 class V4StageHost {
@@ -83,14 +87,24 @@ public:
         range_ = range;
         params_ = params;
         verbose_ = params.verbose;
+        // Hold the stage's device for the whole build. Every allocation below — the
+        // resources, the layers, the scratch — must land on it, and
+        // `DeviceContext::create` deliberately restores the previous device once its
+        // streams are made, so without this a second stage would allocate on the first
+        // stage's device.
+        DeviceScope device_scope(device);
         context_ = DeviceContext::create(device);
 
         const AeonModelLoader& loader = *params.loader;
         const DeepSeekV4Config& config = *params.config;
         const std::vector<V4LayerSpec>& layer_specs = *params.layer_specs;
         // The RoPE tables and the model-level tensors are built for the declared
-        // context, so `context_capacity` is also every layer's `max_seq_len`.
-        resources_.initialize(loader, params.context_capacity, config);
+        // context, so `context_capacity` is also every layer's `max_seq_len`. The head
+        // end is uploaded only on the stage that carries the last layer; every other
+        // stage builds just RoPE, matching the per-stage budget.
+        const bool has_head = (range_.first + range_.count ==
+                               static_cast<uint32_t>(config.num_hidden_layers));
+        resources_.initialize(loader, params.context_capacity, config, has_head);
         scratch_.allocate();
 
         layers_.resize(range.count);
@@ -105,12 +119,16 @@ public:
         // clean slate and capture everything after it" rather than "start clean and
         // hope nothing has happened yet".)
         if (!params.runtime_cfg->supply_telemetry_path.empty()) {
-            tier_.telemetry.enable_jsonl(params.runtime_cfg->supply_telemetry_path,
-                                         params.runtime_cfg->run_id);
+            // A pipeline gives each stage its own sink, so one stage's supply traffic
+            // is not indistinguishable from another's in a single file.
+            std::string telemetry_path = params.runtime_cfg->supply_telemetry_path;
+            if (params.runtime_cfg->parallel.pipeline_parallel > 1) {
+                telemetry_path += ".stage" + std::to_string(params.stage_index);
+            }
+            tier_.telemetry.enable_jsonl(telemetry_path, params.runtime_cfg->run_id);
             if (verbose_) {
                 std::printf("[Stage %u] Supply telemetry -> %s (run_id=%s)\n", range.first,
-                            params.runtime_cfg->supply_telemetry_path.c_str(),
-                            params.runtime_cfg->run_id.c_str());
+                            telemetry_path.c_str(), params.runtime_cfg->run_id.c_str());
             }
         }
     }
@@ -173,6 +191,9 @@ public:
     const V4ActivationScratch& scratch() const noexcept { return scratch_; }
 
     const DeviceStreams& streams() const noexcept { return context_.streams; }
+
+    // The device this stage runs on, for a peer copy at a pipeline boundary.
+    int device_index() const noexcept { return context_.device; }
 
     // --- the layer-major prefill working set ----------------------------------
     //
@@ -395,9 +416,16 @@ public:
 
     void prefill_begin(uint32_t window_tokens) { prefill_controller_.begin(window_tokens); }
 
-    void prefill_before_layer(uint32_t layer) { prefill_controller_.before_layer(layer); }
+    // The graph names layers by their **global** id; the controller, the sweep and the
+    // registry are local-indexed (this stage's layer 0 is its own first layer), so the
+    // global id is translated here, at the one boundary between them.
+    void prefill_before_layer(uint32_t layer) {
+        prefill_controller_.before_layer(layer - range_.first);
+    }
 
-    void prefill_after_layer(uint32_t layer) { prefill_controller_.after_layer(layer); }
+    void prefill_after_layer(uint32_t layer) {
+        prefill_controller_.after_layer(layer - range_.first);
+    }
 
     void prefill_end() { prefill_controller_.end(); }
 
@@ -511,6 +539,10 @@ inline void V4StageHost::initialize_experts() {
     const AeonRuntimeConfig& runtime_cfg = *params_.runtime_cfg;
     if (budget.hot_vram_slots == 0) return;
 
+    // The tier's pools and pinned region are allocated on the stage's device; the
+    // dense upload restored the previous device, so it is re-established here.
+    DeviceScope device_scope(context_.device);
+
     const auto& format = loader.expert_format();
     const uint32_t warm_slots = budget.warm_host_slots;
 
@@ -578,7 +610,7 @@ inline void V4StageHost::initialize_experts() {
         supply_, vram_pool(), *tier_.staging, tier_.registry, expert_scratch_,
         context_.streams, tier_.telemetry,
         runtime_cfg.profile_routing_reuse ? &tier_.reuse_profiler : nullptr,
-        config.swiglu_limit);
+        config.swiglu_limit, range_.first);
 
     // The prefill controller: the sweep and the strategy switch. It borrows the same
     // two components the executor does, and its sweep's bank count was bound by the

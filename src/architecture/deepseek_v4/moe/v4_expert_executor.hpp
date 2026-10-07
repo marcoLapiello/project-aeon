@@ -200,7 +200,8 @@ public:
         const DeviceStreams& streams,
         SupplyTelemetry& telemetry,
         RoutingReuseProfiler* reuse_profiler,
-        float swiglu_limit
+        float swiglu_limit,
+        uint32_t first_layer = 0
     )
         : supply_(supply),
           vram_pool_(vram_pool),
@@ -210,7 +211,8 @@ public:
           streams_(streams),
           telemetry_(telemetry),
           reuse_profiler_(reuse_profiler),
-          swiglu_limit_(swiglu_limit) {
+          swiglu_limit_(swiglu_limit),
+          first_layer_(first_layer) {
         // The fused dispatches are compiled for exactly six experts; a mismatch here
         // would be a shape error inside the kernel launch, so it is refused at
         // construction where the message can say why.
@@ -247,7 +249,9 @@ public:
         supply_.reap_registry_transfers();
         ensure_pool_headroom();
         current_layer_ = layer_id;
-        state_ = supply_.dispatch_layer_prefetch(layer_id, position, ids, leases_);
+        // The tier is local-indexed; the graph names layers globally. The translation
+        // happens here, at the one place a layer id crosses into the tier.
+        state_ = supply_.dispatch_layer_prefetch(layer_id - first_layer_, position, ids, leases_);
         batch_materialized_ = false;
         batch_draws_ += ids.size();
         batch_distinct_ += state_.expert_count();
@@ -272,7 +276,8 @@ public:
         ensure_pool_headroom(static_cast<size_t>(ids.size()) *
                              V4RoutedExpertScratch::kExperts);
         current_layer_ = layer_id;
-        state_ = supply_.dispatch_layer_prefetch_batch(layer_id, first_position, ids, leases_);
+        state_ = supply_.dispatch_layer_prefetch_batch(layer_id - first_layer_, first_position,
+                                                      ids, leases_);
         batch_materialized_ = false;
         batch_draws_ += static_cast<uint64_t>(ids.size()) *
                         V4RoutedExpertScratch::kExperts;
@@ -577,6 +582,9 @@ private:
     // its absence is the off switch: nothing is recorded when it is null.
     RoutingReuseProfiler* reuse_profiler_{nullptr};
     float swiglu_limit_{10.0f};
+    // The stage's first global layer: the offset between the graph's global layer ids
+    // and this tier's local ones.
+    uint32_t first_layer_{0};
 
     uint32_t current_layer_{0};
     V4ExpertSupplyCoordinator::LayerPrefetchState state_;

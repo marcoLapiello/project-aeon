@@ -118,8 +118,16 @@ public:
         const float rms_eps = host_.config().rms_norm_eps;
         const float hc_eps = host_.config().hc_eps;
 
-        auto& scratch = host_.scratch();
-        const auto& resources = host_.resources();
+        // The head end lives on the **last** stage: its scratch holds the final
+        // residual, and its resources hold the head tensors. At one stage this is
+        // stage 0, the single device.
+        V4StageHost& head = host_.stage(host_.stage_count() - 1);
+        // Launch on the head stage's device: a kernel's launch is bound to the device
+        // current at the call, and a pipeline's last stage is not the device the
+        // previous stage left current.
+        DeviceScope device_scope(head.device_index());
+        auto& scratch = head.scratch();
+        const auto& resources = head.resources();
 
         // `hc_head`. Unlike the pre-mix, the norm is **weightless**, the RMS is over
         // the **flattened** 16384, `hc_head_scale` is a scalar, and there is no
@@ -168,10 +176,13 @@ public:
     // body.
     V4LayerBodyOutput run_layer(uint32_t layer_id, uint32_t token_id, uint32_t position,
                                 hipStream_t stream) {
-        const V4LayerBodyTables tables = host_.tables();
+        // A layer lives on exactly one stage; its body reads that stage's scratch, its
+        // RoPE tables and its expert executor. At one stage this is the only stage.
+        V4StageHost& stage = host_.stage_of(layer_id);
+        const V4LayerBodyTables tables = stage.tables();
         return run_layer_body_decoding(
-            host_.layer(layer_id), host_.scratch(), tables, token_id, position, stream,
-            host_.executor(), observer_);
+            stage.layer(layer_id), stage.scratch(), tables, token_id, position, stream,
+            stage.executor(), observer_);
     }
 
     // The whole forward pass for one token at one position: the embedding, 43
@@ -182,21 +193,38 @@ public:
     // `d_res_in`, and every later layer's input is the previous layer's output
     // because the body chained it. `num_layers()` is the model's own count, so a
     // 43-layer checkpoint runs 43 times with no constant in this file.
+    //
+    // A pipeline runs the layers stage by stage and copies the residual pair across
+    // the boundary. The copy is exact, so a pipelined token is bit-identical to the
+    // single-device one: PP adds no arithmetic.
     const half* forward_token(uint32_t token_id, uint32_t position, hipStream_t stream) {
-        embed_token(token_id, stream);
-
-        const uint32_t layers = host_.num_layers();
-        for (uint32_t layer = 0; layer < layers; ++layer) {
-            (void)run_layer(layer, token_id, position, stream);
+        (void)stream;
+        {
+            DeviceScope scope(host_.stage(0).device_index());
+            embed_token(token_id, host_.embed_stream());
         }
 
-        const half* logits = head_stage(stream);
+        const uint32_t stage_count = host_.stage_count();
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            if (stage > 0) handoff_residual(stage - 1, stage);
+            // A stage's compute may create device resources (a transfer event) and must
+            // do so on its own device, not on whichever device the previous stage left
+            // current.
+            DeviceScope scope(host_.stage(stage).device_index());
+            const LayerRange range = host_.topology().stage_layers(stage);
+            const hipStream_t stage_stream = host_.stage(stage).streams().compute;
+            for (uint32_t i = 0; i < range.count; ++i) {
+                (void)run_layer(range.first + i, token_id, position, stage_stream);
+            }
+        }
+
+        const half* logits = head_stage(host_.head_stream());
 
         // The token boundary, and it is a precondition rather than an implementation
         // detail: a lease grants no ordering, so it must be held for as long as compute
         // reading that slot may be in flight. Sampling must read the logits back, so the
         // caller has a compute-stream boundary here for free — which is what makes this
-        // release safe.
+        // release safe. Every stage holds its own leases, so all are released.
         host_.release_expert_leases();
 
         return logits;
@@ -298,62 +326,94 @@ public:
             mark = now;
         };
 
-        host_.ensure_prefill_carry(count);
-        embed_window(token_ids, count, stream);
-
-        const uint32_t layers = host_.num_layers();
-        const V4LayerBodyTables tables = host_.tables();
-        const uint32_t workspace_tokens = std::min(chunk, count);
-
-        // The window is the swept prefill whenever the sweep is enabled and the Hot pool
-        // can hold a whole layer; below the prompt-length gate it is the route-aware
-        // cached supply instead. Both are the same layer-major window — only the expert
-        // supply differs. The window length `count` is what the gate reads.
-        host_.prefill_begin(count);
-        lap(t_begin);
-
-        for (uint32_t layer = 0; layer < layers; ++layer) {
-            // The layer's whole set must be resident before its body runs: the
-            // router lives inside the body, so its selection is not known earlier,
-            // and the sweep loaded the set in layer order precisely because it is
-            // the whole layer rather than a prediction.
-            host_.prefill_before_layer(layer);
-            lap(t_load);
-            host_.ensure_batch_scratch(layer, workspace_tokens);
-            V4LayerBodyBatchScratch& workspace = host_.batch_scratch();
-
-            for (uint32_t offset = 0; offset < count; offset += chunk) {
-                const uint32_t span = std::min(chunk, count - offset);
-                copy_carry_to_workspace(workspace, offset, span, hc_dim, stream);
-                (void)run_layer_body_chunk(
-                    host_.layer(layer), workspace, tables, token_ids + offset,
-                    start_position + offset, span, stream, host_.executor(), observer_);
-                copy_workspace_to_carry(workspace, offset, span, hc_dim, stream);
-            }
-
-            // The layer boundary, which the state forces rather than a policy choosing
-            // it: anything wider would lease the whole model. A lease grants no ordering,
-            // so handing it back needs a compute-stream boundary here.
-            lap(t_issue);
-            CHECK_HIP(hipStreamSynchronize(stream));
-            lap(t_gpu);
-            host_.release_expert_leases();
-            // The layer is dead the moment it retires — a window visits each layer
-            // once — so the sweep releases its whole set and refills the room from
-            // the next layers in order. LRU has nothing to rank here.
-            host_.prefill_after_layer(layer);
-            lap(t_after);
+        const uint32_t stage_count = host_.stage_count();
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            host_.stage(stage).ensure_prefill_carry(count);
+        }
+        {
+            DeviceScope scope(host_.stage(0).device_index());
+            embed_window(token_ids, count, host_.embed_stream());
         }
 
-        host_.prefill_end();
+        const uint32_t workspace_tokens = std::min(chunk, count);
+
+        // Every stage opens the window up front, so a later stage's sweep lookahead reads
+        // its first layers while the earlier stages compute. The window is the swept
+        // prefill whenever the sweep is enabled and the Hot pool can hold a whole layer;
+        // below the prompt-length gate it is the route-aware cached supply instead. Both
+        // are the same layer-major window — only the expert supply differs. The window
+        // length `count` is what the gate reads.
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            host_.stage(stage).prefill_begin(count);
+        }
+        lap(t_begin);
+
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            // The carry crosses a stage boundary as one copy, exactly like the decode
+            // residual; the receiving stage's layers then chain it on their own device.
+            if (stage > 0) handoff_carry(stage - 1, stage, count);
+            V4StageHost& stage_host = host_.stage(stage);
+            // The stage's compute must run on its own device: a transfer event created
+            // lazily during the dispatch below is created on whatever device is current.
+            DeviceScope scope(stage_host.device_index());
+            const LayerRange range = host_.topology().stage_layers(stage);
+            const hipStream_t stage_stream = stage_host.streams().compute;
+            const V4LayerBodyTables tables = stage_host.tables();
+
+            for (uint32_t i = 0; i < range.count; ++i) {
+                const uint32_t layer = range.first + i;
+                // The layer's whole set must be resident before its body runs: the
+                // router lives inside the body, so its selection is not known earlier,
+                // and the sweep loaded the set in layer order precisely because it is
+                // the whole layer rather than a prediction.
+                host_.prefill_before_layer(layer);
+                lap(t_load);
+                stage_host.ensure_batch_scratch(layer, workspace_tokens);
+                V4LayerBodyBatchScratch& workspace = stage_host.batch_scratch();
+                half* carry_half = stage_host.prefill_carry_half();
+                float* carry = stage_host.prefill_carry();
+
+                for (uint32_t offset = 0; offset < count; offset += chunk) {
+                    const uint32_t span = std::min(chunk, count - offset);
+                    copy_carry_to_workspace(workspace, carry_half, carry, offset, span, hc_dim,
+                                            stage_stream);
+                    (void)run_layer_body_chunk(
+                        stage_host.layer(layer), workspace, tables, token_ids + offset,
+                        start_position + offset, span, stage_stream, stage_host.executor(),
+                        observer_);
+                    copy_workspace_to_carry(workspace, carry_half, carry, offset, span, hc_dim,
+                                            stage_stream);
+                }
+
+                // The layer boundary, which the state forces rather than a policy choosing
+                // it: anything wider would lease the whole model. A lease grants no ordering,
+                // so handing it back needs a compute-stream boundary here. Only the layer's
+                // own stage is released and synchronized: a later stage's sweep may already
+                // be prefetching, and releasing its leases here would race with that.
+                lap(t_issue);
+                CHECK_HIP(hipStreamSynchronize(stage_stream));
+                lap(t_gpu);
+                stage_host.release_expert_leases();
+                // The layer is dead the moment it retires — a window visits each layer
+                // once — so the sweep releases its whole set and refills the room from
+                // the next layers in order. LRU has nothing to rank here.
+                host_.prefill_after_layer(layer);
+                lap(t_after);
+            }
+        }
+
+        for (uint32_t stage = 0; stage < stage_count; ++stage) {
+            host_.stage(stage).prefill_end();
+        }
         lap(t_end);
 
         // The head reads the last position's residual, which is where the serial
-        // path leaves it too (`scratch().d_res_in`).
-        copy_carry_row_to_scratch(count - 1, hc_dim, stream);
-        const half* logits = head_stage(stream);
+        // path leaves it too (`scratch().d_res_in`), on the stage that carries the head.
+        V4StageHost& head = host_.stage(stage_count - 1);
+        copy_carry_row_to_scratch(head, count - 1, hc_dim, host_.head_stream());
+        const half* logits = head_stage(host_.head_stream());
         if (timeline) {
-            CHECK_HIP(hipStreamSynchronize(stream));
+            CHECK_HIP(hipStreamSynchronize(host_.head_stream()));
             double t_head = 0;
             lap(t_head);
             std::printf("[Prefill timeline] begin=%.0f load_wait=%.0f issue=%.0f gpu_wait=%.0f "
@@ -382,43 +442,112 @@ private:
     // than made per call.
     std::vector<half> embed_staging_;
 
+    // A stage boundary's residual pair: `d_res_in` and `d_res_in_half`, `hc_mult x hidden`
+    // each, from `from`'s scratch into `to`'s. It is a byte copy, so the pipelined token
+    // is bit-identical to the single-device one.
+    void handoff_residual(uint32_t from, uint32_t to) {
+        const size_t hidden = static_cast<size_t>(kernel::DSV4_HIDDEN_SIZE);
+        const size_t elements = static_cast<size_t>(host_.config().hc_mult) * hidden;
+        handoff_buffer(from, to,
+                       host_.stage(from).scratch().d_res_in,
+                       host_.stage(to).scratch().d_res_in,
+                       elements * sizeof(float));
+        handoff_buffer(from, to,
+                       host_.stage(from).scratch().d_res_in_half,
+                       host_.stage(to).scratch().d_res_in_half,
+                       elements * sizeof(half));
+    }
+
+    // A stage boundary's window carry: `count x hc_dim`, both halves. Same copy rule as
+    // the decode residual, one window wide.
+    void handoff_carry(uint32_t from, uint32_t to, uint32_t count) {
+        const size_t hc_dim = static_cast<size_t>(host_.config().hc_mult) *
+                              static_cast<size_t>(host_.config().hidden_size);
+        const size_t elements = static_cast<size_t>(count) * hc_dim;
+        handoff_buffer(from, to,
+                       host_.stage(from).prefill_carry(),
+                       host_.stage(to).prefill_carry(),
+                       elements * sizeof(float));
+        handoff_buffer(from, to,
+                       host_.stage(from).prefill_carry_half(),
+                       host_.stage(to).prefill_carry_half(),
+                       elements * sizeof(half));
+    }
+
+    // Copy `bytes` from one stage's device to another's. The source stage's compute is
+    // joined on the host first, then the copy is enqueued on the destination stage's
+    // stream so its layers are ordered behind the bytes. A single-stream pipeline is not
+    // overlapped, so this boundary is a join rather than a cross-device event — which
+    // also keeps it correct without any assumption about the interconnect.
+    void handoff_buffer(uint32_t from, uint32_t to, const void* source, void* destination,
+                        size_t bytes) {
+        if (bytes == 0) return;
+        V4StageHost& source_stage = host_.stage(from);
+        V4StageHost& destination_stage = host_.stage(to);
+        hipStream_t source_stream = source_stage.streams().compute;
+        hipStream_t destination_stream = destination_stage.streams().compute;
+
+        // Source ordering: the source stage's kernels must have written the buffer.
+        CHECK_HIP(hipStreamSynchronize(source_stream));
+
+        // Destination ordering: the copy is enqueued **on the destination stream**, so it
+        // is ordered after that stage's prior work (which also writes `d_res_in` on the
+        // previous token) and ahead of its next layers. A plain host-side peer copy would
+        // race with the destination's still-pending kernels; ordering it on the stream is
+        // what makes the handoff deterministic.
+        DeviceScope scope(destination_stage.device_index());
+        if (source_stage.device_index() == destination_stage.device_index()) {
+            CHECK_HIP(hipMemcpyAsync(destination, source, bytes, hipMemcpyDeviceToDevice,
+                                     destination_stream));
+        } else {
+            CHECK_HIP(hipMemcpyPeerAsync(destination, destination_stage.device_index(), source,
+                                         source_stage.device_index(), bytes,
+                                         destination_stream));
+        }
+    }
+
     // The carry <-> workspace copies. Both directions move one token's `hc_dim`
-    // residual, both halves, device to device.
-    void copy_carry_to_workspace(V4LayerBodyBatchScratch& workspace, uint32_t offset,
-                                 uint32_t span, uint32_t hc_dim, hipStream_t stream) {
+    // residual, both halves, device to device, against the owning stage's carry.
+    void copy_carry_to_workspace(V4LayerBodyBatchScratch& workspace, const half* carry_half,
+                                 const float* carry, uint32_t offset, uint32_t span,
+                                 uint32_t hc_dim, hipStream_t stream) {
         for (uint32_t row = 0; row < span; ++row) {
             const V4LayerBodyRow view = workspace.row(row);
             const size_t source = static_cast<size_t>(offset + row) * hc_dim;
-            CHECK_HIP(hipMemcpyAsync(view.d_res_in_half, host_.prefill_carry_half() + source,
+            CHECK_HIP(hipMemcpyAsync(view.d_res_in_half, carry_half + source,
                                      static_cast<size_t>(hc_dim) * sizeof(half),
                                      hipMemcpyDeviceToDevice, stream));
-            CHECK_HIP(hipMemcpyAsync(view.d_res_in, host_.prefill_carry() + source,
+            CHECK_HIP(hipMemcpyAsync(view.d_res_in, carry + source,
                                      static_cast<size_t>(hc_dim) * sizeof(float),
                                      hipMemcpyDeviceToDevice, stream));
         }
     }
 
-    void copy_workspace_to_carry(V4LayerBodyBatchScratch& workspace, uint32_t offset,
-                                 uint32_t span, uint32_t hc_dim, hipStream_t stream) {
+    void copy_workspace_to_carry(V4LayerBodyBatchScratch& workspace, half* carry_half,
+                                 float* carry, uint32_t offset, uint32_t span, uint32_t hc_dim,
+                                 hipStream_t stream) {
         for (uint32_t row = 0; row < span; ++row) {
             const V4LayerBodyRow view = workspace.row(row);
             const size_t destination = static_cast<size_t>(offset + row) * hc_dim;
-            CHECK_HIP(hipMemcpyAsync(host_.prefill_carry_half() + destination, view.d_res_in_half,
+            CHECK_HIP(hipMemcpyAsync(carry_half + destination, view.d_res_in_half,
                                      static_cast<size_t>(hc_dim) * sizeof(half),
                                      hipMemcpyDeviceToDevice, stream));
-            CHECK_HIP(hipMemcpyAsync(host_.prefill_carry() + destination, view.d_res_in,
+            CHECK_HIP(hipMemcpyAsync(carry + destination, view.d_res_in,
                                      static_cast<size_t>(hc_dim) * sizeof(float),
                                      hipMemcpyDeviceToDevice, stream));
         }
     }
 
-    void copy_carry_row_to_scratch(uint32_t row, uint32_t hc_dim, hipStream_t stream) {
-        auto& scratch = host_.scratch();
+    // The last window row into the head stage's scratch, which is where `head_stage`
+    // reads its residual from.
+    void copy_carry_row_to_scratch(V4StageHost& head, uint32_t row, uint32_t hc_dim,
+                                   hipStream_t stream) {
+        auto& scratch = head.scratch();
         const size_t source = static_cast<size_t>(row) * hc_dim;
-        CHECK_HIP(hipMemcpyAsync(scratch.d_res_in, host_.prefill_carry() + source,
+        CHECK_HIP(hipMemcpyAsync(scratch.d_res_in, head.prefill_carry() + source,
                                  static_cast<size_t>(hc_dim) * sizeof(float),
                                  hipMemcpyDeviceToDevice, stream));
-        CHECK_HIP(hipMemcpyAsync(scratch.d_res_in_half, host_.prefill_carry_half() + source,
+        CHECK_HIP(hipMemcpyAsync(scratch.d_res_in_half, head.prefill_carry_half() + source,
                                  static_cast<size_t>(hc_dim) * sizeof(half),
                                  hipMemcpyDeviceToDevice, stream));
     }
