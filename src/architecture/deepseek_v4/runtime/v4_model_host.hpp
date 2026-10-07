@@ -125,13 +125,52 @@ public:
         // would over-count, costing 148 Hot expert slots (675 instead of 823 at context
         // 256). The contract is the authority on the uploaded set — the same table that
         // validates the artifact — so the budget cannot drift from what reaches VRAM.
-        budget_ = MemoryBudgetEngine::evaluate(
-            runtime_cfg, make_v4_memory_geometry(config_),
-            V4ModelContract::uploaded_dense_bytes(config_), expert_format);
-        if (!budget_.is_feasible) {
-            throw std::runtime_error(
-                "V4ModelHost: the memory budget rejected this configuration: " +
-                budget_.rejection_reason);
+        //
+        // Each stage is evaluated on **its own** device and against **its own** layer
+        // range: its dense and attention bytes, plus its proportional share of the host
+        // budget. At one stage the range is the whole model and the share is the whole
+        // host budget, so the single-device figure is unchanged.
+        budgets_.clear();
+        budgets_.reserve(topology_.pp());
+        const uint32_t model_layers = static_cast<uint32_t>(config_.num_hidden_layers);
+        std::vector<uint32_t> stage_layer_counts(topology_.pp());
+        for (uint32_t stage = 0; stage < topology_.pp(); ++stage) {
+            stage_layer_counts[stage] = topology_.stage_layers(stage).count;
+        }
+        const std::vector<size_t> stage_warm_shares = MemoryBudgetEngine::split_host_budget(
+            runtime_cfg.warm_host_bytes, stage_layer_counts);
+        for (uint32_t stage = 0; stage < topology_.pp(); ++stage) {
+            const LayerRange range = topology_.stage_layers(stage);
+            const bool has_head = (range.first + range.count == model_layers);
+
+            // Each stage's host budget is its proportional share, which is what makes
+            // the total host RAM across a pipeline the number the user set rather than
+            // a multiple of it.
+            AeonRuntimeConfig stage_cfg = runtime_cfg;
+            stage_cfg.warm_host_bytes = stage_warm_shares[stage];
+
+            // The artifact's expert catalog covers the whole model; a stage's budget
+            // only ever touches its own layers, so the format is narrowed to the
+            // stage's layer count. `payload_bytes` and `experts_per_layer` are
+            // unchanged.
+            ExpertFormatDescriptor stage_format = expert_format;
+            stage_format.num_layers = range.count;
+
+            MemoryBudgetReport report;
+            {
+                // Evaluate against the stage's own device, so per-device refusals (a
+                // display-loaded card, a fraction with no room) name that device.
+                DeviceScope scope(topology_.device(stage, 0));
+                report = MemoryBudgetEngine::evaluate(
+                    stage_cfg, make_v4_memory_geometry(config_, range),
+                    V4ModelContract::uploaded_dense_bytes(config_, range, has_head),
+                    stage_format);
+            }
+            if (!report.is_feasible) {
+                throw std::runtime_error(
+                    "stage " + std::to_string(stage) + ": " + report.rejection_reason);
+            }
+            budgets_.push_back(std::move(report));
         }
 
         context_capacity_ = runtime_cfg.context_size;
@@ -151,7 +190,7 @@ public:
             stages_.push_back(std::make_unique<V4StageHost>());
             stages_.back()->initialize(
                 topology_.stage_layers(stage), topology_.device(stage, 0),
-                V4StageParams{&loader_, &config_, &layer_specs_, &budget_, &runtime_cfg,
+                V4StageParams{&loader_, &config_, &layer_specs_, &budgets_[stage], &runtime_cfg,
                               context_capacity_, verbose_});
         }
 
@@ -186,13 +225,26 @@ public:
 
         if (verbose_) {
             std::printf(
-                "[Host] %u stages over %d layers (%u Sliding, %u CSA, %u HCA), context %u tokens, "
-                "%u hot + %u warm expert slots%s\n",
+                "[Host] %u stages over %d layers (%u Sliding, %u CSA, %u HCA), context %u tokens%s\n",
                 static_cast<uint32_t>(stages_.size()), config_.num_hidden_layers,
                 count_kind(V4AttentionKind::Sliding), count_kind(V4AttentionKind::CSA),
-                count_kind(V4AttentionKind::HCA), context_capacity_, budget_.hot_vram_slots,
-                budget_.warm_host_slots,
+                count_kind(V4AttentionKind::HCA), context_capacity_,
                 experts_ready() ? "" : " (expert tier not built: no Hot VRAM slot)");
+            // One report per stage: each names its device, its layer range, its own
+            // Hot/Warm capacity and its share of VRAM and host RAM.
+            for (uint32_t stage = 0; stage < budgets_.size(); ++stage) {
+                const MemoryBudgetReport& report = budgets_[stage];
+                const LayerRange range = topology_.stage_layers(stage);
+                std::printf(
+                    "[Stage %u] device %d, layers [%u, %u): %u hot + %u warm expert slots, "
+                    "%.2f GiB dense, %.2f GiB attention, %.2f GiB host\n",
+                    stage, report.device_index, range.first, range.first + range.count,
+                    report.hot_vram_slots, report.warm_host_slots,
+                    static_cast<double>(report.vram_dense_bytes) / (1024.0 * 1024.0 * 1024.0),
+                    static_cast<double>(report.vram_kv_bytes) / (1024.0 * 1024.0 * 1024.0),
+                    static_cast<double>(report.configured_host_budget_bytes) /
+                        (1024.0 * 1024.0 * 1024.0));
+            }
         }
     }
 
@@ -203,7 +255,7 @@ public:
         stages_.clear();
         loader_.close_all();
         layer_specs_.clear();
-        budget_ = MemoryBudgetReport{};
+        budgets_.clear();
         context_capacity_ = 0;
     }
 
@@ -301,7 +353,13 @@ public:
 
     const std::vector<V4LayerSpec>& layer_specs() const noexcept { return layer_specs_; }
 
-    const MemoryBudgetReport& budget() const noexcept { return budget_; }
+    // The whole-model budget, for pp = 1: the single stage's report. A pipeline has
+    // one report per stage (`budgets()` / `stage_budget`).
+    const MemoryBudgetReport& budget() const noexcept { return budgets_.front(); }
+
+    // Every stage's budget report, in stage order.
+    const std::vector<MemoryBudgetReport>& budgets() const noexcept { return budgets_; }
+    const MemoryBudgetReport& stage_budget(uint32_t stage) const { return budgets_.at(stage); }
 
     // The routed-expert supply the layer body drives. It is the *interface* type
     // on purpose: the graph must not be able to tell which tier answered, and it
@@ -599,7 +657,9 @@ private:
     AeonModelLoader loader_;
     DeepSeekV4Config config_;
     std::vector<V4LayerSpec> layer_specs_;
-    MemoryBudgetReport budget_;
+    // One report per stage, in stage order. A single-device run holds exactly one,
+    // and `budget()` returns it; a pipeline holds one per stage.
+    std::vector<MemoryBudgetReport> budgets_;
     uint32_t context_capacity_{0};
     size_t last_released_dense_bytes_{0};
     // Bumped by `reset_generation_state`; the engine's prefix record compares it to

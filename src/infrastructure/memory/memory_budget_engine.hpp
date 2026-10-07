@@ -28,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace aeon::core {
 
@@ -340,6 +341,31 @@ public:
             make_current_swizzled_expert_format(
                 static_cast<uint32_t>(geometry.num_hidden_layers),
                 static_cast<uint32_t>(geometry.routed_experts)));
+    }
+
+    // Split a whole-model host budget across pipeline stages in proportion to their
+    // layer counts (the per-stage Warm share). The shares are **cumulative floors**, so
+    // they sum to exactly `total_bytes` — the earlier stages take `floor(total *
+    // layers/ N)` and the last absorbs the remainder, which a per-stage `total *
+    // count / N` would drop. `stage_layer_counts` must sum to the model's layer count.
+    static std::vector<size_t> split_host_budget(
+        size_t total_bytes,
+        const std::vector<uint32_t>& stage_layer_counts
+    ) {
+        uint64_t total_layers = 0;
+        for (uint32_t count : stage_layer_counts) total_layers += count;
+
+        std::vector<size_t> shares(stage_layer_counts.size(), 0);
+        if (total_layers == 0) return shares;
+        const uint64_t total = static_cast<uint64_t>(total_bytes);
+        uint64_t before = 0;
+        for (size_t i = 0; i < stage_layer_counts.size(); ++i) {
+            const uint64_t after = before + stage_layer_counts[i];
+            shares[i] = static_cast<size_t>(total * after / total_layers -
+                                            total * before / total_layers);
+            before = after;
+        }
+        return shares;
     }
 };
 

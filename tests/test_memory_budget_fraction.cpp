@@ -10,19 +10,27 @@
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/memory/memory_budget.hpp"
+#include "architecture/deepseek_v4/spec/v4_memory_geometry.hpp"
+#include "architecture/deepseek_v4/spec/v4_model_contract.hpp"
+#include "infrastructure/parallel/parallel_topology.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 using aeon::core::AeonRuntimeConfig;
 using aeon::core::AttentionStateMemory;
 using aeon::core::DeviceMemoryInfo;
 using aeon::core::ExpertFormatDescriptor;
+using aeon::core::LayerRange;
 using aeon::core::MemoryBudgetEngine;
 using aeon::core::MemoryBudgetReport;
 using aeon::core::ModelMemoryGeometry;
+using aeon::core::ParallelTopology;
+using aeon::core::ParallelTopologyConfig;
 
 namespace {
 
@@ -134,6 +142,109 @@ int main() {
               std::to_string(low.hot_vram_slots) + " -> " + std::to_string(high.hot_vram_slots));
         check("allowance grows with the fraction",
               high.usable_vram_bytes > low.usable_vram_bytes);
+    }
+
+    // --- the host budget splits across stages with no byte lost ----------------
+    std::printf("\n[host-budget split]\n");
+    {
+        const std::vector<uint32_t> counts{22, 21};
+        const auto shares = MemoryBudgetEngine::split_host_budget(41ULL * kGiB, counts);
+        check("the shares sum to the whole",
+              shares.size() == 2 && shares[0] + shares[1] == 41ULL * kGiB,
+              std::to_string(shares[0]) + " + " + std::to_string(shares[1]));
+        check("the larger stage gets the larger share", shares[0] > shares[1]);
+        const auto one = MemoryBudgetEngine::split_host_budget(41ULL * kGiB, {43});
+        check("one stage takes the whole budget", one.size() == 1 && one[0] == 41ULL * kGiB);
+    }
+
+    // --- per-stage geometry and dense bytes sum to the whole -------------------
+    //
+    // A pipeline splits the model into contiguous layer ranges, and each stage is
+    // budgeted against its own range. The split must be lossless: the per-stage
+    // attention state (and the per-stage dense upload) must sum to the single-device
+    // figures, or a pipeline would silently change the memory the model needs.
+    const std::string config_path =
+        "models/DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon/config.json";
+    if (std::filesystem::exists(config_path)) {
+        std::printf("\n[per-stage geometry / dense sums to the whole]\n");
+        const auto config = aeon::core::DeepSeekV4Config::load_from_json(config_path);
+        const auto whole = aeon::core::make_v4_memory_geometry(config);
+        const size_t whole_dense = aeon::core::V4ModelContract::uploaded_dense_bytes(config);
+        const uint32_t layers = static_cast<uint32_t>(config.num_hidden_layers);
+
+        for (uint32_t pp = 1; pp <= 4; ++pp) {
+            ParallelTopologyConfig topo_cfg;
+            topo_cfg.pipeline_parallel = pp;
+            const auto topology =
+                ParallelTopology::resolve(topo_cfg, static_cast<int>(pp), 1u, layers);
+
+            size_t sum_layer_state = 0;
+            size_t sum_dense = 0;
+            size_t sum_rope = 0;
+            bool ranges_ok = true;
+            for (uint32_t stage = 0; stage < topology.pp(); ++stage) {
+                const LayerRange range = topology.stage_layers(stage);
+                const auto geometry = aeon::core::make_v4_memory_geometry(config, range);
+                const auto attention = geometry.attention_state_memory(4096);
+                sum_layer_state += attention.layer_state_bytes;
+                sum_rope += attention.rope_bytes;
+                const bool has_head = (range.first + range.count == layers);
+                sum_dense += aeon::core::V4ModelContract::uploaded_dense_bytes(
+                    config, range, has_head);
+                ranges_ok = ranges_ok && (range.first + range.count <= layers);
+            }
+
+            const auto whole_attention = whole.attention_state_memory(4096);
+            check(("pp=" + std::to_string(pp) + ": layer state sums to the whole").c_str(),
+                  ranges_ok && sum_layer_state == whole_attention.layer_state_bytes,
+                  std::to_string(sum_layer_state) + " vs " +
+                      std::to_string(whole_attention.layer_state_bytes));
+            check(("pp=" + std::to_string(pp) + ": RoPE is paid on every stage").c_str(),
+                  sum_rope == static_cast<size_t>(pp) * whole_attention.rope_bytes,
+                  std::to_string(sum_rope));
+            check(("pp=" + std::to_string(pp) + ": dense upload sums to the whole").c_str(),
+                  sum_dense == whole_dense,
+                  std::to_string(sum_dense) + " vs " + std::to_string(whole_dense));
+        }
+
+        // A per-stage budget evaluated on a stage's own device is feasible when the
+        // device has the room, and refuses when a stage's host share cannot hold its
+        // corridor peak.
+        ParallelTopologyConfig two_cfg;
+        two_cfg.pipeline_parallel = 2;
+        const auto two = ParallelTopology::resolve(two_cfg, 2, 1u, layers);
+        const LayerRange first = two.stage_layers(0);
+        AeonRuntimeConfig cfg;
+        cfg.context_size = 4096;
+        cfg.warm_host_bytes = 8ULL * kGiB;
+        const ExpertFormatDescriptor stage_format = [&] {
+            // The artifact declares the whole model; a stage sees its own layers.
+            auto format = aeon::core::make_current_swizzled_expert_format(
+                layers, static_cast<uint32_t>(config.n_routed_experts));
+            format.num_layers = first.count;
+            return format;
+        }();
+        const auto stage_report = MemoryBudgetEngine::evaluate(
+            cfg, aeon::core::make_v4_memory_geometry(config, first),
+            aeon::core::V4ModelContract::uploaded_dense_bytes(
+                config, first, first.first + first.count == layers),
+            stage_format, DeviceMemoryInfo{kDevice, total, total});
+        check("a stage budget is feasible on a device with room", stage_report.is_feasible,
+              stage_report.rejection_reason);
+
+        // A host share below one swept corridor is refused (the engine's corridor
+        // check), which is what stops a pipeline from overcommitting host RAM.
+        AeonRuntimeConfig tiny = cfg;
+        tiny.warm_host_bytes = 1ULL * 1024ULL * 1024ULL;  // 1 MiB
+        const auto refused = MemoryBudgetEngine::evaluate(
+            tiny, aeon::core::make_v4_memory_geometry(config, first),
+            aeon::core::V4ModelContract::uploaded_dense_bytes(
+                config, first, first.first + first.count == layers),
+            stage_format, DeviceMemoryInfo{kDevice, total, total});
+        check("a stage share below its corridor peak is refused", !refused.is_feasible,
+              refused.rejection_reason);
+    } else {
+        std::printf("\n[per-stage geometry] skipped: %s is absent\n", config_path.c_str());
     }
 
     std::printf("\n--------------------------------------------------------------------------------\n");

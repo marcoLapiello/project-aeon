@@ -2,6 +2,7 @@
 
 #include "architecture/deepseek_v4/spec/v4_model_spec.hpp"
 #include "infrastructure/artifact/aeon_loader.hpp"
+#include "infrastructure/parallel/parallel_topology.hpp"
 
 #include <cstdint>
 #include <initializer_list>
@@ -139,12 +140,37 @@ public:
     // costing 148 Hot VRAM expert slots (675 instead of 823 at context 256), which is
     // the whole reason for this function.
     static size_t uploaded_dense_bytes(const DeepSeekV4Config& config) {
+        return uploaded_dense_bytes(
+            config,
+            LayerRange{0, static_cast<uint32_t>(config.num_hidden_layers)},
+            /*has_head=*/true);
+    }
+
+    // The bytes **one stage** uploads: the dense weights of its own layer range, plus
+    // the head end (`head.weight`, `norm.weight`, the `hc_head_*` set) only on the
+    // stage that carries the head. Every stage builds its own RoPE tables, but those
+    // are computed rather than uploaded, so they are absent here and counted in the
+    // geometry's attention term instead (which every stage pays).
+    //
+    // The whole-model form is exactly `({0, num_layers}, has_head = true)`, so the
+    // single-stage budget is unchanged and the per-stage bytes sum to the whole.
+    static size_t uploaded_dense_bytes(
+        const DeepSeekV4Config& config,
+        const LayerRange& range,
+        bool has_head
+    ) {
         size_t total = 0;
         for (const auto& requirement : model_tensor_requirements(config)) {
-            if (requirement.name == "embed.weight") continue;  // host-resident
+            // `embed.weight` is host-resident and never copied to a device.
+            if (requirement.name == "embed.weight") continue;
+            if (!has_head && is_head_end_tensor(requirement.name)) continue;
             total += requirement_bytes(requirement);
         }
         for (const auto& layer : V4ModelSpec::resolve_layers(config)) {
+            if (layer.layer_id < range.first ||
+                layer.layer_id >= range.first + range.count) {
+                continue;
+            }
             for (const auto& requirement : layer_tensor_requirements(config, layer)) {
                 total += requirement_bytes(requirement);
             }
@@ -153,6 +179,14 @@ public:
     }
 
 private:
+    // The model-level tensors that belong to the head end, so a stage without the
+    // head does not reserve them. A stage's resource object uploads exactly this set.
+    static bool is_head_end_tensor(const std::string& name) {
+        return name == "head.weight" || name == "norm.weight" ||
+               name == "hc_head_fn" || name == "hc_head_base" ||
+               name == "hc_head_scale";
+    }
+
     static size_t dtype_size(const std::string& dtype) {
         if (dtype == "F16") return 2;
         if (dtype == "F32") return 4;
