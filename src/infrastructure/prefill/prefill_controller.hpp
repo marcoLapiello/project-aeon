@@ -86,7 +86,21 @@ public:
 
     // `window_tokens` is the window length `W`, which the driver is the only one to
     // know at this point — the gate is read here and nowhere else.
+    //
+    // The lifecycle has two levels. The **window** level (`open_window` / `close_window`)
+    // moves the corridor to the window's shape; the **strategy** level
+    // (`begin_strategy` / `end_strategy`) is what reads and releases experts. A single
+    // stage runs them back to back (`begin` / `end`). A pipeline opens the window on
+    // every stage first — the corridor is one region cut for all of them — but runs each
+    // stage's strategy only while that stage's layers run, because all stages read
+    // through the same corridor memory and two sweeps in it at once would overwrite each
+    // other.
     void begin(uint32_t window_tokens) {
+        open_window(window_tokens);
+        begin_strategy();
+    }
+
+    void open_window(uint32_t window_tokens) {
         if (!bound()) {
             prefill_active_ = false;
             sweep_active_ = false;
@@ -116,7 +130,10 @@ public:
                               : services_.partition->staging_batch_slots(),
                 services_.registry->experts_per_layer, outstanding_leases());
         }
-        if (!prefill_active_) return;
+    }
+
+    void begin_strategy() {
+        if (!bound() || !prefill_active_) return;
         if (sweep_active_) {
             sweep_.begin();
         } else {
@@ -154,6 +171,11 @@ public:
     }
 
     void end() {
+        end_strategy();
+        close_window();
+    }
+
+    void end_strategy() {
         if (!bound()) return;
         // Reach a quiescent boundary first: both the partition move and the mode
         // change below require no transfer in flight and no lease held.
@@ -169,6 +191,10 @@ public:
                 services_.registry->end_prefill_stream();
             }
         }
+    }
+
+    void close_window() {
+        if (!bound()) return;
         // Return the corridor to the **decode** partition: the window is over, so the
         // surrendered slots rejoin the Warm free list and decode resumes with the
         // largest residency — the whole reason the boundary moves rather than the

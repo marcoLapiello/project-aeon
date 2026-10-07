@@ -445,7 +445,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Run**: `2026-10-07`; commit `bcb024b`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `aeon_chat --diagnostic`
 - **Class / comparison key**: `E2E / pipeline-parallel`
 - **Platform**: `baseline`, 4x RX 7900 XTX; `pp=1` device 0, `pp=2` devices 0,1, `pp=4` devices 0,1,2,3; PCIe 4.0 x16, P2P enabled
-- [ ] **Invalidate for comparison** | **Reason**: `--`
+- [x] **Invalidate for comparison** | **Reason**: the decode `all_hot` / `has_cold` and NVMe columns for `pp > 1` were read from stage 0 only (the pipeline counters were not aggregated), the run used a per-stage pinned corridor, and the defaults (Warm `0`, `--staging-blocks 2`) are not a tuned configuration. Throughput, Hot-slot and exactness figures are unaffected; re-measure the hit split and NVMe bytes with the aggregated counters.
 - **Workload / configuration**: the `profiling-prompts/prefill-corpus.txt` prompt (`677` tokens), context `32768`, `--greedy`, `64` generated tokens, Warm `0`, default `--gpu-memory-utilization 0.95`; `n=1` per configuration
 - **Metrics**:
 

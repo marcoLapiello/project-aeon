@@ -157,6 +157,70 @@ int main() {
         check("one stage takes the whole budget", one.size() == 1 && one[0] == 41ULL * kGiB);
     }
 
+    // --- the host region is one allocation shared by every stage ---------------
+    //
+    // A pipeline must hold the host RAM the user set, not a multiple of it: the stages'
+    // Warm lanes tile the head of one region, the corridor sits at the tail, and the
+    // lanes at the end are the ones a larger corridor eats.
+    std::printf("\n[shared host region]\n");
+    {
+        const ExpertFormatDescriptor format =
+            aeon::core::make_current_swizzled_expert_format(2, 8);
+        AeonRuntimeConfig cfg;
+        cfg.context_size = 4096;
+        // decode corridor 4 slots, swept peak 16 slots at 2 experts per token.
+        cfg.warm_host_bytes = 40ULL * format.payload_bytes;
+        const std::vector<uint32_t> counts{1, 1};
+        const auto plan = MemoryBudgetEngine::plan_shared_host_region(cfg, format, 2, counts);
+        check("every stage sees the same region",
+              plan.size() == 2 && plan[0].region_slots == 40 && plan[1].region_slots == 40);
+        check("lanes tile the region minus the decode corridor",
+              plan[0].lane_slots + plan[1].lane_slots == 36 && plan[0].lane_base_slots == 0 &&
+                  plan[1].lane_base_slots == plan[0].lane_slots,
+              std::to_string(plan[0].lane_slots) + " + " + std::to_string(plan[1].lane_slots));
+
+        // The last stage's lane is what a swept corridor takes first.
+        cfg.max_hot_vram_slots = 6;
+        const auto last = MemoryBudgetEngine::evaluate(
+            cfg, make_geometry(), 1ULL * kGiB, format,
+            DeviceMemoryInfo{kDevice, total, total}, &plan[1]);
+        const auto first = MemoryBudgetEngine::evaluate(
+            cfg, make_geometry(), 1ULL * kGiB, format,
+            DeviceMemoryInfo{kDevice, total, total}, &plan[0]);
+        check("both lanes are feasible", first.is_feasible && last.is_feasible,
+              first.rejection_reason + last.rejection_reason);
+        check("the report carries the lane base", last.host_lane_base_slots == 18);
+        check("the first lane is untouched by a swept corridor",
+              first.warm_host_slots_min == plan[0].lane_slots,
+              std::to_string(first.warm_host_slots_min));
+        check("the last lane shrinks under a swept corridor",
+              last.warm_host_slots_min < plan[1].lane_slots,
+              std::to_string(last.warm_host_slots_min));
+
+        // Without a Warm budget a pipeline still shares one corridor-only region.
+        AeonRuntimeConfig no_warm = cfg;
+        no_warm.warm_host_bytes = 0;
+        const auto corridor_only =
+            MemoryBudgetEngine::plan_shared_host_region(no_warm, format, 2, counts);
+        check("no Warm, two stages: one corridor-sized region and no lanes",
+              corridor_only[0].region_slots == 16 && corridor_only[0].lane_slots == 0 &&
+                  corridor_only[1].lane_slots == 0,
+              std::to_string(corridor_only[0].region_slots));
+        const auto single = MemoryBudgetEngine::plan_shared_host_region(no_warm, format, 2, {2});
+        check("no Warm, one stage: no region at all", single[0].region_slots == 0);
+
+        // A region below the corridor's peak is refused, whatever the stage count.
+        AeonRuntimeConfig tiny_region = cfg;
+        tiny_region.warm_host_bytes = 8ULL * format.payload_bytes;
+        const auto tiny_plan =
+            MemoryBudgetEngine::plan_shared_host_region(tiny_region, format, 2, counts);
+        const auto tiny_report = MemoryBudgetEngine::evaluate(
+            tiny_region, make_geometry(), 1ULL * kGiB, format,
+            DeviceMemoryInfo{kDevice, total, total}, &tiny_plan[0]);
+        check("a region below the corridor peak is refused", !tiny_report.is_feasible,
+              tiny_report.rejection_reason);
+    }
+
     // --- per-stage geometry and dense bytes sum to the whole -------------------
     //
     // A pipeline splits the model into contiguous layer ranges, and each stage is

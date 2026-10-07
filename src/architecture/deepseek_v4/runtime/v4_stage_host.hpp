@@ -67,6 +67,10 @@ struct V4StageParams {
     // sink (`<path>.stage<k>`) so a pipeline's per-stage traffic is not merged into
     // one file.
     uint32_t stage_index{0};
+    // The pinned host region every stage of the pipeline shares (Warm lanes plus one
+    // corridor), allocated by the host before the expert tiers are built. Null when the
+    // budget plans none.
+    ExpertHostRegion* host_region{nullptr};
 };
 
 class V4StageHost {
@@ -414,7 +418,34 @@ public:
 
     bool prefill_sweep_engaged() const noexcept { return prefill_controller_.engaged(); }
 
-    void prefill_begin(uint32_t window_tokens) { prefill_controller_.begin(window_tokens); }
+    void prefill_begin(uint32_t window_tokens) {
+        prefill_open_window(window_tokens);
+        prefill_begin_strategy();
+    }
+
+    // The window and the strategy are separate steps so a pipeline can open the window
+    // on every stage (the corridor is one region cut for all) and still run only one
+    // stage's sweep at a time. Each re-enters the stage's own device, because the
+    // corridor view's events and the sweep's transfers are created on the current one.
+    void prefill_open_window(uint32_t window_tokens) {
+        DeviceScope scope(context_.device);
+        prefill_controller_.open_window(window_tokens);
+    }
+
+    void prefill_begin_strategy() {
+        DeviceScope scope(context_.device);
+        prefill_controller_.begin_strategy();
+    }
+
+    void prefill_end_strategy() {
+        DeviceScope scope(context_.device);
+        prefill_controller_.end_strategy();
+    }
+
+    void prefill_close_window() {
+        DeviceScope scope(context_.device);
+        prefill_controller_.close_window();
+    }
 
     // The graph names layers by their **global** id; the controller, the sweep and the
     // registry are local-indexed (this stage's layer 0 is its own first layer), so the
@@ -427,7 +458,10 @@ public:
         prefill_controller_.after_layer(layer - range_.first);
     }
 
-    void prefill_end() { prefill_controller_.end(); }
+    void prefill_end() {
+        prefill_end_strategy();
+        prefill_close_window();
+    }
 
     const PrefillSweep& prefill_sweep() const noexcept { return prefill_controller_.sweep(); }
 
@@ -558,6 +592,7 @@ inline void V4StageHost::initialize_experts() {
         static_cast<uint32_t>(config.n_routed_experts),
         static_cast<uint32_t>(config.num_experts_per_tok),
         range_.first,
+        params_.host_region,
         context_.streams.compute, &prefill_controller_.sweep(), &supply_});
 
     // The tiered supply, on the four shared streams.

@@ -34,13 +34,13 @@ The code is the authority. This plan was written against the tree of 2026-10-05 
 4. **Ranks must agree on routing exactly.** The router runs on each rank from the reduced hidden state, so the collective must produce **the same bytes on every rank**. A ring or tree all-reduce does not guarantee that. An all-gather followed by a fixed-order local sum does (§3 D5).
 5. **Pipeline parallelism adds no arithmetic.** A stage boundary is a copy, so PP output must be **bit-identical** to the single-device output. That makes it the strongest gate available, and the reason PP comes first.
 6. **43 layers is prime.** Stages are uneven by construction: contiguous ranges, with the remainder going to the earliest stages (the last stage also carries the head).
-7. **The per-stage staging corridor multiplies host RAM.** A swept prefill holds `blocks × E` payloads per stage. Under PP that cost applies per stage, against a `≈ 40 GiB` honest Warm ceiling. The budget must refuse a configuration that does not fit, not shrink it silently (Step 9).
+7. **A per-stage staging corridor multiplies host RAM.** A swept prefill holds `blocks × E` payloads (`≈ 6.9 GiB` at the default), and with no Warm budget each stage pinned its own at that peak, so PP4 held four. Layer-major prefill runs one stage at a time, so the corridor is one allocation shared by every stage (D2, Step 10b). The budget refuses a configuration whose region cannot hold the corridor peak, with or without Warm.
 8. **Single-thread round-robin launch multiplies host launch cost by `tp`.** It is simple and deterministic, but decode may become launch-bound. Step 21 measures this. Per-rank host threads and HIP graphs are a deferred optimisation.
 
 ## 3. Decisions fixed by this plan
 
 - **D1 — Topology model (R1, R7, R12).** `ParallelTopology{device_ids, tp, pp}`, with `device_ids.size() == tp × pp`, mapped stage-major: `device(stage, rank) = device_ids[stage × tp + rank]`. Users order the ids to put a TP group on one PCIe switch. The degenerate topology is `{[0], 1, 1}`. If `--device-ids` is absent, the default is `0 .. tp·pp−1`.
-- **D2 — Pipeline stage = one tier.** Each stage owns one `ExpertTierState` (registry, pools, Warm share, corridor, direct I/O, supply, executor, prefill controller) over its layer range. The registry never learns about devices (R6). Warm budget per stage = `warm_host_bytes × stage_layers / num_layers`.
+- **D2 — Pipeline stage = one tier.** Each stage owns one `ExpertTierState` (registry, pools, Warm lane, corridor view, direct I/O, supply, executor, prefill controller) over its layer range. The registry never learns about devices (R6). The host region is **not** per stage: `V4ModelHost` allocates one pinned region of `warm_host_bytes` (or, with no Warm and `pp > 1`, one corridor-sized region). It is laid out as the stages' Warm lanes in stage order from the head, each `(region − decode corridor) × stage_layers / num_layers` slots, and **one corridor anchored at the tail**. A phase that needs a larger corridor (routed, swept) takes it from the lanes at the end first, so total Warm lost is the same as on one device. Each stage holds its lane and its own view of the corridor (its own slot events, on its own device).
 - **D3 — TP rank = one slice of every slot.** Within a stage there is one registry and `tp` device pools with **identical slot geometry**. Slot `s` on rank `r` holds rank `r`'s slice of the expert. A Cold read fills the host slot once, and the upload fans out into `tp` copies at offset `r × slice_bytes` (R3). An expert becomes Hot only when all `tp` copies have completed (R6). `hot_vram_slots = min` over the stage's ranks.
 - **D4 — Expert artifact v3, shard-major.** The expert is laid out as `D` shards of `payload/D` bytes. Each shard holds `[W1ₛ, W1sₛ, W2ₛ, W2sₛ, W3ₛ, W3sₛ]`, and each sub-tensor is swizzled at its shard shape. A rank's slice is `D/tp` consecutive shards, i.e. **one contiguous, 4 KiB-aligned range**, and it uploads as one copy. The kernels gain shard-aware addressing (`SwizzledShardGeometry`) instead of the transport re-laying bytes out. Re-layout would cost `6·D/tp` strided copies per expert on the hot path. Addressing changes no arithmetic order, so `TP = 1` on a `D = 8` artifact is bit-identical to v2. v2 artifacts remain valid and load as `D = 1`.
 - **D5 — Collective = all-gather + fixed-order sum, fp32.** Each rank peer-copies its partial into every peer's gather slot `r`. Each rank then sums slots `0..tp−1` in rank order with one kernel. All ranks end up with identical bytes, results are deterministic run to run, and no gate depends on the reduction order (R9). At `tp = 1` it is a no-op with no allocation (R2).
@@ -112,7 +112,7 @@ Two commits, because a split is its own step.
 
 ### Phase B — Pipeline parallelism
 
-**Complete.** Landed in `6b5c76c` (Step 7), `14ebb8c` (Step 8), `bcb024b` (Step 9) and `c15e1a3` (Step 10). A pipeline runs one stage per device and hands the residual across the boundary with a copy, so `topology_equivalence.sh --exact` is byte-identical to the single-device baseline at `pp = 1, 2, 4` on both prompts. Ledger M51 records the `pp ∈ {1, 2, 4}` measurement.
+**Complete.** Landed in `6b5c76c` (Step 7), `14ebb8c` (Step 8), `bcb024b` (Step 9) and `c15e1a3` (Step 10), with a corrective follow-up (Step 10b). A pipeline runs one stage per device and hands the residual across the boundary with a copy, so `topology_equivalence.sh --exact` is byte-identical to the single-device baseline at `pp = 1, 2, 4` on both prompts. Ledger M51 records the `pp ∈ {1, 2, 4}` measurement.
 
 #### Step 7 — A tier over a layer range (G1) — ✅ done
 - `ExpertTierState::Params`: add `uint32_t first_layer` and pass the stage's `count` as `num_layers`. The registry stays local-indexed.
@@ -121,7 +121,7 @@ Two commits, because a split is its own step.
 
 #### Step 8 — Per-stage geometry and budget (G4 + G1, R13 per device) — ✅ done
 - `spec/v4_memory_geometry.hpp::make_v4_memory_geometry(config, LayerRange)` and `V4ModelContract::uploaded_dense_bytes(config, LayerRange, bool has_head)`: dense and KV for the stage's layers, plus RoPE on every stage and the head on the last.
-- `MemoryBudgetEngine`: evaluate once per stage on that stage's device. The host region per stage is D2's share. Refuse when a share cannot hold that stage's corridor peak, with the message "stage k: … lower `--staging-blocks` or raise `--warm-gib`".
+- `MemoryBudgetEngine`: evaluate once per stage on that stage's device, against the stage's lane of the shared host region (`plan_shared_host_region`, D2). Refuse when the region cannot hold the corridor peak, with the message "stage k: … lower `--staging-blocks` or raise `--warm-gib`". (As first landed each stage got a proportional share of the budget and a private corridor; Step 10b replaced that.)
 - `V4ModelHost` holds `std::vector<MemoryBudgetReport>` and prints one line per stage.
 - **Gate:** add per-stage cases to `test_memory_budget_fraction`. Check that the stage geometries sum to the whole: the `pp = 1` result is unchanged.
 
@@ -130,13 +130,23 @@ Two commits, because a split is its own step.
 - `V4ModelHost::initialize`: build `pp` stages, each on its device and layer range, and lift the `pp > 1` refusal.
 - `runtime/v4_graph.hpp`:
   - `forward_token`: at a stage boundary, `hipMemcpyPeerAsync` copies the residual pair (`d_res_in`, `d_res_in_half`, `hc_mult × hidden`) from the source stage's scratch to the next stage's on the source compute stream. Record an event; the destination compute stream waits on it.
-  - `forward_window`: copy the carry (`prefill_carry`, `prefill_carry_half`, `count × hc_dim`) the same way. Call every stage's `prefill_begin` up front, so a later stage's lookahead reads its first layers while earlier stages compute.
+  - `forward_window`: copy the carry (`prefill_carry`, `prefill_carry_half`, `count × hc_dim`) the same way. Open the window (the corridor's shape) on every stage up front, but run each stage's expert strategy only while that stage's layers run (Step 10b): all stages read through the same corridor memory, so two sweeps at once would overwrite each other.
   - `embed_token` and `embed_window` target stage 0. `head_stage` and the logits use the last stage. The sampler's argmax runs on the last stage's stream.
 - Telemetry: when `pp > 1`, each stage writes `<path>.stage<k>`.
 - **Gate:** `topology_equivalence.sh --exact --pipeline-parallel 2` and `--pipeline-parallel 4`, **bit-identical** to the single-device baseline on both prompts. Run `test_v4_prefix_reuse` and `test_v4_engine` with `AEON_TEST_DEVICE_IDS=a,b` and a PP=2 arm (skip below 2 devices).
 
 #### Step 10 — Measure PP (ledger) — ✅ done
 New ledger card for `pp ∈ {1, 2, 4}` on fixed prompts. Record the aggregate Hot slots, the Hot/Warm/Cold hit split, Cold bytes per layer, prefill tok/s, decode tok/s, and the default-fraction slot delta from Step 5 (R11). Update the status row.
+
+M51's hit-split and NVMe columns were read from stage 0 only (see Step 10b) and are not valid for `pp > 1`; its throughput, Hot-slot and exactness figures stand.
+
+#### Step 10b — One host corridor, aggregated counters (G1 + G4) — ✅ done
+A review of Phase B found two defects, fixed as one follow-up.
+- **The corridor was per stage.** With no Warm each stage pinned its own peak corridor (`blocks × E`, `≈ 6.9 GiB`), and with Warm each stage's share had to hold one. Now `V4ModelHost` allocates one `ExpertHostRegion` and `ExpertTierState::Params` takes it as `host_region`. `HostPartition::configure` takes the lane base and size, the corridor is anchored at the region's tail, and `apply` rebinds the lane and the corridor view. `MemoryBudgetEngine::evaluate` takes the stage's `SharedHostRegion`.
+- **The window lifecycle is two-level.** `PrefillController` splits `begin`/`end` into `open_window`/`close_window` (the partition) and `begin_strategy`/`end_strategy` (the reads). A single stage still runs them back to back; `forward_window` opens the window on every stage, runs each stage's strategy for its own layers, then closes. The stage calls are made under that stage's `DeviceScope`. Consequence: a stage's first read wave no longer overlaps the previous stage's compute.
+- **The counters were stage 0 only.** Supply bytes and requests, layer outcomes, sweep and transfer counters, `forced_drains` and `staging_in_use` are summed over stages; `registry_invariants_hold()` covers every stage and feeds the `[Invariants]` line. The routing-reuse curve and `last_expert_dispatch_*` remain stage 0's.
+- **Gate:** `test_memory_budget_fraction` (shared-region cases), `topology_equivalence.sh --exact` at `pp = 2` and at `pp = 4 --warm-gib 20`, and the single-device `test_v4_expert_tiering`, `test_v4_prefill_sweep`, `test_v4_routed_prefill`, `test_v4_warm_frozen_prefill`, `test_v4_engine`, `test_v4_prefix_reuse`. At `pp = 4`, no Warm, the pinned region is one `6.75 GiB` corridor instead of four.
+- **Open, not decided here:** a sweep cursor across stage boundaries (banks by global layer, so the next stage's first wave overlaps the current stage's last layer), the sweep's lookahead depth being bounded by corridor banks rather than the Hot pool, and the fixed `2E` drain at sweep entry.
 
 ### Phase C — The partition-aware artifact
 
@@ -268,7 +278,7 @@ Ledger card for `tp ∈ {1, 2, 4}`, with the same metrics as Step 10 plus collec
 | Risk | Handling |
 | :--- | :--- |
 | Host launch cost × `tp` makes decode launch-bound | Measured at Step 21. Per-rank host threads or HIP graphs are deferred until it is shown to dominate. |
-| Per-stage corridors exceed host RAM under PP | Budget refusal at Step 8. A shared corridor across stages is deferred. |
+| Per-stage corridors exceed host RAM under PP | One shared region and corridor (Step 10b); the budget refuses a region below the corridor peak. |
 | The display-driving GPU is in the device set | Refused by the fraction check (Step 5) with a named reason; the user excludes it by id. |
 | Cross-device `hipStreamWaitEvent` semantics on ROCm | Proven by `test_tp_collective` before any graph code uses it. |
 | Disk space for the v3 artifact | Checked before Step 11. Deleting the v2 artifact after Step 14 needs explicit user confirmation. |

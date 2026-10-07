@@ -284,7 +284,7 @@ Options parse_options(int argc, char** argv) {
 // invariant is not a valid measurement. Its format is therefore stable.
 void print_invariants(const aeon::core::V4Engine& engine) {
     std::cout << "[Invariants] registry.invariants_hold="
-              << (engine.host().registry().invariants_hold() ? "true" : "false")
+              << (engine.host().registry_invariants_hold() ? "true" : "false")
               << " outstanding_leases=" << engine.host().outstanding_expert_leases()
               << " forced_drains=" << engine.host().forced_drains()
               << " staging_in_use=" << engine.host().staging_in_use_slots()
@@ -413,7 +413,9 @@ int main(int argc, char** argv) {
         // Cold. The budget report is the authority on where that trade sits, so it
         // is printed verbatim rather than summarised.
         if (options.verbose) {
-            std::cout << engine.host().budget().to_string();
+            for (const auto& stage_budget : engine.host().budgets()) {
+                std::cout << stage_budget.to_string();
+            }
             // The prefill workspace is derived from `--prefill-window` and
             // `--prefill-chunk` and allocated at load, so its three buffers are
             // reported together: the two VRAM ones (carry, batch scratch) and the
@@ -427,6 +429,7 @@ int main(int argc, char** argv) {
                       << " MiB decode_scratch="
                       << (engine.host().decode_scratch_bytes() / (1024 * 1024))
                       << " MiB pinned_staging=" << (engine.host().staging_bytes() / (1024 * 1024))
+                      << " MiB pinned_region=" << (engine.host().host_region_bytes() / (1024 * 1024))
                       << " MiB\n";
             // A cap is worth reporting explicitly, because the requested value and
             // the applied one differ whenever the cap is below 6 (floored) or above
@@ -538,14 +541,13 @@ int main(int argc, char** argv) {
         // really loaded whole layers. Reported on the verbose path, next to the
         // headline timings, because it is what explains them.
         if (options.verbose) {
-            const auto& sweep = engine.host().prefill_sweep();
             const uint32_t layers = engine.host().num_layers();
             const uint32_t per_layer = engine.host().registry().experts_per_layer;
-            std::cout << "[Prefill sweep] layer_loads=" << sweep.layer_loads()
-                      << " experts_streamed=" << sweep.experts_streamed()
+            std::cout << "[Prefill sweep] layer_loads=" << engine.host().sweep_layer_loads()
+                      << " experts_streamed=" << engine.host().sweep_experts_streamed()
                       << " layers=" << layers
                       << " experts_per_layer=" << per_layer
-                      << " passes=" << (layers ? sweep.layer_loads() / layers : 0)
+                      << " passes=" << (layers ? engine.host().sweep_layer_loads() / layers : 0)
                       << " lookahead=" << engine.host().sweep_lookahead_depth()
                       << " load_ms=" << (engine.host().sweep_load_ns() / 1000000)
                       << " io_ms=" << (engine.host().sweep_io_ns() / 1000000)

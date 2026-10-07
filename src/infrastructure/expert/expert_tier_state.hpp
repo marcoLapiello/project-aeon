@@ -61,11 +61,11 @@ struct ExpertTierState {
     ExpertRegistry registry;
     HostExpertPool host_pool;
     std::unique_ptr<PrefetchStagingArena> staging;
-    // The pinned region the Warm pool and the corridor share, when a host budget is
-    // configured. Empty otherwise, and the corridor allocates its own memory.
-    ExpertHostRegion host_region;
     // The Warm/staging partition. It owns the partition numbers and reaches the
     // region, arena, registry and pools as bound services (see `host_partition.hpp`).
+    // The pinned region itself is not the tier's: it is shared by every stage of a
+    // pipeline, so the corridor exists once however many devices there are, and the
+    // tier holds only its Warm lane and a view of the corridor.
     HostPartition host_partition;
     SupplyTelemetry telemetry;
     RoutingReuseProfiler reuse_profiler;
@@ -95,6 +95,10 @@ struct ExpertTierState {
         // the registry local-indexed (its layer 0 is the stage's own first layer) and
         // adds this only when it addresses the artifact.
         uint32_t first_layer{0};
+        // The pinned region the Warm lane and the corridor live in, allocated by the
+        // host and shared by every stage; its size is `budget.host_region_slots`. Null
+        // when there is no host budget, and the corridor then allocates its own memory.
+        ExpertHostRegion* host_region{nullptr};
         hipStream_t compute{nullptr};
         // The partition refreshes the sweep's bank count from the arena it just built;
         // both are neutral types, supplied by the composer (created model-side, but
@@ -139,39 +143,47 @@ struct ExpertTierState {
         const uint32_t staging_slots = staging_counts.peak;
 
         // The host region: **one** pinned allocation shared by the Warm tier and the
-        // corridor, cut by a boundary the phases move (`apply_host_partition`). Its
-        // total is the configured host budget, so the RAM a run holds is the number
-        // the user set. With no host budget there is no region and the corridor
-        // allocates its own memory at its peak, the decode-only shape.
+        // corridor, cut by a boundary the phases move (`apply_host_partition`), and by
+        // every stage of a pipeline, which each take a Warm lane at the head and a view
+        // of the one corridor at the tail. Its total is the configured host budget, so
+        // the RAM a run holds is the number the user set. With no host budget there is
+        // no region and the corridor allocates its own memory at its peak, the
+        // decode-only shape.
         const uint32_t region_slots = budget.host_region_slots;
         const bool region_active = region_slots > 0;
+        ExpertHostRegion* const region = params.host_region;
         if (region_active) {
+            if (region == nullptr || region->slot_count() != region_slots) {
+                throw std::invalid_argument(
+                    "ExpertTierState: the budget plans a shared host region of " +
+                    std::to_string(region_slots) + " slots but none of that size was provided");
+            }
             if (region_slots < staging_counts.peak) {
                 throw std::runtime_error(
                     "ExpertTierState: the host region (" + std::to_string(region_slots) +
                     " slots) cannot hold the corridor's largest requirement (" +
                     std::to_string(staging_counts.peak) + " slots, a swept prefill)");
             }
-            host_region.allocate(region_slots, format);
             // The corridor's **resting** size, and therefore the partition every phase
             // cuts back to, is decided by `HostPartition::configure`: with the sweep
             // enabled a window is a cleanly delimited phase, so the resting cut is
             // decode's banks and the boundary moves out for a window. With the sweep
             // **off** decode and a chunked window interleave with no phase boundary to
             // cut at, so every partition is the same and nothing ever moves.
-            host_partition.configure(true, staging_counts, runtime.prefill_sweep, region_slots);
+            host_partition.configure(true, staging_counts, runtime.prefill_sweep, region_slots,
+                                     budget.host_lane_base_slots, warm_slots);
             this->staging = std::make_unique<PrefetchStagingArena>(
-                host_region.slot_ptr(host_partition.current_warm_slots()),
+                region->slot_ptr(region_slots - host_partition.staging_decode_slots()),
                 host_partition.staging_decode_slots(), format);
         } else {
-            host_partition.configure(false, staging_counts, false, 0);
+            host_partition.configure(false, staging_counts, false, 0, 0, 0);
             this->staging = std::make_unique<PrefetchStagingArena>(format, staging_slots);
         }
         // Bind the partition's collaborators now that the arena and the region exist,
         // then derive the sweep's bank count from the arena it actually has — a depth
         // change moves the arena and this derivation together, so nothing can disagree.
         host_partition.bind(HostPartition::Services{
-            &registry, &host_pool, this->staging.get(), &host_region,
+            &registry, &host_pool, this->staging.get(), region_active ? region : nullptr,
             params.sweep, params.supply, const_cast<MemoryBudgetReport*>(&budget)});
         host_partition.refresh_sweep_banks(params.experts_per_layer);
 
@@ -213,8 +225,8 @@ struct ExpertTierState {
             // and an allocation of its own otherwise. Either way it is `warm_slots`
             // wide, the capacity the registry was initialised with.
             if (host_partition.active()) {
-                host_pool.bind(host_region.base(), warm_slots, host_region.format(),
-                               host_region.is_pinned());
+                host_pool.bind(region->slot_ptr(budget.host_lane_base_slots), warm_slots,
+                               region->format(), region->is_pinned());
             } else {
                 host_pool.allocate(warm_slots, format);
             }

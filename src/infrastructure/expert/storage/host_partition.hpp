@@ -34,9 +34,10 @@
 // re-read from NVMe on demand — which is why decode gets the most residency and
 // the swept window takes the least.
 //
-// `warm_slots` is the whole description of the split: the Warm head is
-// `[0, warm_slots)` and the corridor is `[warm_slots, region_slots)`. Every step
-// is idempotent, so a caller may apply the same partition repeatedly.
+// The corridor is always the region's tail, so its size alone places it. The Warm
+// lane starts at `lane_base` and holds `warm_slots`: one stage's own lane when the
+// region is shared by a pipeline, the whole head otherwise. Every step is
+// idempotent, so a caller may apply the same partition repeatedly.
 // -----------------------------------------------------------------------------
 
 #include "infrastructure/memory/runtime_config.hpp"
@@ -98,9 +99,17 @@ public:
     // therefore whether the resting cut is decode's `2 x 6` (a window is a cleanly
     // delimited phase) or the chunked size (sweep off: decode and a chunked window
     // interleave with no phase boundary, so every partition is the same).
+    //
+    // The region may be shared with other stages: this stage's Warm lane is
+    // `[lane_base, lane_base + lane_slots)` and the corridor is anchored at the region's
+    // tail, so a larger corridor takes the lanes at the end first and a stage never needs
+    // to know how many others there are.
     void configure(bool active, const StagingSlotCounts& staging, bool phase_cuts,
-                   uint32_t region_slots) {
+                   uint32_t region_slots, uint32_t lane_base, uint32_t lane_slots) {
         active_ = active;
+        region_slots_ = region_slots;
+        lane_base_ = lane_base;
+        lane_slots_ = lane_slots;
         // With the sweep on, a window is a cleanly delimited phase and the resting cut
         // is decode's `2 x 6`; with it off, decode and a chunked window interleave with
         // no phase boundary to cut at, so the resting cut is the chunked size instead.
@@ -113,9 +122,9 @@ public:
         // token's routed experts, double-buffered. `resize` refuses to go below it.
         staging_floor_slots_ = staging.decode;
         if (active) {
-            warm_slots_decode_ = region_slots - staging_decode_slots_;
-            warm_slots_routed_ = region_slots - staging.batch;
-            warm_slots_prefill_ = region_slots - staging.prefill;
+            warm_slots_decode_ = warm_for(staging_decode_slots_);
+            warm_slots_routed_ = warm_for(staging.batch);
+            warm_slots_prefill_ = warm_for(staging.prefill);
             current_warm_slots_ = warm_slots_decode_;
         } else {
             warm_slots_decode_ = 0;
@@ -194,9 +203,13 @@ public:
                 " of " + std::to_string(services_.staging->slot_count()) +
                 ", leases=" + std::to_string(outstanding_leases) + ")");
         }
-        if (warm_slots + staging_slots != services_.region->slot_count()) {
+        const uint32_t region_slots = services_.region->slot_count();
+        // A lane the corridor has swallowed entirely holds nothing, so only a lane that
+        // keeps slots can overlap it.
+        if (staging_slots > region_slots ||
+            (warm_slots > 0 && lane_base_ + warm_slots > region_slots - staging_slots)) {
             throw std::logic_error(
-                "HostPartition: the host partition does not cover the region exactly");
+                "HostPartition: the Warm lane and the corridor overlap in the region");
         }
 
         // Shrink: demote the Warm tail **before** the capacity moves under it, so the
@@ -205,13 +218,13 @@ public:
             services_.registry->release_host_tail(warm_slots);
             services_.registry->shrink_host_capacity(warm_slots);
         }
-        services_.host_pool->bind(services_.region->base(), warm_slots,
+        services_.host_pool->bind(services_.region->slot_ptr(lane_base_), warm_slots,
                                   services_.region->format(), services_.region->is_pinned());
         if (warm_slots > services_.registry->usable_host_capacity()) {
             services_.registry->grow_host_capacity(warm_slots);
         }
-        services_.staging->bind(services_.region->slot_ptr(warm_slots), staging_slots,
-                                services_.region->format());
+        services_.staging->bind(services_.region->slot_ptr(region_slots - staging_slots),
+                                staging_slots, services_.region->format());
 
         refresh_sweep_banks(experts_per_layer);
         services_.budget->transient_staging_bytes =
@@ -220,8 +233,19 @@ public:
     }
 
 private:
+    // Warm's share when the corridor holds `staging_slots` of the region's tail: what is
+    // left of the region ahead of the corridor after this lane's start, up to the lane.
+    uint32_t warm_for(uint32_t staging_slots) const noexcept {
+        const uint32_t room = region_slots_ > staging_slots ? region_slots_ - staging_slots : 0u;
+        const uint32_t usable = room > lane_base_ ? room - lane_base_ : 0u;
+        return std::min(usable, lane_slots_);
+    }
+
     Services services_{};
     bool active_{false};
+    uint32_t region_slots_{0};
+    uint32_t lane_base_{0};
+    uint32_t lane_slots_{0};
     uint32_t staging_decode_slots_{0};
     uint32_t staging_batch_slots_{0};
     uint32_t staging_prefill_slots_{0};

@@ -40,14 +40,61 @@ struct DeviceMemoryInfo {
     size_t total_bytes{0};
 };
 
+// One stage's claim on the host region every stage shares. The region is one pinned
+// allocation laid out as the stages' Warm lanes in stage order from the head, with the
+// corridor anchored at the tail; a phase that needs a larger corridor takes it from the
+// lanes at the end first, so total Warm is the same as on one device.
+struct SharedHostRegion {
+    // The whole region, in slots, identical for every stage.
+    uint32_t region_slots{0};
+    // Where this stage's Warm lane starts, and how many slots it may use at decode.
+    uint32_t lane_base_slots{0};
+    uint32_t lane_slots{0};
+};
+
 class MemoryBudgetEngine {
 public:
+    // Lay out the shared host region for `stage_layer_counts.size()` stages. The Warm
+    // lanes split the region minus the decode corridor in proportion to layer counts.
+    // With no Warm budget and more than one stage the region is still allocated, as the
+    // corridor alone, so stages share one arena instead of each holding its own.
+    static std::vector<SharedHostRegion> plan_shared_host_region(
+        const AeonRuntimeConfig& runtime_cfg,
+        const ExpertFormatDescriptor& expert_format,
+        uint32_t experts_per_token,
+        const std::vector<uint32_t>& stage_layer_counts
+    ) {
+        const StagingSlotCounts staging = staging_slot_counts(
+            runtime_cfg, static_cast<uint32_t>(expert_format.experts_per_layer),
+            experts_per_token);
+        uint32_t region_slots = static_cast<uint32_t>(
+            runtime_cfg.warm_host_bytes / expert_format.payload_bytes);
+        const bool warm_enabled = region_slots > 0;
+        if (!warm_enabled && stage_layer_counts.size() > 1) region_slots = staging.peak;
+
+        const size_t lane_total = warm_enabled && region_slots > staging.decode
+            ? region_slots - staging.decode
+            : 0;
+        const std::vector<size_t> lanes = split_host_budget(lane_total, stage_layer_counts);
+
+        std::vector<SharedHostRegion> plan(stage_layer_counts.size());
+        uint32_t base = 0;
+        for (size_t stage = 0; stage < plan.size(); ++stage) {
+            plan[stage].region_slots = region_slots;
+            plan[stage].lane_base_slots = base;
+            plan[stage].lane_slots = static_cast<uint32_t>(lanes[stage]);
+            base += plan[stage].lane_slots;
+        }
+        return plan;
+    }
+
     static MemoryBudgetReport evaluate(
         const AeonRuntimeConfig& runtime_cfg,
         const ModelMemoryGeometry& geometry,
         size_t dense_weights_bytes,
         const ExpertFormatDescriptor& expert_format,
-        const DeviceMemoryInfo& memory
+        const DeviceMemoryInfo& memory,
+        const SharedHostRegion* shared_region = nullptr
     ) {
         MemoryBudgetReport report;
 
@@ -250,8 +297,17 @@ public:
         report.staging_batch_bytes =
             static_cast<size_t>(staging.batch) * expert_format.payload_bytes;
 
+        // A stage evaluated alone owns the whole region; a pipeline hands each stage its
+        // lane of the one region they all share.
+        const SharedHostRegion region = shared_region != nullptr
+            ? *shared_region
+            : plan_shared_host_region(
+                  runtime_cfg, expert_format,
+                  static_cast<uint32_t>(geometry.experts_per_tok), {1u}).front();
+        const uint32_t region_slots = region.region_slots;
+        const size_t host_region_bytes =
+            static_cast<size_t>(region_slots) * expert_format.payload_bytes;
         report.configured_host_budget_bytes = runtime_cfg.warm_host_bytes;
-        const size_t host_region_bytes = runtime_cfg.warm_host_bytes;
         // The ceiling is already reserve-subtracted, so this is the whole check.
         if (host_region_bytes > report.max_allowed_host_ram_bytes) {
             report.is_feasible = false;
@@ -263,11 +319,11 @@ public:
                 " GiB allowed";
             return report;
         }
-        if (host_region_bytes != 0 && host_region_bytes < report.transient_staging_bytes) {
+        if (runtime_cfg.warm_host_bytes != 0 && region_slots < staging.peak) {
             report.is_feasible = false;
             report.rejection_reason =
                 "Host budget " +
-                std::to_string(host_region_bytes / (1024 * 1024)) +
+                std::to_string(runtime_cfg.warm_host_bytes / (1024 * 1024)) +
                 " MiB cannot hold the " +
                 std::to_string(report.transient_staging_bytes / (1024 * 1024)) +
                 " MiB the corridor needs at its largest (a swept prefill) — raise it or "
@@ -275,18 +331,21 @@ public:
             return report;
         }
 
-        const uint32_t region_slots = static_cast<uint32_t>(
-            host_region_bytes / expert_format.payload_bytes);
         report.host_region_slots = region_slots;
-        report.host_region_bytes =
-            static_cast<size_t>(region_slots) * expert_format.payload_bytes;
-        // Warm keeps what each phase's corridor does not use. Decode gives the corridor
-        // the least, so it is where Warm is largest — which is the point: decode is
-        // where the residency pays.
-        const auto warm_for = [region_slots](uint32_t staging_slots) {
-            return region_slots > staging_slots ? region_slots - staging_slots : 0u;
+        report.host_region_bytes = host_region_bytes;
+        report.host_lane_base_slots = region.lane_base_slots;
+        // Warm keeps what each phase's corridor does not use, within this stage's lane.
+        // Decode gives the corridor the least, so it is where Warm is largest — which is
+        // the point: decode is where the residency pays. The corridor is anchored at the
+        // region's tail, so a larger one eats the lanes at the end first.
+        const auto warm_for = [&region](uint32_t staging_slots) {
+            const uint32_t room = region.region_slots > staging_slots
+                ? region.region_slots - staging_slots : 0u;
+            const uint32_t usable = room > region.lane_base_slots
+                ? room - region.lane_base_slots : 0u;
+            return std::min(usable, region.lane_slots);
         };
-        const uint32_t warm_slots_max = warm_for(staging.decode);
+        const uint32_t warm_slots_max = region.lane_slots;
         report.warm_host_slots_routed = warm_for(staging.batch);
         report.warm_host_slots_min = warm_for(staging.prefill);
 
@@ -314,7 +373,8 @@ public:
         const AeonRuntimeConfig& runtime_cfg,
         const ModelMemoryGeometry& geometry,
         size_t dense_weights_bytes,
-        const ExpertFormatDescriptor& expert_format
+        const ExpertFormatDescriptor& expert_format,
+        const SharedHostRegion* shared_region = nullptr
     ) {
         DeviceMemoryInfo memory;
         (void)hipGetDevice(&memory.device);
@@ -326,7 +386,8 @@ public:
                 std::string("hipMemGetInfo failed: ") + hipGetErrorString(err);
             return report;
         }
-        return evaluate(runtime_cfg, geometry, dense_weights_bytes, expert_format, memory);
+        return evaluate(runtime_cfg, geometry, dense_weights_bytes, expert_format, memory,
+                        shared_region);
     }
 
     static MemoryBudgetReport evaluate(

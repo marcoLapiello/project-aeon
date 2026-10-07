@@ -82,9 +82,11 @@ struct MemoryBudgetReport {
     // taken its share of the corridor.
     uint32_t warm_host_slots_routed{0};
     uint32_t warm_host_slots_min{0};
-    // The shared pinned region: Warm slots followed by the corridor's slots, cut by a
-    // boundary that moves at the phase transitions.
+    // The shared pinned region: the stages' Warm lanes, then one corridor at the tail,
+    // cut by a boundary that moves at the phase transitions. Every stage of a pipeline
+    // reports the same region; `host_lane_base_slots` is where this stage's lane starts.
     uint32_t host_region_slots{0};
+    uint32_t host_lane_base_slots{0};
     size_t host_region_bytes{0};
     size_t expert_payload_bytes{0};
     size_t configured_host_budget_bytes{0};

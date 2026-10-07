@@ -142,9 +142,11 @@ public:
         // validates the artifact — so the budget cannot drift from what reaches VRAM.
         //
         // Each stage is evaluated on **its own** device and against **its own** layer
-        // range: its dense and attention bytes, plus its proportional share of the host
-        // budget. At one stage the range is the whole model and the share is the whole
-        // host budget, so the single-device figure is unchanged.
+        // range: its dense and attention bytes, plus its lane of the host region. The
+        // host region is one allocation for the whole pipeline (Warm lanes, then one
+        // corridor), so the host RAM a run holds is the number the user set however many
+        // stages there are. At one stage the lane is the whole region minus the corridor,
+        // so the single-device figure is unchanged.
         budgets_.clear();
         budgets_.reserve(topology_.pp());
         const uint32_t model_layers = static_cast<uint32_t>(config_.num_hidden_layers);
@@ -152,17 +154,12 @@ public:
         for (uint32_t stage = 0; stage < topology_.pp(); ++stage) {
             stage_layer_counts[stage] = topology_.stage_layers(stage).count;
         }
-        const std::vector<size_t> stage_warm_shares = MemoryBudgetEngine::split_host_budget(
-            runtime_cfg.warm_host_bytes, stage_layer_counts);
+        const std::vector<SharedHostRegion> host_plan = MemoryBudgetEngine::plan_shared_host_region(
+            runtime_cfg, expert_format, static_cast<uint32_t>(config_.num_experts_per_tok),
+            stage_layer_counts);
         for (uint32_t stage = 0; stage < topology_.pp(); ++stage) {
             const LayerRange range = topology_.stage_layers(stage);
             const bool has_head = (range.first + range.count == model_layers);
-
-            // Each stage's host budget is its proportional share, which is what makes
-            // the total host RAM across a pipeline the number the user set rather than
-            // a multiple of it.
-            AeonRuntimeConfig stage_cfg = runtime_cfg;
-            stage_cfg.warm_host_bytes = stage_warm_shares[stage];
 
             // The artifact's expert catalog covers the whole model; a stage's budget
             // only ever touches its own layers, so the format is narrowed to the
@@ -177,9 +174,9 @@ public:
                 // display-loaded card, a fraction with no room) name that device.
                 DeviceScope scope(topology_.device(stage, 0));
                 report = MemoryBudgetEngine::evaluate(
-                    stage_cfg, make_v4_memory_geometry(config_, range),
+                    runtime_cfg, make_v4_memory_geometry(config_, range),
                     V4ModelContract::uploaded_dense_bytes(config_, range, has_head),
-                    stage_format);
+                    stage_format, &host_plan[stage]);
             }
             if (!report.is_feasible) {
                 throw std::runtime_error(
@@ -206,7 +203,7 @@ public:
             stages_.back()->initialize(
                 topology_.stage_layers(stage), topology_.device(stage, 0),
                 V4StageParams{&loader_, &config_, &layer_specs_, &budgets_[stage], &runtime_cfg,
-                              context_capacity_, verbose_, stage});
+                              context_capacity_, verbose_, stage, &host_region_});
         }
 
         // Every dense tensor the contract enumerates has been uploaded by this point,
@@ -232,6 +229,28 @@ public:
             }
         }
 
+        // The one pinned host region, allocated once for every stage after the dense
+        // pages are released: each stage takes a Warm lane from its head and a view of
+        // the corridor at its tail, so the pinned footprint does not grow with the
+        // number of devices.
+        host_region_.free();
+        if (budgets_.front().host_region_slots > 0) {
+            host_region_.allocate(budgets_.front().host_region_slots, expert_format);
+            if (verbose_) {
+                std::printf(
+                    "[Host] Shared pinned region %.2f GiB (%u slots): Warm lanes plus one "
+                    "corridor, peak %.2f GiB, decode %.2f MiB\n",
+                    static_cast<double>(host_region_.slot_count()) *
+                        static_cast<double>(expert_format.payload_bytes) /
+                        (1024.0 * 1024.0 * 1024.0),
+                    host_region_.slot_count(),
+                    static_cast<double>(budgets_.front().transient_staging_bytes) /
+                        (1024.0 * 1024.0 * 1024.0),
+                    static_cast<double>(budgets_.front().staging_decode_bytes) /
+                        (1024.0 * 1024.0));
+            }
+        }
+
         // Now the expert tier, per stage: the Hot/Warm pools, the corridor and the Warm
         // preload all live here, on the stage's own device.
         for (auto& stage : stages_) {
@@ -246,19 +265,17 @@ public:
                 count_kind(V4AttentionKind::HCA), context_capacity_,
                 experts_ready() ? "" : " (expert tier not built: no Hot VRAM slot)");
             // One report per stage: each names its device, its layer range, its own
-            // Hot/Warm capacity and its share of VRAM and host RAM.
+            // Hot/Warm capacity and its VRAM; the host region is reported once above.
             for (uint32_t stage = 0; stage < budgets_.size(); ++stage) {
                 const MemoryBudgetReport& report = budgets_[stage];
                 const LayerRange range = topology_.stage_layers(stage);
                 std::printf(
                     "[Stage %u] device %d, layers [%u, %u): %u hot + %u warm expert slots, "
-                    "%.2f GiB dense, %.2f GiB attention, %.2f GiB host\n",
+                    "%.2f GiB dense, %.2f GiB attention\n",
                     stage, report.device_index, range.first, range.first + range.count,
                     report.hot_vram_slots, report.warm_host_slots,
                     static_cast<double>(report.vram_dense_bytes) / (1024.0 * 1024.0 * 1024.0),
-                    static_cast<double>(report.vram_kv_bytes) / (1024.0 * 1024.0 * 1024.0),
-                    static_cast<double>(report.configured_host_budget_bytes) /
-                        (1024.0 * 1024.0 * 1024.0));
+                    static_cast<double>(report.vram_kv_bytes) / (1024.0 * 1024.0 * 1024.0));
             }
         }
     }
@@ -266,8 +283,10 @@ public:
     void free() noexcept {
         // Each stage tears down its own expert tier and device in construction order
         // reversed; the host owns the artifact, the config and the budget and releases
-        // them last.
+        // them last. The shared region goes after the stages, whose Warm pools and
+        // corridor are views of it.
         stages_.clear();
+        host_region_.free();
         loader_.close_all();
         layer_specs_.clear();
         budgets_.clear();
@@ -429,16 +448,41 @@ public:
         return total;
     }
 
+    // The accessors below that report a **count or a duration** are summed over every
+    // stage: a pipeline's traffic is the sum of its stages', and a figure read from
+    // stage 0 alone silently describes a fraction of the model. `stage(i)` reaches one
+    // stage's own figure.
+    //
     // Times the emergency drain in `ensure_pool_headroom` fired, from the supply
     // telemetry. Zero whenever the pool can hold a token's `6 x 43` leases, which is
     // the intended steady state; a non-zero value is how a gate says it ran the
     // starved regime.
-    uint64_t forced_drains() const noexcept { return stage().forced_drains(); }
+    uint64_t forced_drains() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.forced_drains(); });
+    }
 
     // Staging slots not AVAILABLE. A gate asserts this returns to 0 at the end of a
     // run — the arena must not leak. Reads the concrete executor's arena, so it is
     // safe only after `initialize_experts`; returns 0 when the arena does not exist.
-    uint32_t staging_in_use_slots() const noexcept { return stage().staging_in_use_slots(); }
+    uint32_t staging_in_use_slots() const noexcept {
+        return static_cast<uint32_t>(
+            sum_stages([](const V4StageHost& s) { return s.staging_in_use_slots(); }));
+    }
+
+    // The pinned host region's size: the one allocation holding every stage's Warm lane
+    // and the corridor. Zero when there is no host budget and no pipeline.
+    size_t host_region_bytes() const noexcept {
+        return static_cast<size_t>(host_region_.slot_count()) * host_region_.payload_bytes();
+    }
+
+    // Whether every stage's residency invariants hold. `registry()` is stage 0's alone,
+    // so a gate that must cover the pipeline asks this.
+    bool registry_invariants_hold() const {
+        for (const auto& stage : stages_) {
+            if (stage->experts_ready() && !stage->registry().invariants_hold()) return false;
+        }
+        return true;
+    }
 
     // The staging arena's slot count. A batch dispatcher must not assign more
     // distinct staging indices than this, and the layer-major window refuses a
@@ -481,8 +525,12 @@ public:
     uint32_t last_expert_dispatch_experts() const noexcept {
         return stage().last_expert_dispatch_experts();
     }
-    uint64_t expert_batch_draws() const noexcept { return stage().expert_batch_draws(); }
-    uint64_t expert_batch_distinct() const noexcept { return stage().expert_batch_distinct(); }
+    uint64_t expert_batch_draws() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.expert_batch_draws(); });
+    }
+    uint64_t expert_batch_distinct() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.expert_batch_distinct(); });
+    }
 
     // The demotion-queue capacity the supply was configured with, after the derived
     // default and the `demotion_queue_capacity` override are resolved.
@@ -515,14 +563,21 @@ public:
     // Frozen-prefill state, for a gate: whether the registry is in frozen mode and
     // how many Warm-owned experts currently hold an extra VRAM copy.
     bool warm_frozen() const noexcept { return stage().warm_frozen(); }
-    uint32_t shadow_resident_count() const noexcept { return stage().shadow_resident_count(); }
+    uint32_t shadow_resident_count() const noexcept {
+        return static_cast<uint32_t>(
+            sum_stages([](const V4StageHost& s) { return s.shadow_resident_count(); }));
+    }
     int32_t shadow_slot_of(uint32_t gid) const { return stage().shadow_slot_of(gid); }
-    uint64_t shadow_copies() const noexcept { return stage().shadow_copies(); }
+    uint64_t shadow_copies() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.shadow_copies(); });
+    }
 
     // Logical Warm bytes the supply served in a phase. Requires the telemetry sink to
     // have been enabled.
     uint64_t supply_logical_bytes_from_warm(bool prefill) const noexcept {
-        return stage().supply_logical_bytes_from_warm(prefill);
+        return sum_stages([prefill](const V4StageHost& s) {
+            return s.supply_logical_bytes_from_warm(prefill);
+        });
     }
 
     // Per-layer outcome counts (thesis-1 measurement), from the supply telemetry:
@@ -530,22 +585,33 @@ public:
     // Hot+Warm with no Cold, and with at least one Cold. `outcome` is 0/1/2 for
     // AllHot/WarmNoCold/HasCold.
     uint64_t layer_outcome_count(bool prefill, uint32_t outcome) const noexcept {
-        return stage().layer_outcome_count(prefill, outcome);
+        return sum_stages([prefill, outcome](const V4StageHost& s) {
+            return s.layer_outcome_count(prefill, outcome);
+        });
     }
 
     uint64_t layer_dispatches(bool prefill) const noexcept {
-        return stage().layer_dispatches(prefill);
+        return sum_stages([prefill](const V4StageHost& s) { return s.layer_dispatches(prefill); });
     }
 
     // Lifetime supply traffic, for a benchmark. Never reset, independent of the
     // JSONL sink, so a throughput run can state bytes read without opening one.
-    uint64_t supply_requests() const noexcept { return stage().supply_requests(); }
-    uint64_t supply_bytes_from_nvme() const noexcept { return stage().supply_bytes_from_nvme(); }
-    uint64_t supply_bytes_from_host() const noexcept { return stage().supply_bytes_from_host(); }
-    uint64_t supply_h2d_bytes() const noexcept { return stage().supply_h2d_bytes(); }
+    uint64_t supply_requests() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_requests(); });
+    }
+    uint64_t supply_bytes_from_nvme() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_bytes_from_nvme(); });
+    }
+    uint64_t supply_bytes_from_host() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_bytes_from_host(); });
+    }
+    uint64_t supply_h2d_bytes() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_h2d_bytes(); });
+    }
 
     // Routing reuse-distance profiling: a separate
-    // module with its own switch, not part of the supply telemetry.
+    // module with its own switch, not part of the supply telemetry. The curve is
+    // stage 0's: stack distances do not add across stages.
     bool routing_reuse_enabled() const noexcept { return stage().routing_reuse_enabled(); }
 
     RoutingReuseProfiler::Curve routing_reuse_curve() const {
@@ -596,17 +662,46 @@ public:
     // `window_tokens` is the window length `W`, which the driver is the only one to
     // know at this point — the gate is read here and nowhere else. Both strategies
     // are prefill supplies; `prefill_sweep` enables them, the length picks which.
-    void prefill_begin(uint32_t window_tokens) { stage().prefill_begin(window_tokens); }
+    //
+    // `prefill_begin` / `prefill_end` run the whole lifecycle on the one stage of a
+    // single-device host. A pipeline must not use them: every stage reads through the
+    // same corridor memory, so it opens and closes the window on all stages and runs
+    // each stage's strategy only while that stage's layers run (`V4Graph::forward_window`).
+    void prefill_begin(uint32_t window_tokens) {
+        require_single_stage("prefill_begin");
+        stage().prefill_begin(window_tokens);
+    }
 
     void prefill_before_layer(uint32_t layer) { stage_of_layer(layer).prefill_before_layer(layer); }
 
     void prefill_after_layer(uint32_t layer) { stage_of_layer(layer).prefill_after_layer(layer); }
 
-    void prefill_end() { stage().prefill_end(); }
+    void prefill_end() {
+        require_single_stage("prefill_end");
+        stage().prefill_end();
+    }
+
+    // The pipeline's window: the corridor is cut to the window's shape on every stage
+    // before any stage reads, and returned to decode's shape on every stage after the
+    // last one finishes.
+    void prefill_open_window(uint32_t window_tokens) {
+        for (auto& stage : stages_) stage->prefill_open_window(window_tokens);
+    }
+    void prefill_close_window() {
+        for (auto& stage : stages_) stage->prefill_close_window();
+    }
 
     // Sweep counters, for the gate: how many layer loads ran, how many experts they
-    // streamed, and the deepest frontier the lookahead reached.
+    // streamed, and the deepest frontier the lookahead reached. `prefill_sweep()` is
+    // stage 0's; the two totals below cover the pipeline.
     const PrefillSweep& prefill_sweep() const noexcept { return stage().prefill_sweep(); }
+    uint64_t sweep_layer_loads() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.prefill_sweep().layer_loads(); });
+    }
+    uint64_t sweep_experts_streamed() const noexcept {
+        return sum_stages(
+            [](const V4StageHost& s) { return s.prefill_sweep().experts_streamed(); });
+    }
 
     // The corridor's **fill** per layer — staging slots reading, staging slots
     // copying, and the lookahead layer's reserved-but-not-yet-arrived VRAM experts.
@@ -621,18 +716,24 @@ public:
     // + release), against the wall clock of the window. The split is what says
     // whether a swept prefill is transfer-bound or compute-bound, and how much a
     // load/compute overlap could recover.
-    uint64_t sweep_load_ns() const noexcept { return stage().sweep_load_ns(); }
+    uint64_t sweep_load_ns() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.sweep_load_ns(); });
+    }
     // The dispatch half of the same accounting: time spent *submitting* reads, which
     // is what the double buffer pays to keep the drive busy across the compute.
-    uint64_t sweep_io_ns() const noexcept { return stage().sweep_io_ns(); }
+    uint64_t sweep_io_ns() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.sweep_io_ns(); });
+    }
     // Inside `io_uring_enter` alone, and the SQE count it submitted. When this is
     // large the cost is the drive's queue, not the CPU.
-    uint64_t direct_io_submit_ns() const noexcept { return stage().direct_io_submit_ns(); }
+    uint64_t direct_io_submit_ns() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.direct_io_submit_ns(); });
+    }
     uint64_t direct_io_requests_submitted() const noexcept {
-        return stage().direct_io_requests_submitted();
+        return sum_stages([](const V4StageHost& s) { return s.direct_io_requests_submitted(); });
     }
     uint64_t direct_io_submit_calls() const noexcept {
-        return stage().direct_io_submit_calls();
+        return sum_stages([](const V4StageHost& s) { return s.direct_io_submit_calls(); });
     }
     // The transfer split (see `TieredExpertSupply`): host time blocked on NVMe
     // completions (`io_wait`), CPU time to submit the H2D copies (`h2d_enqueue`), and
@@ -640,23 +741,45 @@ public:
     // event syncs). Unlike the sweep-scoped `sweep_load_ns`, these accumulate across
     // **both** phases, which is what lets one bench attribute prefill and decode from
     // the same counters. `reset_supply_transfer_counters` slices between them.
-    uint64_t supply_io_wait_ns() const noexcept { return stage().supply_io_wait_ns(); }
-    uint64_t supply_h2d_enqueue_ns() const noexcept { return stage().supply_h2d_enqueue_ns(); }
-    uint64_t supply_h2d_drain_ns() const noexcept { return stage().supply_h2d_drain_ns(); }
-    uint64_t supply_h2d_drain_calls() const noexcept { return stage().supply_h2d_drain_calls(); }
+    uint64_t supply_io_wait_ns() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_io_wait_ns(); });
+    }
+    uint64_t supply_h2d_enqueue_ns() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_h2d_enqueue_ns(); });
+    }
+    uint64_t supply_h2d_drain_ns() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_h2d_drain_ns(); });
+    }
+    uint64_t supply_h2d_drain_calls() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_h2d_drain_calls(); });
+    }
     // CPU time in `dispatch`'s per-request loop (the registry reservation and the two
     // `O(catalog)` scans). Reported for both phases, since the loop is shared.
-    uint64_t supply_dispatch_cpu_ns() const noexcept { return stage().supply_dispatch_cpu_ns(); }
+    uint64_t supply_dispatch_cpu_ns() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_dispatch_cpu_ns(); });
+    }
     // Staging slots freed by the completion path instead of a boundary block.
     uint64_t supply_staging_released_on_completion() const noexcept {
-        return stage().supply_staging_released_on_completion();
+        return sum_stages(
+            [](const V4StageHost& s) { return s.supply_staging_released_on_completion(); });
     }
     // Copies the mid-body pump issued.
-    uint64_t supply_copies_pumped() const noexcept { return stage().supply_copies_pumped(); }
-    void reset_supply_transfer_counters() noexcept { stage().reset_supply_transfer_counters(); }
+    uint64_t supply_copies_pumped() const noexcept {
+        return sum_stages([](const V4StageHost& s) { return s.supply_copies_pumped(); });
+    }
+    void reset_supply_transfer_counters() noexcept {
+        for (auto& stage : stages_) stage->reset_supply_transfer_counters();
+    }
     // Layers whose reads were in flight when a body started (1 = the double buffer
-    // is engaged; 0 = the pool is too small for two layers and loads are serial).
-    uint32_t sweep_lookahead_depth() const noexcept { return stage().sweep_lookahead_depth(); }
+    // is engaged; 0 = the pool is too small for two layers and loads are serial). The
+    // deepest of the stages, since a stage that did not sweep reads zero.
+    uint32_t sweep_lookahead_depth() const noexcept {
+        uint32_t deepest = 0;
+        for (const auto& stage : stages_) {
+            deepest = std::max(deepest, stage->sweep_lookahead_depth());
+        }
+        return deepest;
+    }
     // The lookahead length the **free blocks** allow at this instant — the smaller of
     // the free VRAM blocks and the free staging blocks. Derived, not configured: it
     // grows on a larger pool and shrinks to 0 when either runs out.
@@ -665,7 +788,7 @@ public:
     }
     // Test instrument: cap the sweep's read lookahead (0 = staging-bounded only).
     void set_sweep_read_ahead_max(uint32_t max_depth) noexcept {
-        stage().set_sweep_read_ahead_max(max_depth);
+        for (auto& stage : stages_) stage->set_sweep_read_ahead_max(max_depth);
     }
 
     // The start of a new sequence. Every layer's ring sentinels, counters and
@@ -693,6 +816,21 @@ private:
     // maps a layer id to its stage through the topology.
     V4StageHost& stage() { return *stages_.front(); }
     const V4StageHost& stage() const { return *stages_.front(); }
+
+    template <typename Fn>
+    uint64_t sum_stages(Fn&& per_stage) const noexcept {
+        uint64_t total = 0;
+        for (const auto& stage : stages_) total += static_cast<uint64_t>(per_stage(*stage));
+        return total;
+    }
+
+    void require_single_stage(const char* what) const {
+        if (stages_.size() != 1) {
+            throw std::logic_error(std::string("V4ModelHost::") + what +
+                                   " drives one stage; a pipeline opens the window on every "
+                                   "stage and runs each stage's strategy in turn");
+        }
+    }
     V4StageHost& stage_of_layer(uint32_t layer_id) {
         return *stages_.at(topology_.stage_of(layer_id));
     }
@@ -713,6 +851,8 @@ private:
 
     bool verbose_{false};
     AeonModelLoader loader_;
+    // Declared before the stages' state so it outlives every view onto it.
+    ExpertHostRegion host_region_;
     DeepSeekV4Config config_;
     std::vector<V4LayerSpec> layer_specs_;
     // One report per stage, in stage order. A single-device run holds exactly one,

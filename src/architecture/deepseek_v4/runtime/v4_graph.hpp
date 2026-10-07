@@ -337,15 +337,15 @@ public:
 
         const uint32_t workspace_tokens = std::min(chunk, count);
 
-        // Every stage opens the window up front, so a later stage's sweep lookahead reads
-        // its first layers while the earlier stages compute. The window is the swept
-        // prefill whenever the sweep is enabled and the Hot pool can hold a whole layer;
-        // below the prompt-length gate it is the route-aware cached supply instead. Both
-        // are the same layer-major window — only the expert supply differs. The window
-        // length `count` is what the gate reads.
-        for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            host_.stage(stage).prefill_begin(count);
-        }
+        // Every stage opens the window up front, so the one host corridor is cut to the
+        // window's shape on all of them before any reads. Each stage's expert strategy
+        // then runs only while that stage's layers do: all stages read through the same
+        // corridor memory, so two sweeps at once would overwrite each other's bytes. The
+        // window is the swept prefill whenever the sweep is enabled and the Hot pool can
+        // hold a whole layer; below the prompt-length gate it is the route-aware cached
+        // supply instead. Both are the same layer-major window — only the expert supply
+        // differs. The window length `count` is what the gate reads.
+        host_.prefill_open_window(count);
         lap(t_begin);
 
         for (uint32_t stage = 0; stage < stage_count; ++stage) {
@@ -359,6 +359,9 @@ public:
             const LayerRange range = host_.topology().stage_layers(stage);
             const hipStream_t stage_stream = stage_host.streams().compute;
             const V4LayerBodyTables tables = stage_host.tables();
+
+            stage_host.prefill_begin_strategy();
+            lap(t_begin);
 
             for (uint32_t i = 0; i < range.count; ++i) {
                 const uint32_t layer = range.first + i;
@@ -400,11 +403,14 @@ public:
                 host_.prefill_after_layer(layer);
                 lap(t_after);
             }
+
+            // The stage is done with the corridor: settle its transfers so the next
+            // stage's strategy can read into the same memory.
+            stage_host.prefill_end_strategy();
+            lap(t_end);
         }
 
-        for (uint32_t stage = 0; stage < stage_count; ++stage) {
-            host_.stage(stage).prefill_end();
-        }
+        host_.prefill_close_window();
         lap(t_end);
 
         // The head reads the last position's residual, which is where the serial
