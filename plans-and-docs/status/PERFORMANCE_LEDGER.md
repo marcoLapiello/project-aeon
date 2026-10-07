@@ -441,21 +441,33 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Conclusion / next gate**: The G5 server is **working end to end**: streaming is unbuffered, the queue lends the single engine thread FIFO, cancellation is token-granular after prefill and window-granular during it, prefix reuse holds across a re-sent conversation, and every bad input is a defined JSON error. Fixing `JsonValue`'s `\u` surrogate handling was required — a client that escapes an astral code point (e.g. an emoji) as a surrogate pair produced invalid UTF-8 the tokenizer rejected. Deferred and named: response-side DSML → `tool_calls`, `stop` strings, a second transport/auth.
 - **Evidence**: `tests/test_server_{service,codec,http}.cpp`, `tests/test_v4_conversation.cpp`, `tests/test_utf8_chunker.cpp`, `tests/test_dsv4_stream_decoder.cpp`, `server/`, `tools/aeon_serve.cpp`, `tools/engine_cli.hpp`, `scripts/server_smoke.sh`, `scripts/check_server_layering.sh`, [SERVER_EXECUTION_PLAN.md](../execution/completed/SERVER_EXECUTION_PLAN.md)
 
-### M51: Pipeline parallelism — bit-exact, and faster from a larger per-stage Hot pool
-- **Run**: `2026-10-07`; commit `bcb024b`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `aeon_chat --diagnostic`
+### M51: Pipeline parallelism — capacity scales with the device count
+- **Run**: `2026-10-07`; commit `ac8368f`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `aeon_chat --diagnostic`
 - **Class / comparison key**: `E2E / pipeline-parallel`
 - **Platform**: `baseline`, 4x RX 7900 XTX; `pp=1` device 0, `pp=2` devices 0,1, `pp=4` devices 0,1,2,3; PCIe 4.0 x16, P2P enabled
-- [x] **Invalidate for comparison** | **Reason**: the decode `all_hot` / `has_cold` and NVMe columns for `pp > 1` were read from stage 0 only (the pipeline counters were not aggregated), the run used a per-stage pinned corridor, and the defaults (Warm `0`, `--staging-blocks 2`) are not a tuned configuration. Throughput, Hot-slot and exactness figures are unaffected; re-measure the hit split and NVMe bytes with the aggregated counters.
-- **Workload / configuration**: the `profiling-prompts/prefill-corpus.txt` prompt (`677` tokens), context `32768`, `--greedy`, `64` generated tokens, Warm `0`, default `--gpu-memory-utilization 0.95`; `n=1` per configuration
-- **Metrics**:
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: `profiling-prompts/prefill-corpus.txt` (`686` tokens), context `32768`, `--greedy`, `64` generated tokens, `--gpu-memory-utilization 0.98`, `--staging-blocks 3`; two Warm settings, `0` and `35 GiB`, reported separately; `n=1` per configuration
+- **Metrics — Warm 0**:
 
-  | `pp` | aggregate Hot slots | TTFT | prefill tok/s | decode tok/s | decode `all_hot` | decode `has_cold` | NVMe |
-  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-  | 1 | `698` | `24,670 ms` | `27.4` | `2.88` | `7.7%` | `92.3%` | `238.82 GiB` |
-  | 2 | `2390` (`1224+1166`) | `21,812 ms` | `31.0` | `4.42` | `23.6%` | `76.4%` | `95.83 GiB` |
-  | 4 | `5774` (`1458+1458+1455+1403`) | `16,901 ms` | `40.1` | `5.44` | `33.3%` | `66.7%` | `36.69 GiB` |
+  | `pp` | aggregate Hot slots | TTFT | prefill tok/s | decode tok/s | decode `all_hot` | decode `has_cold` | prefill `all_hot` | NVMe |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | `738` | `25,110 ms` | `27.3` | `2.60` | `5.2%` | `94.8%` | `66.7%` | `243.17 GiB` |
+  | 2 | `2471` (`1265+1206`) | `22,329 ms` | `30.7` | `3.79` | `24.8%` | `75.2%` | `67.4%` | `180.33 GiB` |
+  | 4 | `5936` (`1499+1499+1495+1443`) | `16,816 ms` | `40.8` | `4.80` | `45.3%` | `54.7%` | `80.6%` | `126.15 GiB` |
 
-  The aggregate Hot pool grows with `pp` because each stage's device carries fewer layers and therefore less dense + attention state, leaving more VRAM for experts (`698 → 2390 → 5774`). That is the entire source of the gain: the Hot hit rate on decode rises `7.7% → 33.3%` and lifetime NVMe bytes fall `238.82 → 36.69 GiB`. Cold bytes per layer (`NVMe / 43`): `5.55 / 2.23 / 0.85 GiB`. Default-fraction slot delta versus the pre-R13 baseline: `--` (not re-captured in this pass; `698` is the default at context `32768`).
-- **Correctness / service**: `scripts/topology_equivalence.sh --exact --pipeline-parallel 2` and `--pipeline-parallel 4` are **byte-identical** to a `pp=1` baseline on both prompts (short and corpus), and a repeated `pp=2` corpus run is byte-identical to itself (deterministic). Direct logits dumps: `pp=2` vs `pp=1` identical over all `40` corpus positions. `test_v4_engine` `38/0`, `test_v4_prefill_sweep` `15/0`, `test_v4_prefix_reuse` `26/0`, `test_v4_conversation` `14/14` at `pp=1`.
-- **Conclusion / next gate**: Pipeline parallelism adds **no arithmetic** — a stage boundary is a copy, so the result is bit-identical. The measured win is **capacity**, not overlap: splitting the model lets each device hold many more Hot experts, so the three-tier hierarchy serves more from VRAM. Overlapping the handoff (async peer copy) is deferred; the current handoff joins the source stage on the host and enqueues the copy on the destination stream.
-- **Evidence**: `scripts/topology_equivalence.sh`, `aeon_chat --diagnostic`, `src/infrastructure/parallel/peer_access.hpp`, `src/architecture/deepseek_v4/runtime/v4_graph.hpp` (`handoff_residual`, `handoff_carry`), [MULTI_GPU_EXECUTION_PLAN.md](../execution/active/MULTI_GPU_EXECUTION_PLAN.md) Steps 9-10
+  The aggregate Hot pool grows with `pp` because each stage's device carries fewer layers and therefore less dense + attention state (`12.71 GiB → ~3.0 GiB` per stage at `pp=4`), leaving more VRAM for experts (`738 → 2471 → 5936`). The pinned host region does **not** grow with the stage count — one shared region, `10.12 GiB` / `768` slots at every `pp`. The gain is capacity: decode `all_hot` rises `5.2% → 45.3%` (`×8.7`) and lifetime NVMe falls `243.17 → 126.15 GiB`, so decode throughput rises `2.60 → 4.80 tok/s` (`×1.85`). Prefill gains less (`27.3 → 40.8 tok/s`, `×1.49`) because its swept lookahead is depth-1 (`lookahead=1`) and therefore drive-bound, so extra VRAM residency buys little there.
+
+- **Metrics — Warm 35**:
+
+  | `pp` | aggregate Hot slots | Warm slots | TTFT | prefill tok/s | decode tok/s | decode `all_hot` | decode `warm_no_cold` | decode `has_cold` | NVMe |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | `738` | `2642` | `20,832 ms` | `32.9` | `3.59` | `5.2%` | `27.7%` | `67.1%` | `161.97 GiB` |
+  | 2 | `2471` (`1265+1206`) | `2642` (`1351+1291`) | `17,995 ms` | `38.1` | `4.46` | `24.8%` | `15.6%` | `59.6%` | `137.98 GiB` |
+  | 4 | `5936` (`1499+1499+1495+1443`) | `2642` (`675+676+676+615`) | `12,505 ms` | `54.9` | `5.46` | `45.3%` | `10.5%` | `44.1%` | `92.23 GiB` |
+
+  The Warm tier is still one pinned region (`34.99 GiB` / `2654` slots at every `pp`), its lanes divided across the stages and the corridor anchored at the tail, so the host cost is the figure the user set however many stages there are. It leaves the **Hot** pool identical (`738 / 2471 / 5936`) and instead removes Cold reads: NVMe falls `−33% / −23% / −27%` and decode gains a new `warm_no_cold` band (`27.7% / 15.6% / 10.5%`). Its marginal value shrinks as `pp` grows — the larger per-stage Hot pools already absorb the working set, so Warm has less to catch — but the absolute numbers improve at every `pp`: TTFT `−17% / −19% / −26%` and decode `+38% / +18% / +14%`. **`pp=4` with Warm `35` is the best configuration measured** (TTFT `12,505 ms`, decode `5.46 tok/s`).
+
+- **Utilization sensitivity**: at `0.95` (otherwise identical, Warm `0`) every `pp` is equal-or-worse on every metric — Hot slots `−4…−8%`, decode `−2…−3%`, TTFT `+0.6…+3%`, NVMe `+1.7…+3%`. The direction is monotone across all six cells, so `0.98` is the recorded configuration; the gaps are near the run-to-run noise floor, so the magnitude is not asserted (`n=1`).
+- **Correctness / service**: every run reports `registry.invariants_hold=true`, `outstanding_leases=0`, `forced_drains=0`, `staging_in_use=0`, and a coherent generation. Pipeline parallelism adds no arithmetic (a stage boundary is a copy), so the pipelined token is bit-identical to the single-device one; the exactness gate lives in `scripts/topology_equivalence.sh --exact`.
+- **Conclusion / next gate**: Pipeline parallelism's measured win is **capacity, not overlap** — the layer split lets each device hold many more Hot experts, and the three-tier hierarchy then serves more from VRAM. Decode scales strongly; prefill's swept lookahead (`lookahead=1`) is the next lever (a cross-stage sweep cursor), since residency cannot help a drive-bound read queue. The Warm tier compounds the capacity win at both phases and is sizeable even at `pp=4`.
+- **Evidence**: `build/bin/aeon_chat --diagnostic`, `build/multigpu-fresh/{pp1,pp2,pp4}{,_w35}.log`, `src/architecture/deepseek_v4/runtime/v4_graph.hpp` (`handoff_residual`, `handoff_carry`), `src/infrastructure/parallel/peer_access.hpp`, [MULTI_GPU_EXECUTION_PLAN.md](../execution/active/MULTI_GPU_EXECUTION_PLAN.md)

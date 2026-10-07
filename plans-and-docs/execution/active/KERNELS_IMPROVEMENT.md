@@ -19,16 +19,24 @@ build/bin/aeon_chat \
   --prefill-window 4096 \
   --prefill-chunk 256 \
   --staging-blocks 3 \
-  --max-new-tokens 32 \
+  --device-ids 0 \
+  --tensor-parallel 1 \
+  --pipeline-parallel 1 \
+  --gpu-memory-utilization 0.95 \
+  --max-new-tokens 64 \
   --diagnostic --verbose \
   --supply-telemetry <path.jsonl> --run-id <id> \
   --phase-profile
 ```
 
+**Multi-GPU first pass.** The single-device rows keep `--warm-gib 35` and `--gpu-memory-utilization 0.95`, because changing either would invalidate the tables above. The pipeline first pass is the same command with the topology varied, Warm off and the whole device budget exposed — `--warm-gib 0 --gpu-memory-utilization 0.98 --pipeline-parallel {1, 2, 4}` — so the per-stage Hot pools are purely a function of the layer split, not of a host-side Warm tier.
+
 - **Prompt** — `profiling-prompts/prefill-corpus.txt`, trimmed to its first four-and-a-half paragraphs so the rendered prompt is ≈`700` tokens (the exact count is whatever `--diagnostic` prints; `profiling-prompts/first-prompt.txt` is the unrelated single-sentence prompt). A per-prompt-token figure is only comparable within one row, because the corpus was re-trimmed more than once and the pre-`4.1` rows were run on a `666`-token prompt or a `701`-token prefix of the longer corpus. The prompt-token count belongs beside every per-token number.
 - **`--prefill-chunk 256`** — valid: `kMaxTokens = 256` (`v4_layer_body_batch.hpp`); the `--help` text still says `1..64`, so trust the constant.
 - **`--prefill-window 4096`** — `W = 4096`, `C = 256`: `16` chunks fill a window, and the `~677`-token prompt is `ceil(677/256) = 3` chunk bodies per layer × `43` = `129`.
 - **`--staging-blocks 3`** — the swept staging arena, carved **inside** the single pinned `--warm-gib` allocation (not added to it). It moves the prefetch depth, not throughput. Some rows below use `--warm-gib 24` to stay off the host ceiling.
+- **`--device-ids / --tensor-parallel / --pipeline-parallel`** — the topology. Device ids are stage-major (`device(stage, rank) = device_ids[stage × tp + rank]`); the degenerate topology is `--device-ids 0 --tensor-parallel 1 --pipeline-parallel 1`, which is what every single-device row above used.
+- **`--gpu-memory-utilization`** — the fraction of each device's **total** VRAM the budget may plan against, in `(0, 0.99]`. It replaces the old fixed headroom constant, so the Hot pool follows the fraction: the larger it is, the more expert slots each stage holds. The single-device rows were captured at the default `0.95`.
 
 ### Host memory discipline
 
