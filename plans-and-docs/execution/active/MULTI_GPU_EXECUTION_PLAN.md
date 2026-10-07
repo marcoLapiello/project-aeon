@@ -1,7 +1,7 @@
 # Multi-GPU Execution Plan
 
 **Date:** 2026-10-05
-**Status:** Active — not started.
+**Status:** Active — Phase A complete (Steps 0–6), Phase B next.
 **Scope:** One model instance across the host's GPUs: explicit device selection, a VRAM utilization fraction, pipeline parallelism, the partition-aware artifact, tensor parallelism, and their composition — single-stream throughout.
 **Requirements:** [MULTI_GPU_REQUIREMENTS.md](../../specs-and-requirements/multi-gpu/MULTI_GPU_REQUIREMENTS.md) (R1–R13). **Feasibility evidence:** `tests/test_expert_shard_equivalence.cpp`, `tests/test_w2_shard_equivalence.cpp`, `tests/test_attention_shard_equivalence.cpp`.
 
@@ -67,15 +67,17 @@ Each step is one commit and ends green on its listed gates. Run only those gates
 
 ### Phase A — Foundations (single device, behaviour-preserving)
 
-#### Step 0 — Status (docs only)
+**Complete.** Landed in `df891fa` (Steps 0–5 and 6a) and `f5fe482` (Step 6b), single-device throughout. Gates green: `test_parallel_topology` 37/0, `test_memory_budget_fraction` 14/0, `test_v4_engine` 38/0, `test_v4_prefill_sweep` 15/0, `test_v4_prefix_reuse` 26/0, `test_v4_expert_tiering` 29/0, `test_v4_conversation` 14/14, and `topology_equivalence.sh --exact` bit-identical on both prompts.
+
+#### Step 0 — Status (docs only) — ✅ done
 In [PROJECT_STATUS.md](../../status/PROJECT_STATUS.md) §3, move the **Multi-GPU** row from Future to Present and link this plan and the requirements. Pay for it by fusing a Past row, as the maintenance rule requires.
 
-#### Step 1 — The equivalence gate and the R2 baseline
+#### Step 1 — The equivalence gate and the R2 baseline — ✅ done
 - **Create** `scripts/topology_equivalence.sh`, modelled on `expert_tier_invariance.sh`. It runs `aeon_chat --greedy --max-new-tokens 64 --dump-logits` on (a) a short prompt and (b) `profiling-prompts/prefill-corpus.txt` (swept path), for a given flag set, and compares the result against a stored baseline. It has two modes: `--exact` (byte `cmp` of the logits and token ids) and `--tolerance 1e-3` (max relative logit error via an inline Python comparison; offline only, so R10 holds). It also prints the first divergent token.
 - **Capture the baseline** on today's `main`, on the headless device via `HIP_VISIBLE_DEVICES`, into `build/topology-baseline/` (not committed). Record its commit SHA in the script header.
 - **Gate:** the script compares the baseline against itself, exactly.
 
-#### Step 2 — Topology type (G1, pure)
+#### Step 2 — Topology type (G1, pure) — ✅ done
 - **Create** `src/infrastructure/parallel/parallel_topology.hpp`:
   - `struct ParallelTopologyConfig { std::vector<int> device_ids; uint32_t tensor_parallel{1}; uint32_t pipeline_parallel{1}; }`
   - `struct LayerRange { uint32_t first; uint32_t count; }`
@@ -84,25 +86,25 @@ In [PROJECT_STATUS.md](../../status/PROJECT_STATUS.md) §3, move the **Multi-GPU
   - Refusals with named reasons: duplicate or out-of-range id, `ids != tp × pp`, `tp ∤ artifact_max_tp`, `pp > num_layers`, a zero degree.
 - **Gate:** `tests/test_parallel_topology.cpp` (host-only; register next to `test_prefix_record` in `cmake/AeonInfrastructure.cmake`). It covers every refusal, the stage-major mapping, the 43-layer splits for `pp ∈ {1,2,3,4}` (`22/21`, `15/14/14`, `11/11/11/10`), the empty-ids default, and the parse cases.
 
-#### Step 3 — Configuration and flags
+#### Step 3 — Configuration and flags — ✅ done
 - `memory/runtime_config.hpp::AeonRuntimeConfig`: add `ParallelTopologyConfig parallel;` and `double gpu_memory_utilization{0.95};`.
 - `tools/engine_cli.hpp::EngineCli` + `parse_engine_flag`: add `--device-ids`, `--tensor-parallel`, `--pipeline-parallel`, `--gpu-memory-utilization` (range `(0, 0.99]`, named error) and forward them in `to_engine_options`. In `tools/aeon_chat.cpp`, call `parse_engine_flag` for these four before its own chain, so the parsing is not duplicated.
 - `V4ModelHost::initialize`: refuse `tp × pp > 1` with "multi-GPU topology not yet supported" until Step 9 (PP) and Step 19 (TP) lift it.
 - **Gate:** add parse cases to `test_parallel_topology`, and confirm `aeon_serve --help` lists the flags.
 
-#### Step 4 — Explicit device selection (R12, R10)
+#### Step 4 — Explicit device selection (R12, R10) — ✅ done
 - `platform/device.hpp`: **delete** `select_compute_device` and the bus-`0x46` heuristic. **Add** `int select_device(int index, bool verbose)`, which validates the index against `hipGetDeviceCount`, sets the device and prints the name and PCI address. Also add `class DeviceScope` (RAII: `hipGetDevice` → `hipSetDevice(index)` → restore).
 - `V4ModelHost::initialize`: resolve the topology (Step 2) and select `device(0, 0)`. Remove the pre-selection from `aeon_chat.cpp` and `aeon_serve.cpp`, and give `aeon_c4_probe.cpp` a `--device-id` flag.
 - Tests, as one mechanical commit: **create** `tests/test_device.hpp` with `select_test_device()` (the first id of `AEON_TEST_DEVICE_IDS`, default `0`) and `test_device_ids()`, and replace every `select_compute_device(...)` in `tests/`. In `cmake/AeonOptions.cmake`, add the cache var `AEON_TEST_DEVICE_IDS` (default `0`). In `cmake/AeonHelpers.cmake::aeon_add_test`, export it as `ENVIRONMENT`.
 - Scripts: `scripts/*.sh` that run `aeon_chat`/`aeon_serve` pass `--device-ids "${AEON_DEVICE_IDS:-0}"`.
 - **Gate:** `test_v4_engine`, `test_w4a16_swizzled_gemv` and `test_v4_expert_tiering` with `AEON_TEST_DEVICE_IDS=<headless>`, plus `topology_equivalence.sh --exact --device-ids <headless>`.
 
-#### Step 5 — VRAM utilization fraction (R13)
+#### Step 5 — VRAM utilization fraction (R13) — ✅ done
 - `memory/memory_budget_engine.hpp`: split out a pure `evaluate(cfg, geometry, dense_bytes, format, DeviceMemoryInfo{device, free, total})`. Keep the HIP query as a thin wrapper that runs under `DeviceScope`. Set `allowance = floor(fraction × total)`. Refuse when `allowance > free`, with the message "device N: X GiB free < Y GiB allowance at utilization f — lower `--gpu-memory-utilization` or free the device". Set `usable_vram_bytes = allowance`. **Delete** `VRAM_HEADROOM_SAFETY_BYTES` and the `vram_headroom_bytes` term.
 - `memory/memory_budget_report.hpp`: add `device_index` and `gpu_memory_utilization`, and drop the headroom field.
 - **Gate:** **create** `tests/test_memory_budget_fraction.cpp` (host-only, injected `DeviceMemoryInfo`). It checks the accept and refuse boundaries, that Hot slots follow the fraction, and that a display-loaded device (`free < allowance`) is refused. Then run `topology_equivalence.sh --exact` with `--max-hot-slots <baseline slots>`: numerics unchanged at equal residency. The slot count at the default fraction changes by design; record it for Step 10.
 
-#### Step 6 — Device context and the stage host (G1 + G4, behaviour-preserving)
+#### Step 6 — Device context and the stage host (G1 + G4, behaviour-preserving) — ✅ done
 Two commits, because a split is its own step.
 - **6a.** **Create** `src/infrastructure/parallel/device_context.hpp` with `struct DeviceContext { int device; DeviceStreams streams; static DeviceContext create(int device); void destroy() noexcept; }`. Streams are created under `DeviceScope`. `V4ModelHost` holds a `DeviceContext` instead of a bare `DeviceStreams streams_`; `streams()` returns `context.streams`.
 - **6b.** **Create** `src/architecture/deepseek_v4/runtime/v4_stage_host.hpp`: `V4StageHost` owns `{LayerRange, DeviceContext, V4ModelResources, V4ActivationScratch, layers (range), V4PrefillWorkspace, ExpertTierState, V4ExpertSupplyCoordinator, V4RoutedExpertScratch, executor, PrefillController}`. Move `initialize_experts` and the per-stage accessors there unchanged. `V4ModelHost` keeps loader, config, specs, contract and topology, plus `std::vector<V4StageHost> stages_` (size 1). Its existing accessors (`layer(i)`, `scratch()`, `executor()`, `tables()`, `streams()`, prefill hooks, `reset_generation_state`, `drain_expert_streams`) forward to the owning stage, or to all stages for resets and drains. **`V4Graph` and its callers are not edited.**
