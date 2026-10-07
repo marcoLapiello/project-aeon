@@ -72,6 +72,7 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 | `supply-corridor` | Deep swept corridors (`3E`+): read-wave serialization, corridor sizing, Warm borrow | M46 |
 | `e2e-post-relocation` | Post-reorganisation e2e vs the pre-relocation baseline (TTFT, decode, bytes) | M47 |
 | `prefill-kernel-throughput` | Prefill GPU-compute reduction and the phase collapses (end-to-end, phase profile) | M48 |
+| `pipeline-parallel` | A stage per device: exactness and throughput vs the single-device run | M51 |
 
 ## 4. Milestone cards
 
@@ -439,3 +440,22 @@ Authoritative silicon record for the AMD Radeon RX 7900 XTX (`gfx1100`).
 - **Correctness / service**: `test_server_service` `21/0` (one engine run at a time, FIFO, a second job queues, `QueueFull`, a cancelled queued job never reaches the engine, a throwing engine resets and the next runs, `shutdown` terminates every stream, `snapshot` never waits); `test_server_codec` `49/49`; `test_server_http` `27/27` (the latch case proves streaming is not buffered, R1–R6); `test_v4_conversation` `14/14` (stream == batch, cancel mid-decode, cancel in prefill, request validation, supply invariants); `test_utf8_chunker` and `test_dsv4_stream_decoder` `23/23`; `check_server_layering` clean and shown to fail on an injected model include. The end-to-end smoke passed every check.
 - **Conclusion / next gate**: The G5 server is **working end to end**: streaming is unbuffered, the queue lends the single engine thread FIFO, cancellation is token-granular after prefill and window-granular during it, prefix reuse holds across a re-sent conversation, and every bad input is a defined JSON error. Fixing `JsonValue`'s `\u` surrogate handling was required — a client that escapes an astral code point (e.g. an emoji) as a surrogate pair produced invalid UTF-8 the tokenizer rejected. Deferred and named: response-side DSML → `tool_calls`, `stop` strings, a second transport/auth.
 - **Evidence**: `tests/test_server_{service,codec,http}.cpp`, `tests/test_v4_conversation.cpp`, `tests/test_utf8_chunker.cpp`, `tests/test_dsv4_stream_decoder.cpp`, `server/`, `tools/aeon_serve.cpp`, `tools/engine_cli.hpp`, `scripts/server_smoke.sh`, `scripts/check_server_layering.sh`, [SERVER_EXECUTION_PLAN.md](../execution/completed/SERVER_EXECUTION_PLAN.md)
+
+### M51: Pipeline parallelism — bit-exact, and faster from a larger per-stage Hot pool
+- **Run**: `2026-10-07`; commit `bcb024b`; DeepSeek-V4-Flash-0731-INT4-W4A16-Aeon, 43 layers, 256 experts each; `aeon_chat --diagnostic`
+- **Class / comparison key**: `E2E / pipeline-parallel`
+- **Platform**: `baseline`, 4x RX 7900 XTX; `pp=1` device 0, `pp=2` devices 0,1, `pp=4` devices 0,1,2,3; PCIe 4.0 x16, P2P enabled
+- [ ] **Invalidate for comparison** | **Reason**: `--`
+- **Workload / configuration**: the `profiling-prompts/prefill-corpus.txt` prompt (`677` tokens), context `32768`, `--greedy`, `64` generated tokens, Warm `0`, default `--gpu-memory-utilization 0.95`; `n=1` per configuration
+- **Metrics**:
+
+  | `pp` | aggregate Hot slots | TTFT | prefill tok/s | decode tok/s | decode `all_hot` | decode `has_cold` | NVMe |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | `698` | `24,670 ms` | `27.4` | `2.88` | `7.7%` | `92.3%` | `238.82 GiB` |
+  | 2 | `2390` (`1224+1166`) | `21,812 ms` | `31.0` | `4.42` | `23.6%` | `76.4%` | `95.83 GiB` |
+  | 4 | `5774` (`1458+1458+1455+1403`) | `16,901 ms` | `40.1` | `5.44` | `33.3%` | `66.7%` | `36.69 GiB` |
+
+  The aggregate Hot pool grows with `pp` because each stage's device carries fewer layers and therefore less dense + attention state, leaving more VRAM for experts (`698 → 2390 → 5774`). That is the entire source of the gain: the Hot hit rate on decode rises `7.7% → 33.3%` and lifetime NVMe bytes fall `238.82 → 36.69 GiB`. Cold bytes per layer (`NVMe / 43`): `5.55 / 2.23 / 0.85 GiB`. Default-fraction slot delta versus the pre-R13 baseline: `--` (not re-captured in this pass; `698` is the default at context `32768`).
+- **Correctness / service**: `scripts/topology_equivalence.sh --exact --pipeline-parallel 2` and `--pipeline-parallel 4` are **byte-identical** to a `pp=1` baseline on both prompts (short and corpus), and a repeated `pp=2` corpus run is byte-identical to itself (deterministic). Direct logits dumps: `pp=2` vs `pp=1` identical over all `40` corpus positions. `test_v4_engine` `38/0`, `test_v4_prefill_sweep` `15/0`, `test_v4_prefix_reuse` `26/0`, `test_v4_conversation` `14/14` at `pp=1`.
+- **Conclusion / next gate**: Pipeline parallelism adds **no arithmetic** — a stage boundary is a copy, so the result is bit-identical. The measured win is **capacity**, not overlap: splitting the model lets each device hold many more Hot experts, so the three-tier hierarchy serves more from VRAM. Overlapping the handoff (async peer copy) is deferred; the current handoff joins the source stage on the host and enqueues the copy on the destination stream.
+- **Evidence**: `scripts/topology_equivalence.sh`, `aeon_chat --diagnostic`, `src/infrastructure/parallel/peer_access.hpp`, `src/architecture/deepseek_v4/runtime/v4_graph.hpp` (`handoff_residual`, `handoff_carry`), [MULTI_GPU_EXECUTION_PLAN.md](../execution/active/MULTI_GPU_EXECUTION_PLAN.md) Steps 9-10
