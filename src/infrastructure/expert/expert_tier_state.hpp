@@ -91,6 +91,10 @@ struct ExpertTierState {
         uint32_t num_layers{0};
         uint32_t experts_per_layer{0};
         uint32_t experts_per_token{0};
+        // The global id of this tier's first layer. A stage over a layer range keeps
+        // the registry local-indexed (its layer 0 is the stage's own first layer) and
+        // adds this only when it addresses the artifact.
+        uint32_t first_layer{0};
         hipStream_t compute{nullptr};
         // The partition refreshes the sweep's bank count from the arena it just built;
         // both are neutral types, supplied by the composer (created model-side, but
@@ -199,7 +203,7 @@ struct ExpertTierState {
         // boundary, reading the demotion capacity through the pointer.
         bulk_loader.bind(ExpertTierLoader::Services{
             &registry, payload_pool.get(), &host_pool, &direct_io, params.source, &budget,
-            params.compute, &demotion_queue_capacity});
+            params.compute, &demotion_queue_capacity, params.first_layer});
 
         // 12 — Hot, then Warm, filled by batched `O_DIRECT` reads. This is the only
         // step with real mass.

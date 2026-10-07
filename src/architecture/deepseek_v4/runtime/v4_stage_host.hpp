@@ -522,9 +522,10 @@ inline void V4StageHost::initialize_experts() {
     tier_.payload_pool = std::make_unique<UnifiedVRAMExpertPool>();
     tier_.initialize(ExpertTierState::Params{
         &format, &runtime_cfg, &budget, &loader,
-        static_cast<uint32_t>(config.num_hidden_layers),
+        range_.count,
         static_cast<uint32_t>(config.n_routed_experts),
         static_cast<uint32_t>(config.num_experts_per_tok),
+        range_.first,
         context_.streams.compute, &prefill_controller_.sweep(), &supply_});
 
     // The tiered supply, on the four shared streams.
@@ -544,7 +545,8 @@ inline void V4StageHost::initialize_experts() {
         runtime_cfg.demotion_queue_capacity > 0
             ? runtime_cfg.demotion_queue_capacity
             : (runtime_cfg.enable_warm_refill
-                ? static_cast<uint64_t>(config.num_experts_per_tok) : 0));
+                ? static_cast<uint64_t>(config.num_experts_per_tok) : 0),
+        range_.first);
     tier_.demotion_queue_capacity = supply_.demotion_queue_capacity();
     freeze_warm_during_prefill_ = runtime_cfg.freeze_warm_during_prefill;
 

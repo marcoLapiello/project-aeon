@@ -104,6 +104,7 @@
 #include "infrastructure/expert/transport/prefetch_staging.hpp"
 #include "infrastructure/expert/transport/supply_telemetry.hpp"
 #include "infrastructure/expert/transport/tiered_expert_supply.hpp"
+#include "architecture/deepseek_v4/moe/v4_expert_supply.hpp"
 #include "infrastructure/io/aligned_allocator.hpp"
 #include "infrastructure/io/direct_io_reader.hpp"
 
@@ -748,6 +749,81 @@ struct TieringGate {
                     registry.invariants_hold() && registry.demotion_drops == 0,
                     "registry invariants hold, demotion_drops=" +
                         std::to_string(registry.demotion_drops));
+
+        // ---------------------------------------------------------------------
+        // G — a tier over a layer range addresses the artifact's global layers
+        // ---------------------------------------------------------------------
+        //
+        // A stage owns a contiguous range of layers and its registry is local-indexed
+        // (local layer 0 is the stage's own first layer). The only place that becomes a
+        // **global** layer is the artifact address, where the stage's `first_layer` is
+        // added. This tier is built over `[20, 43)`: a fresh registry/pool set whose
+        // local layer ids must read the payloads of global layers 20..42.
+        std::printf("\n[G] A tier over [20, 43) addresses the correct global payloads\n");
+
+        constexpr uint32_t kFirstLayer = 20;
+        constexpr uint32_t kRangeLayers = 23;
+        constexpr uint32_t kLocalLayer = 5;   // -> global layer 25
+        constexpr uint32_t kRangeVram = 64;
+        constexpr uint32_t kRangeHost = 64;
+        constexpr uint64_t kRangeDemotion = 16;
+
+        aeon::core::V4ExpertSupplyCoordinator range_supply;
+        ExpertPayloadPool range_vram_pool;
+        HostExpertPool range_host_pool;
+        PrefetchStagingArena range_staging{12};
+        ExpertRegistry range_registry;
+        SupplyTelemetry range_telemetry;
+        aeon::io::DirectIOReader range_reader{64};
+        std::unordered_map<uint64_t, aeon::io::DirectIOCompletion> range_completions;
+        uint64_t range_next_id{5000};
+
+        range_vram_pool.allocate(kRangeVram, format);
+        range_host_pool.allocate(kRangeHost, format);
+        range_registry.init(kRangeLayers, kExpertsPerLayer, kRangeVram, kRangeHost,
+                            /*preload_warm_host=*/false);
+        // `first_layer = 20`: the coordinator's artifact source adds this to every
+        // local layer before it calls `get_expert_location`.
+        range_supply.configure(
+            &loader, &range_vram_pool, &range_host_pool, &range_registry, &range_staging,
+            &range_telemetry, &range_reader, &range_completions, &range_next_id,
+            compute_stream, sdma_stream, sdma_cold_stream, demotion_stream,
+            format.payload_bytes, kRangeDemotion, kFirstLayer);
+
+        std::vector<int32_t> ranged_experts{7, 11, 13, 17, 19, 23};
+        std::vector<uint32_t> range_leases;
+        auto range_state =
+            range_supply.dispatch_layer_prefetch(kLocalLayer, 0, ranged_experts, range_leases);
+        range_supply.materialize_layer_prefetch(range_state);
+        CHECK_HIP(hipStreamSynchronize(compute_stream));
+        CHECK_HIP(hipStreamSynchronize(sdma_stream));
+        CHECK_HIP(hipStreamSynchronize(sdma_cold_stream));
+        range_supply.reap_registry_transfers();
+
+        size_t ranged_mismatch = 0;
+        for (size_t index = 0; index < range_state.vram_slots.size(); ++index) {
+            const uint32_t global_gid =
+                (kFirstLayer + kLocalLayer) * kExpertsPerLayer +
+                static_cast<uint32_t>(ranged_experts[index]);
+            std::vector<uint8_t> delivered(kPayloadBytes);
+            CHECK_HIP(hipMemcpy(delivered.data(),
+                                range_vram_pool.get_slot_base(
+                                    static_cast<uint32_t>(range_state.vram_slots[index])),
+                                kPayloadBytes, hipMemcpyDeviceToHost));
+            const auto& expected = ground_truth(global_gid);
+            if (byte_diff(delivered.data(), expected.data(), kPayloadBytes).count != 0) {
+                ++ranged_mismatch;
+            }
+        }
+        assert_that("G: a tier over [20,43) reads global layers 20..42",
+                    ranged_mismatch == 0 && range_state.expert_count() == ranged_experts.size(),
+                    "local layer " + std::to_string(kLocalLayer) + " -> global " +
+                        std::to_string(kFirstLayer + kLocalLayer) + ": " +
+                        std::to_string(ranged_experts.size() - ranged_mismatch) + "/" +
+                        std::to_string(ranged_experts.size()) + " bit-exact");
+
+        for (uint32_t gid : range_leases) range_registry.release_lease(gid);
+        range_supply.reap_registry_transfers();
 
         // ---------------------------------------------------------------------
         std::printf("\n[tiering] %s — %u checks, %u failed\n",

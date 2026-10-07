@@ -51,6 +51,10 @@ public:
         const MemoryBudgetReport* budget{nullptr};
         hipStream_t compute{nullptr};
         uint64_t* demotion_queue_capacity{nullptr};  // read at restore time
+        // The global id of this tier's first layer. The registry is local-indexed
+        // (layer 0 is the stage's own first layer), so this is the one term that turns
+        // a local layer into the artifact's global layer when a payload is addressed.
+        uint32_t first_layer{0};
     };
 
     void bind(const Services& services) { services_ = services; }
@@ -78,7 +82,7 @@ public:
                 const int32_t gid = services_.registry->vram_slots[slot];
                 if (gid < 0) continue;
                 const auto& entry = services_.registry->catalog[static_cast<size_t>(gid)];
-                expert_ids.emplace_back(entry.layer_id, entry.expert_id);
+                expert_ids.emplace_back(services_.first_layer + entry.layer_id, entry.expert_id);
                 buffers.emplace_back(format.payload_bytes, format.sector_size);
             }
 
@@ -117,7 +121,7 @@ public:
                 const int32_t gid = services_.registry->host_slots[slot];
                 if (gid < 0) continue;
                 const auto& entry = services_.registry->catalog[static_cast<size_t>(gid)];
-                expert_ids.emplace_back(entry.layer_id, entry.expert_id);
+                expert_ids.emplace_back(services_.first_layer + entry.layer_id, entry.expert_id);
                 destinations.push_back(services_.host_pool->get_expert_slot_ptr(slot));
             }
             services_.direct_io->read_blocking(*services_.source, expert_ids, destinations);

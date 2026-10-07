@@ -56,7 +56,8 @@ public:
         hipStream_t sdma_cold_stream,
         hipStream_t demotion_stream,
         size_t expert_payload_bytes,
-        uint64_t demotion_queue_capacity
+        uint64_t demotion_queue_capacity,
+        uint32_t first_layer = 0
     ) {
         if (aeon_loader == nullptr || expert_registry == nullptr) {
             throw std::invalid_argument("V4ExpertSupplyCoordinator: model source and registry are required");
@@ -68,24 +69,29 @@ public:
         if (has_mapped_experts) {
             source.direct_fd = aeon_loader->expert_direct_fd();
         }
-        source.locate = [aeon_loader, experts_per_layer](uint32_t global_expert_id) {
+        // The requests the registry builds are local-indexed (a stage's layer 0 is its
+        // own first layer), so the artifact is addressed by adding this stage's
+        // `first_layer` — the one term that turns a local layer into a global one. A
+        // single-stage tier has `first_layer == 0` and this is the identity.
+        source.locate = [aeon_loader, experts_per_layer, first_layer](uint32_t global_expert_id) {
             if (experts_per_layer == 0) {
                 throw std::runtime_error("V4ExpertSupplyCoordinator: invalid expert catalog width");
             }
             const uint32_t layer_id = global_expert_id / experts_per_layer;
             const uint32_t expert_id = global_expert_id % experts_per_layer;
-            const auto location = aeon_loader->get_expert_location(layer_id, expert_id);
+            const auto location = aeon_loader->get_expert_location(first_layer + layer_id, expert_id);
             return TieredExpertSupply::PayloadLocation{
                 location.file_offset,
                 location.byte_length
             };
         };
-        source.host_payload = [aeon_loader, has_mapped_experts, experts_per_layer](uint32_t global_expert_id) {
+        source.host_payload = [aeon_loader, has_mapped_experts, experts_per_layer,
+                               first_layer](uint32_t global_expert_id) {
             if (!has_mapped_experts || experts_per_layer == 0) {
                 return static_cast<const uint8_t*>(nullptr);
             }
             return aeon_loader->get_expert_data(
-                global_expert_id / experts_per_layer,
+                first_layer + global_expert_id / experts_per_layer,
                 global_expert_id % experts_per_layer);
         };
 
